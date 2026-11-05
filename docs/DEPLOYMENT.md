@@ -163,7 +163,28 @@ The runner sets `LAB_MAX_PARALLEL` and a per-agent concurrency cap from these nu
    This replaces call (p) in the plan.
 3. **One run cell at a time by default** (`max_parallel_cells: 1`). The second slot is opened only for HackingBuddyGPT cells once M2 has measured real CPU and memory use.
 
-### 0.6 Quickstart for the LXC
+### 0.6 Final runs on CISPA hardware (decided 5 Nov 2026)
+
+| Environment | Used for | Profile |
+|---|---|---|
+| Homelab LXC (CT 111) | Development and testing: M0–M2, self-tests, agent smoke runs, measuring each agent's footprint | `isolation: lxc`, one cell at a time |
+| **CISPA hardware** | **The pilot (M3) and every experiment whose data goes into the paper** | `isolation: sysbox` on a VM or bare metal (the stronger per-cell-daemon design in §1–§4 and the feasibility study §4); `kvm-per-cell` if needed |
+
+Nothing in the harness is specific to either environment: the same release tag, `images.lock` and scripts deploy to both, selected by the host entry in `hosts.yml`.
+
+Data from homelab runs is development data only and is never mixed into paper results.
+
+**To clarify with CISPA IT before M3 (the answers may change the deployment profile):**
+
+1. **Machine type:** a VM or bare metal with root and Docker (the plan as written)? Or a shared cluster (Kubernetes, Slurm, Podman/Apptainer only)? Kubernetes would use the planned `K8sJobBackend`; a Slurm or Apptainer-only cluster needs a new cell backend.
+2. **Kernel and OS:** whether Sysbox can be installed (Ubuntu 24.04 or 22.04 is packaged); otherwise KVM per cell.
+3. **Outbound network:** whether the machine can reach the model providers' APIs and GHCR. If there is a mandatory HTTP proxy, the LiteLLM gateway and image pulls go through it; run cells stay offline either way.
+4. **Approval:** whether running offensive attack agents, even fully contained, needs IT-security or ethics sign-off (the paper's ethics review already plans for this).
+5. **Access:** how the team reaches the machine (VPN, SSH bastion), which replaces Twingate for that host.
+6. **Data:** where run artifacts may live and be backed up (institutional storage policy).
+7. **Resources:** cores, RAM and disk, which set `max_parallel_cells`. With ~128 GB the pilot finishes in about 2 days.
+
+### 0.7 Quickstart for the LXC
 
 ```
 cp deploy/hosts.example.yml deploy/hosts.yml   # address, ssh_user, isolation: lxc, access: twingate

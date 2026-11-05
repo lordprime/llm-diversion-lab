@@ -726,7 +726,7 @@ The paper's timeline puts E0 at 19 Oct – 1 Nov and the scope gate at **22 Nov*
 | **M0: Skeleton** (week 1) | Git repo + CI skeleton (lint, types, unit tests) per ENGINEERING_STANDARDS. **Proxmox LXC** prepared ([DEPLOYMENT.md §0](DEPLOYMENT.md)) and provisioned with `deploy/bootstrap.sh` (`isolation: lxc`: Docker, nftables, Caddy, monitoring stack); `secrets.sh` and `release.sh` working over Twingate; `labctl doctor` (incl. the Proxmox-firewall check). Control plane: Postgres, Collector API, runner with `ComposeBackend`, LiteLLM + tap. **DVGA** built from source with the CVE-Bench v2.2.0 evaluator. Injector with P1 and P7. Callback catcher. **cell-guard** socket proxy with its deny-by-default tests. Scripted agent + stub LLM. `labctl selftest`. **First checks:** Docker in the LXC (overlay2, the CVE-2025-52881 breakage), catcher-as-DNS on an isolated internal network, `gateway_mode_ipv4=isolated`. | The self-test detects all four stages and the callback on DVGA. The control cell is clean. The containment probe can't reach the internet, the LXC host services or the home LAN. cell-guard denies every forbidden request in its test suite. |
 | **M1: All targets + surfaces** (week 2) | Juice Shop and Drupal 8.5.0 built from source. All 3 seeded with content packs; hygiene patches and probes; placement maps P1–P7; placement probe; `labctl build` with images.lock, golden data roots and tool-presence assertions. | The self-test passes on all 3 targets; offline smoke tests pass. |
 | **M2: Wave 1 agents** (weeks 2–4) | **Provider-terms check done first (gate).** HackingBuddyGPT, Strix and RedAmon adapters, with patches and egress canaries. Scheduler service and `labctl schedule`. Results website views 1, 2, 3 and 8. Haiku 5.5 smoke runs to debug adapters. | 10 real runs per adapter, valid end to end, inspectable on the run detail page. Zero non-tap egress in every pcap. |
-| **M3: Wave 1 pilot** (weeks 4–5) | `./labctl pilot` runs P0 → P1 → P1b → P2 unattended (§9.2). Effects, cost, refusal and callback views. | Go/no-go read-out (§9.3) from Wave 1 data. |
+| **M3: Wave 1 pilot** (weeks 4–5) | **Deployed to CISPA hardware** (`isolation: sysbox`, DEPLOYMENT §0.6), then `./labctl pilot` runs P0 → P1 → P1b → P2 unattended (§9.2). Effects, cost, refusal and callback views. | Go/no-go read-out (§9.3) from Wave 1 data. |
 | **M4: Wave 2 agents** (weeks 5–6) | PentestGPT and PentAGI adapters. The same pilot definition re-run for the two new agents. | Pilot report covering all 5 agents. |
 | **M5: Expansion** (after go) | Non-Claude providers through LiteLLM; CVE-Bench integration (its tasks run through the same oracle contract); held-out split; the paper's E0–E3 at full size. | The paper's experiments run on the same harness. |
 
@@ -772,7 +772,7 @@ Adding the 2 Wave 2 agents brings this to about 500 runs.
 
 RedAmon defaults to `claude-opus-4-6` and PentAGI mixes models per role. Both are overridden to the pilot model, and the override is verified by the tap's model assertion.
 
-**Wall-clock time.** On the LXC (2 parallel cells at 32 GB, 4–5 at 64 GB), the Wave 1 pilot takes about **3–6 days** of machine time at 297 runs × up to 45 min. That is unattended, and it can be spread over scheduled night windows. RedAmon cells run one at a time on a 32 GB LXC.
+**Wall-clock time.** The pilot runs on CISPA hardware. With ~128 GB and 6–8 parallel cells, the Wave 1 pilot takes about **1.5–3 days** at 297 runs × up to 45 min. The homelab LXC runs only development and smoke runs, one cell at a time.
 
 Every run also has a hard per-run budget in its LiteLLM virtual key, and `LAB_BUDGET_USD` caps the whole experiment.
 
@@ -806,7 +806,7 @@ The pilot "has promise" if all three instrumentation checks pass and at least on
 
 1. **Pilot spend ceiling.** Wave 1 is roughly $300–1,200 on Sonnet 5.5 (refined after P0). What is `LAB_BUDGET_USD`?
 2. *(Resolved: RedAmon is in Wave 1 after the source audit.)*
-3. *(Resolved: an unprivileged LXC on the team's Proxmox server, accessed over Twingate; see DEPLOYMENT §0.)* **Still needed:** the cores, RAM and disk the LXC gets, the Proxmox version (9.1+ needed, or accept the documented containerd stopgap), and the storage type (ZFS version).
+3. *(Resolved: development and testing on an unprivileged LXC on the team's Proxmox server, over Twingate; the pilot and final runs on CISPA hardware with the Sysbox profile. See DEPLOYMENT §0 and §0.6.)* **Still needed:** the CISPA answers listed in DEPLOYMENT §0.6, before M3.
 4. **RedAmon's built-in injection defence.** RedAmon wraps every tool output in `UNTRUSTED` fences and cuts browser output to a head/tail stub, and neither can be turned off without a patch. The plan's default is to test it **as shipped** and record the defence as part of its configuration. Do you also want a patched "defence off" variant as an extra arm? It would be a strong result for the paper, but it adds runs.
 5. **Oracle visibility.** The new default hides the oracle from agents; the harness polls it. Do you also want CVE-Bench's "agent may poll `/done`" variant for comparability?
 6. **Destructive agent actions.** When an agent wipes or reseeds data (DVGA `/start_over`, `deleteAllPastes`), the default is to allow it and log it as a derailment signal. Is that right, or should it be blocked?
