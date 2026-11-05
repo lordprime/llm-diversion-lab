@@ -838,7 +838,7 @@ The pilot "has promise" if all three instrumentation checks pass and at least on
 | m | Beacon payload family added, lab-only, request-only (no code execution) | §4.4 |
 | n | Website, APIs and Grafana behind Caddy (TLS + login), reached over Twingate; public exposure only via Cloudflare Tunnel + Cloudflare Access | §6, DEPLOYMENT §0 |
 | o | Ansible for host provisioning, thin Bash wrappers for operations; systemd-managed compose stacks | DEPLOYMENT §4 |
-| p | Images built on the lab server (host has internet, cells don't) into a local registry; CI may push instead | DEPLOYMENT §2 |
+| p | Images built in GitHub Actions on each `lab-vN` tag and pushed to GHCR; the lab container only pulls by digest (its 4-core CPU is too slow for builds); `labctl build` on the server is the fallback | DEPLOYMENT §0.5 |
 | q | Python 3.12 + uv, ruff, mypy strict, pydantic v2 as the single schema source, Alembic, pytest + hypothesis; no live LLM in CI | ENGINEERING_STANDARDS §2, §4 |
 | r | A containment alert pauses the queue until a person acknowledges it | TRACKING §3.5 |
 

@@ -68,6 +68,7 @@ pct create <CTID> <template-storage>:vztmpl/<ubuntu-24.04-template>.tar.zst \
 |---|---|
 | Inbound | Allow TCP 22 and 443 **only from the Twingate connector's IP**. Drop everything else. |
 | Outbound | Allow DNS to the LAN resolver. **Drop** 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 and 100.64.0.0/10. Allow everything else: provider APIs, registries, Cloudflare. |
+| IPv6 | Drop inbound. Outbound: drop the LAN `/64`, `fe80::/10` and `fc00::/7`. IPv6 is also disabled inside the container (§0.5). |
 
 Docker's internal cell networks live *inside* the container's network namespace, so this firewall never interferes with traffic inside a cell. `labctl doctor` checks it from inside the LXC by trying to reach a LAN address, which must fail, and a provider API, which must succeed.
 
@@ -128,7 +129,41 @@ It is **deny by default** and allows only the following:
 
 The runner sets `LAB_MAX_PARALLEL` and a per-agent concurrency cap from these numbers. It **never starts a cell that would exceed the LXC's free memory**; it waits instead.
 
-### 0.5 Quickstart for the LXC
+### 0.5 The lab container as built (checked 5 Nov 2026)
+
+**Container 111 `node-03-research` on node `Homelab-IC3`:**
+
+| Check | Result |
+|---|---|
+| Proxmox / kernel | PVE 9.2.25, kernel 7.0.14-25-pve: past the CVE-2025-52881 Docker-in-LXC fix |
+| Container type | Unprivileged (uid map `0 → 100000`), `nesting=1,keyctl=1` |
+| OS | Ubuntu 24.04 LTS |
+| CPU | **4 threads visible.** The host is an AMD PRO A10-9700E (4 cores), so the configured 5 cores are capped at 4. |
+| RAM / swap | 8.2 GiB / 8.0 GiB |
+| Disk | 300 GB ZFS subvolume (ZFS 2.4.4) |
+| overlay2 prerequisites | Overlay mount on the ZFS rootfs works; nested user namespaces work |
+| Netfilter | `nft` and `iptables` present |
+| Time | Clock synchronised by the host (the container can't run its own NTP, and doesn't need to; `labctl doctor` checks the synchronised flag) |
+| Docker | Not installed yet (the bootstrap installs it) |
+| Outbound IPv4 | **Broken: no default route** (`net0` has no `gw=`). Fixed on the host with `gw=192.168.1.1`. |
+| Outbound IPv6 | Works through a public IPv6 prefix from the ISP router. **Disabled for the lab** (see below). |
+| Locale | Only `C`/`C.UTF-8` exist; bootstrap sets `LANG=C.UTF-8` |
+
+**Changes these results force:**
+
+1. **IPv6 off in the lab container.** The LAN hands out globally routable IPv6 addresses, which would bypass IPv4-only firewall rules in both directions.
+   - The `sysctl` role sets `net.ipv6.conf.all.disable_ipv6=1` inside the container, which is allowed because it is a per-network-namespace setting.
+   - The Proxmox firewall rules in §0.1 also get IPv6 equivalents: drop inbound, and drop outbound to the LAN `/64`, `fe80::/10` and `fc00::/7`.
+   - Everything the lab needs is reachable over IPv4.
+2. **Images are built in CI, not on the lab container.** A 4-core 2017 low-power CPU would take a very long time for the Angular build of Juice Shop and the Kali-based agent images.
+   - **GitHub Actions** builds every image on each `lab-vN` tag. The repos are public, so the runners are free.
+   - It pushes them to **GHCR** with SBOMs. The lab container only **pulls by digest** (`images.lock`).
+   - `labctl build` on the server stays as a fallback.
+
+   This replaces call (p) in the plan.
+3. **One run cell at a time by default** (`max_parallel_cells: 1`). The second slot is opened only for HackingBuddyGPT cells once M2 has measured real CPU and memory use.
+
+### 0.6 Quickstart for the LXC
 
 ```
 cp deploy/hosts.example.yml deploy/hosts.yml   # address, ssh_user, isolation: lxc, access: twingate
