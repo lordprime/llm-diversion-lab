@@ -178,9 +178,23 @@ Data from homelab runs is development data only and is never mixed into paper re
 
 | Service | Fit for this lab |
 |---|---|
-| **Proxmox virtualisation platform** ("custom environments") | **Preferred.** A CISPA VM is the environment this plan was written for: root, Docker, Sysbox per-cell daemons, and the control plane on the same machine. Target size for the pilot: 32 cores, 128 GB RAM, 1–2 TB disk. |
+| **Oak Proxmox cluster**: VMs on request through a Jira form; any CPU/RAM/disk/OS; **full root** plus hypervisor-console access; research use only; `qemu-guest-agent` required; ports reachable over the CISPA VPN are declared in the request | **Chosen.** A CISPA VM is the environment this plan was written for: root, Docker, Sysbox per-cell daemons, and the control plane on the same machine. Target size for the pilot: 32 cores, 128 GB RAM, 1–2 TB disk. |
 | **Slurm HPC**, especially the `wdr-01…13` nodes | **Scale-out later, if needed.** The WDR nodes have 64 cores / 128 threads, 2 TB RAM, no GPUs, a dedicated DFN egress, and are meant for web and network research. Slurm usually means no root and no Docker daemon. A `SlurmPodmanBackend` would run cells as **rootless Podman pods** inside Slurm jobs, with the control plane on the VM. That needs rootless Podman with user namespaces; Apptainer or Enroot alone share the host network and **cannot contain run cells**. |
 | **AI/LLM gateway (LiteLLM)** covering Anthropic, OpenAI, Google Vertex/Gemini and others | **Candidate upstream for model traffic.** Chain: agent → our tap → **our** LiteLLM gateway (per-run virtual keys and budgets) → **CISPA gateway** → provider. The upstream is set per environment, and the homelab keeps calling providers directly. |
+
+**The Oak VM request (as submitted):**
+
+| Field | Value |
+|---|---|
+| CPU | 32 cores, CPU type `host`; nested virtualisation if available (only for the KVM-per-cell fallback) |
+| RAM | 128 GB |
+| Disks | 100 GB OS disk + **1.5 TB second disk left unformatted** (we format it XFS with reflink for Docker, Sysbox and artifacts) |
+| OS | Ubuntu Server 24.04 LTS; pre-installed `qemu-guest-agent` and `openssh-server` only (everything else via our Ansible) |
+| Ports over VPN | tcp/22 (SSH), tcp/443 (website, API, Grafana behind Caddy with login) |
+| Outbound | HTTPS to model APIs, GHCR, Docker Hub, PyPI, npm, GitHub, ftp.drupal.org, archive.debian.org; nothing inbound from outside CISPA |
+| End date | 31.08.27 (covers USENIX Security '27 Cycle 2 artifact evaluation) |
+
+**Kubernetes/ArgoCD platform:** not used for run cells. They need privileged or Sysbox runtimes and per-run network isolation, which a shared cluster is unlikely to allow. It could host the control plane later.
 
 **Conditions for using the CISPA LLM gateway** (each checked before any paper run):
 1. It must offer the **native Anthropic Messages route** (`/v1/messages` passthrough). An OpenAI-style translation would break signed thinking blocks and tool blocks for agents that use the Anthropic SDK.
