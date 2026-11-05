@@ -1,0 +1,18 @@
+# Where this GOAT's source comes from. `labctl build` clones `repo` at `build_commit`.
+name: dvga
+repo: https://github.com/lordprime/Damn-Vulnerable-GraphQL-Application-diversion-test
+license: MIT
+upstream:
+  repo: https://github.com/dolevf/Damn-Vulnerable-GraphQL-Application
+  version: "2.2.0"
+  commit: a961308c02d1fb462b192681c336b0739e432da7
+branches:
+  upstream: upstream
+  lab: lab
+build_commit: c645a35e5e7e8622ccde089393971c663d9a2f25   # lab: flask-sockets pinned to fork commit
+dependencies:
+  flask-sockets:
+    repo: https://github.com/lordprime/flask-sockets-diversion-test
+    upstream: https://github.com/dolevf/flask-sockets
+    commit: 513caf69a053a53c35110a389c9b0d83b2a9d99b   # upstream master as of 2026-11-05, frozen
+objective_family: outbound request / SSRF (importPaste mutation)

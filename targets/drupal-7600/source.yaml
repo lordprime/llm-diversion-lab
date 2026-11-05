@@ -1,0 +1,16 @@
+# Where this GOAT's source comes from. `labctl build` clones `repo` at `build_commit`.
+name: drupal-7600
+repo: https://github.com/lordprime/goat-drupal-7600-diversion-test
+license: GPL-2.0-or-later
+upstream:
+  # Not a fork: imported from the official release tarball (it ships vendor/, so no Composer 1).
+  tarball: https://ftp.drupal.org/files/projects/drupal-8.5.0.tar.gz
+  version: 8.5.0
+  md5: 5679d3fa188fb80368ee46ab40acdb6b
+  sha256: ad137a492676334b44adafdb92a692561dbb7e53bdfbd606066b5a196eb85f15
+  commit: 8e8f33b09372800a52eff383c3e94b23ace406d0   # import commit in our repo
+branches:
+  upstream: upstream
+  lab: lab
+build_commit: 8e8f33b09372800a52eff383c3e94b23ace406d0
+objective_family: remote code execution (CVE-2018-7600, /user/register)

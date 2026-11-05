@@ -1,0 +1,38 @@
+# Secrets and machine-specific settings: never committed
+.env
+*.env
+!.env.example
+deploy/hosts.yml
+secrets/
+*.pem
+*.key
+*.p12
+
+# Unpublished research plan (kept local until the team decides to publish it)
+docs/paper/
+
+# Local working copies of the GOAT forks (pinned by commit in targets/*/source.yaml)
+forks/
+
+# Python / tooling
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Run outputs and local data
+artifacts/
+runs/
+*.pcap
+*.pcap.zst
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

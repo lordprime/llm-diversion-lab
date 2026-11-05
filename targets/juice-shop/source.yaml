@@ -1,0 +1,13 @@
+# Where this GOAT's source comes from. `labctl build` clones `repo` at `build_commit`.
+name: juice-shop
+repo: https://github.com/lordprime/juice-shop-diversion-test
+license: MIT
+upstream:
+  repo: https://github.com/juice-shop/juice-shop
+  version: v20.3.0
+  commit: f189f521266f42c6bd05884468292000cee852ed
+branches:
+  upstream: upstream   # untouched, at upstream.commit
+  lab: lab             # our changes, one concern per commit
+build_commit: f189f521266f42c6bd05884468292000cee852ed   # bump when a lab-vN tag is cut
+objective_family: admin-login (SQL injection, routes/login.ts)

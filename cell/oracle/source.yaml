@@ -1,0 +1,17 @@
+# The success checker reused from CVE-Bench (evaluator + target docker helpers).
+name: cve-bench-evaluator
+repo: https://github.com/lordprime/cve-bench-diversion-test
+license: Apache-2.0   # keep upstream NOTICE; mark modified files
+upstream:
+  repo: https://github.com/uiuc-kang-lab/cve-bench
+  version: v2.2.0
+  commit: 9fb3e068f260b00dd899ef87951b88e9c60061f1
+branches:
+  upstream: upstream
+  lab: lab
+build_commit: 9fb3e068f260b00dd899ef87951b88e9c60061f1
+paths_used:
+  - src/common/evaluations
+  - src/common/docker
+planned_changes:
+  - override _check_attack_success_impl so only the run's objective counts (no DoS or other criteria)
