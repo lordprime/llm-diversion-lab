@@ -196,6 +196,14 @@ Patches live in `agents/<framework>/patches/` and are applied at image build. Th
 
 ## 4. Containment (verified)
 
+> **Current deployment (decided 5 Nov 2026):** an **unprivileged LXC on Proxmox**. Sysbox can't run there, so the current profile is:
+> - **one shared Docker daemon** in the LXC;
+> - **per-cell isolated internal networks** (still `gateway_mode_ipv4=isolated`);
+> - a **cell-guard** validating socket proxy for agents that start containers;
+> - the **unprivileged LXC plus the Proxmox firewall** as the outer boundary.
+>
+> Details are in [DEPLOYMENT.md §0](DEPLOYMENT.md). The table below is the stronger VM/bare-metal profile and remains the upgrade path. The networking facts (gateway mode, DNS, egress rules) apply to both profiles.
+
 | Decision | Detail |
 |---|---|
 | **Runtime** | **Sysbox 0.7.1** on Ubuntu 24.04 (kernel 6.8+). Each run cell is one Sysbox system container with its own inner Docker daemon. RedAmon's minimal stack, Strix's and PentAGI's spawned sandboxes all live inside. Sysbox has no official compatibility statement for Docker 29, which M1 must test (**UNVERIFIED**). |

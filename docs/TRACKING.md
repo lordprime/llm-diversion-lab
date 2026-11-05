@@ -58,7 +58,7 @@ Every transition is a timestamped row (`run_transitions`), so per-stage duration
 
 ### 3.1 Research tracking: the Results website
 
-Served through Caddy on the private channel. These pages extend the plan's §6 with what a remote, multi-person team needs.
+Served through Caddy, reached privately over Twingate (later, optionally, through Cloudflare Tunnel behind Cloudflare Access). These pages extend the plan's §6 with what a remote, multi-person team needs.
 
 | Page | Shows |
 |---|---|

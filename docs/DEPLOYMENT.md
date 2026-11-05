@@ -5,6 +5,140 @@
 
 ---
 
+## 0. Deployment target: an unprivileged LXC on the Proxmox homelab (decided 5 Nov 2026)
+
+The lab runs in a dedicated **unprivileged LXC container on the team's Proxmox server**, because the server can't spare the resources for a VM.
+- **Private access** goes through **Twingate**.
+- **Anything made public later** goes through **Cloudflare Tunnel with Cloudflare Access** in front.
+
+The bare-metal/VM design in the rest of this document stays as the **upgrade path** if the lab moves to stronger hardware. This section overrides it where they differ.
+
+| Area | Bare-metal/VM design | **LXC design (current)** |
+|---|---|---|
+| Per-run isolation | Sysbox: its own Docker daemon per run cell | **One Docker daemon inside the LXC.** Each run cell is its own compose project on isolated internal networks. Agents that start containers get a **cell-guard** socket proxy instead of the real Docker socket (§0.3). Sysbox can't run in an unprivileged LXC. |
+| Outer boundary | Host nftables | The **unprivileged LXC** (root inside maps to an unprivileged user on the Proxmox host), the **Proxmox firewall on the container** (internet only, never the home LAN), and nftables inside the LXC |
+| Storage | XFS disk with reflink golden roots per cell | The LXC's root disk on Proxmox storage. All cells share one image store, so there are no per-cell image copies and much less disk is needed. |
+| Kernel settings | Set by Ansible | Set once on the Proxmox host (§0.1) |
+| Private access | SSH tunnel / WireGuard / Tailscale | **Twingate**: SSH, the website and Grafana as Twingate resources |
+| Public access (later) | Not planned | **Cloudflare Tunnel** (`cloudflared` in the LXC → Caddy), **behind Cloudflare Access** (email allow-list). Never expose GOATs, run cells, Prometheus, or any API without login. |
+
+**What is weaker, stated plainly:** all run cells share one Docker daemon and one kernel.
+- **Where an escape lands:** a container escape lands inside the unprivileged LXC, not on the homelab host, and the Proxmox firewall still blocks the home LAN.
+- **What it could reach:** an escaped run could see other runs in progress.
+- **Mitigations:**
+  - agents never touch the real Docker socket (cell-guard);
+  - no privileged containers;
+  - default AppArmor and seccomp profiles are kept;
+  - containment probes run in every self-test;
+  - parallelism is capped.
+- **Reporting:** the paper's methods section reports this setup.
+
+### 0.1 Create the container (once, on the Proxmox host)
+
+**Proxmox version:** **PVE 9.1 or later.**
+- Docker inside unprivileged LXCs broke after the runc/containerd fix for CVE-2025-52881 (November 2025: `permission denied` on `net.ipv4.ip_unprivileged_port_start`). Community reports say newer `lxc-pve` in PVE 9.1 fixes it.
+- The stopgaps found in forums are pinning `containerd.io` to 1.7.28, which gives up the CVE fix, or `lxc.apparmor.profile: unconfined`, which removes AppArmor confinement. **Neither is used by default.** The Ansible `docker` role detects the failure and stops with this explanation; the containerd pin is applied only if `allow_containerd_pin: true` is set in `hosts.yml`, and the run records it.
+
+| Setting | Value |
+|---|---|
+| Template | Ubuntu 24.04 standard (`pveam update && pveam available \| grep ubuntu-24.04`) |
+| Type | **Unprivileged** (never privileged) |
+| Features | `nesting=1,keyctl=1` |
+| CPU / RAM | See §0.4 |
+| Swap | 4–8 GB |
+| Root disk | ≥ 400 GB on fast storage (ZFS ≥ 2.2 or LVM-thin) |
+| Network | Static IP on the LAN bridge, **`firewall=1`** on the NIC |
+| Start at boot | Yes |
+
+```
+pct create <CTID> <template-storage>:vztmpl/<ubuntu-24.04-template>.tar.zst \
+  --hostname llm-lab --unprivileged 1 --features nesting=1,keyctl=1 \
+  --cores 8 --memory 32768 --swap 8192 --rootfs <storage>:400 \
+  --net0 name=eth0,bridge=vmbr0,ip=<static-ip>/24,gw=<gateway>,firewall=1 \
+  --onboot 1 --ostype ubuntu
+```
+
+**Proxmox host settings (once):**
+- `vm.max_map_count=262144` in `/etc/sysctl.d/99-llm-lab.conf`, recommended for RedAmon's Neo4j. An unprivileged container cannot set it itself.
+- **If the storage is ZFS:** ZFS ≥ 2.2 is required for Docker's overlay2 driver inside the LXC (`zfs version`). One community report describes an unprivileged-LXC file-permission problem on PVE 9.0 with ZFS 2.3.4; M0 checks for it.
+
+**Proxmox firewall for the container** (enable the firewall at datacenter and container level):
+
+| Direction | Rule |
+|---|---|
+| Inbound | Allow TCP 22 and 443 **only from the Twingate connector's IP**. Drop everything else. |
+| Outbound | Allow DNS to the LAN resolver. **Drop** 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 and 100.64.0.0/10. Allow everything else: provider APIs, registries, Cloudflare. |
+
+Docker's internal cell networks live *inside* the container's network namespace, so this firewall never interferes with traffic inside a cell. `labctl doctor` checks it from inside the LXC by trying to reach a LAN address, which must fail, and a provider API, which must succeed.
+
+**Access for the operator and for automation:** create a sudo user in the container, add the operator workstation's SSH public key, and add the container's port 22 (and later 443) as a Twingate resource.
+
+### 0.2 What the Ansible roles do differently
+
+Selected with `isolation: lxc` in `hosts.yml`.
+
+| Role | LXC behaviour |
+|---|---|
+| `storage` | No disk formatting. Checks free space and that Docker uses `overlay2`; fails with guidance otherwise. |
+| `sysbox` | Skipped |
+| `docker` | Same pinned Docker CE. Starts a test container to detect the CVE-2025-52881 breakage and stops with guidance (see §0.1). |
+| `sysctl` | Applies only settings an unprivileged container may change. Host-only settings are **verified**, not set. |
+| `firewall` | nftables inside the LXC (the cell-subnet egress rules in `DOCKER-USER`) as before. The Proxmox-level firewall is the manual step in §0.1, verified by `labctl doctor`. |
+| `access` | Twingate: nothing to install in the container; the connector runs elsewhere on the LAN |
+| `caddy` | Unchanged: listens on the container's IP, port 443, reachable over Twingate |
+| `cloudflared` *(new, off by default)* | Tunnel from the LXC to Caddy for the website and Grafana hostnames only. **Cloudflare Access is required** on every hostname; the role refuses to enable a hostname without an Access policy reference. |
+| `cell-guard` images | Built and pinned like every other harness image |
+
+### 0.3 cell-guard (new component)
+
+**Agents never get the real Docker socket.** Each cell whose agent starts containers (Strix; PentAGI in Wave 2) gets its own **cell-guard**: a small validating proxy on a Unix socket. It is mounted where the agent expects `docker.sock`, or set as `DOCKER_HOST`. The runner alone uses the real socket.
+
+It is **deny by default** and allows only the following:
+
+| Request | Rule |
+|---|---|
+| Create a container | **Image:** must be in the `images.lock` allow-list. **Forced:** the network is the cell's internal network; label `lab.run_id`; memory, CPU and PID limits. **Denied:** privileged, host network/PID/IPC/user namespace, devices, bind mounts outside the cell's scratch volume, capabilities beyond `NET_RAW`/`NET_ADMIN`, unconfined seccomp or AppArmor. |
+| Start, stop, kill, wait, remove, inspect, logs, attach, exec | Only on containers carrying this cell's `lab.run_id` |
+| List or inspect images | Allowed (read-only). Pull, build, push and import are denied. |
+| Networks and volumes | List or inspect own only. Volume create gets a forced label. Network create and connect are denied. |
+| Everything else (swarm, plugins, system prune, events of other containers, …) | Denied |
+
+- **Logging:** every request is logged as allowed or denied into the run's evidence. A denial is a containment signal: it shows on the Containment dashboard, and an attempted escape pattern triggers the containment alert.
+- **Streams:** it must pass HTTP connection upgrades through, for attach and exec streams.
+- **Build plan:** built in M0 with tests. Existing pieces (`mikesir87/docker-socket-proxy`, the OPA Docker authorization plugin) are evaluated first as a base.
+- **Who needs it:** HackingBuddyGPT, PentestGPT and RedAmon's minimal stack never need the socket.
+
+### 0.4 Sizing and parallelism
+
+**Per-cell memory** (no Sysbox overhead):
+
+| Cell | RAM (estimate, measured in M2) |
+|---|---|
+| HackingBuddyGPT + GOAT + proxies + catcher | ~2–3 GB |
+| Strix (Kali sandbox + Chromium) + GOAT + proxies | ~5–7 GB |
+| RedAmon minimal stack + GOAT + proxies | ~11–13 GB |
+| Control plane + monitoring (always on) | ~5–6 GB |
+
+| LXC size | Parallel cells (planning) |
+|---|---|
+| 8 cores / 32 GB | 2 (RedAmon one at a time) |
+| 16 cores / 64 GB | 4–5 |
+
+**Disk:** about 100 GB of images (RedAmon alone ~70 GB) plus artifacts (plan 100–200 GB for the pilot), so a **400 GB** root disk.
+
+The runner sets `LAB_MAX_PARALLEL` and a per-agent concurrency cap from these numbers. It **never starts a cell that would exceed the LXC's free memory**; it waits instead.
+
+### 0.5 Quickstart for the LXC
+
+```
+cp deploy/hosts.example.yml deploy/hosts.yml   # address, ssh_user, isolation: lxc, access: twingate
+./deploy/bootstrap.sh lab1                      # no disk formatting in the LXC profile
+./deploy/secrets.sh lab1                        # paste ANTHROPIC_API_KEY + budget
+./deploy/release.sh lab1 --tag v0.1.0           # deploy, build images, self-test
+# then open https://<lxc-ip> over Twingate
+labctl --remote lab1 pilot
+```
+
 ## 1. Topology
 
 ```
@@ -104,13 +238,17 @@ All scripts live in `deploy/`.
 
 ```yaml
 lab1:
-  address: 10.0.0.20          # or a DNS name on the private network
+  address: 10.0.0.20          # the LXC's IP, reachable over Twingate
   ssh_user: admin             # sudo-capable user for provisioning
-  data_disk: /dev/nvme1n1     # formatted only with --format-data-disk
-  artifact_disk: /dev/sda     # optional
-  access: ssh-tunnel          # ssh-tunnel | wireguard | tailscale
+  isolation: lxc              # lxc (current) | sysbox (VM / bare metal)
+  access: twingate            # twingate | ssh-tunnel | wireguard | tailscale
+  allow_containerd_pin: false # see §0.1; only as a documented stopgap
+  cloudflare_tunnel: false    # public website/Grafana via Cloudflare Access (later)
   backup_repo: s3:https://…/lab-backups   # restic repository URL
-  max_parallel_cells: 6
+  max_parallel_cells: 2
+  # sysbox profile only:
+  # data_disk: /dev/nvme1n1   # formatted only with --format-data-disk
+  # artifact_disk: /dev/sda
 ```
 
 ### 4.2 Scripts

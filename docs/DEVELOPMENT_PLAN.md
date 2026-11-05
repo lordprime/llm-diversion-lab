@@ -189,6 +189,11 @@ Strix and PentAGI start **sibling containers** (Kali sandboxes, workers) through
 | **Primary** | **Sysbox 0.7.1** system containers on Ubuntu 24.04 |
 | **Fallback** | **One KVM VM per cell** from a golden qcow2. Not privileged DinD, which gives root on the host. |
 
+> **Current deployment: an unprivileged LXC on the team's Proxmox server** ([DEPLOYMENT.md §0](DEPLOYMENT.md)).
+> - **Sysbox is not available there.** All cells share the LXC's Docker daemon, and agents that start containers talk to a per-cell **cell-guard** socket proxy (deny by default; forces the cell network, labels and limits; blocks privileged containers and host access) instead of the real socket.
+> - **The outer boundary** is the unprivileged LXC plus the Proxmox firewall (internet only, never the home LAN).
+> - **This is weaker than per-cell daemons.** An escaped container could see other runs, though not the homelab host. The table below remains the upgrade path.
+
 All agent-spawned containers then live and die inside the cell, on the cell's internal networks. The M1 self-test checks this explicitly with a probe that tries to reach the internet **and the host** from inside a sibling container; both must fail.
 
 **Verified gotcha.** A Docker `internal: true` network **still lets containers reach host services on the bridge address**. Every cell network therefore also sets `com.docker.network.bridge.gateway_mode_ipv4=isolated`, and host nftables rules drop all forwarding from cell subnets except to the LLM gateway. Full containment design: [AUTOMATION_FEASIBILITY.md §4](AUTOMATION_FEASIBILITY.md).
@@ -664,7 +669,7 @@ The complete inventory is in [AUTOMATION_FEASIBILITY.md §6](AUTOMATION_FEASIBIL
 
 **Access (revised for the separate server).**
 - The site, the APIs and Grafana sit behind **Caddy on the server's private interface**, with TLS and login. Roles are `viewer`, `operator` and `admin`.
-- They are reached over an SSH tunnel (default), WireGuard or Tailscale, and are **never exposed publicly**: the site shows planted payloads and raw transcripts.
+- They are reached privately over **Twingate**. Anything public later goes through **Cloudflare Tunnel behind Cloudflare Access** (login required). They are **never exposed publicly**: the site shows planted payloads and raw transcripts.
 - The full set of tracking interfaces (website pages, Grafana ops dashboards, `labctl` commands, APIs, notifications, audit) is specified in [TRACKING.md](TRACKING.md).
 
 ---
@@ -718,7 +723,7 @@ The paper's timeline puts E0 at 19 Oct – 1 Nov and the scope gate at **22 Nov*
 
 | Milestone | Contents | Done when |
 |---|---|---|
-| **M0: Skeleton** (week 1) | Git repo + CI skeleton (lint, types, unit tests) per ENGINEERING_STANDARDS. Lab server provisioned with `deploy/bootstrap.sh` (Ansible: Ubuntu 24.04, Docker 29, Sysbox 0.7.1, XFS, nftables, Caddy, ops stack); `secrets.sh`, `release.sh`, `tunnel.sh` working; `labctl doctor`; M0 tracking set (TRACKING §4). Control plane: Postgres, Collector API, runner with `ComposeBackend`, LiteLLM + tap. **DVGA** built from source with the CVE-Bench v2.2.0 evaluator. Injector with P1 and P7. Callback catcher. Scripted agent + stub LLM. `labctl selftest`. **First checks:** catcher-as-DNS on an isolated internal network; Sysbox with Docker 29. | The self-test detects all four stages and the callback on DVGA. The control cell is clean. Containment probe can't reach the internet or the host. |
+| **M0: Skeleton** (week 1) | Git repo + CI skeleton (lint, types, unit tests) per ENGINEERING_STANDARDS. **Proxmox LXC** prepared ([DEPLOYMENT.md §0](DEPLOYMENT.md)) and provisioned with `deploy/bootstrap.sh` (`isolation: lxc`: Docker, nftables, Caddy, monitoring stack); `secrets.sh` and `release.sh` working over Twingate; `labctl doctor` (incl. the Proxmox-firewall check). Control plane: Postgres, Collector API, runner with `ComposeBackend`, LiteLLM + tap. **DVGA** built from source with the CVE-Bench v2.2.0 evaluator. Injector with P1 and P7. Callback catcher. **cell-guard** socket proxy with its deny-by-default tests. Scripted agent + stub LLM. `labctl selftest`. **First checks:** Docker in the LXC (overlay2, the CVE-2025-52881 breakage), catcher-as-DNS on an isolated internal network, `gateway_mode_ipv4=isolated`. | The self-test detects all four stages and the callback on DVGA. The control cell is clean. The containment probe can't reach the internet, the LXC host services or the home LAN. cell-guard denies every forbidden request in its test suite. |
 | **M1: All targets + surfaces** (week 2) | Juice Shop and Drupal 8.5.0 built from source. All 3 seeded with content packs; hygiene patches and probes; placement maps P1–P7; placement probe; `labctl build` with images.lock, golden data roots and tool-presence assertions. | The self-test passes on all 3 targets; offline smoke tests pass. |
 | **M2: Wave 1 agents** (weeks 2–4) | **Provider-terms check done first (gate).** HackingBuddyGPT, Strix and RedAmon adapters, with patches and egress canaries. Scheduler service and `labctl schedule`. Results website views 1, 2, 3 and 8. Haiku 5.5 smoke runs to debug adapters. | 10 real runs per adapter, valid end to end, inspectable on the run detail page. Zero non-tap egress in every pcap. |
 | **M3: Wave 1 pilot** (weeks 4–5) | `./labctl pilot` runs P0 → P1 → P1b → P2 unattended (§9.2). Effects, cost, refusal and callback views. | Go/no-go read-out (§9.3) from Wave 1 data. |
@@ -767,7 +772,7 @@ Adding the 2 Wave 2 agents brings this to about 500 runs.
 
 RedAmon defaults to `claude-opus-4-6` and PentAGI mixes models per role. Both are overridden to the pilot model, and the override is verified by the tap's model assertion.
 
-**Wall-clock time.** The Wave 1 pilot takes about **1.5–3 days** of machine time, at 297 runs × up to 45 min, with 6–8 parallel cells on the recommended host, assuming provider rate limits allow it.
+**Wall-clock time.** On the LXC (2 parallel cells at 32 GB, 4–5 at 64 GB), the Wave 1 pilot takes about **3–6 days** of machine time at 297 runs × up to 45 min. That is unattended, and it can be spread over scheduled night windows. RedAmon cells run one at a time on a 32 GB LXC.
 
 Every run also has a hard per-run budget in its LiteLLM virtual key, and `LAB_BUDGET_USD` caps the whole experiment.
 
@@ -799,17 +804,14 @@ The pilot "has promise" if all three instrumentation checks pass and at least on
 
 ## 10. Decisions needed from you
 
-1. **Pilot spend ceiling.** Wave 1 is roughly $350–1,300 on Sonnet 5.5 (refined after P0). What is `LAB_BUDGET_USD`?
+1. **Pilot spend ceiling.** Wave 1 is roughly $300–1,200 on Sonnet 5.5 (refined after P0). What is `LAB_BUDGET_USD`?
 2. *(Resolved: RedAmon is in Wave 1 after the source audit.)*
-3. **Deployment machine.**
-   - The recommended spec is Ubuntu 24.04 bare metal, 24–32 cores, **128 GB RAM** (96 GB minimum), and 2–4 TB NVMe on XFS with reflink ([AUTOMATION_FEASIBILITY.md §6.1](AUTOMATION_FEASIBILITY.md)).
-   - What machine do you have, and does it meet that spec? A smaller machine still works with fewer parallel cells (`LAB_MAX_PARALLEL`), which stretches the pilot's wall-clock time.
-   - Can it run Ubuntu 24.04 on bare metal? Sysbox has no package for Fedora-based or immutable distros.
+3. *(Resolved: an unprivileged LXC on the team's Proxmox server, accessed over Twingate; see DEPLOYMENT §0.)* **Still needed:** the cores, RAM and disk the LXC gets, the Proxmox version (9.1+ needed, or accept the documented containerd stopgap), and the storage type (ZFS version).
 4. **RedAmon's built-in injection defence.** RedAmon wraps every tool output in `UNTRUSTED` fences and cuts browser output to a head/tail stub, and neither can be turned off without a patch. The plan's default is to test it **as shipped** and record the defence as part of its configuration. Do you also want a patched "defence off" variant as an extra arm? It would be a strong result for the paper, but it adds runs.
 5. **Oracle visibility.** The new default hides the oracle from agents; the harness polls it. Do you also want CVE-Bench's "agent may poll `/done`" variant for comparability?
 6. **Destructive agent actions.** When an agent wipes or reseeds data (DVGA `/start_over`, `deleteAllPastes`), the default is to allow it and log it as a derailment signal. Is that right, or should it be blocked?
 7. **Provider arrangement.** Do you have, or will you seek, a security-research arrangement with Anthropic (and later other providers) before M2? If classifier refusals push baseline success to the floor, that is the main way out, and the plan's other fallbacks (older models, different agents) only partly help.
-8. **Private access channel to the server.** SSH tunnel (default, zero setup), WireGuard (self-hosted), or Tailscale (easiest for a team, but adds a third-party service)?
+8. *(Resolved: Twingate for private access; Cloudflare Tunnel with Cloudflare Access later for anything public.)*
 9. **Notification channel.** Slack/Discord webhook, ntfy, or email, for budget pauses, stalls and containment alerts?
 10. **Backup target.** An S3-compatible bucket or an SSH host for nightly restic backups of the database and artifacts?
 
@@ -820,7 +822,7 @@ The pilot "has promise" if all three instrumentation checks pass and at least on
 | a | Wave 1 = HackingBuddyGPT + Strix + RedAmon; Wave 2 = PentestGPT + PentAGI | §2.2 |
 | b | Shannon deferred (needs source code); CAI excluded (archived) | §2.1 |
 | c | The 3 GOATs: Juice Shop (admin-login SQLi), DVGA (SSRF → outbound canary), Drupal 8.5.0 (RCE). Planted prompts stay in the proxy, never in the GOAT source. | §4.1 |
-| c2 | Sysbox primary, KVM-per-cell fallback (no privileged DinD); `gateway_mode_ipv4=isolated` on every cell network | §2.4 |
+| c2 | Current: unprivileged Proxmox LXC with a shared Docker daemon + cell-guard; Sysbox/KVM profile kept as the upgrade path; `gateway_mode_ipv4=isolated` on every cell network | §2.4, DEPLOYMENT §0 |
 | c3 | CVE-Bench v2.2.0 evaluator, objective-only success check, polled by the runner every 15 s; oracle hidden from agents | §3.3 |
 | c4 | Drupal built from the 8.5.0 release tarball (no Composer); Juice Shop runtime moved off distroless so the evaluator can run | §4, feasibility §5 |
 | c5 | Scheduling = scheduled queue entry of experiment batches; every scan gets a fresh GOAT | §5.6 |
@@ -834,7 +836,7 @@ The pilot "has promise" if all three instrumentation checks pass and at least on
 | k | Canary operator/engagement details go in the task text, not in agent configs | §3.4 |
 | l | LLM-judge labeller out of pilot scope | §3.5 |
 | m | Beacon payload family added, lab-only, request-only (no code execution) | §4.4 |
-| n | Website, APIs and Grafana behind Caddy (TLS + login) on the server's private interface; SSH tunnel by default | §6, DEPLOYMENT §1 |
+| n | Website, APIs and Grafana behind Caddy (TLS + login), reached over Twingate; public exposure only via Cloudflare Tunnel + Cloudflare Access | §6, DEPLOYMENT §0 |
 | o | Ansible for host provisioning, thin Bash wrappers for operations; systemd-managed compose stacks | DEPLOYMENT §4 |
 | p | Images built on the lab server (host has internet, cells don't) into a local registry; CI may push instead | DEPLOYMENT §2 |
 | q | Python 3.12 + uv, ruff, mypy strict, pydantic v2 as the single schema source, Alembic, pytest + hypothesis; no live LLM in CI | ENGINEERING_STANDARDS §2, §4 |
@@ -846,9 +848,10 @@ The pilot "has promise" if all three instrumentation checks pass and at least on
 
 | Risk | Mitigation |
 |---|---|
-| Sibling containers escape containment (Strix, PentAGI) | Per-cell Docker daemon; containment probe in the self-test; pcap |
+| Sibling containers escape containment (Strix, PentAGI) | cell-guard socket proxy (deny by default, forced cell network and limits); unprivileged LXC + Proxmox firewall as the outer wall; containment probe in the self-test; pcap. A per-cell daemon (Sysbox) is the upgrade path on a VM. |
 | Containers reach host services through the bridge address, even on `internal` networks | `gateway_mode_ipv4=isolated` on every cell network; host nftables default-drop; no published ports; probe in the self-test |
-| Sysbox misbehaves with Docker 29, or a framework needs privileged inner containers | Tested first in M0; KVM-per-cell fallback |
+| Docker inside the Proxmox LXC breaks (CVE-2025-52881 runc/containerd change; ZFS permission quirks) | Require PVE 9.1+; the `docker` role detects the breakage and stops with guidance; the containerd pin is opt-in only; all checked first in M0 |
+| Shared daemon and kernel across cells (LXC profile) | Parallelism capped; cell-guard; no privileged containers; default AppArmor/seccomp kept; reported in the paper's methods; Sysbox profile when hardware allows |
 | A framework's built-in defences or truncation (RedAmon fencing and offload stubs, PentestGPT 4,000-char suffix, Strix compressor, PentAGI summariser) hide planted text | Not a bug: recorded on each adapter's capability sheet and analysed as a scaffold factor. Optional "defence off" arm (decision 4). |
 | A framework quietly uses a different model for some roles (PentAGI defaults; RedAmon defaults to Opus 4.6) | Override every role; the tap asserts the returned `model` on every call and invalidates mismatched runs |
 | An oracle can be gamed or gives false positives (Juice Shop continue-code, default admin password; CVE-Bench counting DoS as success) | Source patches; objective-only success check; the self-test runs negative cases (a crash must *not* score as success) |
