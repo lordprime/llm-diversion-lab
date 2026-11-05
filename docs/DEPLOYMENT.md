@@ -168,21 +168,34 @@ The runner sets `LAB_MAX_PARALLEL` and a per-agent concurrency cap from these nu
 | Environment | Used for | Profile |
 |---|---|---|
 | Homelab LXC (CT 111) | Development and testing: M0–M2, self-tests, agent smoke runs, measuring each agent's footprint | `isolation: lxc`, one cell at a time |
-| **CISPA hardware** | **The pilot (M3) and every experiment whose data goes into the paper** | `isolation: sysbox` on a VM or bare metal (the stronger per-cell-daemon design in §1–§4 and the feasibility study §4); `kvm-per-cell` if needed |
+| **CISPA hardware** | **The pilot (M3) and every experiment whose data goes into the paper** | **A VM on CISPA's Proxmox platform** with `isolation: sysbox` (the stronger per-cell-daemon design in §1–§4 and the feasibility study §4). Slurm WDR nodes with rootless Podman later, only if more scale is needed. |
 
 Nothing in the harness is specific to either environment: the same release tag, `images.lock` and scripts deploy to both, selected by the host entry in `hosts.yml`.
 
 Data from homelab runs is development data only and is never mixed into paper results.
 
-**To clarify with CISPA IT before M3 (the answers may change the deployment profile):**
+**What CISPA offers (from the IT research portal, 5 Nov 2026; detail pages are login-gated and still to be read):**
 
-1. **Machine type:** a VM or bare metal with root and Docker (the plan as written)? Or a shared cluster (Kubernetes, Slurm, Podman/Apptainer only)? Kubernetes would use the planned `K8sJobBackend`; a Slurm or Apptainer-only cluster needs a new cell backend.
-2. **Kernel and OS:** whether Sysbox can be installed (Ubuntu 24.04 or 22.04 is packaged); otherwise KVM per cell.
-3. **Outbound network:** whether the machine can reach the model providers' APIs and GHCR. If there is a mandatory HTTP proxy, the LiteLLM gateway and image pulls go through it; run cells stay offline either way.
-4. **Approval:** whether running offensive attack agents, even fully contained, needs IT-security or ethics sign-off (the paper's ethics review already plans for this).
-5. **Access:** how the team reaches the machine (VPN, SSH bastion), which replaces Twingate for that host.
-6. **Data:** where run artifacts may live and be backed up (institutional storage policy).
-7. **Resources:** cores, RAM and disk, which set `max_parallel_cells`. With ~128 GB the pilot finishes in about 2 days.
+| Service | Fit for this lab |
+|---|---|
+| **Proxmox virtualisation platform** ("custom environments") | **Preferred.** A CISPA VM is the environment this plan was written for: root, Docker, Sysbox per-cell daemons, and the control plane on the same machine. Target size for the pilot: 32 cores, 128 GB RAM, 1–2 TB disk. |
+| **Slurm HPC**, especially the `wdr-01…13` nodes | **Scale-out later, if needed.** The WDR nodes have 64 cores / 128 threads, 2 TB RAM, no GPUs, a dedicated DFN egress, and are meant for web and network research. Slurm usually means no root and no Docker daemon. A `SlurmPodmanBackend` would run cells as **rootless Podman pods** inside Slurm jobs, with the control plane on the VM. That needs rootless Podman with user namespaces; Apptainer or Enroot alone share the host network and **cannot contain run cells**. |
+| **AI/LLM gateway (LiteLLM)** covering Anthropic, OpenAI, Google Vertex/Gemini and others | **Candidate upstream for model traffic.** Chain: agent → our tap → **our** LiteLLM gateway (per-run virtual keys and budgets) → **CISPA gateway** → provider. The upstream is set per environment, and the homelab keeps calling providers directly. |
+
+**Conditions for using the CISPA LLM gateway** (each checked before any paper run):
+1. It must offer the **native Anthropic Messages route** (`/v1/messages` passthrough). An OpenAI-style translation would break signed thinking blocks and tool blocks for agents that use the Anthropic SDK.
+2. We need to know whether Claude is served **directly by Anthropic or through Vertex/Bedrock**. That changes model IDs, the available features and refusal behaviour, so it is recorded on every run.
+3. **No silent model aliasing or fallbacks** on their side. The tap's model assertion catches this, but it would invalidate runs.
+4. Its rate limits and budgets are shared with the institute, so they set the pilot's concurrency.
+5. Its logging and retention policy, and approval for offensive-security prompts on institutional accounts.
+
+**To clarify with CISPA IT before M3:**
+1. **A VM on the Proxmox platform:** size, root, Docker and Sysbox allowed, lifetime and renewal, and outbound access to GHCR and the model APIs (directly or through a proxy).
+2. **Approval** to run contained offensive-security agents. Attack traffic never leaves the VM; only model API calls go out.
+3. **Access** to the VM (VPN, SSH bastion), which replaces Twingate for that host.
+4. **Data:** where run artifacts may be stored and backed up.
+5. **The LLM gateway questions** above.
+6. **Only if scaling to Slurm later:** the container runtime on the `wdr` nodes, user namespaces, maximum walltime, node-local scratch, and whether WDR jobs can reach the control-plane VM.
 
 ### 0.7 Quickstart for the LXC
 
