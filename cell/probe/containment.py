@@ -19,19 +19,26 @@ Destinations are ``<category>:<kind>:<target>[:<port>]``:
 
 Rules that keep a broken or mis-specified probe from reading as "contained":
 
-* A must-fail ``tcp`` target **must be an IP literal**: with a hostname, a resolution
-  failure would look like containment although no address was tried (rejected at
-  parse time; a directly constructed one is reported as ``error``).
+* A must-fail ``tcp`` target **must be an IP literal** that stands for a network path:
+  not a hostname (a resolution failure would look like containment although no
+  address was tried), and not loopback, unspecified, multicast, broadcast or reserved
+  (``255.255.255.255``, ``224.0.0.0/4``, ``240.0.0.0/4``, ``ff00::/8``, IPv4-mapped and
+  IPv4-compatible forms included), which fail instantly without testing any path.
+  Rejected at parse time (``--host-gateway`` and ``--lan`` too); a directly
+  constructed one, or a bad gateway read from the route table, is ``error``.
 * Each must-fail category counts as probed only with at least one **tcp** result. DNS
   results are extra evidence (a leak is still a breach), never coverage: a failed
   lookup says nothing about IP reachability.
-* ``reach`` must be **tcp** and must not be loopback or unspecified (``127.0.0.0/8``,
-  ``::1``, ``0.0.0.0``, ``::``, ``localhost``): a probe with no network can still reach
-  itself. A ``reach`` hostname (a cell service name) is resolved first; if it does not
-  resolve, or any answer is loopback/unspecified, the result is ``error``. Otherwise the
-  probe connects to the first resolved address.
-* The timeout is at least :data:`MIN_TIMEOUT_S` (1 s): a tiny timeout would turn every
-  reachable destination into ``timeout``, which counts as contained.
+* ``reach`` must be **tcp** and must not be anything a probe with no network can still
+  reach: loopback, unspecified, multicast, broadcast, reserved, link-local
+  (``169.254.0.0/16``, ``fe80::/10``), ``localhost``, a non-standard numeric form
+  (``127.1``, ``0x7f.1``, ``2130706433``) or one of the probe's **own** addresses
+  (detected by binding to it). A ``reach`` hostname (a cell service name) is resolved
+  first; if it does not resolve, or any answer fails these checks, the result is
+  ``error``. Otherwise the probe connects to the first resolved address.
+* The timeout is within [:data:`MIN_TIMEOUT_S`, :data:`MAX_TIMEOUT_S`] (1-60 s): a tiny
+  timeout would turn every reachable destination into ``timeout``, which counts as
+  contained; a huge one would stall the self-test.
 
 Outcomes, per destination:
 
@@ -87,6 +94,7 @@ __all__ = [
     "DEFAULT_LAN",
     "DEFAULT_TIMEOUT_S",
     "HOST_PORTS",
+    "MAX_TIMEOUT_S",
     "MIN_TIMEOUT_S",
     "Category",
     "Connector",
@@ -110,6 +118,7 @@ __all__ = [
 #: Per-destination timeout in seconds, and the floor below which probing is refused.
 DEFAULT_TIMEOUT_S = 2.0
 MIN_TIMEOUT_S = 1.0
+MAX_TIMEOUT_S = 60.0
 #: Well-known public anycast resolvers (IPv4 and IPv6) on 443, and a name to resolve.
 DEFAULT_INTERNET: tuple[tuple[str, int], ...] = (
     ("1.1.1.1", 443),
@@ -378,15 +387,98 @@ def _ip(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
         return None
 
 
-def _is_self(text: str) -> bool:
-    """Loopback or unspecified: reachable without any network."""
-    addr = _ip(text)
+_Address = ipaddress.IPv4Address | ipaddress.IPv6Address
+_LIMITED_BROADCAST = ipaddress.IPv4Address("255.255.255.255")
+
+
+def _legacy_v4(text: str) -> ipaddress.IPv4Address | None:
+    """A non-standard IPv4 form ``inet_aton`` accepts (``127.1``, ``0x7f.1``, ``2130706433``)."""
+    if _ip(text) is not None:
+        return None
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(text))
+    except (OSError, ValueError):
+        return None
+
+
+def _forms(addr: _Address) -> list[_Address]:
+    """``addr`` plus the IPv4 address an IPv4-mapped or IPv4-compatible IPv6 one carries."""
+    forms: list[_Address] = [addr]
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            forms.append(addr.ipv4_mapped)
+        elif int(addr) < 2**32:
+            forms.append(ipaddress.IPv4Address(int(addr)))
+    return forms
+
+
+def _never_a_path(addr: _Address) -> str | None:
+    """Why ``addr`` can never stand for a network path (it fails or succeeds locally)."""
+    for form in _forms(addr):
+        if form.is_loopback:
+            return "loopback"
+        if form.is_unspecified:
+            return "unspecified"
+        if form.is_multicast:
+            return "multicast"
+        if isinstance(form, ipaddress.IPv4Address) and (
+            form == _LIMITED_BROADCAST or form.is_reserved
+        ):
+            return "broadcast or reserved"
+    return None
+
+
+def _must_fail_problem(target: str) -> str | None:
+    """Why ``target`` cannot be a must-fail tcp target, or ``None`` if it can.
+
+    It must be an IP literal that is not loopback, unspecified, multicast, broadcast or
+    reserved: those fail (or succeed) instantly without testing any path, so they
+    would "cover" a category with a meaningless ``unreachable``.
+    """
+    addr = _ip(target)
     if addr is None:
-        name = text.lower().rstrip(".")
-        return name == "localhost" or name.endswith(".localhost")
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-        addr = addr.ipv4_mapped
-    return addr.is_loopback or addr.is_unspecified
+        return "is not an IP literal"
+    reason = _never_a_path(addr)
+    return f"is {reason}" if reason else None
+
+
+def _reach_problem(target: str) -> str | None:
+    """Why ``target`` (an IP or a name) can never prove the probe's network, if it can't.
+
+    Static checks only; :func:`_binds_locally` adds the probe's own addresses.
+    """
+    name = target.lower().rstrip(".")
+    if name == "localhost" or name.endswith(".localhost"):
+        return "is localhost"
+    if _legacy_v4(target) is not None:
+        return "is a non-standard numeric address (use a dotted quad or a name)"
+    addr = _ip(target)
+    if addr is None:
+        return None  # a name: checked again once resolved
+    reason = _never_a_path(addr)
+    if reason:
+        return f"is {reason}"
+    if any(form.is_link_local for form in _forms(addr)):
+        return "is link-local"
+    return None
+
+
+def _binds_locally(ip: str) -> bool:
+    """True if ``ip`` is one of this machine's own addresses (a ``bind`` to it works).
+
+    A connect to the probe's own address never leaves the container, so it proves
+    nothing about the network.
+    """
+    addr = _ip(ip)
+    if addr is None:
+        return False
+    family = socket.AF_INET6 if isinstance(addr, ipaddress.IPv6Address) else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.bind((ip, 0))
+    except OSError:
+        return False
+    return True
 
 
 def _errno_name(exc: BaseException) -> str | None:
@@ -433,19 +525,27 @@ class _Untestable(Exception):
 
 
 def _reach_address(dest: Destination, resolve: Resolver, timeout: float) -> tuple[str, ...]:
-    """The addresses a must-reach tcp destination stands for; never loopback."""
-    if _is_self(dest.target):
-        raise _Untestable(f"reach target {dest.target!r} is loopback or unspecified")
+    """The addresses a must-reach tcp destination stands for.
+
+    Never loopback, unspecified, multicast, broadcast, reserved, link-local or one of
+    the probe's own addresses, whether given directly or resolved from a name.
+    """
+    problem = _reach_problem(dest.target)
+    if problem:
+        raise _Untestable(f"reach target {dest.target!r} {problem}")
     if _ip(dest.target) is not None:
-        return (dest.target,)
-    answers = tuple(resolve(dest.target, timeout))
-    if not answers:
-        raise _Untestable(f"reach target {dest.target!r} resolved to no address")
-    if any(_is_self(a) for a in answers):
-        raise _Untestable(
-            f"reach target {dest.target!r} resolves to loopback or unspecified: "
-            + ", ".join(answers)
-        )
+        answers: tuple[str, ...] = (dest.target,)
+    else:
+        answers = tuple(resolve(dest.target, timeout))
+        if not answers:
+            raise _Untestable(f"reach target {dest.target!r} resolved to no address")
+    for answer in answers:
+        problem = "is not an address" if _ip(answer) is None else _reach_problem(answer)
+        if problem is None and _binds_locally(answer):
+            problem = "is one of the probe's own addresses"
+        if problem:
+            via = "" if answer == dest.target else f" resolves to {answer}, which"
+            raise _Untestable(f"reach target {dest.target!r}{via} {problem}")
     return answers
 
 
@@ -468,8 +568,8 @@ def _probe_one(
             if dest.category.must_reach:
                 answers = _reach_address(dest, resolve, timeout)
                 address = answers[0]
-            elif _ip(dest.target) is None:
-                raise _Untestable(f"must-fail tcp target {dest.target!r} is not an IP literal")
+            elif problem := _must_fail_problem(dest.target):
+                raise _Untestable(f"must-fail tcp target {dest.target!r} {problem}")
             connect(address, dest.port, timeout)
             return ProbeResult(
                 dest, Outcome.REACHABLE, "tcp handshake completed", elapsed(), answers=answers
@@ -506,10 +606,13 @@ def probe(
 ) -> ContainmentReport:
     """Probe every destination in order; never raises because of a destination.
 
-    Raises :class:`ValueError` if ``timeout`` is below :data:`MIN_TIMEOUT_S`.
+    Raises :class:`ValueError` if ``timeout`` is outside
+    [:data:`MIN_TIMEOUT_S`, :data:`MAX_TIMEOUT_S`].
     """
-    if not timeout >= MIN_TIMEOUT_S:
-        raise ValueError(f"timeout must be at least {MIN_TIMEOUT_S}s, got {timeout!r}")
+    if not MIN_TIMEOUT_S <= timeout <= MAX_TIMEOUT_S:
+        raise ValueError(
+            f"timeout must be within {MIN_TIMEOUT_S}-{MAX_TIMEOUT_S}s, got {timeout!r}"
+        )
     results = tuple(_probe_one(d, connect, resolve, timeout) for d in destinations)
     return ContainmentReport(results=results, timeout_s=timeout)
 
@@ -579,8 +682,8 @@ def _split_host_port(spec: str, rest: str) -> tuple[str, int]:
 
 def _reach_spec(spec: str, rest: str) -> tuple[str, int]:
     host, port = _split_host_port(spec, rest)
-    if _is_self(host):
-        raise _bad(spec, "a reach target may not be loopback, unspecified or localhost")
+    if problem := _reach_problem(host):
+        raise _bad(spec, f"a reach target {problem}")
     return host, port
 
 
@@ -610,8 +713,8 @@ def parse_destination(spec: str, *, sinkhole: Sequence[str] = ()) -> Destination
         host, port = _reach_spec(spec, rest)
     else:
         host, port = _split_host_port(spec, rest)
-        if _ip(host) is None:
-            raise _bad(spec, "a must-fail tcp target must be an IP literal, not a hostname")
+        if problem := _must_fail_problem(host):
+            raise _bad(spec, f"a must-fail tcp target {problem}")
     return Destination(category, kind, host, port)
 
 
@@ -673,7 +776,7 @@ def _parser() -> argparse.ArgumentParser:
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT_S,
-        help=f"seconds per probe (at least {MIN_TIMEOUT_S})",
+        help=f"seconds per probe ({MIN_TIMEOUT_S}-{MAX_TIMEOUT_S})",
     )
     p.add_argument("--route-file", default=DEFAULT_ROUTE_FILE, help=argparse.SUPPRESS)
     return p
@@ -687,13 +790,17 @@ def main(
 ) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    if not args.timeout >= MIN_TIMEOUT_S:
-        parser.error(f"--timeout must be at least {MIN_TIMEOUT_S}")
+    if not MIN_TIMEOUT_S <= args.timeout <= MAX_TIMEOUT_S:
+        parser.error(f"--timeout must be within {MIN_TIMEOUT_S}-{MAX_TIMEOUT_S}")
     try:
         dests = [parse_destination(s, sinkhole=args.sinkhole) for s in args.dest]
         reach = [_reach_spec(f"reach:tcp:{r}", r) for r in args.reach]
     except ValueError as exc:
         parser.error(str(exc))
+    for flag, values in (("--host-gateway", [args.host_gateway]), ("--lan", args.lan)):
+        for value in values or ():
+            if value is not None and (problem := _must_fail_problem(value)):
+                parser.error(f"{flag} {value!r} {problem}")
     if args.defaults or not dests:
         if args.lan is None and not args.allow_default_lan:
             parser.error("the default set needs --lan ADDR (or --allow-default-lan)")

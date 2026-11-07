@@ -1,8 +1,8 @@
 """Containment probe: every must-fail destination is reported, never raised.
 
 The connector and resolver are injected, so no test touches the network except the
-loopback tests, which use a listener (and a closed port) on 127.0.0.1 as a must-fail
-destination (a must-reach destination may never be loopback).
+real-connector tests, which aim the socket at a listener (or a closed port) on
+127.0.0.1 behind a TEST-NET destination (loopback is never a valid target).
 """
 
 from __future__ import annotations
@@ -17,9 +17,11 @@ from pathlib import Path
 
 import pytest
 
+from cell.probe import containment
 from cell.probe.containment import (
     ALL_CATEGORIES,
     DEFAULT_INTERNET,
+    MAX_TIMEOUT_S,
     MIN_TIMEOUT_S,
     Category,
     ContainmentReport,
@@ -178,13 +180,26 @@ def test_dns_answers_only_from_the_sinkhole_are_not_a_breach() -> None:
     assert result.ok
 
 
+def _to_loopback(port: int) -> Callable[[str, int, float], None]:
+    """The real connector, aimed at a loopback port whatever the destination says.
+
+    Loopback is not a valid must-fail target, so the destination is a TEST-NET address
+    and only the socket underneath is local.
+    """
+
+    def connect(host: str, port_: int, timeout: float) -> None:
+        tcp_connect("127.0.0.1", port, timeout)
+
+    return connect
+
+
 def test_a_dead_destination_in_the_real_connector_is_reported() -> None:
-    """The real connector against a closed loopback port: refused, never raised."""
+    """The real connector against a closed port: refused, never raised."""
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]  # bound but not listening: connections are refused
-        dest = Destination(Category.HOST, Kind.TCP, "127.0.0.1", port)
-        report = probe([dest], timeout=1.0)
+        dest = Destination(Category.HOST, Kind.TCP, "192.0.2.7", port)
+        report = probe([dest], connect=_to_loopback(port), timeout=1.0)
 
     (result,) = report.results
     assert result.outcome is Outcome.REFUSED
@@ -200,8 +215,8 @@ def test_ipv6_unreachable_on_a_v4_only_cell_is_ok() -> None:
 
 
 def test_reachable_destination_is_reported_as_success(listener: int) -> None:
-    dest = Destination(Category.LAN, Kind.TCP, "127.0.0.1", listener)
-    report = probe([dest], connect=tcp_connect, timeout=1.0)
+    dest = Destination(Category.LAN, Kind.TCP, "192.0.2.8", listener)
+    report = probe([dest], connect=_to_loopback(listener), timeout=1.0)
 
     (result,) = report.results
     assert result.outcome is Outcome.REACHABLE
@@ -447,11 +462,184 @@ def test_timeout_below_the_floor_is_refused(timeout: float) -> None:
         probe([INTERNET], connect=_ok_connect, timeout=timeout)
 
 
-@pytest.mark.parametrize("value", ["0.001", "0.5", "0", "-1"])
-def test_cli_timeout_below_the_floor_is_a_usage_error(value: str) -> None:
+@pytest.mark.parametrize("value", ["0.001", "0.5", "0", "-1", "60.5", "3600", "nan", "inf"])
+def test_cli_timeout_outside_the_bounds_is_a_usage_error(value: str) -> None:
     with pytest.raises(SystemExit) as exc:
         main(["--dest", "internet:tcp:192.0.2.1:443", "--timeout", value])
     assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("timeout", [60.001, 600.0, float("inf"), float("nan")])
+def test_timeout_above_the_ceiling_is_refused(timeout: float) -> None:
+    assert MAX_TIMEOUT_S == 60.0
+    with pytest.raises(ValueError, match="timeout"):
+        probe([INTERNET], connect=_ok_connect, timeout=timeout)
+
+
+def test_timeout_at_the_bounds_is_accepted() -> None:
+    for timeout in (MIN_TIMEOUT_S, MAX_TIMEOUT_S):
+        assert probe([INTERNET], connect=_ok_connect, timeout=timeout).timeout_s == timeout
+
+
+# --------------------------------------------------------------------- R4: bad must-fail targets
+
+#: Targets that fail instantly without testing any path, so they cannot cover a category.
+BAD_MUST_FAIL = [
+    "255.255.255.255",  # limited broadcast
+    "224.0.0.1",  # multicast
+    "239.255.255.250",
+    "240.0.0.1",  # reserved (class E)
+    "0.0.0.0",  # noqa: S104 -- an address under test, nothing binds to it
+    "127.0.0.1",
+    "127.9.9.9",
+    "::1",
+    "::",
+    "ff02::1",
+    "::ffff:255.255.255.255",  # IPv4-mapped forms
+    "::ffff:127.0.0.1",
+    "::ffff:224.0.0.1",
+]
+
+
+def _spec(category: str, ip: str, port: int = 443) -> str:
+    host = f"[{ip}]" if ":" in ip else ip
+    return f"{category}:tcp:{host}:{port}"
+
+
+@pytest.mark.parametrize("ip", BAD_MUST_FAIL)
+@pytest.mark.parametrize("category", ["internet", "host", "lan"])
+def test_bad_must_fail_target_is_rejected_at_parse(category: str, ip: str) -> None:
+    with pytest.raises(ValueError, match="destination"):
+        parse_destination(_spec(category, ip))
+
+
+@pytest.mark.parametrize("ip", BAD_MUST_FAIL)
+def test_bad_must_fail_target_is_an_error_at_probe_time(ip: str) -> None:
+    called: list[str] = []
+
+    def connect(host: str, port: int, timeout: float) -> None:
+        called.append(host)
+        raise OSError(errno.ENETUNREACH, "Network is unreachable")
+
+    report = probe([Destination(Category.INTERNET, Kind.TCP, ip, 443)], connect=connect)
+    assert called == []
+    assert report.results[0].outcome is Outcome.ERROR
+    assert not report.results[0].ok
+
+
+def test_broadcast_targets_cannot_cover_categories() -> None:
+    """Reviewer's shape: instant ENETUNREACH on broadcast/multicast is not containment."""
+    dests = [
+        Destination(Category.INTERNET, Kind.TCP, "255.255.255.255", 443),
+        Destination(Category.HOST, Kind.TCP, "224.0.0.1", 22),
+        Destination(Category.LAN, Kind.TCP, "ff02::1", 80),
+        REACH,
+    ]
+    report = probe(
+        dests,
+        connect=lambda h, p, t: (
+            _only_reach(h, p, t)
+            if h == TAP_IP
+            else _raising(OSError(errno.ENETUNREACH, "x"))(h, p, t)
+        ),
+        resolve=_resolve_tap,
+    )
+    assert not is_contained(report)
+    assert [r.outcome for r in report.results[:3]] == [Outcome.ERROR] * 3
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--defaults", "--lan", "255.255.255.255", "--reach", "tap:8080"],
+        ["--defaults", "--lan", "224.0.0.1", "--reach", "tap:8080"],
+        ["--defaults", "--lan", "router.home", "--reach", "tap:8080"],
+        ["--defaults", "--lan", "192.168.1.1", "--host-gateway", "127.0.0.1", "--reach", "t:1"],
+        ["--defaults", "--lan", "192.168.1.1", "--host-gateway", "0.0.0.0", "--reach", "t:1"],  # noqa: S104
+        ["--defaults", "--lan", "192.168.1.1", "--host-gateway", "gw", "--reach", "t:1"],
+    ],
+)
+def test_host_gateway_and_lan_are_validated_at_parse(argv: list[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(argv)
+    assert exc.value.code == 2
+
+
+def test_bad_default_gateway_from_the_route_table_is_an_error(
+    route_file: Callable[[str], str],
+) -> None:
+    dests = default_destinations(
+        lan=["192.168.1.1"],
+        reach=[("tap", 8080)],
+        route_file=route_file(_HEADER + _default_route("255.255.255.255", 0)),
+    )
+    report = _contained_probe(dests)
+    host = [r for r in report.results if r.destination.category is Category.HOST]
+    assert {r.outcome for r in host} == {Outcome.ERROR}
+    assert not is_contained(report)
+
+
+# --------------------------------------------------------------------- R5: reach targets
+
+
+@pytest.mark.parametrize("ip", ["169.254.1.1", "169.254.169.254", "fe80::1"])
+def test_link_local_reach_is_rejected(ip: str) -> None:
+    with pytest.raises(ValueError, match="destination"):
+        parse_destination(_spec("reach", ip, 8080))
+    report = probe([Destination(Category.REACH, Kind.TCP, ip, 8080)], connect=_ok_connect)
+    assert report.results[0].outcome is Outcome.ERROR
+
+
+@pytest.mark.parametrize("ip", ["224.0.0.1", "255.255.255.255", "::ffff:127.0.0.1"])
+def test_multicast_broadcast_and_mapped_loopback_reach_are_rejected(ip: str) -> None:
+    with pytest.raises(ValueError, match="destination"):
+        parse_destination(_spec("reach", ip, 8080))
+
+
+def test_reach_name_resolving_to_link_local_is_an_error() -> None:
+    report = probe([REACH], connect=_ok_connect, resolve=lambda n, t: ["169.254.10.10"])
+    assert report.results[0].outcome is Outcome.ERROR
+
+
+@pytest.mark.parametrize("host", ["2130706433", "0177.0.0.1", "127.1", "0x7f.1", "0"])
+def test_legacy_numeric_loopback_reach_forms_are_rejected(host: str) -> None:
+    """inet_aton accepts these and they all mean a loopback/unspecified address."""
+    with pytest.raises(ValueError, match="destination"):
+        parse_destination(f"reach:tcp:{host}:80")
+
+
+def test_reach_to_one_of_the_probes_own_addresses_is_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connect to the container's own address never leaves it (kernel loopback)."""
+    monkeypatch.setattr(containment, "_binds_locally", lambda ip: ip == "10.88.0.99")
+    dest = Destination(Category.REACH, Kind.TCP, "10.88.0.99", 8080)
+    report = probe([dest], connect=_ok_connect)
+    assert report.results[0].outcome is Outcome.ERROR
+    assert "own address" in report.results[0].detail
+
+    named = probe([REACH], connect=_ok_connect, resolve=lambda n, t: ["10.88.0.99"])
+    assert named.results[0].outcome is Outcome.ERROR
+
+
+def _own_address() -> str | None:
+    """A non-loopback local IPv4 address, if this machine has one (no packet is sent)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect(("192.0.2.1", 9))
+        except OSError:
+            return None
+        addr: str = s.getsockname()[0]
+    return None if addr.startswith("127.") or addr == "0.0.0.0" else addr  # noqa: S104
+
+
+def test_real_self_address_detection() -> None:
+    own = _own_address()
+    if own is None:
+        pytest.skip("no non-loopback IPv4 address on this machine")
+    report = probe([Destination(Category.REACH, Kind.TCP, own, 8080)], connect=_ok_connect)
+    assert report.results[0].outcome is Outcome.ERROR
+    assert containment._binds_locally("192.0.2.1") is False
 
 
 # --------------------------------------------------------------------- defaults
@@ -543,7 +731,6 @@ def test_full_default_set_with_reach_is_contained(route_file: Callable[[str], st
         ("host:tcp:172.30.0.1:22", HOST),
         ("lan:tcp:192.168.1.1:80", LAN),
         ("lan:tcp:[fd00::1]:443", Destination(Category.LAN, Kind.TCP, "fd00::1", 443)),
-        ("lan:tcp:127.0.0.1:80", Destination(Category.LAN, Kind.TCP, "127.0.0.1", 80)),
         ("reach:tcp:tap:8080", REACH),
         ("reach:tcp:10.88.0.10:8080", Destination(Category.REACH, Kind.TCP, TAP_IP, 8080)),
     ],
@@ -623,23 +810,23 @@ def test_main_exits_zero_when_contained(capsys: pytest.CaptureFixture[str]) -> N
 def test_main_prints_report_and_exits_nonzero_when_not_contained(
     listener: int, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A real loopback listener as a reachable must-fail destination."""
+    """A real listener (reached through loopback) behind a reachable must-fail address."""
 
     def connect(host: str, port: int, timeout: float) -> None:
-        if host == "127.0.0.1":
-            tcp_connect(host, port, timeout)
+        if host == "192.0.2.9":
+            tcp_connect("127.0.0.1", listener, timeout)
         else:
             _only_reach(host, port, timeout)
 
     code = main(
-        [*FULL_CLI, "--dest", f"lan:tcp:127.0.0.1:{listener}"],
+        [*FULL_CLI, "--dest", f"lan:tcp:192.0.2.9:{listener}"],
         connect=connect,
         resolve=_resolve_tap,
     )
     doc = json.loads(capsys.readouterr().out)
     assert code == 1
     assert doc["contained"] is False
-    assert [r["outcome"] for r in doc["results"] if r["target"] == "127.0.0.1"] == ["reachable"]
+    assert [r["outcome"] for r in doc["results"] if r["target"] == "192.0.2.9"] == ["reachable"]
 
 
 def test_main_without_reach_is_never_contained(capsys: pytest.CaptureFixture[str]) -> None:
