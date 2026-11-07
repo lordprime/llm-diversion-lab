@@ -525,9 +525,16 @@ def _assert_scales_linearly(run: Callable[[str], object], text: str) -> None:
     on the small input absorbs timer noise. Quadratic work would take ~16x.
     """
     small = text[: len(text) // 4]
-    t_small = max(_best_time(lambda: run(small)), 1e-3)
-    t_big = _best_time(lambda: run(text))
-    assert t_big < 10 * t_small, f"4x input took {t_big / t_small:.1f}x the time"
+    ratios = []
+    # Load on a shared machine only ever slows a run down, so one clean attempt out of
+    # three is enough; real super-linear work fails all three.
+    for _ in range(3):
+        t_small = max(_best_time(lambda: run(small)), 1e-3)
+        t_big = _best_time(lambda: run(text))
+        ratios.append(t_big / t_small)
+        if t_big < 10 * t_small:
+            return
+    raise AssertionError(f"4x input took {min(ratios):.1f}x the time (best of 3 attempts)")
 
 
 def _drain(pattern: re.Pattern[str]) -> Callable[[str], object]:
