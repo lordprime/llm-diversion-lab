@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import base64
 import json
+from dataclasses import fields
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from dnslib import QTYPE, RCODE, DNSRecord  # type: ignore[import-untyped]
@@ -48,7 +50,9 @@ from control.core.models import (
 )
 from control.core.tokens import derive_token, new_tag
 
-LAB_KEY = bytes.fromhex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+# Used only to make fixture manifests, as the control plane does. The catcher itself
+# never sees a key: it verifies tokens against the manifest's placement tokens.
+CONTROL_PLANE_KEY = b"control-plane-only-fixture-key"
 OTHER_KEY = b"some-other-lab-key"
 RUN_ID = new_id("run")
 TAG = new_tag()
@@ -59,7 +63,7 @@ CATCHER_IP = "10.99.0.53"
 EVENTS = TypeAdapter(Event)
 
 
-def _placement(pid: str, surface: Surface, url: str, key: bytes = LAB_KEY) -> Placement:
+def _placement(pid: str, surface: Surface, url: str) -> Placement:
     return Placement(
         placement_id=pid,
         run_id=RUN_ID,
@@ -69,15 +73,15 @@ def _placement(pid: str, surface: Surface, url: str, key: bytes = LAB_KEY) -> Pl
         payload_id="beacon-test",
         payload_version="1",
         tag=TAG,
-        token=derive_token(key, RUN_ID, pid),
+        token=_token(pid),
         content_sha256="0" * 64,
     )
 
 
-def _manifest(*, injected: bool = True, key: bytes = LAB_KEY) -> RunManifest:
+def _manifest(*, injected: bool = True) -> RunManifest:
     placements = [
-        _placement(P1_ID, Surface.P1, "/robots.txt", key),
-        _placement(P7_ID, Surface.P7, "/.env", key),
+        _placement(P1_ID, Surface.P1, "/robots.txt"),
+        _placement(P7_ID, Surface.P7, "/.env"),
     ]
     return RunManifest(
         run_id=RUN_ID,
@@ -95,14 +99,14 @@ def _manifest(*, injected: bool = True, key: bytes = LAB_KEY) -> RunManifest:
 
 
 def _token(pid: str) -> str:
-    return derive_token(LAB_KEY, RUN_ID, pid)
+    return derive_token(CONTROL_PLANE_KEY, RUN_ID, pid)
 
 
 def _config(tmp_path: Path, *, injected: bool = True) -> CatcherConfig:
     manifest = _manifest(injected=injected)
     return CatcherConfig(
         run_id=RUN_ID,
-        tokens=TokenIndex.build(manifest, LAB_KEY),
+        tokens=TokenIndex.build(manifest),
         evidence_dir=tmp_path,
     )
 
@@ -135,15 +139,35 @@ def test_streams_are_distinct() -> None:
 
 def test_token_to_run_maps_each_placement() -> None:
     manifest = _manifest()
-    assert token_to_run(_token(P1_ID), manifest, LAB_KEY) == (RUN_ID, P1_ID)
-    assert token_to_run(_token(P7_ID), manifest, LAB_KEY) == (RUN_ID, P7_ID)
+    assert token_to_run(_token(P1_ID), manifest) == (RUN_ID, P1_ID)
+    assert token_to_run(_token(P7_ID), manifest) == (RUN_ID, P7_ID)
+
+
+def test_token_to_run_needs_only_the_manifest() -> None:
+    # Arbitrary well-formed tokens, not derived from any key: verification is a
+    # comparison against the manifest's own placement tokens.
+    manifest = _manifest()
+    p1, p7 = manifest.placements
+    custom = manifest.model_copy(
+        update={
+            "placements": [
+                p1.model_copy(update={"token": "abcdefgh2345"}),
+                p7.model_copy(update={"token": "zzzzzz777777"}),
+            ]
+        }
+    )
+    assert token_to_run("abcdefgh2345", custom) == (RUN_ID, P1_ID)
+    assert token_to_run("zzzzzz777777", custom) == (RUN_ID, P7_ID)
+    assert token_to_run(_token(P1_ID), custom) is None
+    index = TokenIndex.build(custom)
+    assert index.find(["/r/ZZZZZZ777777"]) == ("zzzzzz777777", P7_ID)
 
 
 @pytest.mark.parametrize(
     "token",
     [
-        "aaaaaaaaaaaa",  # well-formed, does not verify
-        derive_token(OTHER_KEY, RUN_ID, "pl_x"),  # forged with another key
+        "aaaaaaaaaaaa",  # well-formed, not in the manifest
+        derive_token(OTHER_KEY, RUN_ID, P1_ID),  # well-formed, made with another key
         "ABCDEFGHIJKL",  # not lowercase
         "short",
         "",
@@ -151,20 +175,39 @@ def test_token_to_run_maps_each_placement() -> None:
     ],
 )
 def test_token_to_run_rejects_unknown_or_malformed(token: str) -> None:
-    assert token_to_run(token, _manifest(), LAB_KEY) is None
+    assert token_to_run(token, _manifest()) is None
 
 
 def test_token_to_run_control_run_has_no_tokens() -> None:
-    assert token_to_run(_token(P1_ID), _manifest(injected=False), LAB_KEY) is None
+    assert token_to_run(_token(P1_ID), _manifest(injected=False)) is None
 
 
-def test_token_index_refuses_a_key_that_does_not_reproduce_the_manifest() -> None:
-    with pytest.raises(ValueError, match="does not reproduce"):
-        TokenIndex.build(_manifest(key=OTHER_KEY), LAB_KEY)
+def _with_tokens(*tokens: str) -> RunManifest:
+    manifest = _manifest()
+    placements = [
+        p.model_copy(update={"token": t})  # model_copy skips validation, like a bad file
+        for p, t in zip(manifest.placements, tokens, strict=True)
+    ]
+    return manifest.model_copy(update={"placements": placements})
+
+
+@pytest.mark.parametrize("bad", ["SHORT", "ABCDEFGHIJKL", "abcdefghijk1", "", "abcdefghijklm"])
+def test_token_index_refuses_malformed_manifest_token(bad: str) -> None:
+    with pytest.raises(ValueError, match="malformed callback token"):
+        TokenIndex.build(_with_tokens(_token(P1_ID), bad))
+
+
+def test_token_index_refuses_duplicate_manifest_tokens() -> None:
+    # RunManifest itself does not require unique tokens, so this is a valid manifest.
+    manifest = RunManifest.model_validate_json(
+        _with_tokens(_token(P1_ID), _token(P1_ID)).model_dump_json()
+    )
+    with pytest.raises(ValueError, match="duplicate callback token"):
+        TokenIndex.build(manifest)
 
 
 def test_token_index_find_scans_text() -> None:
-    index = TokenIndex.build(_manifest(), LAB_KEY)
+    index = TokenIndex.build(_manifest())
     assert index.find([f"see https://x.test/report?id={_token(P7_ID)}&ok=1"]) == (
         _token(P7_ID),
         P7_ID,
@@ -190,45 +233,78 @@ def _env_files(tmp_path: Path, manifest: RunManifest) -> dict[str, str]:
     return {"LAB_MANIFEST": str(path), "LAB_EVIDENCE_DIR": str(tmp_path / "ev")}
 
 
-def test_config_from_env_builds_token_index(tmp_path: Path) -> None:
-    env = _env_files(tmp_path, _manifest()) | {"LAB_HMAC_KEY": LAB_KEY.hex(), "LAB_RUN_ID": RUN_ID}
+def test_config_from_env_builds_token_index_without_a_key(tmp_path: Path) -> None:
+    env = _env_files(tmp_path, _manifest()) | {"LAB_RUN_ID": RUN_ID}
+    assert "LAB_HMAC_KEY" not in env
     config = CatcherConfig.from_env(env)
     assert config.run_id == RUN_ID
     assert config.evidence_dir == tmp_path / "ev"
     assert config.tokens.lookup(_token(P1_ID)) == (_token(P1_ID), P1_ID)
-    assert LAB_KEY.hex() not in repr(config)
+    assert config.tokens.lookup(_token(P7_ID)) == (_token(P7_ID), P7_ID)
 
 
-def test_config_requires_key_for_injected_run(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="LAB_HMAC_KEY"):
-        CatcherConfig.from_env(_env_files(tmp_path, _manifest()))
+class _SpyEnv(dict[str, str]):
+    """An env mapping that remembers every name the config asks for."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.asked: set[str] = set()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        self.asked.add(key)
+        return super().get(key, default)
+
+    def __getitem__(self, key: str) -> str:
+        self.asked.add(key)
+        return super().__getitem__(key)
 
 
-def test_config_rejects_bad_hex_without_echoing_key(tmp_path: Path) -> None:
-    env = _env_files(tmp_path, _manifest()) | {"LAB_HMAC_KEY": "zz-secret-zz"}
-    with pytest.raises(ValueError, match="LAB_HMAC_KEY") as info:
-        CatcherConfig.from_env(env)
-    assert "zz-secret-zz" not in str(info.value)
+def test_config_has_no_key_and_never_reads_one(tmp_path: Path) -> None:
+    assert {f.name for f in fields(CatcherConfig)} == {"run_id", "tokens", "evidence_dir"}
+    assert {f.name for f in fields(TokenIndex)} == {"run_id", "entries"}
+    env = _SpyEnv(_env_files(tmp_path, _manifest()))
+    CatcherConfig.from_env(env)
+    assert "LAB_MANIFEST" in env.asked
+    assert not any("KEY" in name or "HMAC" in name for name in env.asked)
 
 
-def test_config_rejects_wrong_key(tmp_path: Path) -> None:
+def test_a_key_in_the_env_is_ignored(tmp_path: Path) -> None:
     env = _env_files(tmp_path, _manifest()) | {"LAB_HMAC_KEY": OTHER_KEY.hex()}
-    with pytest.raises(ValueError, match="does not reproduce") as info:
+    config = CatcherConfig.from_env(env)
+    assert config.tokens.lookup(_token(P1_ID)) == (_token(P1_ID), P1_ID)
+    assert OTHER_KEY.hex() not in repr(config)
+
+
+def test_cell_code_never_mentions_the_lab_key() -> None:
+    cell_dir = Path(__file__).resolve().parents[2] / "cell"
+    for path in cell_dir.rglob("*.py"):
+        text = path.read_text()
+        for word in ("LAB_HMAC_KEY", "derive_token(", "lab_key"):
+            assert word not in text, f"{path} mentions {word}"
+
+
+def test_config_refuses_malformed_manifest_token(tmp_path: Path) -> None:
+    # The manifest schema already rejects it on load; either way the catcher won't start.
+    env = _env_files(tmp_path, _with_tokens(_token(P1_ID), "NOT-A-TOKEN"))
+    with pytest.raises(ValueError, match="token"):
         CatcherConfig.from_env(env)
-    assert OTHER_KEY.hex() not in str(info.value)
+
+
+def test_config_refuses_duplicate_manifest_tokens(tmp_path: Path) -> None:
+    env = _env_files(tmp_path, _with_tokens(_token(P7_ID), _token(P7_ID)))
+    with pytest.raises(ValueError, match="duplicate callback token"):
+        CatcherConfig.from_env(env)
 
 
 def test_config_rejects_run_id_mismatch(tmp_path: Path) -> None:
-    env = _env_files(tmp_path, _manifest()) | {
-        "LAB_HMAC_KEY": LAB_KEY.hex(),
-        "LAB_RUN_ID": new_id("run"),
-    }
+    env = _env_files(tmp_path, _manifest()) | {"LAB_RUN_ID": new_id("run")}
     with pytest.raises(ValueError, match="LAB_RUN_ID"):
         CatcherConfig.from_env(env)
 
 
-def test_config_control_run_needs_no_key(tmp_path: Path) -> None:
+def test_config_control_run(tmp_path: Path) -> None:
     config = CatcherConfig.from_env(_env_files(tmp_path, _manifest(injected=False)))
+    assert config.tokens.entries == ()
     assert config.tokens.lookup(_token(P1_ID)) is None
 
 
@@ -252,7 +328,7 @@ def test_http_path_token_maps_to_run_and_placement(tmp_path: Path) -> None:
     assert cb.host == "cb.lab.test"
     assert cb.token == tok
     assert cb.placement_id == P1_ID
-    assert token_to_run(cb.token, _manifest(), LAB_KEY) == (RUN_ID, P1_ID)
+    assert token_to_run(cb.token, _manifest()) == (RUN_ID, P1_ID)
     assert cb.source_ip == "testclient"
 
 
@@ -337,7 +413,7 @@ def test_http_records_ordered_raw_headers(tmp_path: Path) -> None:
 
 
 def test_http_unverified_token_recorded_without_token(tmp_path: Path) -> None:
-    forged = derive_token(OTHER_KEY, RUN_ID, P1_ID)
+    forged = derive_token(OTHER_KEY, RUN_ID, P1_ID)  # well-formed, not in the manifest
     with _client(_config(tmp_path)) as client:
         resp = client.get(f"/r/{forged}")
     assert resp.content == FIXED_BODY

@@ -5,11 +5,9 @@ Configuration (:meth:`CatcherConfig.from_env`):
 * ``LAB_MANIFEST`` (required): path of the run's :class:`RunManifest` JSON. Its
   placements' tokens are the only ones a callback can verify against; a control run
   has none, so its callbacks are recorded with ``token`` ``None``.
-* ``LAB_HMAC_KEY`` (hex; required when the manifest has placements): the lab key the
-  tokens were derived with. It is used once at startup to build a
-  :class:`~cell.catcher.classify.TokenIndex` (which fails loudly if the key does not
-  reproduce the manifest's tokens) and is then dropped: it is never stored, logged or
-  echoed in an error.
+* No key. Tokens are verified against the manifest's own placement tokens
+  (:class:`~cell.catcher.classify.TokenIndex`); the lab-wide HMAC key never enters a
+  run cell. The catcher refuses to start if a placement token is malformed or repeated.
 * ``LAB_EVIDENCE_DIR`` (optional, default ``./evidence``): the run's evidence volume.
 * ``LAB_RUN_ID`` (optional): if set, must equal the manifest's ``run_id``.
 
@@ -53,7 +51,6 @@ __all__ = [
     "HTTP_EVENTS_FILE",
     "CallbackLog",
     "CatcherConfig",
-    "parse_lab_key",
     "parse_port",
 ]
 
@@ -71,19 +68,6 @@ _ID_RE = re.compile(ID_PATTERN)
 
 
 # --------------------------------------------------------------------------- config
-
-
-def parse_lab_key(value: str | None) -> bytes:
-    """Decode ``LAB_HMAC_KEY`` (hex). Errors never include the value."""
-    if not value or not value.strip():
-        raise ValueError("LAB_HMAC_KEY: not set")
-    try:
-        key = bytes.fromhex(value.strip())
-    except ValueError:
-        raise ValueError("LAB_HMAC_KEY: not valid hex") from None
-    if not key:
-        raise ValueError("LAB_HMAC_KEY: empty")
-    return key
 
 
 def parse_port(value: str, name: str) -> int:
@@ -119,13 +103,9 @@ class CatcherConfig:
         run_id = env.get("LAB_RUN_ID")
         if run_id and run_id != manifest.run_id:
             raise ValueError(f"LAB_RUN_ID {run_id!r} differs from manifest {manifest.run_id!r}")
-        if manifest.placements or env.get("LAB_HMAC_KEY"):
-            tokens = TokenIndex.build(manifest, parse_lab_key(env.get("LAB_HMAC_KEY")))
-        else:
-            tokens = TokenIndex(run_id=manifest.run_id)
         return cls(
             run_id=manifest.run_id,
-            tokens=tokens,
+            tokens=TokenIndex.build(manifest),
             evidence_dir=Path(env.get("LAB_EVIDENCE_DIR") or DEFAULT_EVIDENCE_DIR),
         )
 

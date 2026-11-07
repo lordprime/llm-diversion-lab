@@ -2,19 +2,20 @@
 
 Tokens
 ------
-A placement's callback token is ``derive_token(lab_key, run_id, placement_id)``
-(:mod:`control.core.tokens`). HMAC tokens cannot be inverted, so a token is mapped back
-by recomputing the token of every placement in the run's manifest and comparing in
-constant time (:func:`token_to_run`). The catcher builds a :class:`TokenIndex` once at
-startup (which also proves the configured key reproduces the manifest's tokens) and
-then only compares strings; the key itself is not kept.
+The control plane derives each placement's callback token with the lab key
+(:func:`control.core.tokens.derive_token`) and writes it into the run's manifest
+(``Placement.token``). The lab key never enters a run cell: a callback token is
+verified by constant-time comparison against the tokens of the run's own manifest
+(:func:`token_to_run`), so the catcher needs no secret and could not forge a token for
+another run. The catcher builds a :class:`TokenIndex` once at startup, which refuses a
+manifest whose tokens are malformed or not unique.
 
 Token search is case-insensitive: text is lowercased first, because DNS resolvers may
 randomise qname case (0x20 encoding) and Host names are case-insensitive. A
 *candidate* is a run of exactly 12 base32 characters (``[a-z2-7]``) bounded by
 non-alphanumerics (start/end, ``/``, ``.``, ``=``, ``&``, ``"``...). A candidate
-becomes the callback's token only if it verifies against the run's manifest; a
-random 12-letter word never does (60 bits of HMAC).
+becomes the callback's token only if it equals one of the run's placement tokens; a
+random 12-letter word practically never does (60 bits per token).
 
 Leak classification
 -------------------
@@ -51,7 +52,7 @@ from typing import Final
 from urllib.parse import unquote_plus
 
 from control.core.models import Callback, CallbackChannel, LeakFlag, RunManifest
-from control.core.tokens import TOKEN_LENGTH, TOKEN_PATTERN, derive_token
+from control.core.tokens import TOKEN_LENGTH, TOKEN_PATTERN
 
 __all__ = [
     "MIN_SECRET_CHARS",
@@ -85,49 +86,49 @@ def token_candidates(text: str) -> list[str]:
     return _CANDIDATE_RE.findall(text.lower())
 
 
-def token_to_run(token: str, manifest: RunManifest, lab_key: bytes) -> tuple[str, str] | None:
+def token_to_run(token: str, manifest: RunManifest) -> tuple[str, str] | None:
     """Map a token to ``(run_id, placement_id)`` of ``manifest``, or ``None``.
 
-    Recomputes :func:`derive_token` for every placement and compares in constant time.
-    A malformed token, a token of another run or key, and any token of a control run
-    (no placements) give ``None``.
+    Compares ``token`` in constant time against every placement's ``token`` in the
+    run's manifest; no key is needed. A malformed token, a token not planted in this
+    run, and any token of a control run (no placements) give ``None``.
     """
     if not _TOKEN_RE.fullmatch(token):
         return None
     match: tuple[str, str] | None = None
     for placement in manifest.placements:
-        expected = derive_token(lab_key, manifest.run_id, placement.placement_id)
-        if hmac.compare_digest(expected, token) and match is None:
+        if hmac.compare_digest(placement.token, token) and match is None:
             match = (manifest.run_id, placement.placement_id)
     return match
 
 
 @dataclass(frozen=True, slots=True)
 class TokenIndex:
-    """The verified callback tokens of one run: ``(token, placement_id)`` pairs.
+    """The callback tokens of one run: ``(token, placement_id)`` pairs from its manifest.
 
-    Holds derived tokens only, never the lab key. Empty for a control run.
+    Holds the manifest's tokens only; no key. Empty for a control run.
     """
 
     run_id: str
     entries: tuple[tuple[str, str], ...] = ()
 
     @classmethod
-    def build(cls, manifest: RunManifest, lab_key: bytes) -> TokenIndex:
-        """Derive every placement's token; raise if ``lab_key`` does not reproduce one.
+    def build(cls, manifest: RunManifest) -> TokenIndex:
+        """Index the manifest's placement tokens; raise if any is malformed or repeated.
 
-        The manifest carries each placement's token; a mismatch means the catcher was
-        given the wrong key and would silently verify nothing, so it fails loudly.
+        A malformed or duplicated token would make callbacks unverifiable or ambiguous,
+        so the catcher refuses to start instead.
         """
         entries: list[tuple[str, str]] = []
+        seen: set[str] = set()
         for placement in manifest.placements:
-            derived = derive_token(lab_key, manifest.run_id, placement.placement_id)
-            if not hmac.compare_digest(derived, placement.token):
-                raise ValueError(
-                    "LAB_HMAC_KEY does not reproduce the token of placement "
-                    f"{placement.placement_id}"
-                )
-            entries.append((derived, placement.placement_id))
+            token = placement.token
+            if not isinstance(token, str) or not _TOKEN_RE.fullmatch(token):
+                raise ValueError(f"placement {placement.placement_id}: malformed callback token")
+            if token in seen:
+                raise ValueError(f"placement {placement.placement_id}: duplicate callback token")
+            seen.add(token)
+            entries.append((token, placement.placement_id))
         return cls(run_id=manifest.run_id, entries=tuple(entries))
 
     def lookup(self, token: str) -> tuple[str, str] | None:
