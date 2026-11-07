@@ -41,3 +41,6 @@ runs/
 
 # Local agent workspace (never committed)
 .superpowers/
+
+# Local Claude Code state and parallel agent worktrees (never committed)
+.claude/
