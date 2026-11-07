@@ -7,7 +7,9 @@
 #
 # Keys:
 #   address               IP the workstation reaches over the access channel
-#   ssh_user              user for SSH and Ansible (root in the LXC; sudo-capable otherwise)
+#   ssh_user              user for SSH and Ansible. LXC profile: root, key only (a
+#                         documented exception, DEPLOYMENT §0.1). VM / sysbox profile:
+#                         a non-root sudo user; root login is turned off there.
 #   ssh_port              optional, default 22
 #   isolation             lxc (current: unprivileged LXC, one shared Docker daemon)
 #                         | sysbox (VM or bare metal, per-cell daemons; not built in M0)
@@ -17,10 +19,13 @@
 #   cloudflare_tunnel     public website/Grafana behind Cloudflare Access (later; the
 #                         cloudflared role is a stub that refuses to run in M0)
 #   max_parallel_cells    hard cap on concurrent run cells on this host (§0.5: 1 on CT 111)
+#   backup_repo           restic repository URL; accepted, but backups are not built in
+#                         M0 (the scripts warn that it is unused)
 #   vars                  optional mapping of extra Ansible variables for this host,
 #                         e.g. lab_llm_gateway_address / lab_llm_gateway_port
 #
-# Not used in M0 (roles not built yet): backup_repo, data_disk, artifact_disk.
+# Not accepted yet (sysbox-profile disk formatting is not built): data_disk,
+# artifact_disk.
 
 lab1:
   address: 192.168.1.145 # CT 111 on the homelab, reachable over Twingate
@@ -30,3 +35,16 @@ lab1:
   allow_containerd_pin: false
   cloudflare_tunnel: false
   max_parallel_cells: 1
+
+# A VM in the sysbox profile (the CISPA upgrade path, DEPLOYMENT §0.6). Not usable in
+# M0: the sysbox role needs sysbox_deb_sha256 and disk formatting is not built.
+# cispa1:
+#   address: 192.0.2.20        # placeholder (TEST-NET): the VM's address over the VPN
+#   ssh_user: admin            # sudo user; root SSH login is off in this profile
+#   isolation: sysbox
+#   access: ssh-tunnel
+#   allow_containerd_pin: false
+#   cloudflare_tunnel: false
+#   max_parallel_cells: 4
+#   vars:
+#     sysbox_deb_sha256: "<published SHA-256 of sysbox-ce 0.7.1>"

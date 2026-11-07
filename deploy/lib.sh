@@ -87,11 +87,11 @@ def die(msg):
 KNOWN = {
     "address": str, "ssh_user": str, "ssh_port": int, "isolation": str, "access": str,
     "allow_containerd_pin": bool, "cloudflare_tunnel": bool, "max_parallel_cells": int,
-    "vars": dict,
+    "backup_repo": str, "vars": dict,
 }
 DEFAULTS = {
     "ssh_port": 22, "allow_containerd_pin": False, "cloudflare_tunnel": False,
-    "max_parallel_cells": 1, "vars": {},
+    "max_parallel_cells": 1, "backup_repo": "", "vars": {},
 }
 CHOICES = {
     "isolation": ("lxc", "sysbox"),
@@ -137,6 +137,9 @@ if not 1 <= cfg["ssh_port"] <= 65535:
     die(f"{name}: 'ssh_port' out of range")
 if cfg["max_parallel_cells"] < 1:
     die(f"{name}: 'max_parallel_cells' must be at least 1")
+if cfg["backup_repo"]:
+    print(f"WARNING: {name}: backup_repo is set but unused (backups are not built in M0)",
+          file=sys.stderr)
 for key in cfg["vars"]:
     if not re.fullmatch(r"[a-z_][a-z0-9_]*", str(key)) or key in KNOWN or key.startswith("ansible_"):
         die(f"{name}: vars.{key} is not an allowed variable name")

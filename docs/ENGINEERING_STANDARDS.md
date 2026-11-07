@@ -118,6 +118,7 @@ These standards exist for one reason: every number in the paper must be **tracea
   - **LiteLLM is used only as the official image pinned by digest.** Earlier PyPI releases were malicious.
 - **Container posture:** no `--privileged` outside the Sysbox runtime; no published ports from cells; `no-new-privileges` where compatible; resource limits on every container.
 - **Server:** SSH keys only, no root login, firewall default-deny inbound, nothing exposed publicly, automatic security updates for everything *except* pinned Docker, Sysbox and kernel packages (those are upgraded in maintenance windows).
+  - **Documented exception, LXC profile only:** the homelab container (CT 111) is provisioned as `root`, with key-only login (`PermitRootLogin prohibit-password`) over Twingate, because it was set up that way. Root inside the unprivileged LXC maps to an unprivileged user on the Proxmox host. A VM (the sysbox profile) uses a non-root sudo user with `PermitRootLogin no`, and `site.yml` enforces it. See [DEPLOYMENT.md §0.1](DEPLOYMENT.md).
 - **Offensive tooling hygiene:** attack frameworks and GOATs run only inside cells. The workstation and CI runners never run an attack framework against anything except a cell.
 
 ---

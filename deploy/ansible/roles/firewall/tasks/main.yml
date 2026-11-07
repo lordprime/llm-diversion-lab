@@ -1,10 +1,12 @@
 ---
-# nftables inside the LXC (DEPLOYMENT §0.2). Two parts:
-# - the host's own input rules: a native nftables table (inet lab_host), loaded by
-#   lab-firewall.service; only that table is ever replaced, never the ruleset;
-# - run-cell egress: rules in Docker's DOCKER-USER chain, written with iptables-nft
-#   (so they are nftables rules in Docker's `ip filter` table, in the syntax Docker
-#   itself uses there), re-applied by lab-cell-egress.service whenever Docker starts.
+# nftables inside the LXC (DEPLOYMENT §0.2). Runs BEFORE the docker role, and fails
+# closed: Docker is installed with a drop-in that Requires= lab-firewall.service,
+# so Docker never starts (not even its first start from the apt postinst) without
+# the host firewall. Two layers stop run-cell egress:
+# 1. table inet lab_host (lab-firewall.service): input drop for cells and a forward
+#    chain that drops cell traffic leaving the cell networks, and forwarded IPv6;
+# 2. Docker's DOCKER-USER chain (lab-cell-egress.service), written with iptables-nft
+#    in the syntax Docker itself uses there, re-applied whenever Docker starts.
 # The Proxmox firewall on the container (internet only, never the LAN) is the manual
 # step in §0.1, verified by `labctl doctor`.
 - name: Check the LLM gateway exception is well formed
@@ -46,7 +48,7 @@
     group: root
     mode: "0755"
 
-- name: Write the host input rules
+- name: Write the host firewall (input and forward)
   ansible.builtin.template:
     src: host.nft.j2
     dest: /etc/lab/host.nft
@@ -79,6 +81,23 @@
     - Reload the host firewall
     - Re-apply the cell egress rules
 
+- name: Create the docker.service drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/docker.service.d/
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Make Docker require the host firewall
+  ansible.builtin.template:
+    src: docker-requires-lab-firewall.conf.j2
+    dest: /etc/systemd/system/docker.service.d/10-lab-firewall.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
+
 # Its stop action is `nft flush ruleset`, which would also wipe Docker's rules.
 # Only boot-time enablement is turned off; a running instance is left alone.
 - name: Keep the distribution's nftables.service off at boot
@@ -86,6 +105,7 @@
     name: nftables
     enabled: false
 
+# A failing nft load fails this task, and the play stops before Docker exists.
 - name: Enable and start the lab firewall units
   ansible.builtin.systemd_service:
     name: "{{ item }}"
@@ -100,7 +120,7 @@
 - name: Apply changed rules now
   ansible.builtin.meta: flush_handlers
 
-- name: Verify the host table and the cell egress rules are loaded
+- name: Verify both firewall layers are loaded
   ansible.builtin.command:
     argv: [/usr/local/sbin/lab-cell-egress, check]
   changed_when: false

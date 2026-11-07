@@ -267,6 +267,8 @@ lab_step "Write /srv/lab/secrets/lab.env on $host"
 	for name in "${kept_names[@]}"; do
 		printf 'KEEP %s\n' "$name"
 	done
+	# The host replaces lab.env only if this marker arrives with the right count.
+	printf 'END %d\n' $((${#set_names[@]} + ${#kept_names[@]}))
 } | lab_remote_stdin secrets.sh write
 unset VALUES
 

@@ -3,16 +3,21 @@
 #
 #   preflight                       bootstrap + secrets done, Docker up, no cells running (exit 4)
 #   receive TAG SHA256 COMMIT WHO   read a `git archive` tar on stdin into releases/TAG
+#   begin TAG                       remember the current release as the rollback target
 #   pull REF...                     docker pull each image@sha256:digest
-#   compose-pull TAG [allow-build]  pull (or, as a fallback, build) the control-plane images
-#   migrate TAG                     pg_dump, then the release's one-shot `migrate` service
+#   compose-pull TAG [allow-build]  check every image is pinned by digest, then pull
+#                                   (or, as a fallback, build) the control-plane images
+#   migrate TAG                     stop the app services (db keeps running), pg_dump,
+#                                   then `run --rm --no-deps migrate` from the new release
 #   activate TAG [allow-build]      swap `current` to TAG and (re)start the control plane
 #   selftest                        `labctl selftest --quick` (exit 3 if labctl is absent)
-#   rollback                        swap `current` back, restore the pre-migration dump
+#   rollback                        stop the app services, restore the pre-migration dump,
+#                                   swap `current` back, start the old release
 #   record TAG COMMIT WHO RESULT    append the deployment to deployments.jsonl
 set -Eeuo pipefail
 
-LAB=/srv/lab
+# LAB_ROOT is for the test suite only; on a host it is never set.
+LAB=${LAB_ROOT:-/srv/lab}
 REL=$LAB/releases
 STATE=$REL/.state
 ENV_FILE=$LAB/secrets/lab.env
@@ -93,25 +98,59 @@ cmd_pull() {
 
 cmd_compose_pull() {
 	local tree
+	local image unpinned=()
 	tree=$(release_tree "$1")
 	if [[ ${2:-} == allow-build ]]; then
 		compose "$tree" pull --ignore-buildable
 		echo "building control-plane images on this host (--allow-build fallback)"
 		compose "$tree" build
-	else
-		compose "$tree" pull
+		return 0
 	fi
+	# Images are built in CI and pulled by digest; a tag could change under us.
+	while IFS= read -r image; do
+		[[ -z $image || $image =~ @sha256:[0-9a-f]{64}$ ]] || unpinned+=("$image")
+	done < <(compose "$tree" config --images)
+	((${#unpinned[@]} == 0)) || die "control-plane images not pinned by digest: ${unpinned[*]}"
+	compose "$tree" pull
+}
+
+# app_services TREE: every service except the database and the one-shot migrate.
+app_services() {
+	compose "$1" config --services | grep -vxE 'db|migrate' || true
+}
+
+# stop_writers: stop the running release's app services; the database keeps running.
+stop_writers() {
+	local services
+	[[ -L $LAB/current ]] || return 0
+	mapfile -t services < <(app_services "$LAB/current")
+	((${#services[@]} > 0)) || return 0
+	echo "stopping app services: ${services[*]}"
+	compose "$LAB/current" stop "${services[@]}"
+}
+
+# begin TAG: remember which release to roll back to, before anything changes.
+cmd_begin() {
+	release_tree "$1" >/dev/null
+	mkdir -p "$STATE"
+	rm -f "$STATE/pending-dump"
+	if [[ -L $LAB/current ]]; then
+		readlink "$LAB/current" >"$STATE/previous"
+	else
+		: >"$STATE/previous"
+	fi
+	echo "rollback target: $(<"$STATE/previous")"
 }
 
 cmd_migrate() {
 	local tree dump
 	tree=$(release_tree "$1")
 	mkdir -p "$STATE"
-	rm -f "$STATE/pending-dump"
 	if ! compose "$tree" config --services | grep -qx migrate; then
 		echo "this release has no 'migrate' service: no migrations to run"
 		return 0
 	fi
+	stop_writers
 	if compose "$tree" ps --status running --services | grep -qx db; then
 		dump=$LAB/backups/pre-$1-$(date -u +%Y%m%dT%H%M%SZ).dump
 		# shellcheck disable=SC2016 # expanded inside the db container, not here
@@ -121,20 +160,15 @@ cmd_migrate() {
 		echo "pre-migration dump: $dump"
 	else
 		echo "database not running yet (first deploy): no pre-migration dump"
+		compose "$tree" up -d "${WAIT[@]}" db
 	fi
-	compose "$tree" run --rm migrate
+	compose "$tree" run --rm --no-deps migrate
 }
 
 cmd_activate() {
 	local tree build=(--no-build)
 	tree=$(release_tree "$1")
 	[[ ${2:-} == allow-build ]] && build=()
-	mkdir -p "$STATE"
-	if [[ -L $LAB/current ]]; then
-		readlink "$LAB/current" >"$STATE/previous"
-	else
-		: >"$STATE/previous"
-	fi
 	swap_current "$tree"
 	compose "$LAB/current" up -d --remove-orphans "${WAIT[@]}" "${build[@]}"
 }
@@ -147,20 +181,24 @@ cmd_selftest() {
 	labctl selftest --quick
 }
 
+# rollback: stop writers -> restore the dump -> swap `current` back -> start it.
 cmd_rollback() {
-	local prev="" dump
+	local prev="" dump restored=""
 	[[ -f $STATE/previous ]] && prev=$(<"$STATE/previous")
+	stop_writers
+	if [[ -f $STATE/pending-dump && -L $LAB/current ]]; then
+		dump=$(<"$STATE/pending-dump")
+		# shellcheck disable=SC2016 # expanded inside the db container, not here
+		compose "$LAB/current" exec -T db \
+			sh -c 'pg_restore --clean --if-exists -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <"$dump"
+		rm -f "$STATE/pending-dump"
+		restored=" (the database was restored from $dump)"
+		echo "database restored from $dump"
+	fi
 	if [[ -n $prev && -d $prev ]]; then
 		swap_current "$prev"
-		compose "$LAB/current" up -d --remove-orphans --no-build "${WAIT[@]}"
-		if [[ -f $STATE/pending-dump ]]; then
-			dump=$(<"$STATE/pending-dump")
-			# shellcheck disable=SC2016 # expanded inside the db container, not here
-			compose "$LAB/current" exec -T db \
-				sh -c 'pg_restore --clean --if-exists -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <"$dump"
-			rm -f "$STATE/pending-dump"
-			echo "database restored from $dump"
-		fi
+		compose "$LAB/current" up -d --remove-orphans --no-build "${WAIT[@]}" ||
+			die "the previous release $prev did not start$restored; check the host (status.sh)"
 	else
 		echo "no previous release: stopping the failed one"
 		if [[ -L $LAB/current ]]; then
@@ -181,6 +219,7 @@ sub=${1:-}
 shift || true
 case $sub in
 preflight) cmd_preflight ;;
+begin) cmd_begin "$@" ;;
 receive) cmd_receive "$@" ;;
 pull) cmd_pull "$@" ;;
 compose-pull) cmd_compose_pull "$@" ;;
@@ -189,5 +228,5 @@ activate) cmd_activate "$@" ;;
 selftest) cmd_selftest ;;
 rollback) cmd_rollback ;;
 record) cmd_record "$@" ;;
-*) die "usage: release.sh preflight|receive|pull|compose-pull|migrate|activate|selftest|rollback|record" ;;
+*) die "usage: release.sh preflight|begin|receive|pull|compose-pull|migrate|activate|selftest|rollback|record" ;;
 esac

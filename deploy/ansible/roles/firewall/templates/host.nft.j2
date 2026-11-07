@@ -1,8 +1,22 @@
 #!/usr/sbin/nft -f
 # {{ ansible_managed }} (role firewall)
-# The lab host's own input rules. Loaded by lab-firewall.service. This file only
+# The lab host's own firewall, loaded by lab-firewall.service BEFORE Docker starts
+# (docker.service Requires= it, so Docker never runs without it). This file only
 # ever replaces its own table: Docker keeps its rules in other tables, so a ruleset
 # flush must never be used here.
+#
+# Two layers stop run-cell egress: the forward chain below (this table) and the
+# DOCKER-USER rules from lab-cell-egress. A packet dropped by either is dropped.
+#
+# Contracts with the runner and the control plane (DEPLOYMENT §0.2):
+# - cell networks are created only inside the cell_nets set (LAB_CELL_NETWORKS in
+#   /srv/lab/host.env is rendered from the same variable);
+# - the host never opens connections INTO a cell (replies from a cell to the host
+#   are dropped like any other cell-to-host packet); the runner uses docker exec/cp;
+# - control-plane ports are published on 127.0.0.1 only; Caddy on :443 is the one
+#   entry point from outside.
+# Drop logging is rate-limited. An unprivileged LXC logs from its netns only if the
+# Proxmox host sets net.netfilter.nf_log_all_netns=1; the counters work regardless.
 
 table inet lab_host
 delete table inet lab_host
@@ -20,11 +34,27 @@ table inet lab_host {
 		iif "lo" accept
 		# Run cells never reach the LXC itself (a Docker internal network still
 		# lets containers reach host services on the bridge address).
+		ip saddr @cell_nets limit rate 10/minute log prefix "lab-drop cell-to-host "
 		ip saddr @cell_nets counter drop comment "lab: cell to host"
 		ct state established,related accept
 		ct state invalid drop
 		meta l4proto icmp accept
 		tcp dport { {{ firewall_ssh_port }}, {{ firewall_https_port }} } accept comment "lab: ssh, caddy"
+		limit rate 10/minute log prefix "lab-drop inbound "
 		counter comment "lab: dropped inbound"
+	}
+
+	# Runs before Docker's own forward rules (priority filter - 10). `accept` here
+	# only ends this chain: Docker's chains (and DOCKER-USER) still see the packet.
+	chain forward {
+		type filter hook forward priority filter - 10; policy accept;
+
+		meta nfproto ipv6 counter drop comment "lab: no forwarded IPv6"
+		ip saddr @cell_nets ip daddr @cell_nets accept comment "lab: within the cell networks"
+{% if lab_llm_gateway_address %}
+		ip saddr @cell_nets ip daddr {{ lab_llm_gateway_address }} tcp dport {{ lab_llm_gateway_port }} accept comment "lab: cells to the LLM gateway"
+{% endif %}
+		ip saddr @cell_nets limit rate 10/minute log prefix "lab-drop cell-egress "
+		ip saddr @cell_nets counter drop comment "lab: cell egress"
 	}
 }

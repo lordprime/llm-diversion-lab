@@ -1,0 +1,7 @@
+# {{ ansible_managed }} (role firewall)
+# Docker never starts without the host firewall. If lab-firewall.service fails
+# (for example an nft load error), Docker does not start, so run cells can never
+# run with egress unfiltered.
+[Unit]
+Requires=lab-firewall.service
+After=lab-firewall.service

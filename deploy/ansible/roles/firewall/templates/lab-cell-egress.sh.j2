@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # {{ ansible_managed }} (role firewall)
 # Run-cell egress rules in Docker's DOCKER-USER chain (DEPLOYMENT §4.3 firewall).
+# This is the SECOND layer: the first is the forward chain in nftables table
+# inet lab_host, which is loaded before Docker can start.
 # Forwarding from the cell networks is dropped, except to the cell networks
 # themselves (Docker's per-network isolation decides there) and to the LLM gateway.
 # Docker preserves DOCKER-USER across restarts; lab-cell-egress.service re-applies
@@ -50,8 +52,8 @@ check() {
 		echo "FORWARD does not jump to DOCKER-USER" >&2
 		return 1
 	fi
-	if ! nft list table inet lab_host >/dev/null 2>&1; then
-		echo "nftables table inet lab_host is not loaded" >&2
+	if ! nft list chain inet lab_host forward 2>/dev/null | grep -q '"lab: cell egress"'; then
+		echo "nftables table inet lab_host (forward cell drop) is not loaded" >&2
 		return 1
 	fi
 	echo "OK: cell egress rules in DOCKER-USER for ${CELL_NETS[*]}; host table loaded"

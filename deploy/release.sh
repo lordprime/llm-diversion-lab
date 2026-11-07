@@ -11,11 +11,14 @@ Deploys the git tag to /srv/lab/releases/<tag> on <host> and makes it current:
  2. refuse if run cells are in flight (containers labelled lab.run_id);
  3. `git archive` the tag and copy it over SSH, verified by SHA-256;
  4. pull every image in the tag's deploy/images.lock by digest, and the
-    control-plane images (deploy/compose/control-plane.yml);
- 5. if the release has a `migrate` service: pg_dump, then run it;
+    control-plane images (deploy/compose/control-plane.yml), which must all be
+    pinned by digest (unless --allow-build);
+ 5. if the release has a `migrate` service: stop the app services (the database
+    keeps running), pg_dump, then `compose run --rm --no-deps migrate`;
  6. swap the `current` symlink and restart the control plane (compose up --wait);
  7. `labctl selftest --quick` if labctl is installed;
- 8. on any failure in 5-7: swap `current` back, restore the dump, exit non-zero;
+ 8. on any failure in 5-7: stop the app services, restore the dump, swap
+    `current` back, start the previous release, exit non-zero;
  9. record the deployment in /srv/lab/deployments.jsonl.
 
 Re-deploying a tag that is already on the host reuses it; a tag that now points
@@ -142,6 +145,9 @@ rollback() {
 	fi
 	lab_fail "$1; THE ROLLBACK ALSO FAILED: check $host by hand (status.sh)"
 }
+
+lab_step "Record the rollback target on $host"
+lab_remote release.sh begin "$tag"
 
 lab_step "Migrate the database on $host"
 lab_remote release.sh migrate "$tag" || rollback "migrations failed"

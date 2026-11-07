@@ -18,9 +18,11 @@ base_packages:
 # Only C and C.UTF-8 exist in the CT 111 template (§0.5).
 base_locale: C.UTF-8
 
-# Root logs in by key only when root is the provisioning user (the LXC); with a
-# sudo user, root login is off entirely (ENGINEERING_STANDARDS §7).
-base_ssh_permit_root_login: "{{ 'prohibit-password' if ansible_user == 'root' else 'no' }}"
+# Per profile. The LXC profile keeps root login by key only: CT 111 was set up with
+# root-over-Twingate SSH, a documented exception (DEPLOYMENT §0.1,
+# ENGINEERING_STANDARDS §7). A VM (sysbox profile) provisions as a sudo user and
+# turns root login off entirely.
+base_ssh_permit_root_login: "{{ 'prohibit-password' if isolation == 'lxc' else 'no' }}"
 
 # Packages that only change in a maintenance window (DEPLOYMENT §2 row 6).
 base_unattended_blocklist:

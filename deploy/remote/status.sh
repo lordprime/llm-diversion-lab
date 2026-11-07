@@ -68,18 +68,12 @@ else
 fi
 
 section firewall
-if nft list table inet lab_host >/dev/null 2>&1; then
-	echo "  nftables table inet lab_host loaded"
+# Both layers: the nft table (input + forward drops) and the DOCKER-USER rules.
+if /usr/local/sbin/lab-cell-egress check 2>&1 | sed 's/^/  /'; then
+	nft list chain inet lab_host forward 2>/dev/null |
+		awk '/counter packets/ && /drop/ {print "  forward drops (cells, IPv6): " $0}'
 else
-	echo "  nftables table inet lab_host NOT loaded"
-	problems+=("host firewall")
-fi
-if iptables -w 5 -S DOCKER-USER 2>/dev/null | grep -q 'lab-cell-egress'; then
-	echo "  DOCKER-USER cell egress rules present"
-	iptables -w 5 -L DOCKER-USER -v -n -x 2>/dev/null | awk '/DROP/ {print "  dropped from cells: " $1 " packets"}'
-else
-	echo "  DOCKER-USER cell egress rules MISSING"
-	problems+=("cell egress rules")
+	problems+=("firewall")
 fi
 
 section disk

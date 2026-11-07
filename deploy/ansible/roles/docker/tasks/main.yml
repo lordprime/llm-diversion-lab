@@ -45,12 +45,18 @@
   register: docker_key_info
   when: not ansible_check_mode
 
-- name: Check it is Docker's release key
+# Exactly one primary key, and it is Docker's: an extra key appended to the file
+# (which apt would also trust) fails the check. gpg prints each primary key as a
+# `pub` record followed by its `fpr` record.
+- name: Check the keyring holds exactly Docker's release key
+  vars:
+    docker_key_records: "{{ docker_key_info.stdout_lines }}"
   ansible.builtin.assert:
     that:
-      - ("fpr:::::::::" ~ docker_apt_key_fingerprint ~ ":") in docker_key_info.stdout
+      - docker_key_records | select('match', '^pub:') | list | length == 1
+      - (docker_key_records | select('match', '^fpr:') | first).split(':')[9] == docker_apt_key_fingerprint
     fail_msg: >-
-      /etc/apt/keyrings/docker.asc is not Docker's signing key
+      /etc/apt/keyrings/docker.asc is not exactly Docker's signing key
       {{ docker_apt_key_fingerprint }}; refusing to trust it.
     quiet: true
   when: not ansible_check_mode
@@ -123,6 +129,8 @@
       - docker-buildx-plugin
       - docker-compose-plugin
     state: present
+    # No Recommends: docker-ce-rootless-extras would come in unpinned and unheld.
+    install_recommends: false
     allow_change_held_packages: true
   when: docker_ce_version | length > 0
 

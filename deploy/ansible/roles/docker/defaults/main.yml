@@ -20,7 +20,10 @@ docker_held_packages:
   - docker-buildx-plugin
   - docker-compose-plugin
 
-# CVE-2025-52881 stopgap, used only with allow_containerd_pin: true (§0.1).
+# CVE-2025-52881 stopgap, used only with allow_containerd_pin: true (§0.1). The apt
+# request is `containerd.io=<this>*`, so it matches any Debian revision of 1.7.28.
+# The exact revision is fixed in Task 17 once apt on CT 111 shows which ones exist;
+# set it here then (e.g. "1.7.28-1~ubuntu.24.04~noble").
 docker_containerd_pin_version: "1.7.28"
 
 docker_log_max_size: 50m

@@ -2,8 +2,9 @@
 # Runs ON THE LAB HOST as root, shipped by lab_remote (deploy/lib.sh) for secrets.sh.
 #
 #   names   print the variable NAMES present in lab.env (never values)
-#   write   read "SET NAME=VALUE" / "KEEP NAME" lines on stdin and replace lab.env
-#           atomically (temp file in the same directory, 0600 lab:lab, then rename)
+#   write   read "SET NAME=VALUE" / "KEEP NAME" lines and a final "END <count>" on
+#           stdin; only a complete stream (END present, count matching) replaces
+#           lab.env, atomically (temp file in the same directory, 0600 lab, rename)
 #   reload  recreate the control-plane services whose environment changed
 #   test    one zero-cost model-list call per configured provider
 #
@@ -11,9 +12,10 @@
 # its config on stdin, so they never appear in argv, logs or messages.
 set -Eeuo pipefail
 
-LAB=/srv/lab
+# LAB_ROOT and LAB_OWNER are for the test suite only; on a host they are never set.
+LAB=${LAB_ROOT:-/srv/lab}
 ENV_FILE=$LAB/secrets/lab.env
-LAB_USER=lab
+LAB_USER=${LAB_OWNER:-lab}
 
 die() {
 	printf 'ERROR: %s\n' "$*" >&2
@@ -39,7 +41,7 @@ cmd_names() {
 }
 
 cmd_write() {
-	local tmp line name count=0
+	local tmp line name count=0 ended=""
 	[[ -d $LAB/secrets ]] || die "$LAB/secrets is missing: run bootstrap.sh first"
 	read_env
 	tmp=$(mktemp "$LAB/secrets/.lab.env.XXXXXX")
@@ -48,7 +50,13 @@ cmd_write() {
 	printf '# Written by deploy/secrets.sh at %s. Do not edit by hand.\n' \
 		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$tmp"
 	while IFS= read -r line; do
+		[[ -z $ended ]] || die "data after the END marker"
 		case $line in
+		"END "*)
+			ended=${line#END }
+			[[ $ended =~ ^[0-9]+$ ]] || die "malformed END line"
+			continue
+			;;
 		"SET "*)
 			line=${line#SET }
 			[[ $line =~ ^[A-Z][A-Z0-9_]*=[^[:space:]]+$ ]] || die "malformed SET line"
@@ -63,7 +71,9 @@ cmd_write() {
 		esac
 		count=$((count + 1))
 	done
-	chown "$LAB_USER:$LAB_USER" "$tmp"
+	[[ -n $ended ]] || die "input ended without the END marker (truncated?); lab.env unchanged"
+	((ended == count)) || die "END says $ended variables but $count arrived; lab.env unchanged"
+	chown "$LAB_USER:" "$tmp"
 	chmod 0600 "$tmp"
 	sync "$tmp"
 	mv -f "$tmp" "$ENV_FILE"

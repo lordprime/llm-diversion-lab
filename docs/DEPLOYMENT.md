@@ -1,7 +1,7 @@
 # Deployment: Running the Lab on a Separate Server
 
 **Companion to:** [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md), [AUTOMATION_FEASIBILITY.md](AUTOMATION_FEASIBILITY.md)
-**Status:** plan and script specification. The scripts are specified precisely enough to implement directly, but they are not written yet.
+**Status:** plan and script specification. The M0 deploy scripts and the Ansible roles for the LXC profile are written (`deploy/`, tested by `tests/deploy/test_scripts.py`). Anything marked **not built in M0** is still design only.
 
 ---
 
@@ -59,7 +59,9 @@ pct create <CTID> <template-storage>:vztmpl/<ubuntu-24.04-template>.tar.zst \
 ```
 
 **Proxmox host settings (once):**
-- `vm.max_map_count=262144` in `/etc/sysctl.d/99-llm-lab.conf`, recommended for RedAmon's Neo4j. An unprivileged container cannot set it itself.
+- `vm.max_map_count=262144` in `/etc/sysctl.d/99-llm-lab.conf`, recommended for RedAmon's Neo4j. An unprivileged container cannot set it itself. The `sysctl` role only verifies it (and `fs.inotify.*`), and warns if it is low.
+- Optional: `net.netfilter.nf_log_all_netns=1`, so the container's rate-limited firewall drop logs (prefix `lab-drop`) reach the kernel log. Without it, the drop counters still work. Task 17 checks which applies on CT 111.
+- Do not boot the host with `ipv6.disable=1`: the cell compose files set `net.ipv6.*` sysctls, so container creation would fail (closed) and no cell could run. IPv6 is turned off per namespace instead (§0.5).
 - **If the storage is ZFS:** ZFS ≥ 2.2 is required for Docker's overlay2 driver inside the LXC (`zfs version`). One community report describes an unprivileged-LXC file-permission problem on PVE 9.0 with ZFS 2.3.4; M0 checks for it.
 
 **Proxmox firewall for the container** (enable the firewall at datacenter and container level):
@@ -72,7 +74,10 @@ pct create <CTID> <template-storage>:vztmpl/<ubuntu-24.04-template>.tar.zst \
 
 Docker's internal cell networks live *inside* the container's network namespace, so this firewall never interferes with traffic inside a cell. `labctl doctor` checks it from inside the LXC by trying to reach a LAN address, which must fail, and a provider API, which must succeed.
 
-**Access for the operator and for automation:** create a sudo user in the container, add the operator workstation's SSH public key, and add the container's port 22 (and later 443) as a Twingate resource.
+**Access for the operator and for automation:** add the operator workstation's SSH public key to `root`'s `authorized_keys` in the container, and add the container's ports 22 and 443 as Twingate resources.
+- **Documented exception (LXC profile only):** the container is provisioned as `root`, with key-only login, because CT 111 was set up with root SSH over Twingate. Root inside the unprivileged container maps to an unprivileged user on the Proxmox host.
+- The `base` role first proves a key-only login works from the workstation, and only then turns off password login (`PermitRootLogin prohibit-password`).
+- A VM (the sysbox profile, §0.6) keeps the standard rule: a non-root sudo user (`ssh_user: admin`) and `PermitRootLogin no`. `site.yml` refuses `ssh_user: root` there.
 
 ### 0.2 What the Ansible roles do differently
 
@@ -80,15 +85,24 @@ Selected with `isolation: lxc` in `hosts.yml`.
 
 | Role | LXC behaviour |
 |---|---|
-| `storage` | No disk formatting. Checks free space and that Docker uses `overlay2`; fails with guidance otherwise. |
-| `sysbox` | Skipped |
-| `docker` | Same pinned Docker CE. Starts a test container to detect the CVE-2025-52881 breakage and stops with guidance (see §0.1). |
-| `sysctl` | Applies only settings an unprivileged container may change. Host-only settings are **verified**, not set. |
-| `firewall` | nftables inside the LXC (the cell-subnet egress rules in `DOCKER-USER`) as before. The Proxmox-level firewall is the manual step in §0.1, verified by `labctl doctor`. |
+| `storage` | No disk formatting (`--format-data-disk` is refused). Checks free space on `/` (≥ 50 GB by default) and that Docker uses `overlay2`; fails with guidance otherwise. |
+| `sysbox` | Skipped (and refuses to run in an LXC) |
+| `docker` | Same pinned Docker CE (one minor, never 29.1.0, apt-held, installed without Recommends). Starts a local test container to detect the CVE-2025-52881 breakage and stops with guidance (see §0.1). |
+| `sysctl` | Applies only settings an unprivileged container may change (`net.ipv6.conf.{all,default}.disable_ipv6=1`, `net.ipv4.ip_forward=1`). Host-only settings are **verified**, not set. |
+| `firewall` | See below. Runs **before** `docker`. |
 | `access` | Twingate: nothing to install in the container; the connector runs elsewhere on the LAN |
-| `caddy` | Unchanged: listens on the container's IP, port 443, reachable over Twingate |
-| `cloudflared` *(new, off by default)* | Tunnel from the LXC to Caddy for the website and Grafana hostnames only. **Cloudflare Access is required** on every hostname; the role refuses to enable a hostname without an Access policy reference. |
+| `caddy` | Listens on the container's IP, port 443 only, reachable over Twingate. `tls internal` (Caddy's own CA). Basic auth, with the login generated on the host (`/srv/lab/secrets/web-basic-auth`). Routes: `/api/*` → API, `/grafana*` → Grafana, everything else → website. Upstreams are on `127.0.0.1` and set as variables. |
+| `cloudflared` *(off by default)* | **Not built in M0**: a stub that refuses to run when `cloudflare_tunnel: true`. Design: a tunnel from the LXC to Caddy for the website and Grafana hostnames only. **Cloudflare Access is required** on every hostname; the role refuses to enable a hostname without an Access policy reference. |
 | `cell-guard` images | Built and pinned like every other harness image |
+
+**The `firewall` role (fails closed).** nftables inside the LXC, in two layers.
+1. **First layer.** Table `inet lab_host`, loaded by `lab-firewall.service`. A drop-in makes `docker.service` `Requires=` and `After=` this unit, so Docker never starts without it.
+   - Its input chain drops anything from the cell networks, then allows only SSH and 443.
+   - Its forward chain drops forwarded IPv6, and drops cell traffic that leaves the cell networks. The only exception is the LLM gateway, if one is configured.
+2. **Second layer.** The cell-subnet egress rules in `DOCKER-USER`, re-applied whenever Docker starts.
+- Drops are counted and logged at a limited rate.
+- The cell networks are one variable (`lab_cell_networks`), also exported as `LAB_CELL_NETWORKS` in `/srv/lab/host.env` for the runner.
+- The Proxmox-level firewall is the manual step in §0.1, verified by `labctl doctor`.
 
 ### 0.3 cell-guard (new component)
 
@@ -155,7 +169,8 @@ The runner sets `LAB_MAX_PARALLEL` and a per-agent concurrency cap from these nu
 **Changes these results force:**
 
 1. **IPv6 off in the lab container.** The LAN hands out globally routable IPv6 addresses, which would bypass IPv4-only firewall rules in both directions.
-   - The `sysctl` role sets `net.ipv6.conf.all.disable_ipv6=1` inside the container, which is allowed because it is a per-network-namespace setting.
+   - The `sysctl` role sets `net.ipv6.conf.all.disable_ipv6=1` (and `default`) inside the container, which is allowed because it is a per-network-namespace setting. The firewall also drops all forwarded IPv6.
+   - Hosts booted with `ipv6.disable=1` cannot run cells: the cell compose files set `net.ipv6.*` sysctls, so container creation fails closed.
    - The Proxmox firewall rules in §0.1 also get IPv6 equivalents: drop inbound, and drop outbound to the LAN `/64`, `fe80::/10` and `fc00::/7`.
    - Everything the lab needs is reachable over IPv4.
 2. **Images are built in CI, not on the lab container.** A 4-core 2017 low-power CPU would take a very long time for the Angular build of Juice Shop and the Kali-based agent images.
@@ -217,12 +232,15 @@ Data from homelab runs is development data only and is never mixed into paper re
 ### 0.7 Quickstart for the LXC
 
 ```
-cp deploy/hosts.example.yml deploy/hosts.yml   # address, ssh_user, isolation: lxc, access: twingate
-./deploy/bootstrap.sh lab1                      # no disk formatting in the LXC profile
-./deploy/secrets.sh lab1                        # paste ANTHROPIC_API_KEY + budget
-./deploy/release.sh lab1 --tag v0.1.0           # deploy, build images, self-test
-# then open https://<lxc-ip> over Twingate
-labctl --remote lab1 pilot
+cp deploy/hosts.example.yml deploy/hosts.yml   # lab1: 192.168.1.145, root, isolation: lxc, access: twingate
+./deploy/bootstrap.sh lab1                      # Ansible via uvx; no disk formatting in the LXC profile
+./deploy/secrets.sh lab1                        # ANTHROPIC_API_KEY + LAB_BUDGET_USD
+                                                #   (M0: a placeholder key with --no-test-calls)
+./deploy/release.sh lab1 --tag v0.1.0           # deploy, pull images by digest, self-test
+                                                #   (--allow-build only as a fallback)
+./deploy/tunnel.sh lab1                         # Twingate: prints the URLs; no tunnel needed
+# then open https://<lxc-ip>/ over Twingate; login: ssh root@<lxc-ip> cat /srv/lab/secrets/web-basic-auth
+labctl --remote lab1 pilot                      # labctl arrives with a later M0 task
 ```
 
 ## 1. Topology
@@ -244,7 +262,7 @@ There are three machines (the second and third can be the same box):
 
 | Machine | Role | What runs there |
 |---|---|---|
-| **Workstation** (developer laptop or desktop) | Write code, run unit tests, deploy, watch | git, uv, Ansible (via pipx), the deploy scripts, `labctl` **in remote mode**, a browser |
+| **Workstation** (developer laptop or desktop) | Write code, run unit tests, deploy, watch | git, uv, Ansible (run by the scripts with `uvx --from ansible-core==2.22.0`; nothing installed globally), the deploy scripts, `labctl` **in remote mode**, a browser |
 | **Lab server** (Ubuntu 24.04 bare metal, spec in [AUTOMATION_FEASIBILITY.md §6.1](AUTOMATION_FEASIBILITY.md)) | Build images, run the control plane, run cells | Docker 29 + Sysbox 0.7.1, the control-plane stack (Postgres, APIs, runner, scheduler, LiteLLM gateway, website), the **ops stack** (Prometheus, Grafana, Loki, node-exporter, cAdvisor), a **local image registry**, Caddy as the private reverse proxy, backups |
 | **Backup target** (any S3-compatible bucket or SSH host) | Off-machine copies | restic repository holding Postgres dumps and run artifacts |
 
@@ -260,7 +278,7 @@ There are three machines (the second and third can be the same box):
 
 | Option | Notes |
 |---|---|
-| **(a) SSH tunnel** | Zero setup; `./deploy/tunnel.sh`. **Default.** |
+| **(a) SSH tunnel** | Zero setup; `./deploy/tunnel.sh` (`access: ssh-tunnel`). The default for a VM. The LXC uses **Twingate** (§0), where `tunnel.sh` only prints the URLs. |
 | **(b) WireGuard** | Self-hosted; good for a multi-person team |
 | **(c) Tailscale** | Easiest for a team, but adds a third-party coordination service |
 
@@ -276,9 +294,9 @@ Whichever is chosen, the website, the APIs and Grafana are reached **only** thro
 | 2 | **Web UI, APIs and Grafana are behind Caddy with auth**, bound to the private interface (or localhost + SSH tunnel). They are no longer "localhost-only on the laptop". Roles: `viewer`, `operator` (start, pause, schedule), `admin` (tokens, deploys). | Plan §6 |
 | 3 | **Secrets live only on the server:** `/srv/lab/secrets/lab.env`, mode 0600, owner `lab`. They are pushed once with `deploy/secrets.sh` and never stored on the workstation after the push (the script reads them from the prompt or a file and doesn't keep a copy). | Plan §5.1 |
 | 4 | **Images are built on the server** in a separate build phase. The host has internet, the cells don't. Images are pushed to the server's local registry (`127.0.0.1:5000`) and pinned in `images.lock`. CI can build and push instead, using the same registry over the private channel. | Feasibility §6.2 |
-| 5 | **Services are managed by systemd** (wrapping `docker compose`), restart automatically, and survive reboot. On start, the runner **reconciles**: it finds cells left over from a crash, records those runs as `invalid: host_restart`, reaps the cells and re-queues the runs. | Plan §5.4 |
-| 6 | **Pinned system packages.** Docker, containerd, Sysbox and the kernel are apt-pinned so unattended upgrades can't change them mid-experiment. They are upgraded only through `deploy/upgrade-host.sh` in a maintenance window, followed by a self-test. | Feasibility §6.1 |
-| 7 | **Time sync (chrony)** is mandatory, because the evidence ordering across injector, tap, catcher and pcap depends on it. `labctl doctor` fails if clock offset > 50 ms. | Plan §3.1 |
+| 5 | **Services are managed by systemd** (wrapping `docker compose`), restart automatically, and survive reboot. On start, the runner **reconciles**: it finds cells left over from a crash, records those runs as `invalid: host_restart`, reaps the cells and re-queues the runs. **In M0** `release.sh` starts the control plane with `docker compose up -d --wait` (compose project `lab`), and containers restart through their compose restart policy. The `lab` role's systemd units and timers are **not built in M0**. | Plan §5.4 |
+| 6 | **Pinned system packages.** Docker, containerd, Sysbox and the kernel are held (`dpkg` hold) and blocklisted for unattended upgrades, so they can't change mid-experiment. They are upgraded only through `deploy/upgrade-host.sh` (**not built in M0**) in a maintenance window, followed by a self-test. | Feasibility §6.1 |
+| 7 | **Time sync** is mandatory, because the evidence ordering across injector, tap, catcher and pcap depends on it. `labctl doctor` fails if clock offset > 50 ms. A VM runs chrony (installed by `base`). An LXC uses the Proxmox host's clock and cannot run its own NTP, so `labctl doctor` checks the synchronised flag. | Plan §3.1 |
 | 8 | **Remote observability and alerts:** nobody is watching the box, so the server pushes notifications (see [TRACKING.md](TRACKING.md)). | new |
 | 9 | **Storage layout and backups:** XFS data volume, reflink golden roots, artifact retention, nightly restic backups, and a restore drill before the pilot. | new |
 | 10 | **Release tracking:** the deployed release tag + git SHA is recorded on every run and shown on every page footer. | Plan §5.5 |
@@ -290,18 +308,22 @@ Whichever is chosen, the website, the APIs and Grafana are reached **only** thro
 
 ```
 /srv/lab/
-  releases/<tag>/          # unpacked release trees (code, compose files, configs)
+  host.env                 # host profile, not secret (isolation, LAB_CELL_NETWORKS, containerd pin, ...)
+  releases/<tag>/          # unpacked release trees (code, compose files, configs) + RELEASE (tag, commit, sha256)
+  releases/.state/         # rollback target and pending pre-migration dump of the release in progress
   current -> releases/<tag>
-  secrets/lab.env          # 0600 lab:lab  (provider keys, budgets, notify URLs)
-  secrets/ca/              # lab CA for the callback catcher's TLS (generated on first run)
-  secrets/hmac.key         # callback-token key (generated on first run)
+  deployments.jsonl        # one line per deploy or rollback (M0; the deployments table comes later)
+  secrets/lab.env          # 0600 lab:lab  (provider keys, budgets, notify URLs; written by secrets.sh)
+  secrets/hmac.key         # callback-token key, 32 random bytes (generated once by bootstrap.sh)
+  secrets/web-basic-auth   # Caddy login, root 0600 (generated once by bootstrap.sh)
+  secrets/ca/              # lab CA for the callback catcher's TLS (generated by the catcher on first run)
   db/                      # Postgres data (control plane)
-  registry/                # local image registry storage
-  golden/<images.lock-hash>/docker/   # golden inner /var/lib/docker per image set
-  cells/<run_id>/          # per-run reflink clone + run volume (deleted after shipping)
+  cells/<run_id>/          # per-run state (sysbox profile: reflink clone + run volume); deleted after shipping
   artifacts/               # write-once run artifacts (separate disk recommended)
   ops/                     # prometheus, grafana, loki data
-  backups/                 # local staging for restic
+  backups/                 # pre-migration dumps; local staging for restic
+  registry/                # sysbox profile only, not built in M0 (the LXC pulls from GHCR)
+  golden/<images.lock-hash>/docker/   # sysbox profile only, not built in M0
 ```
 
 **Disks:**
@@ -319,65 +341,90 @@ All scripts live in `deploy/`.
 - They are **idempotent**: re-running converges, and they never destroy data unless an explicit `--yes-destroy-…` flag is given.
 - They read the target from `deploy/hosts.yml`.
 - They print a one-line summary on success, and on failure the failing step plus a pointer to the relevant runbook.
+- Shared code lives in `deploy/lib.sh`. Steps that run on the host are real scripts in `deploy/remote/`, shipped over SSH. Secret values and release archives travel on stdin, never in argv.
 
 ### 4.1 `deploy/hosts.yml` (copied from `hosts.example.yml`)
 
 ```yaml
-lab1:
-  address: 10.0.0.20          # the LXC's IP, reachable over Twingate
-  ssh_user: admin             # sudo-capable user for provisioning
+lab1:                         # the LXC profile (CT 111)
+  address: 192.168.1.145      # the LXC's IP, reachable over Twingate
+  ssh_user: root              # LXC exception: root, key only (§0.1)
+  ssh_port: 22                # optional, default 22
   isolation: lxc              # lxc (current) | sysbox (VM / bare metal)
-  access: twingate            # twingate | ssh-tunnel | wireguard | tailscale
+  access: twingate            # twingate | ssh-tunnel | wireguard | tailscale (the last two not built in M0)
   allow_containerd_pin: false # see §0.1; only as a documented stopgap
-  cloudflare_tunnel: false    # public website/Grafana via Cloudflare Access (later)
-  backup_repo: s3:https://…/lab-backups   # restic repository URL
-  max_parallel_cells: 2
-  # sysbox profile only:
-  # data_disk: /dev/nvme1n1   # formatted only with --format-data-disk
-  # artifact_disk: /dev/sda
+  cloudflare_tunnel: false    # public website/Grafana via Cloudflare Access (later; stub in M0)
+  max_parallel_cells: 1       # §0.5
+  # backup_repo: s3:https://…/lab-backups   # accepted, but backups are not built in M0
+  # vars: {lab_llm_gateway_address: …}      # optional extra Ansible variables
+
+cispa1:                       # the sysbox profile (a VM, §0.6), not usable in M0
+  address: 192.0.2.20
+  ssh_user: admin             # non-root sudo user; root login is off
+  isolation: sysbox
+  access: ssh-tunnel
+  max_parallel_cells: 4
+  # data_disk / artifact_disk: not built in M0 (refused as unknown keys)
 ```
+
+The scripts validate every host entry: an unknown key, a bad type or a bad value stops them before anything runs. `bootstrap.sh` turns the entry into an Ansible inventory.
 
 ### 4.2 Scripts
 
 | Script | Purpose | What it does, in order | Target time |
 |---|---|---|---|
-| **`bootstrap.sh <host> [--format-data-disk]`** | Turn a fresh Ubuntu 24.04 install into a lab server | 1. Check the workstation has `ansible` (installs it with pipx if missing). 2. Run `ansible/site.yml` against the host (roles in §4.3). 3. Generate the lab CA and HMAC key on the server if absent. 4. Start the registry and ops stack. 5. Run `labctl doctor` remotely and print the report. | ≤ 20 min |
-| **`secrets.sh <host> [--from-file path]`** | Install or rotate provider keys and settings | 1. Prompt for (or read) each variable in `.env.example`: required (`ANTHROPIC_API_KEY`, `LAB_BUDGET_USD`) and optional (other providers, `NOTIFY_*`). 2. Validate the format of each value (shows variable **names** only, never values). 3. Write `secrets/lab.env` atomically over SSH (mode 0600). 4. Reload the gateway. 5. Make one zero-cost test call per provider (a model list request) and report OK or failed. | ≤ 2 min |
-| **`release.sh <host> --tag vX.Y.Z [--drain]`** | Deploy a version | 1. Refuse if the git tree is dirty or the tag is missing. 2. `git archive` the tag and copy it to `releases/<tag>` (rsync, checksummed). 3. If an experiment is running: **refuse**, or with `--drain` pause the queue and wait for in-flight runs to finish. 4. Run DB migrations (Alembic) with a pre-migration `pg_dump`. 5. `labctl build --changed-only` on the server: rebuild only images whose inputs changed, push to the local registry, update `images.lock` and the golden roots. 6. Swap the `current` symlink and restart the services. 7. `labctl selftest --quick` (one target, no tokens). 8. On failure: **automatic rollback** to the previous symlink + DB restore from step 4, then exit non-zero. 9. Record the deployment (tag, SHA, who, when) in the `deployments` table. | ≤ 10 min (warm caches) |
-| **`rollback.sh <host> [--to vX.Y.Z]`** | Return to a previous release | Swap the symlink back, run down-migrations to that release's schema (or restore the pre-migration dump), restart, run the self-test | ≤ 5 min |
-| **`build.sh <host> [--all]`** | Rebuild images without a release (e.g. a GOAT content-pack change) | `labctl build` on the server; prints the new `images.lock` diff | varies (first full build: ~1–2 h, RedAmon and Kali images dominate) |
-| **`status.sh <host>`** | Quick health | Services up, queue depth, runs in flight, spend vs budget, disk free, last backup time, deployed tag | seconds |
-| **`tunnel.sh <host>`** | Private access without a VPN | `ssh -N -L 8443:127.0.0.1:8443` (Caddy: website, API, Grafana on one port) and prints the URLs | seconds |
-| **`logs.sh <host> [service\|--run <run_id>] [-f]`** | Read logs | journald or Loki query by service or by `run_id` | seconds |
-| **`backup.sh <host>` / `restore.sh <host> --snapshot <id>`** | Off-machine copies | `pg_dump` + artifacts → restic. A nightly systemd timer runs the same thing. Restore is documented and **drilled once before the pilot**. | depends on size |
-| **`reap.sh <host>`** | Clean up orphans by hand (a timer also does this) | Remove cells, networks and volumes labelled `lab.run_id` whose run isn't running | seconds |
-| **`upgrade-host.sh <host>`** | Planned upgrade of the pinned Docker, Sysbox or kernel | Refuse during experiments → unpin → upgrade → reboot if needed → re-pin → `labctl doctor` + full self-test | ≤ 30 min |
+| **`bootstrap.sh <host> [--check] [--format-data-disk] [--skip-doctor]`** | Turn a fresh Ubuntu 24.04 install into a lab server | 1. Validate the host in `hosts.yml` and render an Ansible inventory. 2. Run `ansible/site.yml` against the host with `uvx --from ansible-core==2.22.0 ansible-playbook` (nothing installed globally; `--check` is a `--check --diff` dry run). The roles are in §4.3; they generate the HMAC key and the web login on the server if absent. 3. Run `labctl doctor` remotely and print the report; if labctl is not installed yet, warn and continue. `--format-data-disk` is refused in the LXC profile and not built for the sysbox profile. *Not built in M0:* starting the registry and ops stack. | ≤ 20 min |
+| **`secrets.sh <host> [--from-file path] [--validate-only] [--no-test-calls]`** | Install or rotate provider keys and settings | 1. Prompt for (or read) each variable in `.env.example`: required (`ANTHROPIC_API_KEY`, `LAB_BUDGET_USD`) and optional (other providers, `NOTIFY_*`). Enter keeps the host's current value. 2. Validate each value against the type tag in its `.env.example` comment (shows variable **names** only, never values). 3. Write `secrets/lab.env` atomically over SSH (mode 0600, owner `lab`). Values travel on stdin, and an `END <count>` marker must arrive before the file is replaced. 4. Recreate the control-plane services whose environment changed. 5. Make one zero-cost test call per provider (a model-list request) from the server and report OK or failed (`--no-test-calls` for M0's placeholder key). | ≤ 2 min |
+| **`release.sh <host> --tag vX.Y.Z [--allow-build] [--skip-selftest]`** | Deploy a version | 1. Refuse if the git tree is dirty or the tag is missing; the tag must contain `deploy/compose/control-plane.yml` and a fully pinned `deploy/images.lock`. 2. If run cells are in flight (containers labelled `lab.run_id`): **refuse**. 3. `git archive` the tag and stream it over SSH into `releases/<tag>`, verified by SHA-256. A tag that moved to another commit is refused. 4. Pull every `images.lock` image by digest, plus the control-plane images, which must all be pinned by digest. `--allow-build` builds on the server instead, as a fallback only: images are built in CI (§0.5). 5. If the release has a `migrate` service: stop the app services (the database keeps running), take a `pg_dump`, then run `compose run --rm --no-deps migrate`. 6. Swap the `current` symlink and restart the services (`compose up --wait`). 7. `labctl selftest --quick` (one target, no tokens), if labctl is installed. 8. On failure in 5–7: **automatic rollback**: stop the app services, restore the dump, swap `current` back, start the previous release, exit non-zero. 9. Record the deployment (tag, SHA, who, when) in `/srv/lab/deployments.jsonl`; the `deployments` table comes with the control plane. *Not built in M0:* `--drain` (there is no queue pause yet). | ≤ 10 min (warm caches) |
+| **`status.sh <host>`** | Quick health | Deployed tag; host profile; Docker version and storage driver; control-plane services; run cells in flight; queue and spend vs budget (via `labctl status` once installed); `lab.env` variable count, mode and owner; both firewall layers (`lab-cell-egress check`) and drop counters; disk free; memory. Last backup time is n/a in M0. Exits 1 when degraded. | seconds |
+| **`tunnel.sh <host> [--local-port N]`** | Private access | With `access: twingate`: no tunnel, prints the URLs and where the web login is. With `access: ssh-tunnel`: `ssh -N -L 127.0.0.1:8443:<address>:443` to Caddy. | seconds |
+| **`rollback.sh <host> [--to vX.Y.Z]`** *(not built in M0; `release.sh` rolls back on failure)* | Return to a previous release | Swap the symlink back, run down-migrations to that release's schema (or restore the pre-migration dump), restart, run the self-test | ≤ 5 min |
+| **`build.sh <host> [--all]`** *(not built in M0; images are built in CI)* | Rebuild images without a release (e.g. a GOAT content-pack change) | `labctl build` on the server; prints the new `images.lock` diff | varies (first full build: ~1–2 h, RedAmon and Kali images dominate) |
+| **`logs.sh <host> [service\|--run <run_id>] [-f]`** *(not built in M0)* | Read logs | journald or Loki query by service or by `run_id` | seconds |
+| **`backup.sh <host>` / `restore.sh <host> --snapshot <id>`** *(not built in M0)* | Off-machine copies | `pg_dump` + artifacts → restic. A nightly systemd timer runs the same thing. Restore is documented and **drilled once before the pilot**. | depends on size |
+| **`reap.sh <host>`** *(not built in M0)* | Clean up orphans by hand (a timer also does this) | Remove cells, networks and volumes labelled `lab.run_id` whose run isn't running | seconds |
+| **`upgrade-host.sh <host>`** *(not built in M0)* | Planned upgrade of the pinned Docker, Sysbox or kernel | Refuse during experiments → unpin → upgrade → reboot if needed → re-pin → `labctl doctor` + full self-test | ≤ 30 min |
 
 ### 4.3 Ansible roles (`deploy/ansible/`)
 
 | Role | Responsibilities |
 |---|---|
-| `base` | Updates; packages (git, jq, curl, tcpdump, chrony, nftables, restic, python3.12, uv); create the `lab` user; SSH hardening (keys only, no root login); fail2ban; unattended security upgrades with apt pins for docker-ce, containerd, sysbox and linux-image |
-| `storage` | Check (and, only with `--format-data-disk`, create) XFS with `ftype=1,reflink=1`; fstab entries; `/srv/lab` tree with ownership |
-| `docker` | Docker CE 29.x from Docker's apt repo (pinned minor, **never 29.1.0**); compose plugin ≥ 2.24; `/etc/docker/daemon.json` (data-root on the XFS disk, log rotation, `live-restore`, default address pools that don't overlap the cell subnets) |
-| `sysbox` | Download the Sysbox 0.7.1 `.deb`, **verify its SHA-256**, install, and check `sysbox-runc --version` |
-| `sysctl` | `vm.max_map_count=262144` (Neo4j), higher `fs.inotify.*`, `kernel.pid_max`, `net.ipv4.ip_forward=1` |
-| `firewall` | nftables: inbound default-drop except SSH (+ WireGuard if chosen); in the `DOCKER-USER` chain, **drop all forwarding from cell subnets except to the LLM gateway IP:port**; log drops (rate-limited) for the containment report |
-| `access` | One of ssh-tunnel (no-op), WireGuard (keys + peer config) or Tailscale (install + join with an auth key supplied interactively) |
-| `caddy` | Reverse proxy on the private interface only: website, Control/Results API and Grafana under one TLS origin; internal CA or Tailscale certificates; basic auth for the pilot (OIDC later) |
-| `registry` | `registry:2` bound to 127.0.0.1:5000, storage in `/srv/lab/registry` |
-| `ops` | Prometheus (scrapes node-exporter, cAdvisor and lab services), Grafana with the provisioned dashboards from [TRACKING.md](TRACKING.md), Loki + promtail (container logs, labels incl. `run_id`), Alertmanager → notification webhook |
-| `lab` | systemd units: `lab-control.service` (compose stack: Postgres, APIs, runner workers, scheduler, gateway, website), `lab-reaper.timer`, `lab-backup.timer`, `lab-selftest.timer` (nightly, in the maintenance window) |
+`site.yml` runs the roles in this order: `base`, `storage`, `sysctl`, `firewall`, `docker`, then `sysbox` (sysbox profile only), `access`, `caddy`, and `cloudflared` (only with `cloudflare_tunnel: true`). The `firewall` role comes before `docker`, so Docker is never started without the host firewall. Pre-checks: Ubuntu 24.04; the LXC profile runs in an LXC guest; a VM is provisioned as a sudo user. The roles are `ansible-lint` clean (production profile) and support `--check`.
+
+| Role | Responsibilities |
+|---|---|
+| `base` | See below |
+| `storage` | Free-space check on `/` and the `overlay2` check (§0.2). *Sysbox profile, not built in M0:* check (and, only with `--format-data-disk`, create) XFS with `ftype=1,reflink=1`; fstab entries |
+| `docker` | Docker CE 29.x from Docker's apt repo, pinned to one minor (`docker_ce_minor`, **never 29.1.0**). The keyring must hold exactly Docker's release key. Installed without Recommends and apt-held. Compose plugin ≥ 2.24. `/etc/docker/daemon.json`: overlay2, log rotation, `live-restore`, IPv6 off, default address pools that don't overlap the cell subnets or the LAN; data-root on the XFS disk only in the sysbox profile. Then the CVE-2025-52881 container start test (§0.1) |
+| `sysbox` | Download the Sysbox 0.7.1 `.deb`, **verify its SHA-256** (`sysbox_deb_sha256`, required), install, and check `sysbox-runc --version`. Refuses in an LXC |
+| `sysctl` | Namespaced settings: IPv6 off, `net.ipv4.ip_forward=1`. Host-only settings (`vm.max_map_count=262144` for Neo4j, `fs.inotify.*`) are verified in the LXC and warn when low. *Setting them for the sysbox profile is not built in M0* |
+| `firewall` | Fail-closed nftables in two layers (§0.2). Layer 1: table `inet lab_host` (input default-drop except SSH and 443; forward drop of cell egress and forwarded IPv6), loaded by `lab-firewall.service`, which `docker.service` requires. Layer 2: in the `DOCKER-USER` chain, **drop all forwarding from cell subnets except to the LLM gateway IP:port**. Drops are counted, and logged at a limited rate, for the containment report |
+| `access` | twingate and ssh-tunnel: nothing to install. WireGuard (keys + peer config) and Tailscale (install + join with an auth key supplied interactively): **not built in M0**, refused |
+| `caddy` | Reverse proxy on the private address only (the LXC: its IP, port 443): website, Control/Results API and Grafana under one TLS origin; `tls internal`; basic auth for the pilot with a login generated on the host (OIDC later) |
+| `cloudflared` | **Not built in M0**: a stub that refuses to run (§0.2) |
+| `registry` | **Not built in M0** (the LXC pulls from GHCR): `registry:2` bound to 127.0.0.1:5000, storage in `/srv/lab/registry` |
+| `ops` | **Not built in M0**: Prometheus (scrapes node-exporter, cAdvisor and lab services), Grafana with the provisioned dashboards from [TRACKING.md](TRACKING.md), Loki + promtail (container logs, labels incl. `run_id`), Alertmanager → notification webhook. Its host-side ports must be added to the firewall's input chain |
+| `lab` | **Not built in M0**: systemd units: `lab-control.service` (compose stack: Postgres, APIs, runner workers, scheduler, gateway, website), `lab-reaper.timer`, `lab-backup.timer`, `lab-selftest.timer` (nightly, in the maintenance window) |
+
+**`base`**
+- Updates and packages: git, jq, curl, tcpdump, nftables, iptables, restic, openssl, rsync. chrony only on a VM. fail2ban only when not behind Twingate (all clients share the connector's IP).
+- Locale `C.UTF-8`.
+- Creates the `lab` user and the `/srv/lab` tree with ownership.
+- Generates the HMAC key once.
+- **SSH hardening.** Key-only login, turned on only after a key-only login is proven. `PermitRootLogin` depends on the profile: `prohibit-password` for the LXC (§0.1 exception), `no` on a VM.
+- Unattended security upgrades, with docker-ce, containerd, sysbox and linux-image held and blocklisted.
 
 ### 4.4 The fresh-server quickstart
 
+This is the VM / bare-metal (sysbox) path. The LXC quickstart is §0.7. `--format-data-disk` and the sysbox profile are **not built in M0**.
+
 ```
-cp deploy/hosts.example.yml deploy/hosts.yml     # set address, disks, access method
-./deploy/bootstrap.sh lab1 --format-data-disk     # provision (≈20 min)
-./deploy/secrets.sh lab1                          # paste ANTHROPIC_API_KEY + budget
-./deploy/release.sh lab1 --tag v0.1.0             # deploy, build images, self-test
-./deploy/tunnel.sh lab1                           # open https://localhost:8443
-labctl --remote lab1 pilot                        # or: ssh lab1 'labctl pilot'
+cp deploy/hosts.example.yml deploy/hosts.yml     # set address, sudo user, disks, access method
+./deploy/bootstrap.sh cispa1 --format-data-disk   # provision (≈20 min); not built in M0
+./deploy/secrets.sh cispa1                        # paste ANTHROPIC_API_KEY + budget
+./deploy/release.sh cispa1 --tag v0.1.0           # deploy, pull images by digest, self-test
+./deploy/tunnel.sh cispa1                         # access: ssh-tunnel → open https://localhost:8443
+labctl --remote cispa1 pilot                      # or: ssh cispa1 'labctl pilot'
 ```
 
 Beyond that, the user only fills in `.env` values. Everything else is scripted, idempotent and verified by `labctl doctor` and the self-test.
@@ -387,7 +434,7 @@ Beyond that, the user only fills in `.env` values. Everything else is scripted, 
 ## 5. Operating rules
 
 - **Maintenance window** (configurable; default Sunday 03:00–05:00 server time): nightly self-test, backups, image garbage collection. Host upgrades happen only here.
-- **No deploys during a running experiment.** `release.sh` refuses unless `--drain` is given. An experiment's runs all use one release; the experiment records it and refuses to resume on a different release unless it is explicitly re-registered.
+- **No deploys during a running experiment.** `release.sh` refuses while any run cell is in flight. `--drain` (pause the queue, wait for in-flight runs) is **not built in M0**. An experiment's runs all use one release; the experiment records it and refuses to resume on a different release unless it is explicitly re-registered.
 - **Artifact retention:**
   - raw artifacts are kept for the life of the paper and backed up;
   - pcaps older than 90 days can be compressed to `.pcap.zst`;

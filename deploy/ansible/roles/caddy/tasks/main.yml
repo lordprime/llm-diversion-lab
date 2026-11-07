@@ -21,9 +21,15 @@
       pw=$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | cut -c1-24)
       printf 'user: %s\npassword: %s\n' {{ caddy_basic_auth_user | quote }} "$pw" \
         > {{ caddy_basic_auth_file | quote }}
-      caddy hash-password --plaintext "$pw" > {{ caddy_basic_auth_hash_file | quote }}
-      chgrp caddy {{ caddy_basic_auth_hash_file | quote }}
-      chmod 0640 {{ caddy_basic_auth_hash_file | quote }}
+      # The password goes to caddy on stdin (not a terminal, so it reads one line),
+      # never in argv where other processes could see it.
+      hash=$(printf '%s\n' "$pw" | caddy hash-password)
+      [[ -n $hash ]] || { echo "caddy hash-password returned nothing" >&2; exit 1; }
+      tmp={{ (caddy_basic_auth_hash_file ~ '.tmp') | quote }}
+      printf '%s\n' "$hash" > "$tmp"
+      chgrp caddy "$tmp"
+      chmod 0640 "$tmp"
+      mv -f "$tmp" {{ caddy_basic_auth_hash_file | quote }}
     executable: /bin/bash
     creates: "{{ caddy_basic_auth_hash_file }}"
   no_log: true

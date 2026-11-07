@@ -26,6 +26,17 @@
         fail_msg: deploy/hosts.yml has an invalid host profile (see hosts.example.yml)
         quiet: true
 
+    # Root over SSH (key only) is a documented exception for the LXC profile
+    # (DEPLOYMENT §0.1, ENGINEERING_STANDARDS §7); a VM provisions as a sudo user.
+    - name: Check a VM is provisioned by a sudo user, not root
+      ansible.builtin.assert:
+        that:
+          - isolation == 'lxc' or ansible_user != 'root'
+        fail_msg: >-
+          isolation: sysbox provisions as a non-root sudo user (ssh_user: admin in
+          hosts.example.yml); root SSH login is allowed only for the LXC profile.
+        quiet: true
+
     - name: Check the host runs Ubuntu 24.04
       ansible.builtin.assert:
         that:
@@ -47,20 +58,28 @@
         quiet: true
       when: isolation == 'lxc'
 
+  # firewall comes before docker: Docker is installed with a systemd drop-in that
+  # requires the host firewall, so it never starts (even once) without it.
   roles:
     - role: base
     - role: storage
     - role: sysctl
+    - role: firewall
     - role: docker
     - role: sysbox
       when: isolation == 'sysbox'
-    - role: firewall
     - role: access
     - role: caddy
     - role: cloudflared
       when: cloudflare_tunnel | bool
 
   post_tasks:
+    - name: Verify both firewall layers with Docker running
+      ansible.builtin.command:
+        argv: [/usr/local/sbin/lab-cell-egress, check]
+      changed_when: false
+      when: not ansible_check_mode
+
     - name: Write the host profile read by labctl and the runner
       ansible.builtin.template:
         src: host.env.j2
