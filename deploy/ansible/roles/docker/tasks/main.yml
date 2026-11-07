@@ -1,0 +1,169 @@
+---
+- name: Check Docker's address pools stay clear of the cell networks
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import ipaddress, json, sys
+        pools = [ipaddress.ip_network(p) for p in json.loads(sys.argv[1])]
+        cells = [ipaddress.ip_network(c) for c in json.loads(sys.argv[2])]
+        clash = [f"{p} overlaps {c}" for p in pools for c in cells if p.overlaps(c)]
+        sys.exit("; ".join(clash) or None)
+      - "{{ docker_default_address_pools | map(attribute='base') | list | to_json }}"
+      - "{{ lab_cell_networks | to_json }}"
+  changed_when: false
+  check_mode: false
+
+- name: Install the apt repository prerequisites
+  ansible.builtin.apt:
+    name: [ca-certificates, curl, gnupg]
+    state: present
+
+- name: Create the apt keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Download Docker's apt signing key
+  ansible.builtin.get_url:
+    url: "{{ docker_apt_key_url }}"
+    dest: /etc/apt/keyrings/docker.asc
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Read the key's fingerprint
+  ansible.builtin.command:
+    argv: [gpg, --show-keys, --with-colons, /etc/apt/keyrings/docker.asc]
+  changed_when: false
+  check_mode: false
+  register: docker_key_info
+  when: not ansible_check_mode
+
+- name: Check it is Docker's release key
+  ansible.builtin.assert:
+    that:
+      - ("fpr:::::::::" ~ docker_apt_key_fingerprint ~ ":") in docker_key_info.stdout
+    fail_msg: >-
+      /etc/apt/keyrings/docker.asc is not Docker's signing key
+      {{ docker_apt_key_fingerprint }}; refusing to trust it.
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Add Docker's apt repository
+  ansible.builtin.template:
+    src: docker.sources.j2
+    dest: /etc/apt/sources.list.d/docker.sources
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Refresh the apt cache
+  ansible.builtin.apt:
+    update_cache: true
+  changed_when: false
+
+- name: Read the installed docker-ce version
+  ansible.builtin.command:
+    argv: [dpkg-query, --show, "--showformat=${Version}", docker-ce]
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  register: docker_installed
+
+- name: List the docker-ce versions in the repository
+  ansible.builtin.command:
+    argv: [apt-cache, madison, docker-ce]
+  changed_when: false
+  check_mode: false
+  register: docker_madison
+
+- name: Choose the docker-ce version
+  vars:
+    docker_minor_re: "^5:{{ docker_ce_minor | regex_escape }}\\.[0-9]+-"
+    docker_forbidden_re: "^5:({{ docker_ce_forbidden_versions | map('regex_escape') | join('|') }})-"
+    docker_candidates: >-
+      {{ docker_madison.stdout_lines
+         | map('regex_replace', '^\\s*docker-ce\\s*[|]\\s*(\\S+)\\s*[|].*$', '\\1')
+         | select('match', docker_minor_re)
+         | reject('match', docker_forbidden_re)
+         | list }}
+  ansible.builtin.set_fact:
+    # Keep an installed version of the pinned minor (no surprise upgrades on re-run);
+    # otherwise take the newest allowed patch.
+    docker_ce_version: >-
+      {{ docker_installed.stdout
+         if (docker_installed.rc == 0
+             and docker_installed.stdout is match(docker_minor_re)
+             and docker_installed.stdout is not match(docker_forbidden_re))
+         else (docker_candidates | first | default('')) }}
+
+- name: Check a usable docker-ce version exists
+  ansible.builtin.assert:
+    that:
+      - docker_ce_version | length > 0
+    fail_msg: >-
+      No docker-ce {{ docker_ce_minor }}.x other than
+      {{ docker_ce_forbidden_versions | join(', ') }} in Docker's repository. Pick another
+      29.x minor with `docker_ce_minor` under this host's `vars:` in hosts.yml.
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Install Docker CE and the compose plugin, version {{ docker_ce_version }}
+  ansible.builtin.apt:
+    name:
+      - "docker-ce={{ docker_ce_version }}"
+      - "docker-ce-cli={{ docker_ce_version }}"
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+    allow_change_held_packages: true
+  when: docker_ce_version | length > 0
+
+- name: Hold the Docker packages (upgraded only in a maintenance window)
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: "{{ docker_held_packages }}"
+  when: not ansible_check_mode
+
+- name: Write /etc/docker/daemon.json
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    content: "{{ docker_daemon_config | to_nice_json }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: dockerd --validate --config-file %s
+  notify: Restart Docker
+
+- name: Start Docker at boot
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started
+  when: not ansible_check_mode
+
+- name: Apply a changed daemon.json now
+  ansible.builtin.meta: flush_handlers
+
+- name: Let the lab user run the control plane
+  ansible.builtin.user:
+    name: "{{ lab_user }}"
+    groups: docker
+    append: true
+  when: not ansible_check_mode
+
+- name: Verify the Docker installation
+  ansible.builtin.import_tasks: verify.yml
+  when: not ansible_check_mode
+
+- name: Check containers can start (CVE-2025-52881 Docker-in-LXC breakage)
+  ansible.builtin.import_tasks: cve_2025_52881.yml
+  when: not ansible_check_mode

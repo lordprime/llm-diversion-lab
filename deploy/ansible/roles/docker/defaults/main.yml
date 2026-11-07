@@ -1,0 +1,38 @@
+---
+# Docker CE 29.x from Docker's apt repository, pinned to one minor (DEPLOYMENT §4.3).
+# The newest patch of this minor is installed once; after that the installed
+# version is kept (and apt-held) until the minor is changed here on purpose.
+docker_ce_minor: "29.1"
+# Never installed, whatever the minor: 29.1.0 is excluded by the deployment spec.
+docker_ce_forbidden_versions:
+  - "29.1.0"
+docker_compose_min_version: "2.24.0"
+
+docker_apt_key_url: https://download.docker.com/linux/ubuntu/gpg
+# Docker's release signing key (docs.docker.com/engine/install/ubuntu).
+docker_apt_key_fingerprint: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+docker_apt_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}"
+
+docker_held_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+# CVE-2025-52881 stopgap, used only with allow_containerd_pin: true (§0.1).
+docker_containerd_pin_version: "1.7.28"
+
+docker_log_max_size: 50m
+docker_log_max_file: "5"
+
+docker_daemon_config:
+  storage-driver: overlay2
+  log-driver: json-file
+  log-opts:
+    max-size: "{{ docker_log_max_size }}"
+    max-file: "{{ docker_log_max_file }}"
+  live-restore: true
+  ipv6: false
+  ip6tables: false
+  default-address-pools: "{{ docker_default_address_pools }}"

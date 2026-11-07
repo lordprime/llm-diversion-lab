@@ -1,0 +1,6 @@
+---
+# TCP ports the host itself accepts (input chain, policy drop): SSH and Caddy.
+firewall_ssh_port: "{{ ansible_port | default(22) }}"
+firewall_https_port: 443
+# Comment on every DOCKER-USER rule this role owns (status.sh and labctl find them).
+firewall_cell_egress_tag: lab-cell-egress

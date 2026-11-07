@@ -1,0 +1,17 @@
+# {{ ansible_managed }} (role firewall)
+[Unit]
+Description=Lab host input firewall (nftables table inet lab_host)
+Wants=network-pre.target
+Before=network-pre.target docker.service shutdown.target
+Conflicts=shutdown.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft --file /etc/lab/host.nft
+ExecReload=/usr/sbin/nft --file /etc/lab/host.nft
+ExecStop=/usr/sbin/nft delete table inet lab_host
+
+[Install]
+WantedBy=multi-user.target

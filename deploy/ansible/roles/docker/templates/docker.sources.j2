@@ -1,0 +1,7 @@
+# {{ ansible_managed }} (role docker)
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: {{ ansible_facts['distribution_release'] }}
+Components: stable
+Architectures: {{ docker_apt_arch }}
+Signed-By: /etc/apt/keyrings/docker.asc

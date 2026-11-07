@@ -1,0 +1,11 @@
+# {{ ansible_managed }} (role sysctl)
+# Only per-network-namespace settings, which an unprivileged LXC may change
+# (DEPLOYMENT §0.2). Host-only settings are verified by the role, never set here.
+
+# IPv6 off: the LAN hands out globally routable IPv6 addresses, which would
+# bypass the IPv4-only firewall rules in both directions (§0.5).
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+
+# Docker routes between its networks (Docker sets it too; stated here explicitly).
+net.ipv4.ip_forward = 1

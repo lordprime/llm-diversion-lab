@@ -1,0 +1,84 @@
+---
+# LXC: no disk formatting. Docker, the image store and /srv/lab share the
+# container's root disk on Proxmox storage (§0, §0.2).
+- name: Refuse disk formatting in the LXC profile
+  ansible.builtin.assert:
+    that:
+      - not (format_data_disk | bool)
+    fail_msg: >-
+      There is no disk formatting in the LXC profile: Docker uses the container's
+      root disk (DEPLOYMENT §0.2). Drop --format-data-disk.
+    quiet: true
+  when: isolation == 'lxc'
+
+- name: Refuse disk formatting until the sysbox profile is built
+  ansible.builtin.assert:
+    that:
+      - not (format_data_disk | bool)
+    fail_msg: >-
+      XFS data-disk formatting (sysbox profile, DEPLOYMENT §4.3) is not built in M0.
+    quiet: true
+  when: isolation == 'sysbox'
+
+- name: Measure free space and the filesystem type of /
+  ansible.builtin.command:
+    argv:
+      - df
+      - --block-size=1G
+      - --output=avail,fstype
+      - /
+  changed_when: false
+  check_mode: false
+  register: storage_df
+
+- name: Parse the df output
+  ansible.builtin.set_fact:
+    storage_free_gb: "{{ (storage_df.stdout_lines | last).split()[0] | int }}"
+    storage_fstype: "{{ (storage_df.stdout_lines | last).split()[1] }}"
+
+- name: Check there is enough free space
+  ansible.builtin.assert:
+    that:
+      - storage_free_gb | int >= storage_min_free_gb | int
+    fail_msg: >-
+      Only {{ storage_free_gb }} GB free on / ({{ storage_fstype }}); the lab needs at
+      least {{ storage_min_free_gb }} GB (§0.4 plans 400 GB). Grow the container's
+      root disk on the Proxmox host (pct resize <CTID> rootfs +<N>G) and re-run.
+    quiet: true
+
+- name: Check the root filesystem can carry overlay2
+  ansible.builtin.assert:
+    that:
+      - storage_fstype in ['zfs', 'ext4', 'xfs']
+    fail_msg: >-
+      / is {{ storage_fstype }}; Docker's overlay2 driver needs ext4, xfs (ftype=1) or
+      ZFS 2.2 or later on the Proxmox host (§0.1).
+    quiet: true
+
+- name: Note the ZFS requirement on the Proxmox host
+  ansible.builtin.debug:
+    msg: >-
+      / is ZFS: overlay2 needs ZFS >= 2.2 on the Proxmox host (`zfs version` there;
+      CT 111 had 2.4.4 on 5 Nov 2026). The docker role checks the driver it gets.
+  when: storage_fstype == 'zfs'
+
+# On the first run Docker is not installed yet; the docker role checks the driver
+# right after installing it. On re-runs this catches a driver change early.
+- name: Read Docker's storage driver if Docker is installed
+  ansible.builtin.command:
+    argv: [docker, info, --format, json]
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  register: storage_docker_info
+
+- name: Check Docker uses overlay2
+  ansible.builtin.assert:
+    that:
+      - (storage_docker_info.stdout | from_json).Driver == 'overlay2'
+    fail_msg: >-
+      Docker uses the '{{ (storage_docker_info.stdout | from_json).Driver }}' storage
+      driver, not overlay2. In an LXC on ZFS this means ZFS < 2.2 on the Proxmox host
+      or a missing nesting=1 feature (§0.1); vfs would copy every image layer in full.
+    quiet: true
+  when: storage_docker_info.rc == 0

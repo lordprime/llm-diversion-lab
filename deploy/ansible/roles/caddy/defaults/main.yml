@@ -1,0 +1,16 @@
+---
+# Caddy listens on the container's own IP (reached over Twingate), never 0.0.0.0.
+caddy_listen_address: "{{ address | default(ansible_host) }}"
+
+# Upstreams on the host's loopback, published by the control-plane compose file
+# (deploy/compose/control-plane.yml). Override per host under `vars:` in hosts.yml.
+caddy_upstream_website: 127.0.0.1:8080
+caddy_upstream_api: 127.0.0.1:8000
+caddy_upstream_grafana: 127.0.0.1:3000
+
+# Basic auth for the pilot (OIDC later, DEPLOYMENT §4.3). The password is generated
+# on the host once and stays there (root-only file); only its bcrypt hash is in
+# Caddy's configuration.
+caddy_basic_auth_user: lab
+caddy_basic_auth_file: "{{ lab_root }}/secrets/web-basic-auth"
+caddy_basic_auth_hash_file: /etc/caddy/basic-auth.hash

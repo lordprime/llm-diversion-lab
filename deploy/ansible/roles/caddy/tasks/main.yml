@@ -1,0 +1,66 @@
+---
+- name: Check Caddy's listen address is one of this host's addresses
+  ansible.builtin.assert:
+    that:
+      - caddy_listen_address in ansible_facts['all_ipv4_addresses']
+    fail_msg: >-
+      caddy_listen_address {{ caddy_listen_address }} is not an address of this host
+      ({{ ansible_facts['all_ipv4_addresses'] | join(', ') }}).
+    quiet: true
+
+- name: Install Caddy (Ubuntu archive)
+  ansible.builtin.apt:
+    name: caddy
+    state: present
+
+- name: Generate the web login once (the password never leaves the host)
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      umask 077
+      pw=$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | cut -c1-24)
+      printf 'user: %s\npassword: %s\n' {{ caddy_basic_auth_user | quote }} "$pw" \
+        > {{ caddy_basic_auth_file | quote }}
+      caddy hash-password --plaintext "$pw" > {{ caddy_basic_auth_hash_file | quote }}
+      chgrp caddy {{ caddy_basic_auth_hash_file | quote }}
+      chmod 0640 {{ caddy_basic_auth_hash_file | quote }}
+    executable: /bin/bash
+    creates: "{{ caddy_basic_auth_hash_file }}"
+  no_log: true
+
+- name: Read the password hash
+  ansible.builtin.slurp:
+    src: "{{ caddy_basic_auth_hash_file }}"
+  register: caddy_hash_file
+  no_log: true
+  when: not ansible_check_mode
+
+- name: Write the Caddyfile
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: /etc/caddy/Caddyfile
+    owner: root
+    group: caddy
+    mode: "0640"
+    validate: caddy adapt --adapter caddyfile --config %s
+  vars:
+    caddy_basic_auth_hash: "{{ caddy_hash_file.content | b64decode | trim }}"
+  notify: Reload Caddy
+  when: not ansible_check_mode
+
+- name: Start Caddy at boot
+  ansible.builtin.systemd_service:
+    name: caddy
+    enabled: true
+    state: started
+  when: not ansible_check_mode
+
+- name: Apply a changed Caddyfile now
+  ansible.builtin.meta: flush_handlers
+
+- name: Check Caddy answers on 443 and asks for a login
+  ansible.builtin.uri:
+    url: "https://{{ caddy_listen_address }}/"
+    validate_certs: false
+    status_code: 401
+  when: not ansible_check_mode

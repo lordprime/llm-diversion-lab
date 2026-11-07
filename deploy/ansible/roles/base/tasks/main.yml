@@ -1,0 +1,56 @@
+---
+- name: Install the base packages
+  ansible.builtin.apt:
+    name: "{{ base_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install chrony (a VM keeps its own clock; an LXC uses the host's, §0.5)
+  ansible.builtin.apt:
+    name: chrony
+    state: present
+  when: isolation != 'lxc'
+
+# Behind Twingate every SSH client arrives from the connector's address, so one ban
+# would lock everyone out; the Proxmox firewall already limits port 22 to it.
+- name: Install fail2ban (not behind Twingate)
+  ansible.builtin.apt:
+    name: fail2ban
+    state: present
+  when: access != 'twingate'
+
+- name: Set the system locale
+  ansible.builtin.copy:
+    dest: /etc/default/locale
+    content: "LANG={{ base_locale }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Turn on unattended security upgrades
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Keep the pinned packages out of unattended upgrades
+  ansible.builtin.template:
+    src: 51lab-unattended-blocklist.j2
+    dest: /etc/apt/apt.conf.d/51lab-unattended-blocklist
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Create the lab user
+  ansible.builtin.import_tasks: user.yml
+
+- name: Harden SSH
+  ansible.builtin.import_tasks: ssh.yml
+
+- name: Create the /srv/lab tree and keys
+  ansible.builtin.import_tasks: tree.yml

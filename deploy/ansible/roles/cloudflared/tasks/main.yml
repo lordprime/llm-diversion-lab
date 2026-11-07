@@ -1,0 +1,9 @@
+---
+# Stub. site.yml runs it only with cloudflare_tunnel: true, and it refuses: the real
+# role must require a Cloudflare Access policy on every hostname (DEPLOYMENT §0.2).
+- name: Refuse until the cloudflared role is built
+  ansible.builtin.fail:
+    msg: >-
+      cloudflare_tunnel: true, but the cloudflared role is not built in M0. When it
+      is, it must refuse any hostname without a Cloudflare Access policy and expose
+      only the website and Grafana (§0.2). Set cloudflare_tunnel: false.

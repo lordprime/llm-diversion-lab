@@ -1,0 +1,107 @@
+---
+# nftables inside the LXC (DEPLOYMENT §0.2). Two parts:
+# - the host's own input rules: a native nftables table (inet lab_host), loaded by
+#   lab-firewall.service; only that table is ever replaced, never the ruleset;
+# - run-cell egress: rules in Docker's DOCKER-USER chain, written with iptables-nft
+#   (so they are nftables rules in Docker's `ip filter` table, in the syntax Docker
+#   itself uses there), re-applied by lab-cell-egress.service whenever Docker starts.
+# The Proxmox firewall on the container (internet only, never the LAN) is the manual
+# step in §0.1, verified by `labctl doctor`.
+- name: Check the LLM gateway exception is well formed
+  ansible.builtin.assert:
+    that:
+      - lab_llm_gateway_address == '' or lab_llm_gateway_address is match('^[0-9]{1,3}([.][0-9]{1,3}){3}$')
+      - lab_llm_gateway_port | int >= 1
+      - lab_llm_gateway_port | int <= 65535
+    fail_msg: lab_llm_gateway_address must be empty or an IPv4 address, with a valid port.
+    quiet: true
+
+- name: Install nftables and iptables
+  ansible.builtin.apt:
+    name: [nftables, iptables]
+    state: present
+
+- name: Read the iptables backend
+  ansible.builtin.command:
+    argv: [iptables, --version]
+  changed_when: false
+  check_mode: false
+  register: firewall_iptables_version
+
+- name: Check iptables writes nftables rules
+  ansible.builtin.assert:
+    that:
+      - "'nf_tables' in firewall_iptables_version.stdout"
+    fail_msg: >-
+      iptables is '{{ firewall_iptables_version.stdout }}', not the nf_tables backend;
+      Docker's rules and the lab's would live in two different firewalls.
+      Run: update-alternatives --set iptables /usr/sbin/iptables-nft
+    quiet: true
+
+- name: Create /etc/lab
+  ansible.builtin.file:
+    path: /etc/lab
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write the host input rules
+  ansible.builtin.template:
+    src: host.nft.j2
+    dest: /etc/lab/host.nft
+    owner: root
+    group: root
+    mode: "0644"
+    validate: nft --check --file %s
+  notify: Reload the host firewall
+
+- name: Write the cell egress script
+  ansible.builtin.template:
+    src: lab-cell-egress.sh.j2
+    dest: /usr/local/sbin/lab-cell-egress
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Re-apply the cell egress rules
+
+- name: Install the firewall units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - lab-firewall.service
+    - lab-cell-egress.service
+  notify:
+    - Reload the host firewall
+    - Re-apply the cell egress rules
+
+# Its stop action is `nft flush ruleset`, which would also wipe Docker's rules.
+# Only boot-time enablement is turned off; a running instance is left alone.
+- name: Keep the distribution's nftables.service off at boot
+  ansible.builtin.systemd_service:
+    name: nftables
+    enabled: false
+
+- name: Enable and start the lab firewall units
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop:
+    - lab-firewall.service
+    - lab-cell-egress.service
+  when: not ansible_check_mode
+
+- name: Apply changed rules now
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify the host table and the cell egress rules are loaded
+  ansible.builtin.command:
+    argv: [/usr/local/sbin/lab-cell-egress, check]
+  changed_when: false
+  when: not ansible_check_mode

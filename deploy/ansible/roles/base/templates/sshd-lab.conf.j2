@@ -1,0 +1,10 @@
+# {{ ansible_managed }} (role base)
+# Key-only SSH. Ubuntu reads sshd_config.d/*.conf before the main file and the
+# first value wins, so this file overrides 50-cloud-init.conf and sshd_config.
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin {{ base_ssh_permit_root_login }}
+X11Forwarding no
+MaxAuthTries 4

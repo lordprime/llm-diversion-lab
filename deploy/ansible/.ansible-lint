@@ -1,0 +1,4 @@
+---
+# ansible-lint configuration for deploy/ansible (ENGINEERING_STANDARDS §2).
+profile: production
+offline: true

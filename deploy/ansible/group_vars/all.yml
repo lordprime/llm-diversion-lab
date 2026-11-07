@@ -1,0 +1,29 @@
+---
+# Lab-wide settings shared by several roles. Per-host overrides go under `vars:`
+# for that host in deploy/hosts.yml (they take precedence over this file).
+
+lab_root: /srv/lab
+lab_user: lab
+
+# Run-cell networks. CONTRACT with the runner: every cell network is created with
+# an explicit subnet inside one of these. The firewall drops all forwarding from
+# them except to each other (Docker's per-network isolation applies there) and to
+# the LLM gateway below; the host's input chain drops everything from them.
+lab_cell_networks:
+  - 10.231.0.0/16
+
+# Where cells may send LLM traffic when the gateway is NOT itself on the cell's
+# uplink network. Empty means no exception: cells reach nothing outside the cell
+# networks.
+lab_llm_gateway_address: ""
+lab_llm_gateway_port: 4000
+
+# Docker's pools for every other network (control plane, compose defaults). They
+# must not overlap the cell networks, the home LAN (192.168.0.0/16; Docker's
+# built-in defaults include 192.168.0.0/16) or Twingate/CGNAT (100.64.0.0/10).
+docker_default_address_pools:
+  - base: 172.20.0.0/14
+    size: 24
+
+# Set by `bootstrap.sh --format-data-disk` (sysbox profile only; refused in an LXC).
+format_data_disk: false

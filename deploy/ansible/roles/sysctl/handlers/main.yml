@@ -1,0 +1,5 @@
+---
+- name: Apply the lab sysctl settings
+  ansible.builtin.command:
+    argv: [sysctl, --load=/etc/sysctl.d/90-lab.conf]
+  changed_when: true

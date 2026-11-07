@@ -1,0 +1,32 @@
+# Lab hosts for the deploy scripts (docs/DEPLOYMENT.md §4.1).
+#
+#   cp deploy/hosts.example.yml deploy/hosts.yml   # git-ignored; edit the copy
+#
+# One top-level key per host; the scripts take that key as their <host> argument
+# (./deploy/bootstrap.sh lab1). Unknown keys are refused, so a typo fails loudly.
+#
+# Keys:
+#   address               IP the workstation reaches over the access channel
+#   ssh_user              user for SSH and Ansible (root in the LXC; sudo-capable otherwise)
+#   ssh_port              optional, default 22
+#   isolation             lxc (current: unprivileged LXC, one shared Docker daemon)
+#                         | sysbox (VM or bare metal, per-cell daemons; not built in M0)
+#   access                twingate | ssh-tunnel | wireguard | tailscale
+#   allow_containerd_pin  true only as the documented CVE-2025-52881 stopgap (§0.1);
+#                         gives up the runc fix and is recorded in /srv/lab/host.env
+#   cloudflare_tunnel     public website/Grafana behind Cloudflare Access (later; the
+#                         cloudflared role is a stub that refuses to run in M0)
+#   max_parallel_cells    hard cap on concurrent run cells on this host (§0.5: 1 on CT 111)
+#   vars                  optional mapping of extra Ansible variables for this host,
+#                         e.g. lab_llm_gateway_address / lab_llm_gateway_port
+#
+# Not used in M0 (roles not built yet): backup_repo, data_disk, artifact_disk.
+
+lab1:
+  address: 192.168.1.145 # CT 111 on the homelab, reachable over Twingate
+  ssh_user: root
+  isolation: lxc
+  access: twingate
+  allow_containerd_pin: false
+  cloudflare_tunnel: false
+  max_parallel_cells: 1

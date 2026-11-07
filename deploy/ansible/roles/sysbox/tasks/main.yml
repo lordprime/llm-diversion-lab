@@ -1,0 +1,47 @@
+---
+# site.yml skips this role unless isolation == 'sysbox'; it refuses on its own too.
+- name: Refuse to run outside the sysbox profile
+  ansible.builtin.assert:
+    that:
+      - isolation == 'sysbox'
+      - ansible_facts['virtualization_type'] != 'lxc'
+    fail_msg: Sysbox runs only with isolation sysbox on a VM or bare metal, never in an LXC.
+    quiet: true
+
+- name: Require the published SHA-256 of the Sysbox package
+  ansible.builtin.assert:
+    that:
+      - sysbox_deb_sha256 is match('^[0-9a-f]{64}$')
+    fail_msg: >-
+      Set sysbox_deb_sha256 (this host's `vars:` in hosts.yml) to the SHA-256 published
+      for sysbox-ce {{ sysbox_version }}; an unverified .deb is never installed.
+    quiet: true
+
+- name: Download the Sysbox package (checksum verified)
+  ansible.builtin.get_url:
+    url: "{{ sysbox_deb_url }}"
+    dest: "/var/cache/sysbox-ce_{{ sysbox_version }}.deb"
+    checksum: "sha256:{{ sysbox_deb_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install Sysbox
+  ansible.builtin.apt:
+    deb: "/var/cache/sysbox-ce_{{ sysbox_version }}.deb"
+    state: present
+
+- name: Read the Sysbox version
+  ansible.builtin.command:
+    argv: [sysbox-runc, --version]
+  changed_when: false
+  register: sysbox_runc_version
+  when: not ansible_check_mode
+
+- name: Check the Sysbox version
+  ansible.builtin.assert:
+    that:
+      - sysbox_version in sysbox_runc_version.stdout
+    fail_msg: "sysbox-runc reports {{ sysbox_runc_version.stdout }}, expected {{ sysbox_version }}"
+    quiet: true
+  when: not ansible_check_mode

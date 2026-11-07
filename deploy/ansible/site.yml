@@ -1,0 +1,70 @@
+---
+# Provision one lab host (docs/DEPLOYMENT.md §0.2, §4.3). Run through
+# deploy/bootstrap.sh, which turns deploy/hosts.yml into the inventory.
+#
+# isolation: lxc (current, CT 111): one Docker daemon inside an unprivileged LXC;
+# Sysbox is skipped. isolation: sysbox (VM or bare metal) is the upgrade path; its
+# disk formatting and host sysctls are not built in M0.
+#
+# Optional roles from the docs that are NOT here yet: registry (the LXC pulls from
+# GHCR), ops (Prometheus/Grafana/Loki), lab (systemd units and timers: reaper,
+# backup, self-test) and backup (restic). cloudflared is a stub that refuses to run.
+- name: Provision a lab host
+  hosts: all
+  gather_facts: true
+  become: "{{ ansible_user != 'root' }}"
+
+  pre_tasks:
+    - name: Check the host profile from hosts.yml
+      ansible.builtin.assert:
+        that:
+          - isolation in ['lxc', 'sysbox']
+          - access in ['twingate', 'ssh-tunnel', 'wireguard', 'tailscale']
+          - max_parallel_cells | int >= 1
+          - allow_containerd_pin is boolean
+          - cloudflare_tunnel is boolean
+        fail_msg: deploy/hosts.yml has an invalid host profile (see hosts.example.yml)
+        quiet: true
+
+    - name: Check the host runs Ubuntu 24.04
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Ubuntu'
+          - ansible_facts['distribution_version'] == '24.04'
+        fail_msg: >-
+          The lab roles target Ubuntu 24.04 LTS; this host runs
+          {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}.
+        quiet: true
+
+    - name: Check the LXC profile really runs in an LXC guest
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['virtualization_type'] == 'lxc'
+          - ansible_facts['virtualization_role'] == 'guest'
+        fail_msg: >-
+          isolation: lxc, but this host is {{ ansible_facts['virtualization_type'] }}/{{
+          ansible_facts['virtualization_role'] }}. Use isolation: sysbox for a VM or bare metal.
+        quiet: true
+      when: isolation == 'lxc'
+
+  roles:
+    - role: base
+    - role: storage
+    - role: sysctl
+    - role: docker
+    - role: sysbox
+      when: isolation == 'sysbox'
+    - role: firewall
+    - role: access
+    - role: caddy
+    - role: cloudflared
+      when: cloudflare_tunnel | bool
+
+  post_tasks:
+    - name: Write the host profile read by labctl and the runner
+      ansible.builtin.template:
+        src: host.env.j2
+        dest: "{{ lab_root }}/host.env"
+        owner: root
+        group: root
+        mode: "0644"

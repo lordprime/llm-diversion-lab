@@ -1,0 +1,43 @@
+---
+base_packages:
+  - ca-certificates
+  - curl
+  - git
+  - gnupg
+  - iptables
+  - jq
+  - nftables
+  - openssh-server
+  - openssl
+  - python3
+  - restic
+  - rsync
+  - tcpdump
+  - unattended-upgrades
+
+# Only C and C.UTF-8 exist in the CT 111 template (§0.5).
+base_locale: C.UTF-8
+
+# Root logs in by key only when root is the provisioning user (the LXC); with a
+# sudo user, root login is off entirely (ENGINEERING_STANDARDS §7).
+base_ssh_permit_root_login: "{{ 'prohibit-password' if ansible_user == 'root' else 'no' }}"
+
+# Packages that only change in a maintenance window (DEPLOYMENT §2 row 6).
+base_unattended_blocklist:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+  - sysbox-ce
+  - linux-image-
+
+base_lab_dirs:
+  - { path: "", mode: "0755" }
+  - { path: releases, mode: "0755" }
+  - { path: secrets, mode: "0700" }
+  - { path: artifacts, mode: "0750" }
+  - { path: cells, mode: "0750" }
+  - { path: db, mode: "0700" }
+  - { path: ops, mode: "0750" }
+  - { path: backups, mode: "0700" }

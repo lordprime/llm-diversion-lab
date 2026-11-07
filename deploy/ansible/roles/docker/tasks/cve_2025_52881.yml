@@ -1,0 +1,95 @@
+---
+# After the runc/containerd fix for CVE-2025-52881 (Nov 2025), Docker in an
+# unprivileged LXC fails to start any container: runc gets "permission denied" on
+# net.ipv4.ip_unprivileged_port_start. Newer lxc-pve (PVE >= 9.1) fixes it.
+# Detected by starting one real container; the stopgap (pinning containerd.io to
+# 1.7.28, which gives up the CVE fix) is applied only with allow_containerd_pin.
+- name: Install the container start test
+  ansible.builtin.copy:
+    src: lab-docker-start-test.sh
+    dest: /usr/local/sbin/lab-docker-start-test
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Start a test container
+  ansible.builtin.command: /usr/local/sbin/lab-docker-start-test
+  changed_when: false
+  failed_when: false
+  register: docker_start_test
+
+- name: Apply the containerd stopgap (allow_containerd_pin)
+  when:
+    - docker_start_test.rc != 0
+    - "'ip_unprivileged_port_start' in docker_start_test.stderr"
+    - allow_containerd_pin | bool
+  block:
+    - name: Pin containerd.io to {{ docker_containerd_pin_version }}
+      ansible.builtin.apt:
+        name: "containerd.io={{ docker_containerd_pin_version }}*"
+        state: present
+        allow_downgrade: true
+        allow_change_held_packages: true
+
+    - name: Hold containerd.io
+      ansible.builtin.dpkg_selections:
+        name: containerd.io
+        selection: hold
+
+    - name: Restart Docker on the pinned containerd
+      ansible.builtin.systemd_service:
+        name: docker
+        state: restarted
+
+    - name: Start the test container again
+      ansible.builtin.command: /usr/local/sbin/lab-docker-start-test
+      changed_when: false
+      failed_when: false
+      register: docker_start_test_pinned
+
+- name: Combine the test results
+  ansible.builtin.set_fact:
+    docker_start_result: >-
+      {{ docker_start_test_pinned if docker_start_test_pinned is defined
+         and docker_start_test_pinned is not skipped else docker_start_test }}
+
+- name: Stop with guidance when containers cannot start here
+  ansible.builtin.fail:
+    msg: |
+      Docker cannot start containers in this container.
+      {{ docker_start_result.stderr | trim }}
+
+      {% if 'ip_unprivileged_port_start' in docker_start_result.stderr %}
+      This is the Docker-in-unprivileged-LXC breakage that followed the runc/containerd
+      fix for CVE-2025-52881 (November 2025). DEPLOYMENT.md §0.1:
+        Fix (preferred): upgrade the Proxmox host to PVE 9.1 or later (newer lxc-pve),
+          restart the container, and re-run bootstrap.sh.
+        Stopgap: set `allow_containerd_pin: true` for this host in deploy/hosts.yml.
+          It pins containerd.io {{ docker_containerd_pin_version }}, which GIVES UP the
+          CVE fix; it is recorded in /srv/lab/host.env so every run records it.
+        Not used: `lxc.apparmor.profile: unconfined` (removes AppArmor confinement).
+      {% else %}
+      Check `journalctl -u docker` and that the container has features nesting=1,keyctl=1
+      (DEPLOYMENT §0.1).
+      {% endif %}
+  when: docker_start_result.rc != 0
+
+- name: Read the installed containerd.io version
+  ansible.builtin.command:
+    argv: [dpkg-query, --show, "--showformat=${Version}", containerd.io]
+  changed_when: false
+  register: docker_containerd_version
+
+- name: Record whether containerd is pinned
+  ansible.builtin.set_fact:
+    docker_containerd_pinned: "{{ docker_containerd_version.stdout is match(docker_containerd_pin_version | regex_escape ~ '-') }}"
+
+- name: Refuse a containerd pin that is no longer allowed
+  ansible.builtin.assert:
+    that:
+      - allow_containerd_pin | bool or not docker_containerd_pinned | bool
+    fail_msg: >-
+      containerd.io {{ docker_containerd_version.stdout }} is the CVE-2025-52881 stopgap pin,
+      but allow_containerd_pin is false. Unpin it (apt-mark unhold containerd.io &&
+      apt-get install containerd.io) once the Proxmox host is fixed, then re-run.
+    quiet: true

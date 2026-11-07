@@ -1,0 +1,4 @@
+---
+# Free space required on the filesystem holding / (and so /var/lib/docker and
+# /srv/lab in the LXC). §0.4 plans a 400 GB disk; M0 (DVGA only) needs far less.
+storage_min_free_gb: 50

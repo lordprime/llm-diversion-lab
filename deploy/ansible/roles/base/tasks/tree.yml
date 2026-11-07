@@ -1,0 +1,23 @@
+---
+- name: Create the /srv/lab tree (DEPLOYMENT §3)
+  ansible.builtin.file:
+    path: "{{ lab_root }}/{{ item.path }}"
+    state: directory
+    owner: "{{ lab_user }}"
+    group: "{{ lab_user }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ base_lab_dirs }}"
+  loop_control:
+    label: "{{ lab_root }}/{{ item.path }}"
+
+# The callback-token key (plan §3.4) is generated on the host and never leaves it;
+# Ansible never rotates it (that would orphan every token already issued).
+- name: Generate the callback-token HMAC key once
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      umask 077
+      openssl rand -out {{ (lab_root ~ '/secrets/hmac.key') | quote }} 32
+      chown {{ lab_user | quote }}:{{ lab_user | quote }} {{ (lab_root ~ '/secrets/hmac.key') | quote }}
+    executable: /bin/bash
+    creates: "{{ lab_root }}/secrets/hmac.key"

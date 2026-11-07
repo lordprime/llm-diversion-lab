@@ -1,0 +1,72 @@
+---
+- name: Write the lab's namespaced kernel settings
+  ansible.builtin.template:
+    src: 90-lab.conf.j2
+    dest: /etc/sysctl.d/90-lab.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Apply the lab sysctl settings
+
+- name: Apply changed settings now
+  ansible.builtin.meta: flush_handlers
+
+- name: Read back the namespaced settings
+  ansible.builtin.command:
+    argv:
+      - sysctl
+      - --values
+      - net.ipv6.conf.all.disable_ipv6
+      - net.ipv6.conf.default.disable_ipv6
+      - net.ipv4.ip_forward
+  changed_when: false
+  check_mode: false
+  register: sysctl_applied
+
+- name: Check IPv6 is off and forwarding is on
+  ansible.builtin.assert:
+    that:
+      - sysctl_applied.stdout_lines == ['1', '1', '1']
+    fail_msg: >-
+      Expected disable_ipv6=1 (all, default) and ip_forward=1, got
+      {{ sysctl_applied.stdout_lines }}. The container may not allow namespaced sysctls.
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Read the host-only settings (verify, never set)
+  ansible.builtin.command:
+    argv: [sysctl, --values, "{{ item.key }}"]
+  changed_when: false
+  check_mode: false
+  loop: "{{ sysctl_verify_host | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: sysctl_host_values
+
+- name: List host settings below their minimum
+  ansible.builtin.set_fact:
+    sysctl_host_low: >-
+      {{ sysctl_host_low | default([]) + [item.item.key ~ '=' ~ item.stdout ~ ' (need >= ' ~ item.item.value ~ ')'] }}
+  loop: "{{ sysctl_host_values.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+  when: item.stdout | int < item.item.value | int
+
+- name: Warn about host settings below their minimum
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: host-only kernel settings below the lab's minimum:
+      {{ sysctl_host_low | join(', ') }}. Set them on the Proxmox host in
+      /etc/sysctl.d/99-llm-lab.conf (DEPLOYMENT §0.1); the container cannot.
+  when:
+    - sysctl_host_low is defined
+    - not sysctl_enforce_host_settings | bool
+
+- name: Stop on host settings below their minimum (sysctl_enforce_host_settings)
+  ansible.builtin.fail:
+    msg: >-
+      Host-only kernel settings below the lab's minimum: {{ sysctl_host_low | join(', ') }}.
+      Set them on the Proxmox host in /etc/sysctl.d/99-llm-lab.conf (DEPLOYMENT §0.1).
+  when:
+    - sysctl_host_low is defined
+    - sysctl_enforce_host_settings | bool

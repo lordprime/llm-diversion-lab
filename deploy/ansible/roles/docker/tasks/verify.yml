@@ -1,0 +1,51 @@
+---
+- name: Read the Docker server version
+  ansible.builtin.command:
+    argv: [docker, version, --format, json]
+  changed_when: false
+  register: docker_version_info
+
+- name: Record the Docker server version
+  ansible.builtin.set_fact:
+    docker_server_version: "{{ (docker_version_info.stdout | from_json).Server.Version }}"
+
+- name: Check the Docker version is the pinned minor and not excluded
+  ansible.builtin.assert:
+    that:
+      - docker_server_version is match(docker_ce_minor | regex_escape ~ '[.]')
+      - docker_server_version not in docker_ce_forbidden_versions
+    fail_msg: >-
+      Docker {{ docker_server_version }} is running; expected {{ docker_ce_minor }}.x and
+      never {{ docker_ce_forbidden_versions | join(', ') }}.
+    quiet: true
+
+- name: Read the compose plugin version
+  ansible.builtin.command:
+    argv: [docker, compose, version, --short]
+  changed_when: false
+  register: docker_compose_version
+
+- name: Check the compose plugin is recent enough
+  ansible.builtin.assert:
+    that:
+      - docker_compose_version.stdout | trim | regex_replace('^v', '') is version(docker_compose_min_version, '>=')
+    fail_msg: >-
+      docker compose {{ docker_compose_version.stdout | trim }} is older than
+      {{ docker_compose_min_version }}.
+    quiet: true
+
+- name: Read Docker's storage driver
+  ansible.builtin.command:
+    argv: [docker, info, --format, json]
+  changed_when: false
+  register: docker_info
+
+- name: Check Docker uses overlay2
+  ansible.builtin.assert:
+    that:
+      - (docker_info.stdout | from_json).Driver == 'overlay2'
+    fail_msg: >-
+      Docker runs the '{{ (docker_info.stdout | from_json).Driver }}' storage driver,
+      not overlay2. In an LXC on ZFS: ZFS >= 2.2 on the Proxmox host and nesting=1
+      on the container are required (DEPLOYMENT §0.1).
+    quiet: true

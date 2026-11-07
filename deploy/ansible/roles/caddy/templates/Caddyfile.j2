@@ -1,0 +1,31 @@
+# {{ ansible_managed }} (role caddy)
+# Private reverse proxy: website, Control/Results API and Grafana under one TLS
+# origin on {{ caddy_listen_address }}:443, reachable over {{ access }} only. Never
+# public (DEPLOYMENT §0.2); the host firewall admits 443 and the Proxmox firewall
+# admits it only from the Twingate connector.
+{
+	admin localhost:2019
+	skip_install_trust
+	auto_https disable_redirects
+}
+
+https://{{ caddy_listen_address }} {
+	bind {{ caddy_listen_address }}
+	tls internal
+
+	basicauth {
+		{{ caddy_basic_auth_user }} {{ caddy_basic_auth_hash }}
+	}
+
+	handle /api/* {
+		reverse_proxy {{ caddy_upstream_api }}
+	}
+
+	handle /grafana* {
+		reverse_proxy {{ caddy_upstream_grafana }}
+	}
+
+	handle {
+		reverse_proxy {{ caddy_upstream_website }}
+	}
+}

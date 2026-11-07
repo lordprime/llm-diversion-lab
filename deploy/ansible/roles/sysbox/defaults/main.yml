@@ -1,0 +1,10 @@
+---
+# Sysbox per-cell Docker daemons: the VM / bare-metal upgrade path (isolation:
+# sysbox, DEPLOYMENT §4.3). Never used in the LXC profile, where Sysbox cannot run.
+sysbox_version: "0.7.1"
+sysbox_deb_url: >-
+  https://downloads.nestybox.com/sysbox/releases/v{{ sysbox_version }}/sysbox-ce_{{
+  sysbox_version }}-0.linux_amd64.deb
+# The published SHA-256 of that .deb. Deliberately empty: copy it from the Sysbox
+# release page when the sysbox profile is first used; the role refuses without it.
+sysbox_deb_sha256: ""

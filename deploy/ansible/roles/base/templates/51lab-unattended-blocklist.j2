@@ -1,0 +1,7 @@
+// {{ ansible_managed }} (role base)
+// Pinned packages change only through a maintenance window (DEPLOYMENT §2 row 6).
+Unattended-Upgrade::Package-Blacklist {
+{% for pkg in base_unattended_blocklist %}
+    "{{ pkg }}";
+{% endfor %}
+};

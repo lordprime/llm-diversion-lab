@@ -1,0 +1,11 @@
+---
+# Host-only kernel settings: an unprivileged LXC cannot change them, so they are
+# set once on the Proxmox host (§0.1) and only VERIFIED here (minimum values).
+sysctl_verify_host:
+  vm.max_map_count: 262144 # RedAmon's Neo4j (not needed for M0's DVGA cells)
+  fs.inotify.max_user_watches: 524288
+  fs.inotify.max_user_instances: 512
+
+# true: a host setting below its minimum fails the play; false: warn only. M0 runs
+# DVGA cells only, which need none of them, so the default is to warn.
+sysctl_enforce_host_settings: false

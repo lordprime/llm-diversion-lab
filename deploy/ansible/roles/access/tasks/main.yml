@@ -1,0 +1,21 @@
+---
+# Private access channel (DEPLOYMENT §0, §1). Twingate needs nothing in the
+# container: its connector runs elsewhere on the LAN.
+- name: Twingate needs nothing installed here
+  ansible.builtin.debug:
+    msg: >-
+      access: twingate. Add {{ ansible_host }} ports 22 and 443 as Twingate resources;
+      the Proxmox firewall must admit them only from the connector's IP (§0.1).
+  when: access == 'twingate'
+
+- name: An SSH tunnel needs nothing installed here
+  ansible.builtin.debug:
+    msg: "access: ssh-tunnel. Use ./deploy/tunnel.sh {{ inventory_hostname }} on the workstation."
+  when: access == 'ssh-tunnel'
+
+- name: Refuse access methods not built in M0
+  ansible.builtin.fail:
+    msg: >-
+      access: {{ access }} is not built in M0 (WireGuard/Tailscale roles are the
+      bare-metal upgrade path, §4.3). Use twingate or ssh-tunnel.
+  when: access in ['wireguard', 'tailscale']

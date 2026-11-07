@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }} (role firewall)
+# Run-cell egress rules in Docker's DOCKER-USER chain (DEPLOYMENT §4.3 firewall).
+# Forwarding from the cell networks is dropped, except to the cell networks
+# themselves (Docker's per-network isolation decides there) and to the LLM gateway.
+# Docker preserves DOCKER-USER across restarts; lab-cell-egress.service re-applies
+# it whenever Docker starts.
+#
+#   apply  replace DOCKER-USER atomically (iptables-restore --noflush), then verify
+#   check  verify DOCKER-USER holds exactly these rules and lab_host is loaded
+#   show   print the rules in iptables-restore format
+set -Eeuo pipefail
+
+CELL_NETS=({% for net in lab_cell_networks %}{{ net | quote }}{{ ' ' if not loop.last else '' }}{% endfor %})
+GATEWAY_ADDR={{ lab_llm_gateway_address | quote }}
+GATEWAY_PORT={{ lab_llm_gateway_port | string | quote }}
+TAG={{ firewall_cell_egress_tag | quote }}
+IPT=(iptables --wait 10)
+
+rules() {
+	local src dst
+	echo '*filter'
+	echo ':DOCKER-USER - [0:0]'
+	for src in "${CELL_NETS[@]}"; do
+		for dst in "${CELL_NETS[@]}"; do
+			echo "-A DOCKER-USER -s $src -d $dst -m comment --comment $TAG -j RETURN"
+		done
+		if [[ -n $GATEWAY_ADDR ]]; then
+			echo "-A DOCKER-USER -s $src -d $GATEWAY_ADDR/32 -p tcp -m tcp --dport $GATEWAY_PORT -m comment --comment $TAG -j RETURN"
+		fi
+		echo "-A DOCKER-USER -s $src -m comment --comment $TAG -j DROP"
+	done
+	echo '-A DOCKER-USER -j RETURN'
+	echo 'COMMIT'
+}
+
+check() {
+	local want have
+	want=$(rules | grep -c '^-A')
+	have=$("${IPT[@]}" -S DOCKER-USER | grep -c '^-A' || true)
+	if [[ $want != "$have" ]]; then
+		echo "DOCKER-USER has $have rules, expected $want" >&2
+		return 1
+	fi
+	if ! "${IPT[@]}" -S DOCKER-USER | grep -q -- "--comment $TAG -j DROP"; then
+		echo "DOCKER-USER lacks the cell DROP rule" >&2
+		return 1
+	fi
+	if ! "${IPT[@]}" -C FORWARD -j DOCKER-USER 2>/dev/null; then
+		echo "FORWARD does not jump to DOCKER-USER" >&2
+		return 1
+	fi
+	if ! nft list table inet lab_host >/dev/null 2>&1; then
+		echo "nftables table inet lab_host is not loaded" >&2
+		return 1
+	fi
+	echo "OK: cell egress rules in DOCKER-USER for ${CELL_NETS[*]}; host table loaded"
+}
+
+case ${1:-apply} in
+apply)
+	rules | iptables-restore --wait 10 --noflush
+	"${IPT[@]}" -C FORWARD -j DOCKER-USER 2>/dev/null || "${IPT[@]}" -I FORWARD 1 -j DOCKER-USER
+	check
+	;;
+check) check ;;
+show) rules ;;
+*)
+	echo "usage: lab-cell-egress apply|check|show" >&2
+	exit 2
+	;;
+esac

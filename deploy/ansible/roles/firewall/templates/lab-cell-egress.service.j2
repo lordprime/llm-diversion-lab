@@ -1,0 +1,16 @@
+# {{ ansible_managed }} (role firewall)
+# Started with Docker (WantedBy) and restarted with it (PartOf), after it is up, so
+# DOCKER-USER exists. Stopping leaves the rules in place on purpose.
+[Unit]
+Description=Lab run-cell egress rules (DOCKER-USER)
+After=docker.service lab-firewall.service
+PartOf=docker.service
+Requires=lab-firewall.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/lab-cell-egress apply
+
+[Install]
+WantedBy=docker.service
