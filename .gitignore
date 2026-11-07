@@ -38,3 +38,6 @@ runs/
 .idea/
 .vscode/
 .DS_Store
+
+# Local agent workspace (never committed)
+.superpowers/
