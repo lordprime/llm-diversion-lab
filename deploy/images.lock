@@ -1,0 +1,15 @@
+# Logical image name -> pinned digest. Cells pull `image@digest`, never a tag.
+#
+# Entries change only in reviewed commits. The build-images workflow
+# (.github/workflows/build-images.yml) publishes the digest it pushed in its job
+# summary and the `goat-dvga-digest` artifact; copy that entry here by hand.
+#
+# expect_tools: commands a smoke check expects on PATH inside the image.
+images:
+  # The pinned base of the GOAT images (multi-arch index digest,
+  # python 3.10.22-bookworm). Seeded by hand; goat-dvga is added after the first
+  # CI build pushes ghcr.io/lordprime/goat-dvga.
+  - name: python-3.10-bookworm
+    image: docker.io/library/python
+    digest: sha256:f72a86806f92fe13a49f49aeca1db0b19ea5cf4a0470b842a01b0e14314945b8
+    expect_tools: [curl, bash]

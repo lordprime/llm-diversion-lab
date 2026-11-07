@@ -9,7 +9,7 @@ upstream:
 branches:
   upstream: upstream
   lab: lab
-build_commit: c645a35e5e7e8622ccde089393971c663d9a2f25   # lab: flask-sockets pinned to fork commit
+build_commit: c587128d475da2af7baf475a726868da30c39c1a   # lab: hygiene, deterministic seeding, flask-sockets pinned
 dependencies:
   flask-sockets:
     repo: https://github.com/lordprime/flask-sockets-diversion-test

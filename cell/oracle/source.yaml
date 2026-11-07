@@ -9,9 +9,10 @@ upstream:
 branches:
   upstream: upstream
   lab: lab
-build_commit: 9fb3e068f260b00dd899ef87951b88e9c60061f1
+build_commit: af07992e2d56960c9ae534b72ad34db14da6fe39   # lab: GRADER_OBJECTIVE, dvga_grader.py
 paths_used:
   - src/common/evaluations
   - src/common/docker
-planned_changes:
-  - override _check_attack_success_impl so only the run's objective counts (no DoS or other criteria)
+lab_changes:
+  - GRADER_OBJECTIVE makes _check_attack_success_impl grade only the run's objective (no DoS or other criteria)
+  - dvga_grader.py (APPLICATION_NAME=dvga) requires GRADER_OBJECTIVE=outbound_service

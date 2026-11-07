@@ -1,0 +1,188 @@
+name: build-images
+
+# Builds the DVGA GOAT image (DVGA lab fork + CVE-Bench evaluator) from the fork
+# commits pinned in targets/dvga/source.yaml and cell/oracle/source.yaml, checks
+# it, and pushes it to GHCR. The pushed digest goes to the job summary and an
+# artifact; recording it in deploy/images.lock is a normal reviewed commit.
+on:
+  push:
+    tags:
+      - "lab-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-images-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/lordprime/goat-dvga
+
+jobs:
+  goat-dvga:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned fork commits
+        id: pins
+        run: |
+          set -euo pipefail
+          # top-level `key: value` of a source.yaml (indented upstream keys don't match)
+          read_pin() { sed -n "s/^$2:[[:space:]]*\([^[:space:]#]*\).*/\1/p" "$1"; }
+          dvga_repo=$(read_pin targets/dvga/source.yaml repo)
+          dvga_commit=$(read_pin targets/dvga/source.yaml build_commit)
+          eval_repo=$(read_pin cell/oracle/source.yaml repo)
+          eval_commit=$(read_pin cell/oracle/source.yaml build_commit)
+          [[ "$dvga_repo" == https://github.com/* && "$eval_repo" == https://github.com/* ]] \
+            || { echo "unexpected fork repo URL" >&2; exit 1; }
+          for c in "$dvga_commit" "$eval_commit"; do
+            [[ "$c" =~ ^[0-9a-f]{40}$ ]] || { echo "not a full commit sha: $c" >&2; exit 1; }
+          done
+          {
+            echo "dvga_repo=$dvga_repo"
+            echo "dvga_commit=$dvga_commit"
+            echo "eval_repo=$eval_repo"
+            echo "eval_commit=$eval_commit"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Clone forks at the pinned commits
+        env:
+          DVGA_REPO: ${{ steps.pins.outputs.dvga_repo }}
+          DVGA_COMMIT: ${{ steps.pins.outputs.dvga_commit }}
+          EVAL_REPO: ${{ steps.pins.outputs.eval_repo }}
+          EVAL_COMMIT: ${{ steps.pins.outputs.eval_commit }}
+        run: |
+          set -euo pipefail
+          fetch() {  # repo commit dir
+            git init --quiet "$3"
+            git -C "$3" fetch --quiet --depth 1 "$1" "$2"
+            git -C "$3" checkout --quiet --detach FETCH_HEAD
+            test "$(git -C "$3" rev-parse HEAD)" = "$2"
+          }
+          fetch "$DVGA_REPO" "$DVGA_COMMIT" "$RUNNER_TEMP/dvga"
+          fetch "$EVAL_REPO" "$EVAL_COMMIT" "$RUNNER_TEMP/cvebench"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        env:
+          DVGA_COMMIT: ${{ steps.pins.outputs.dvga_commit }}
+          EVAL_COMMIT: ${{ steps.pins.outputs.eval_commit }}
+        run: |
+          set -euo pipefail
+          docker buildx build --load \
+            -f targets/dvga/Dockerfile \
+            --build-context dvga="$RUNNER_TEMP/dvga" \
+            --build-context cvebench="$RUNNER_TEMP/cvebench" \
+            --build-arg DVGA_COMMIT="$DVGA_COMMIT" \
+            --build-arg EVALUATOR_COMMIT="$EVAL_COMMIT" \
+            --label org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
+            --label org.opencontainers.image.revision="${GITHUB_SHA}" \
+            -t goat-dvga:ci \
+            targets/dvga
+
+      - name: Check tools and permissions inside the image
+        run: |
+          set -euo pipefail
+          # tools the app and CVE-Bench's scripts need
+          docker run --rm --entrypoint /bin/bash goat-dvga:ci -c 'command -v curl && command -v bash'
+          # as the app user: nothing that decides the result is readable
+          docker run --rm --user dvga --entrypoint /bin/bash goat-dvga:ci -c '
+            set -u
+            fail=0
+            for p in /evaluator/grader.py /evaluator/launch.sh /cve_metadata.yml /entrypoint.sh; do
+              if cat "$p" >/dev/null 2>&1; then echo "readable by dvga: $p"; fail=1; fi
+            done
+            if ls /evaluator >/dev/null 2>&1; then echo "listable by dvga: /evaluator"; fail=1; fi
+            for v in APPLICATION_NAME GRADER_OBJECTIVE; do
+              if [ -n "${!v:-}" ]; then echo "image-wide env leaks $v"; fail=1; fi
+            done
+            exit $fail'
+          # ownership and modes, as root
+          docker run --rm --entrypoint /bin/bash goat-dvga:ci -c '
+            set -eu
+            test "$(stat -c %U:%G:%a /evaluator)" = root:root:700
+            test "$(stat -c %U:%G:%a /cve_metadata.yml)" = root:root:400
+            test "$(stat -c %U:%G:%a /evaluator/launch.sh)" = root:root:700
+            test ! -e /opt/dvga/requirements.txt
+            test ! -e /opt/dvga/README.md
+            test ! -e /opt/dvga/tests
+            # the base image ships one requirements.txt (mercurial help text); no other
+            test -z "$(find / -xdev -name requirements.txt ! -path "/usr/lib/python3/dist-packages/mercurial/*" -print -quit)"
+            ! grep -rli diversion /opt/dvga /opt/venv /evaluator /opt/evaluator-python /cve_metadata.yml /entrypoint.sh'
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Run the image's behaviour tests (health, done, permissions, objective, crash)
+        env:
+          GOAT_DVGA_IMAGE: goat-dvga:ci
+          GOAT_DVGA_REQUIRE: "1"
+        run: |
+          uv sync --frozen
+          uv run pytest -v tests/targets/test_dvga_image.py
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        id: push
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          tag="sha-${GITHUB_SHA::12}"
+          if [[ "$REF_TYPE" == tag ]]; then tag="$REF_NAME"; fi
+          docker tag goat-dvga:ci "$IMAGE:$tag"
+          docker push "$IMAGE:$tag" | tee push.log
+          digest=$(grep -oE 'digest: sha256:[0-9a-f]{64}' push.log | tail -n 1 | cut -d' ' -f2)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad digest: $digest" >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Record the digest
+        env:
+          TAG: ${{ steps.push.outputs.tag }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          DVGA_COMMIT: ${{ steps.pins.outputs.dvga_commit }}
+          EVAL_COMMIT: ${{ steps.pins.outputs.eval_commit }}
+        run: |
+          set -euo pipefail
+          cat > images.lock.entry.yml <<EOF
+          # Paste into deploy/images.lock in a reviewed commit.
+            - name: goat-dvga
+              image: ${IMAGE}
+              digest: ${DIGEST}
+              expect_tools: [curl, bash]
+              # tag ${TAG}; dvga ${DVGA_COMMIT}; evaluator ${EVAL_COMMIT}
+          EOF
+          {
+            echo "## goat-dvga"
+            echo
+            echo "Pushed \`${IMAGE}:${TAG}\`"
+            echo
+            echo "**Digest:** \`${DIGEST}\`"
+            echo
+            echo "- DVGA fork commit: \`${DVGA_COMMIT}\`"
+            echo "- CVE-Bench fork commit: \`${EVAL_COMMIT}\`"
+            echo
+            echo "deploy/images.lock entry (commit it by hand, after review):"
+            echo
+            echo '```yaml'
+            cat images.lock.entry.yml
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: goat-dvga-digest
+          path: images.lock.entry.yml

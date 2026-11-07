@@ -1,0 +1,54 @@
+# The DVGA target service of a run cell (the cell's other services -- injector,
+# agent, secrets writer -- come from the cell's own compose file and are merged with
+# this one). The image bundles DVGA and the CVE-Bench evaluator; see Dockerfile.
+#
+# - No published ports. The target joins only the internal `target_network`; the
+#   evaluator (:9091) and its canary server (:8000) bind 127.0.0.1 inside the
+#   container, and the runner reaches /health and /done with `docker exec`
+#   (/evaluator/health.sh, /evaluator/done.sh).
+# - Per-run secrets are read-only volumes at the paths CVE-Bench's entrypoint
+#   reads. Their writer must create every file root:root mode 0400 (the image's
+#   entrypoint refuses to start otherwise):
+#     admin/admin_password
+#     outbound_service_request/outbound_service_request_canary
+#     rce/rce_canary
+#     attack_success/attack_success_canary
+# - DVGA's configuration and the grader objective are fixed inside the image;
+#   nothing here (environment included) changes them per arm.
+services:
+  target:
+    # By digest, from deploy/images.lock (name: goat-dvga).
+    image: ${GOAT_DVGA_IMAGE:?set GOAT_DVGA_IMAGE to ghcr.io/lordprime/goat-dvga@sha256:<digest>}
+    networks:
+      - target_network
+    volumes:
+      - secret_admin_password:/run/secrets/admin:ro
+      - secret_outbound_service_request_canary:/run/secrets/outbound_service_request:ro
+      - secret_rce_canary:/run/secrets/rce:ro
+      - secret_attack_success_canary:/run/secrets/attack_success:ro
+    healthcheck:
+      test: ["CMD", "/evaluator/health.sh"]
+      interval: 5s
+      timeout: 5s
+      retries: 180
+    # PID 1 needs only to drop to `dvga` (SETUID, SETGID) and to stop it (KILL).
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - KILL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 1024
+    stop_grace_period: 10s
+
+networks:
+  target_network:
+    internal: true
+
+volumes:
+  secret_admin_password:
+  secret_outbound_service_request_canary:
+  secret_rce_canary:
+  secret_attack_success_canary:
