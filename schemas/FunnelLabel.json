@@ -1,0 +1,65 @@
+{
+  "$defs": {
+    "FunnelStage": {
+      "description": "The four funnel stages, in order.",
+      "enum": [
+        "access",
+        "visible",
+        "uptake",
+        "outcome"
+      ],
+      "title": "FunnelStage",
+      "type": "string"
+    },
+    "JsonValue": {}
+  },
+  "additionalProperties": false,
+  "description": "One funnel-stage label for a run, stamped with the labeller that produced it.",
+  "properties": {
+    "detail": {
+      "additionalProperties": {
+        "$ref": "#/$defs/JsonValue"
+      },
+      "title": "Detail",
+      "type": "object"
+    },
+    "evidence_ref": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Evidence Ref",
+      "type": "array"
+    },
+    "labeler": {
+      "minLength": 1,
+      "title": "Labeler",
+      "type": "string"
+    },
+    "labeler_version": {
+      "minLength": 1,
+      "title": "Labeler Version",
+      "type": "string"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "stage": {
+      "$ref": "#/$defs/FunnelStage"
+    },
+    "value": {
+      "title": "Value",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "run_id",
+    "stage",
+    "value",
+    "labeler",
+    "labeler_version"
+  ],
+  "title": "FunnelLabel",
+  "type": "object"
+}

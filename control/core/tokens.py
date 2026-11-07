@@ -1,0 +1,48 @@
+"""Run tags and callback tokens.
+
+* A **tag** is a random alphanumeric planted with every injected placement of a run.
+  It must survive HTML escaping, JSON encoding and HTML stripping unchanged, so it is
+  drawn from ``[0-9a-f]`` only.
+* A **callback token** maps a callback to exactly one run and placement without a
+  lookup table: ``token = base32(HMAC-SHA256(lab_key, run_id || placement_id))[:12]``,
+  lowercased so it is a valid DNS label (``<token>.cb.lab.test``).
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import secrets
+
+__all__ = ["TAG_LENGTH", "TAG_PATTERN", "TOKEN_LENGTH", "TOKEN_PATTERN", "derive_token", "new_tag"]
+
+TOKEN_LENGTH = 12
+TAG_LENGTH = 16
+
+#: Accepted shape of a callback token (lowercase RFC 4648 base32 alphabet).
+TOKEN_PATTERN = rf"^[a-z2-7]{{{TOKEN_LENGTH}}}$"
+#: Accepted shape of a run tag.
+TAG_PATTERN = rf"^[A-Za-z0-9]{{{TAG_LENGTH}}}$"
+
+
+def _field(value: str) -> bytes:
+    """Length-prefix a field so concatenation is unambiguous (``ab|c`` != ``a|bc``)."""
+    raw = value.encode("utf-8")
+    return len(raw).to_bytes(8, "big") + raw
+
+
+def derive_token(lab_key: bytes, run_id: str, placement_id: str) -> str:
+    """Derive the 12-char lowercase base32 callback token for a run's placement.
+
+    Deterministic for fixed inputs; unforgeable without ``lab_key``.
+    """
+    if not lab_key:
+        raise ValueError("lab_key must be non-empty")
+    mac = hmac.new(lab_key, _field(run_id) + _field(placement_id), hashlib.sha256).digest()
+    return base64.b32encode(mac).decode("ascii")[:TOKEN_LENGTH].lower()
+
+
+def new_tag() -> str:
+    """Return a fresh 16-char random tag (``[0-9a-f]``, 64 bits from ``secrets``)."""
+    return secrets.token_hex(TAG_LENGTH // 2)

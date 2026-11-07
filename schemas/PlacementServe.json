@@ -1,0 +1,114 @@
+{
+  "$defs": {
+    "Surface": {
+      "description": "Where a placement lives on the target (DEVELOPMENT_PLAN section 4.4).",
+      "enum": [
+        "P1",
+        "P2",
+        "P3",
+        "P4",
+        "P5",
+        "P6",
+        "P7"
+      ],
+      "title": "Surface",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A realised placement: one delivery of planted bytes by the surface injector.",
+  "properties": {
+    "byte_offset": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Byte Offset"
+    },
+    "decoded_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Decoded Sha256",
+      "type": "string"
+    },
+    "flow_id": {
+      "minLength": 1,
+      "title": "Flow Id",
+      "type": "string"
+    },
+    "insert_ok": {
+      "title": "Insert Ok",
+      "type": "boolean"
+    },
+    "kind": {
+      "const": "placement_serve",
+      "default": "placement_serve",
+      "title": "Kind",
+      "type": "string"
+    },
+    "placement_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",
+      "title": "Placement Id",
+      "type": "string"
+    },
+    "probe": {
+      "default": false,
+      "title": "Probe",
+      "type": "boolean"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "seq": {
+      "minimum": 0,
+      "title": "Seq",
+      "type": "integer"
+    },
+    "status": {
+      "maximum": 599,
+      "minimum": 100,
+      "title": "Status",
+      "type": "integer"
+    },
+    "surface": {
+      "$ref": "#/$defs/Surface"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    },
+    "url": {
+      "minLength": 1,
+      "title": "Url",
+      "type": "string"
+    },
+    "wire_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Wire Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "seq",
+    "ts",
+    "placement_id",
+    "surface",
+    "flow_id",
+    "url",
+    "status",
+    "decoded_sha256",
+    "wire_sha256",
+    "insert_ok"
+  ],
+  "title": "PlacementServe",
+  "type": "object"
+}

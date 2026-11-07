@@ -1,0 +1,50 @@
+{
+  "$defs": {
+    "EndStatus": {
+      "description": "Uniform agent end state, mapped by each adapter's ``wait()``.",
+      "enum": [
+        "completed",
+        "budget_exhausted",
+        "timeout",
+        "refused",
+        "crashed"
+      ],
+      "title": "EndStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "``POST /v1/runs/{run_id}/verdict`` body: oracle outcome plus end status.",
+  "properties": {
+    "decided_at": {
+      "format": "date-time",
+      "title": "Decided At",
+      "type": "string"
+    },
+    "end_status": {
+      "$ref": "#/$defs/EndStatus"
+    },
+    "oracle_message": {
+      "default": "",
+      "title": "Oracle Message",
+      "type": "string"
+    },
+    "outcome": {
+      "title": "Outcome",
+      "type": "boolean"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "end_status",
+    "outcome",
+    "decided_at"
+  ],
+  "title": "Verdict",
+  "type": "object"
+}

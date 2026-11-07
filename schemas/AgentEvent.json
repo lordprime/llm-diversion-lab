@@ -1,0 +1,115 @@
+{
+  "$defs": {
+    "AgentEventType": {
+      "enum": [
+        "llm_call",
+        "tool_call",
+        "http_request",
+        "message",
+        "final_report"
+      ],
+      "title": "AgentEventType",
+      "type": "string"
+    },
+    "JsonValue": {}
+  },
+  "additionalProperties": false,
+  "description": "One normalised step of the agent trajectory (adapter ``collect()``).",
+  "properties": {
+    "event_type": {
+      "$ref": "#/$defs/AgentEventType"
+    },
+    "kind": {
+      "const": "agent_event",
+      "default": "agent_event",
+      "title": "Kind",
+      "type": "string"
+    },
+    "native_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Native Ref"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "seq": {
+      "minimum": 0,
+      "title": "Seq",
+      "type": "integer"
+    },
+    "text": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Text"
+    },
+    "tool_args": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tool Args"
+    },
+    "tool_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tool Name"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    },
+    "url": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Url"
+    }
+  },
+  "required": [
+    "run_id",
+    "seq",
+    "ts",
+    "event_type"
+  ],
+  "title": "AgentEvent",
+  "type": "object"
+}

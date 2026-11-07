@@ -1,0 +1,181 @@
+{
+  "$defs": {
+    "Arm": {
+      "enum": [
+        "control",
+        "injected"
+      ],
+      "title": "Arm",
+      "type": "string"
+    },
+    "Placement": {
+      "additionalProperties": false,
+      "description": "A planned placement: where a prevention prompt *should* be served in a run.",
+      "properties": {
+        "content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Sha256",
+          "type": "string"
+        },
+        "locator": {
+          "minLength": 1,
+          "title": "Locator",
+          "type": "string"
+        },
+        "payload_id": {
+          "minLength": 1,
+          "title": "Payload Id",
+          "type": "string"
+        },
+        "payload_version": {
+          "minLength": 1,
+          "title": "Payload Version",
+          "type": "string"
+        },
+        "placement_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",
+          "title": "Placement Id",
+          "type": "string"
+        },
+        "run_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "surface": {
+          "$ref": "#/$defs/Surface"
+        },
+        "tag": {
+          "pattern": "^[A-Za-z0-9]{16}$",
+          "title": "Tag",
+          "type": "string"
+        },
+        "token": {
+          "pattern": "^[a-z2-7]{12}$",
+          "title": "Token",
+          "type": "string"
+        },
+        "url": {
+          "minLength": 1,
+          "title": "Url",
+          "type": "string"
+        }
+      },
+      "required": [
+        "placement_id",
+        "run_id",
+        "surface",
+        "url",
+        "locator",
+        "payload_id",
+        "payload_version",
+        "tag",
+        "token",
+        "content_sha256"
+      ],
+      "title": "Placement",
+      "type": "object"
+    },
+    "Surface": {
+      "description": "Where a placement lives on the target (DEVELOPMENT_PLAN section 4.4).",
+      "enum": [
+        "P1",
+        "P2",
+        "P3",
+        "P4",
+        "P5",
+        "P6",
+        "P7"
+      ],
+      "title": "Surface",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Everything planned for one run, written before the agent starts.\n\nA control run is tag-free: no ``tag`` and no placements. An injected run has a\ntag and at least one placement, each belonging to this run and carrying its tag.",
+  "properties": {
+    "agent": {
+      "minLength": 1,
+      "title": "Agent",
+      "type": "string"
+    },
+    "arm": {
+      "$ref": "#/$defs/Arm"
+    },
+    "attempt": {
+      "default": 1,
+      "exclusiveMinimum": 0,
+      "title": "Attempt",
+      "type": "integer"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "experiment_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",
+      "title": "Experiment Id",
+      "type": "string"
+    },
+    "model": {
+      "minLength": 1,
+      "title": "Model",
+      "type": "string"
+    },
+    "pair_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",
+      "title": "Pair Id",
+      "type": "string"
+    },
+    "placements": {
+      "items": {
+        "$ref": "#/$defs/Placement"
+      },
+      "title": "Placements",
+      "type": "array"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "schedule_index": {
+      "minimum": 0,
+      "title": "Schedule Index",
+      "type": "integer"
+    },
+    "tag": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Za-z0-9]{16}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Tag"
+    },
+    "target": {
+      "minLength": 1,
+      "title": "Target",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "experiment_id",
+    "pair_id",
+    "arm",
+    "target",
+    "agent",
+    "model",
+    "schedule_index",
+    "tag",
+    "placements",
+    "created_at"
+  ],
+  "title": "RunManifest",
+  "type": "object"
+}

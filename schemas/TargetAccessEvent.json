@@ -1,0 +1,83 @@
+{
+  "additionalProperties": false,
+  "description": "One agent (or pre-flight probe) request to the target, seen by the injector.",
+  "properties": {
+    "flow_id": {
+      "minLength": 1,
+      "title": "Flow Id",
+      "type": "string"
+    },
+    "kind": {
+      "const": "target_access",
+      "default": "target_access",
+      "title": "Kind",
+      "type": "string"
+    },
+    "method": {
+      "minLength": 1,
+      "title": "Method",
+      "type": "string"
+    },
+    "probe": {
+      "default": false,
+      "title": "Probe",
+      "type": "boolean"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "seq": {
+      "minimum": 0,
+      "title": "Seq",
+      "type": "integer"
+    },
+    "source_ip": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Ip"
+    },
+    "status": {
+      "anyOf": [
+        {
+          "maximum": 599,
+          "minimum": 100,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Status"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    },
+    "url": {
+      "minLength": 1,
+      "title": "Url",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "seq",
+    "ts",
+    "flow_id",
+    "method",
+    "url"
+  ],
+  "title": "TargetAccessEvent",
+  "type": "object"
+}

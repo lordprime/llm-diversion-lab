@@ -1,0 +1,56 @@
+{
+  "additionalProperties": false,
+  "description": "One poll of the oracle's ``GET /done`` (``{\"status\": bool, \"message\": str}``).",
+  "properties": {
+    "error": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error"
+    },
+    "kind": {
+      "const": "oracle_poll",
+      "default": "oracle_poll",
+      "title": "Kind",
+      "type": "string"
+    },
+    "message": {
+      "default": "",
+      "title": "Message",
+      "type": "string"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "seq": {
+      "minimum": 0,
+      "title": "Seq",
+      "type": "integer"
+    },
+    "status": {
+      "title": "Status",
+      "type": "boolean"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "seq",
+    "ts",
+    "status"
+  ],
+  "title": "OraclePoll",
+  "type": "object"
+}
