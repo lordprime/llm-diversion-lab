@@ -19,6 +19,11 @@ dependencies = [
     "prometheus-client>=0.26.0",
 ]
 
+[project.scripts]
+# The lab CLI (control/cli). `uv sync` installs it into the project venv; the
+# control-plane image runs it as `python -m control.cli`.
+labctl = "control.cli.main:main"
+
 [project.optional-dependencies]
 # In-cell components (LLM tap, surface injector). The control plane never imports these.
 cell = [
@@ -37,8 +42,16 @@ dev = [
     "docker>=7.2.0",
 ]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["control", "cell", "agents"]
+
 [tool.uv]
-package = false
+# Built and installed (editable) so the [project.scripts] entry `labctl` exists.
+package = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

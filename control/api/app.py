@@ -1,11 +1,15 @@
 """FastAPI application for the Collector API.
 
-Run with ``uvicorn control.api.app:app`` (database from ``$DATABASE_URL``), or build
-an app bound to a specific engine with :func:`create_app` (tests do this).
+Build an app bound to a specific engine with :func:`create_app` (tests do this); the
+module-level :data:`app` uses ``$DATABASE_URL``.
 
 * ``GET /healthz``: liveness; never touches the database.
 * ``GET /readyz``: readiness; ``200`` if ``SELECT 1`` succeeds, else ``503``.
-* ``GET /metrics``: Prometheus metrics (:mod:`control.api.metrics`); no database.
+* ``GET /metrics``: Prometheus metrics (:mod:`control.api.metrics`), read from the
+  database at each scrape; still ``200`` (with ``lab_metrics_database_up 0``) without one.
+
+Run the Collector process with ``python -m control.api`` (:mod:`control.api.__main__`),
+which configures the structured logging first.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from control.api import collector
 from control.api.metrics import LabMetrics, metrics_router
+from control.db.engine import get_engine
 
 __all__ = ["app", "create_app"]
 
@@ -29,15 +34,18 @@ def create_app(engine: Engine | None = None, *, metrics: LabMetrics | None = Non
     """Build the Collector API app.
 
     ``engine`` defaults to the ``$DATABASE_URL`` one (resolved on first use);
-    ``metrics`` defaults to a fresh :class:`LabMetrics` with its own registry.
+    ``metrics`` defaults to a fresh :class:`LabMetrics` with its own registry that
+    reads the same database at each scrape.
     """
+    if metrics is None:
+        metrics = LabMetrics(lambda: engine if engine is not None else get_engine())
     app = FastAPI(
         title="LLM Diversion Lab Collector API",
         version="1",
         summary="The only write path for run evidence into Postgres.",
     )
     app.state.engine = engine
-    app.state.metrics = metrics if metrics is not None else LabMetrics()
+    app.state.metrics = metrics
     app.include_router(collector.router)
     app.include_router(metrics_router())
 

@@ -1,32 +1,52 @@
 """Prometheus metrics for the lab services (docs/TRACKING.md §3.2).
 
-:class:`LabMetrics` owns its own :class:`~prometheus_client.CollectorRegistry` (never
-the process-global one), so apps and tests can each have an isolated set. The
-Collector app exposes one at ``GET /metrics`` (:func:`metrics_router`) in the
-Prometheus text exposition format.
-
-Metrics:
+Process model
+-------------
+**Every lab metric is derived at scrape time from persistent state**, never counted
+in a process's memory, so a restart of the Collector (or of the runner, or of the
+self-test) loses nothing and two Collector processes report the same values:
 
 * ``lab_runs_total`` (counter; ``status``, ``end_status``, ``agent``, ``target``,
-  ``arm``): finished runs. ``end_status`` is ``none`` when the run has none (e.g. an
-  invalid run that never ended normally).
-* ``lab_invalid_runs_total`` (counter; ``reason``): runs marked invalid, by reason.
-* ``lab_runs_in_flight`` (gauge; ``agent``): runs currently executing.
+  ``arm``): finished runs, i.e. rows of ``runs`` with ``status`` ``valid`` or
+  ``invalid``. ``agent`` / ``target`` are the run's ``agent_id`` / ``target_id``;
+  ``end_status`` is ``none`` when the run has none.
+* ``lab_invalid_runs_total`` (counter; ``reason``): runs with ``status = 'invalid'``.
+  The runs table does not record *why* a run was invalid yet, so ``reason`` is
+  :data:`UNRECORDED_REASON` until a reason column exists (a later schema change).
+* ``lab_runs_in_flight`` (gauge; ``agent``): runs with ``status = 'running'``; ``0``
+  for every registered agent with none.
 * ``lab_selftest_last_success_timestamp`` (gauge): Unix time of the last passing
-  self-test.
+  self-test, from the self-test status file (:mod:`control.core.selftest_status`);
+  ``0`` when no self-test has passed (or the file is unreadable), so a staleness
+  alert fires rather than going quiet.
+* ``lab_metrics_database_up`` (gauge): ``1`` if the run metrics above could be read
+  from the database during this scrape, else ``0``; the run families are then
+  **absent** (never reported as a misleading ``0``).
 
-Plus the standard ``process_*``, ``python_gc_*`` and ``python_info`` collectors.
+The counters are monotonic because runs are never deleted (an invalid run is retried
+as a new row); restoring a pre-migration dump can lower them, which Prometheus reads
+as a counter reset.
 
-Counters live in the memory of the process that increments them: a process that
-records runs must be the one scraped (or expose its own ``/metrics``).
+The alternative, the runner incrementing counters through the Collector API, was
+rejected: in-memory counters reset on every Collector restart, and persisting them
+would duplicate what the runs table already records.
+
+Each scrape runs a few ``GROUP BY`` queries in one ``READ ONLY`` transaction with a
+:data:`QUERY_TIMEOUT_MS` statement timeout.
+
+:class:`LabMetrics` owns its own :class:`~prometheus_client.CollectorRegistry` (never
+the process-global one), plus the standard ``process_*``, ``python_gc_*`` and
+``python_info`` collectors. The Collector app exposes it at ``GET /metrics``
+(:func:`metrics_router`).
 """
 
 from __future__ import annotations
 
-import time
-from collections.abc import Iterator
-from contextlib import contextmanager
+import logging
+from collections.abc import Callable, Iterable, Iterator
 from enum import Enum
+from pathlib import Path
+from typing import Final
 
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
@@ -36,17 +56,27 @@ from prometheus_client import (
     PLATFORM_COLLECTOR,
     PROCESS_COLLECTOR,
     CollectorRegistry,
-    Counter,
-    Gauge,
     generate_latest,
 )
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
+from prometheus_client.registry import Collector
+from sqlalchemy import Engine, func, select, text
+from sqlalchemy.exc import SQLAlchemyError
+
+from control.core.models import RunStatus
+from control.core.selftest_status import SelftestStatusError, read_selftest_status
+from control.db.tables import Agent, Run
 
 __all__ = [
     "METRIC_NAMES",
     "NONE_LABEL",
+    "QUERY_TIMEOUT_MS",
+    "UNRECORDED_REASON",
     "LabMetrics",
     "metrics_router",
 ]
+
+log = logging.getLogger(__name__)
 
 #: The lab's own metric names, as they appear in the exposition.
 METRIC_NAMES: tuple[str, ...] = (
@@ -54,10 +84,17 @@ METRIC_NAMES: tuple[str, ...] = (
     "lab_invalid_runs_total",
     "lab_runs_in_flight",
     "lab_selftest_last_success_timestamp",
+    "lab_metrics_database_up",
 )
 
 #: Label value used for an absent ``end_status``.
-NONE_LABEL = "none"
+NONE_LABEL: Final = "none"
+#: ``reason`` label of ``lab_invalid_runs_total`` while runs carry no invalidity reason.
+UNRECORDED_REASON: Final = "unrecorded"
+#: Statement timeout of the scrape queries.
+QUERY_TIMEOUT_MS: Final = 5_000
+
+EngineSource = Engine | Callable[[], Engine]
 
 
 def _label(value: str | Enum | None) -> str:
@@ -68,75 +105,144 @@ def _label(value: str | Enum | None) -> str:
     return value
 
 
-class LabMetrics:
-    """The lab's service metrics, registered on their own registry."""
+class _RunTableCollector(Collector):
+    """Builds the lab metric families from the database and the self-test file."""
 
-    def __init__(self, registry: CollectorRegistry | None = None) -> None:
+    def __init__(self, engine: EngineSource | None, selftest_status_file: Path | None) -> None:
+        self._engine = engine
+        self._selftest_status_file = selftest_status_file
+
+    def describe(self) -> Iterable[Metric]:
+        # Families without samples: registering never touches the database.
+        return list(self._families(db=None))
+
+    def collect(self) -> Iterable[Metric]:
+        return list(self._families(db=self._read_database()))
+
+    def _read_database(self) -> _RunCounts | None:
+        if self._engine is None:
+            return None
+        try:
+            engine = self._engine() if callable(self._engine) else self._engine
+            return _query(engine)
+        except (SQLAlchemyError, RuntimeError, ValueError) as exc:
+            log.warning("metrics: database unavailable: %s", type(exc).__name__)
+            return None
+
+    def _families(self, db: _RunCounts | None) -> Iterator[Metric]:
+        runs = CounterMetricFamily(
+            "lab_runs",
+            "Finished runs.",
+            labels=["status", "end_status", "agent", "target", "arm"],
+        )
+        invalid = CounterMetricFamily(
+            "lab_invalid_runs", "Runs marked invalid, by reason.", labels=["reason"]
+        )
+        in_flight = GaugeMetricFamily(
+            "lab_runs_in_flight", "Runs currently executing.", labels=["agent"]
+        )
+        if db is not None:
+            for labels, count in db.finished:
+                runs.add_metric(list(labels), count)
+            if db.invalid:
+                invalid.add_metric([UNRECORDED_REASON], db.invalid)
+            for agent, count in db.in_flight:
+                in_flight.add_metric([agent], count)
+        yield runs
+        yield invalid
+        yield in_flight
+
+        selftest = GaugeMetricFamily(
+            "lab_selftest_last_success_timestamp", "Unix time of the last passing self-test."
+        )
+        selftest.add_metric([], self._selftest_timestamp())
+        yield selftest
+
+        up = GaugeMetricFamily(
+            "lab_metrics_database_up",
+            "1 if the run metrics were read from the database in this scrape, else 0.",
+        )
+        up.add_metric([], 0.0 if db is None else 1.0)
+        yield up
+
+    def _selftest_timestamp(self) -> float:
+        try:
+            ts = read_selftest_status(self._selftest_status_file).last_success_timestamp
+        except SelftestStatusError as exc:
+            log.warning("metrics: unreadable self-test status: %s", exc)
+            return 0.0
+        return 0.0 if ts is None else ts
+
+
+class _RunCounts:
+    __slots__ = ("finished", "in_flight", "invalid")
+
+    def __init__(
+        self,
+        finished: list[tuple[tuple[str, str, str, str, str], int]],
+        invalid: int,
+        in_flight: list[tuple[str, int]],
+    ) -> None:
+        self.finished = finished
+        self.invalid = invalid
+        self.in_flight = in_flight
+
+
+def _query(engine: Engine) -> _RunCounts:
+    finished_q = (
+        select(Run.status, Run.end_status, Run.agent_id, Run.target_id, Run.arm, func.count())
+        .where(Run.status.in_([RunStatus.VALID, RunStatus.INVALID]))
+        .group_by(Run.status, Run.end_status, Run.agent_id, Run.target_id, Run.arm)
+    )
+    in_flight_q = (
+        select(Agent.agent_id, func.count(Run.run_id))
+        .select_from(Agent)
+        .outerjoin(Run, (Run.agent_id == Agent.agent_id) & (Run.status == RunStatus.RUNNING))
+        .group_by(Agent.agent_id)
+    )
+    with engine.connect() as conn, conn.begin():
+        conn.execute(text("SET TRANSACTION READ ONLY"))
+        conn.execute(text(f"SET LOCAL statement_timeout = {int(QUERY_TIMEOUT_MS)}"))
+        finished = [
+            (
+                (
+                    _label(status),
+                    _label(end_status),
+                    agent,
+                    target,
+                    _label(arm),
+                ),
+                int(count),
+            )
+            for status, end_status, agent, target, arm, count in conn.execute(finished_q)
+        ]
+        in_flight = [(agent, int(count)) for agent, count in conn.execute(in_flight_q)]
+    invalid = sum(count for labels, count in finished if labels[0] == RunStatus.INVALID.value)
+    return _RunCounts(finished, invalid, in_flight)
+
+
+class LabMetrics:
+    """The lab's service metrics, on their own registry, derived at scrape time.
+
+    ``engine`` is the database to read (an :class:`~sqlalchemy.Engine` or a callable
+    returning one, resolved at each scrape); ``None`` reports the database as down.
+    ``selftest_status_file`` defaults to ``$LAB_SELFTEST_STATUS_FILE`` / the default
+    location of :mod:`control.core.selftest_status`.
+    """
+
+    def __init__(
+        self,
+        engine: EngineSource | None = None,
+        *,
+        selftest_status_file: Path | None = None,
+        registry: CollectorRegistry | None = None,
+    ) -> None:
         if registry is None:
             registry = CollectorRegistry()
             for collector in (PROCESS_COLLECTOR, PLATFORM_COLLECTOR, GC_COLLECTOR):
                 registry.register(collector)
         self.registry = registry
-        self.runs_total = Counter(
-            "lab_runs",
-            "Finished runs.",
-            ["status", "end_status", "agent", "target", "arm"],
-            registry=registry,
-        )
-        self.invalid_runs_total = Counter(
-            "lab_invalid_runs", "Runs marked invalid, by reason.", ["reason"], registry=registry
-        )
-        self.runs_in_flight = Gauge(
-            "lab_runs_in_flight",
-            "Runs currently executing.",
-            ["agent"],
-            registry=registry,
-        )
-        self.selftest_last_success_timestamp = Gauge(
-            "lab_selftest_last_success_timestamp",
-            "Unix time of the last passing self-test.",
-            registry=registry,
-        )
-
-    # ----------------------------------------------------------------- recording
-
-    def record_run(
-        self,
-        *,
-        status: str | Enum,
-        end_status: str | Enum | None,
-        agent: str,
-        target: str,
-        arm: str | Enum,
-    ) -> None:
-        """Count one finished run."""
-        self.runs_total.labels(
-            status=_label(status),
-            end_status=_label(end_status),
-            agent=agent,
-            target=target,
-            arm=_label(arm),
-        ).inc()
-
-    def record_invalid_run(self, reason: str | Enum) -> None:
-        """Count one run marked invalid for ``reason``."""
-        self.invalid_runs_total.labels(reason=_label(reason)).inc()
-
-    @contextmanager
-    def track_in_flight(self, agent: str) -> Iterator[None]:
-        """Count a run as in flight for the duration of the block, even if it raises."""
-        gauge = self.runs_in_flight.labels(agent=agent)
-        gauge.inc()
-        try:
-            yield
-        finally:
-            gauge.dec()
-
-    def record_selftest_success(self, timestamp: float | None = None) -> None:
-        """Record a passing self-test at ``timestamp`` (default: now)."""
-        self.selftest_last_success_timestamp.set(time.time() if timestamp is None else timestamp)
-
-    # ----------------------------------------------------------------- exposition
+        registry.register(_RunTableCollector(engine, selftest_status_file))
 
     def exposition(self) -> bytes:
         """The registry in the Prometheus text exposition format."""
