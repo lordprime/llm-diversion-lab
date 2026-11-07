@@ -834,3 +834,240 @@ def test_cookie_header_text_is_masked(text: str) -> None:
     assert "[REDACTED:cookie_header]" in out
     if "Server: x" in text:
         assert out.endswith("\r\nServer: x")
+
+
+# --------------------------------------------------------------------- fix round 4
+
+_WINDOW = MAX_INPUT_CHARS // 2
+_FUZZ_SECRET = "hunter2" + "SECRETVALUE"
+#: The reviewer's NEW-1 shapes: a name and a value a window cut can separate.
+WINDOW_SHAPES = [
+    "password: " + _FUZZ_SECRET,
+    "Authorization: Bearer " + _FUZZ_SECRET,
+    '"password": "correct horse ' + _FUZZ_SECRET + '"',
+    "Cookie: a=1; b=" + _FUZZ_SECRET,
+    "password:\n  " + _FUZZ_SECRET,
+]
+
+
+def _lorem(n: int) -> str:
+    return ("lorem " * (n // 6 + 1))[:n]
+
+
+def _sk_filler(n: int) -> str:
+    """Maskable filler: one key-shaped token, redacted to a few characters."""
+    return "sk-" + "A" * (n - 3)
+
+
+def _pem_filler(n: int) -> str:
+    body = ("QUJD" * 16 + "\n") * ((n - 60) // 65)
+    return "-----BEGIN PRIVATE KEY-----\n" + body + "-----END PRIVATE KEY-----"
+
+
+SHRINKERS = {"sk_token": _sk_filler, "pem_block": _pem_filler}
+
+
+@pytest.mark.parametrize("shrinker", sorted(SHRINKERS))
+@pytest.mark.parametrize("shape", WINDOW_SHAPES)
+def test_tail_window_cut_at_every_offset_never_leaks(shape: str, shrinker: str) -> None:
+    """The tail window starts at every offset of the shape; maskable filler follows."""
+    shrink = SHRINKERS[shrinker]
+    for off in range(len(shape) + 1):
+        rest = shape[off:] + " "
+        tail = rest + shrink(_WINDOW - len(rest))
+        tail += _lorem(_WINDOW - len(tail))
+        assert len(tail) == _WINDOW
+        text = _lorem(MAX_INPUT_CHARS) + " " + shape[:off] + tail
+        out = redact_text(text)
+        assert "SECRETVAL" not in out, (off, out[-200:])
+
+
+@pytest.mark.parametrize("shrinker", sorted(SHRINKERS))
+@pytest.mark.parametrize("shape", [*WINDOW_SHAPES, "db=postgres://admin:" + _FUZZ_SECRET + "@db"])
+def test_head_window_cut_at_every_offset_never_leaks(shape: str, shrinker: str) -> None:
+    """The head window ends at every offset of the shape; maskable filler precedes it."""
+    shrink = SHRINKERS[shrinker]
+    for off in range(len(shape) + 1):
+        lead = shrink(_WINDOW - off - 1)
+        lead += _lorem(_WINDOW - off - 1 - len(lead))
+        text = lead + " " + shape + " " + _lorem(MAX_INPUT_CHARS)
+        assert text[_WINDOW - off : _WINDOW - off + len(shape)] == shape
+        out = redact_text(text)
+        assert "SECRETVAL" not in out, (off, out[:200])
+
+
+def test_the_tail_windows_leading_margin_never_reaches_the_output() -> None:
+    margin = ("m" * 7 + " ") * (8 * 1024 // 8)  # exactly the 8 KiB lead-in margin
+    for joint in ("\n", " ", "mmm\n", ""):
+        tail = margin + joint
+        tail += _sk_filler(_WINDOW - len(tail))
+        text = _lorem(MAX_INPUT_CHARS).replace("m", "x") + " " + tail
+        out = redact_text(text)
+        emitted = out.rpartition(TRUNCATED)[2]
+        assert "m" not in emitted, (repr(joint), emitted[:120])
+        assert "[REDACTED:openai]" in emitted
+
+
+def test_the_head_windows_trailing_margin_never_reaches_the_output() -> None:
+    margin = ("m" * 7 + " ") * (8 * 1024 // 8)
+    for joint in ("\n", " ", "\nmmm", ""):
+        head = _sk_filler(_WINDOW - len(margin) - len(joint)) + joint + margin
+        assert len(head) == _WINDOW
+        text = head + " " + _lorem(MAX_INPUT_CHARS).replace("m", "x")
+        out = redact_text(text)
+        emitted = out.partition(TRUNCATED)[0]
+        assert "m" not in emitted, (repr(joint), emitted[-120:])
+        if joint:  # with no joint the key and the margin are one token: dropped whole
+            assert emitted.startswith("[REDACTED:openai]")
+
+
+def test_windows_cut_at_a_line_boundary_after_the_margin() -> None:
+    from control.core import logging as lab_logging
+
+    assert lab_logging.MARGIN_CHARS == 8 * 1024
+    lines = "".join(f"line{i:05d} " + "w" * 40 + "\n" for i in range(700))
+    window = lines[: MAX_INPUT_CHARS // 2]
+    head = lab_logging._head_window(window)
+    tail = lab_logging._tail_window(window)
+    assert window.startswith(head) and head.endswith("\n")
+    assert len(head) <= len(window) - lab_logging.MARGIN_CHARS
+    assert len(head) > len(window) - lab_logging.MARGIN_CHARS - 60  # the nearest line end
+    assert window.endswith(tail) and tail.startswith("line")
+    assert len(tail) <= len(window) - lab_logging.MARGIN_CHARS
+    assert len(tail) > len(window) - lab_logging.MARGIN_CHARS - 60
+    flat = "word " * (len(window) // 5)  # no newline: cut at the margin, whole words
+    assert flat.endswith(lab_logging._tail_window(flat))
+    assert lab_logging._tail_window(flat).split()[0] == "word"
+    assert flat.startswith(lab_logging._head_window(flat))
+
+
+#: NEW-2: Python string prefixes and escaped (double-encoded) JSON.
+PREFIXED_AND_ESCAPED = [
+    "{'password': b'hunter2'}",
+    "Creds(password=b'hunter2')",
+    "{'password': r'hunter2'}",
+    "{'password': rb'hunter2'}",
+    "{'password': u\"hunter2\"}",
+    'secret=B"hunter2"',
+    '{"args": "{\\"password\\": \\"hunter2\\"}"}',
+    'password=\\"hunter2\\"',
+    "{\\'password\\': \\'hunter2\\'}",
+    '{"args": "{\\"password\\": \\"a\\\\\\"hunter2\\"}"}',  # escaped quote, double-encoded
+]
+
+
+@pytest.mark.parametrize("text", PREFIXED_AND_ESCAPED)
+def test_prefixed_and_escaped_quoted_values_are_masked(text: str) -> None:
+    out = redact_text(text)
+    assert "hunter2" not in out, out
+    assert "[REDACTED:assignment]" in out
+
+
+def test_prefixed_and_escaped_values_keep_their_quotes() -> None:
+    assert redact_text("Creds(password=b'hunter2')") == ("Creds(password=b'[REDACTED:assignment]')")
+    assert redact_text('{"args": "{\\"password\\": \\"hunter2\\"}"}') == (
+        '{"args": "{\\"password\\": \\"[REDACTED:assignment]\\"}"}'
+    )
+    # a double-encoded value ending in a backslash: the next field is not swallowed
+    assert redact_text('{"a": "{\\"password\\": \\"x\\\\\\\\\\", \\"n\\": \\"v\\"}"}') == (
+        '{"a": "{\\"password\\": \\"[REDACTED:assignment]\\", \\"n\\": \\"v\\"}"}'
+    )
+    assert redact_text("password=bob") == "password=[REDACTED:assignment]"
+
+
+#: NEW-3: the rest of a secret after an escape, a list, ``=>`` or a delimiter.
+REST_OF_SECRET = [
+    '"password": "a\\"hunter2"',
+    "'password': 'it\\'shunter2'",
+    '"password": ["hunter2"]',
+    '"password": [ "hunter2", "x"]',
+    "password => 'hunter2'",
+    "password=>hunter2",
+    "password=a,hunter2",
+    "password=a;hunter2",
+    "password=a&hunter2",
+    "password=it'shunter2",
+    'password=a"hunter2',
+    "password=***;hunter2",
+    "password: |\n  hunter2",
+    "password: >-\n  hunter2",
+    "password: |+\n  first\n\n  hunter2\n",
+    "  db:\n    password: |2  # comment\n      line1\n      hunter2\n  next: 1",
+    "- password: >\n    hunter2",
+]
+
+
+@pytest.mark.parametrize("text", REST_OF_SECRET)
+def test_the_rest_of_a_secret_is_masked(text: str) -> None:
+    out = redact_text(text)
+    assert "hunter2" not in out, out
+
+
+def test_yaml_block_scalars_stop_at_the_dedent() -> None:
+    text = "auth:\n  password: |\n    hunter2\n    more\n\n  user: bob\nnext: 1"
+    assert redact_text(text) == ("auth:\n  password: [REDACTED:assignment]\n\n  user: bob\nnext: 1")
+
+
+def test_yaml_block_scalars_are_bounded() -> None:
+    text = "password: |\n" + "".join(f"  l{i:03d}\n" for i in range(100))
+    out = redact_text(text)
+    assert "l000" not in out and "l063" not in out
+    assert "l064" in out  # 64 lines at most
+
+
+def test_query_parameters_still_stop_at_ampersand() -> None:
+    assert redact_text("GET /cb?api_key=hunter2&page=2") == (
+        "GET /cb?api_key=[REDACTED:query_param]&page=2"
+    )
+
+
+def test_assignment_values_run_to_whitespace() -> None:
+    assert redact_text("password=a,b;c&d next") == "password=[REDACTED:assignment] next"
+    assert redact_text("password=a\nnext") == "password=[REDACTED:assignment]\nnext"
+
+
+#: Extra adversarial shapes for the round-4 value grammar and the windows.
+ROUND4_ADVERSARIAL = {
+    "yaml_indicator_run": _fill("password: |\n"),
+    "yaml_block_lines": "password: |\n" + _fill("  x\n"),
+    "yaml_blank_lines": "password: >-\n" + _fill(" \n"),
+    "yaml_spaces": "password: |\n" + " " * (_64K - 13),
+    "escaped_open_run": _fill('password=\\"'),
+    "escaped_value": 'password=\\"' + _fill("\\\\\\"),
+    "backslash_run": _fill("\\"),
+    "quote_escape_run": 'password="' + _fill('\\"'),
+    "prefix_run": _fill("password=b"),
+    "prefix_quote_run": _fill("password=rb'"),
+    "list_run": _fill("password: [ "),
+    "list_spaces": "password: [" + " " * (_64K - 12),
+    "arrow_run": _fill("password =>"),
+    "escaped_name_run": _fill('\\"password\\": '),
+    "newline_run": _fill("\n"),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(ROUND4_ADVERSARIAL))
+@pytest.mark.parametrize("name", [n for n, _ in REDACTION_PATTERNS])
+def test_every_pattern_is_linear_on_round4_shapes(name: str, shape: str) -> None:
+    pattern = dict(REDACTION_PATTERNS)[name]
+    start = time.perf_counter()
+    for _ in pattern.finditer(ROUND4_ADVERSARIAL[shape]):
+        pass
+    assert time.perf_counter() - start < 0.5
+
+
+@pytest.mark.parametrize("shape", sorted(ROUND4_ADVERSARIAL))
+def test_redact_text_is_fast_on_round4_shapes(shape: str) -> None:
+    start = time.perf_counter()
+    redact_text(ROUND4_ADVERSARIAL[shape])
+    assert time.perf_counter() - start < 0.5
+
+
+@pytest.mark.parametrize("shape", sorted({**ADVERSARIAL, **ROUND4_ADVERSARIAL, **CHAINS}))
+def test_redact_text_is_fast_above_the_ceiling(shape: str) -> None:
+    """Windowed redaction (two windows with their margins) on 4x the ceiling."""
+    text = {**ADVERSARIAL, **ROUND4_ADVERSARIAL, **CHAINS}[shape] * 4
+    assert len(text) > MAX_INPUT_CHARS
+    start = time.perf_counter()
+    redact_text(text)
+    assert time.perf_counter() - start < 0.5

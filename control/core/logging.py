@@ -49,11 +49,17 @@ traceback):
   ``query_param``) match only *name + separator*, check the name in Python (the
   :func:`is_sensitive_key` rule for assignments) and consume the value only when the
   name is secret; a rejected match resumes right after its separator, so a value like
-  ``DB_PASSWORD=x`` in ``msg=DB_PASSWORD=x`` is still scanned;
+  ``DB_PASSWORD=x`` in ``msg=DB_PASSWORD=x`` is still scanned. An assigned value may be
+  quoted (backslash escapes honoured, an optional ``b``/``r``/``u`` string prefix, an
+  escaped ``\"`` quote for JSON inside a JSON string, the first element of a ``[...]``
+  list), a YAML block scalar (``password: |`` and the deeper-indented lines after it,
+  at most 64 lines / 4 KiB) or unquoted, running to whitespace;
 * redaction runs on the **whole** string before any cut (up to
-  :data:`MAX_INPUT_CHARS`; beyond that, on a head and a tail window whose cut edges
-  first drop their partial token), so a cut never splits a secret into a leaking
-  prefix. The redacted string is then cut to :data:`HEAD_CHARS` +
+  :data:`MAX_INPUT_CHARS`; beyond that, on a head and a tail window, each redacted
+  with a :data:`MARGIN_CHARS` margin of context at its cut edge that is then
+  discarded: the kept part ends/starts at a line boundary beyond the margin), so a
+  cut never splits a secret into a leaking prefix nor separates a name from its value
+  in the output. The redacted string is then cut to :data:`HEAD_CHARS` +
   :data:`TRUNCATED` + :data:`TAIL_CHARS` (a traceback keeps its root cause and its
   final lines), dropping any token split at a cut;
 * the value of any field whose *name* is sensitive (:func:`is_sensitive_key`) becomes
@@ -94,6 +100,7 @@ from structlog.typing import EventDict, Processor, WrappedLogger
 
 __all__ = [
     "HEAD_CHARS",
+    "MARGIN_CHARS",
     "MAX_DEPTH",
     "MAX_INPUT_CHARS",
     "MAX_TEXT_CHARS",
@@ -119,6 +126,10 @@ REDACTED = "[REDACTED]"
 #: head window and a tail window of half this size each (the timing tests prove every
 #: pattern linear and fast at this size).
 MAX_INPUT_CHARS = 64 * 1024
+#: Each window is redacted with this much context at its cut edge (the end of the head
+#: window, the start of the tail window) that is then discarded, never emitted, so a
+#: name cut off from its value at the edge cannot leave the value unmasked in the output.
+MARGIN_CHARS = 8 * 1024
 #: After redaction a string longer than this keeps its first :data:`HEAD_CHARS` and
 #: last :data:`TAIL_CHARS` (so a traceback keeps its root cause and its final lines),
 #: joined by :data:`TRUNCATED`. A token cut in half at either edge is dropped.
@@ -190,12 +201,15 @@ REDACTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "auth_scheme",
         re.compile(r"(?i)\b(?P<keep>(?:bearer|basic|token|digest)[ \t]{1,64}+)\S++"),
     ),
-    # ``NAME=`` / ``"name": "`` (whitespace, newlines included, around the separator):
+    # ``NAME=`` / ``"name": "`` / ``name => '`` (whitespace, newlines included, around
+    # the separator), then optionally ``[`` (a list's first element), a Python string
+    # prefix (``b'``, ``rb"``...) and an opening quote, which may be escaped (``\"``, a
+    # JSON document inside a JSON string, e.g. an LLM tool call's ``arguments``):
     (
         "assignment",
         re.compile(
-            r"(?P<keep>(?<![\w-])(?P<aname>[\w-]{1,256}+)[\"']?\s{0,64}+[:=]\s{0,64}+"
-            r"(?P<quote>[\"']?))"
+            r"(?P<keep>(?<![\w-])(?P<aname>[\w-]{1,256}+)(?:\\?[\"'])?\s{0,64}+(?:=>|[:=])"
+            r"\s{0,64}+(?:(?:\[\s{0,64}+)?[bBrRuU]{0,2}+(?P<quote>\\?[\"']))?)"
         ),
     ),
 )
@@ -230,26 +244,86 @@ def _query_name_is_secret(match: re.Match[str]) -> bool:
     return name in _QUERY_NAMES or any(p in compact for p in _QUERY_PARTS)
 
 
-_UNQUOTED_VALUE = re.compile(r"[^\s\"',;&]++")
-_QUOTED_VALUE = {q: re.compile(rf"[^{q}\r\n]{{1,4096}}+") for q in ("'", '"')}
+#: An unquoted assigned value runs to whitespace (``,;&"'`` included: they may be part
+#: of the secret).
+_UNQUOTED_VALUE = re.compile(r"\S++")
+#: A quoted value, honouring backslash escapes, up to its closing quote.
+_QUOTED_VALUE = {q: re.compile(rf"(?:[^{q}\\\r\n]|\\[^\r\n]){{1,4096}}+") for q in ("'", '"')}
+#: A value opened by an escaped quote (``\"``, JSON inside a JSON string), up to the
+#: escaped closing quote. Units, in order: an escaped backslash (``\\\\``), an escaped
+#: quote (``\\\"``), any other escape, a plain character.
+_ESCAPED_QUOTED_VALUE = {
+    q: re.compile(rf"(?:\\{{4}}|\\{{3}}{q}|\\[^{q}\r\n]|[^\\{q}\r\n]){{1,4096}}+")
+    for q in ("'", '"')
+}
+#: A YAML block scalar indicator (``|``, ``>-``, ``|2+``...) ending its line.
+_YAML_BLOCK = re.compile(r"[|>][1-9+\-]{0,2}+[ \t]{0,64}+(?:#[^\r\n]{0,256}+)?(?=\r?\n)")
+_YAML_LINE = re.compile(r"\r?\n(?P<indent>[ \t]*+)(?P<body>[^\r\n]*+)")
+#: A YAML block scalar is masked for at most this many lines / characters.
+_YAML_MAX_LINES = 64
+_YAML_MAX_CHARS = 4096
 _QUERY_VALUE = re.compile(r"[^&;#\s\"']++")
 #: A value already masked by an earlier pattern, possibly behind its auth scheme.
 _ALREADY_MASKED = re.compile(r"(?i)(?:(?:bearer|basic|token|digest)[ \t]{1,64}+)?\[REDACTED")
 
 
-def _assignment_value(match: re.Match[str]) -> re.Pattern[str]:
+def _end(pattern: re.Pattern[str], text: str, pos: int) -> int | None:
+    value = pattern.match(text, pos)
+    return value.end() if value is not None else None
+
+
+def _assignment_value(match: re.Match[str], text: str) -> int | None:
+    """Where the value assigned by ``match`` ends (``None``: no value)."""
+    end = match.end()
     quote = match.group("quote")
-    return _QUOTED_VALUE[quote] if quote else _UNQUOTED_VALUE
+    if quote:
+        table = _ESCAPED_QUOTED_VALUE if len(quote) == 2 else _QUOTED_VALUE
+        return _end(table[quote[-1]], text, end)
+    if (block := _YAML_BLOCK.match(text, end)) is not None:
+        return _yaml_block_end(text, match.start(), block.end())
+    return _end(_UNQUOTED_VALUE, text, end)
+
+
+def _yaml_block_end(text: str, key_start: int, pos: int) -> int:
+    """The end of the block scalar whose indicator ends at ``pos`` (bounded).
+
+    Its lines are the following ones indented deeper than the key's line (blank lines
+    included when more content follows), at most :data:`_YAML_MAX_LINES` lines starting
+    within :data:`_YAML_MAX_CHARS`. Linear: each line is examined once, as the line
+    after one block, and the key's line is looked back over for at most 1 KiB.
+    """
+    lo = max(0, key_start - 1024)
+    newline = text.rfind("\n", lo, key_start)
+    if newline < 0 and lo > 0:
+        indent = 0  # the line start is too far back: assume the shallowest key
+    else:
+        prefix = text[newline + 1 : key_start]
+        indent = len(prefix) - len(prefix.lstrip(" \t"))
+    end = pos
+    limit = pos + _YAML_MAX_CHARS
+    cur = pos
+    for _ in range(_YAML_MAX_LINES):
+        if cur >= limit or (line := _YAML_LINE.match(text, cur)) is None:
+            break
+        if line.group("body"):
+            if len(line.group("indent")) <= indent:
+                break
+            end = line.end()
+        cur = line.end()
+    return end
 
 
 #: Patterns that match only ``name`` + separator: the check on the name, and the
 #: pattern for the value that follows when the name is secret.
 _GUARDED: dict[
     str,
-    tuple[Callable[[re.Match[str]], bool], Callable[[re.Match[str]], re.Pattern[str]]],
+    tuple[Callable[[re.Match[str]], bool], Callable[[re.Match[str], str], int | None]],
 ] = {
     "assignment": (_assigned_is_secret, _assignment_value),
-    "query_param": (_query_name_is_secret, lambda _match: _QUERY_VALUE),
+    "query_param": (
+        _query_name_is_secret,
+        lambda match, text: _end(_QUERY_VALUE, text, match.end()),
+    ),
 }
 
 #: A field name containing any of these (snake-cased, lowercased) is sensitive.
@@ -280,18 +354,56 @@ def redact_text(text: str) -> str:
 
     Redaction always runs before any cut that could split a secret: on the whole
     string up to :data:`MAX_INPUT_CHARS`, else on a head and a tail window of half that
-    size whose cut edges first lose their partial token. The redacted result is then
-    cut to :data:`HEAD_CHARS` + :data:`TRUNCATED` + :data:`TAIL_CHARS`, again dropping
-    any token split at a cut.
+    size, each redacted with a :data:`MARGIN_CHARS` margin of context at its cut edge
+    that is then discarded (see :func:`_head_window`). The redacted result is then cut
+    to :data:`HEAD_CHARS` + :data:`TRUNCATED` + :data:`TAIL_CHARS`, dropping any token
+    split at a cut.
     """
     if len(text) > MAX_INPUT_CHARS:
         half = MAX_INPUT_CHARS // 2
-        text = _redact_all(_head(text, half)) + TRUNCATED + _redact_all(_tail(text, half))
+        text = _head_window(text[:half]) + TRUNCATED + _tail_window(text[-half:])
     else:
         text = _redact_all(text)
     if len(text) <= MAX_TEXT_CHARS:
         return text
     return _head(text, HEAD_CHARS) + TRUNCATED + _tail(text, TAIL_CHARS)
+
+
+def _head_window(window: str) -> str:
+    """The redacted head window, minus its trailing :data:`MARGIN_CHARS` margin.
+
+    The whole window is redacted (so a secret whose value runs into the margin is seen
+    with its name), then only the part before the margin is kept: up to the last line
+    boundary before it, else up to the margin minus a token it splits. A mask that
+    straddles the kept end is dropped whole. No character of the margin is emitted.
+    """
+    cut = max(0, len(window) - MARGIN_CHARS)
+    newline = window.rfind("\n", 0, cut)
+    if newline >= 0:
+        cut = newline + 1
+    else:
+        while 0 < cut < len(window) and not (window[cut - 1].isspace() or window[cut].isspace()):
+            cut -= 1
+    redacted, (kept,) = _redact_all_tracked(window, [(cut, False)])
+    return redacted[:kept]
+
+
+def _tail_window(window: str) -> str:
+    """The redacted tail window, minus its leading :data:`MARGIN_CHARS` margin.
+
+    The mirror of :func:`_head_window`: the kept part starts at the first line
+    boundary after the margin, else right after the margin minus a token it splits,
+    and a mask straddling that start is dropped whole.
+    """
+    cut = min(MARGIN_CHARS, len(window))
+    newline = window.find("\n", cut)
+    if newline >= 0:
+        cut = newline + 1
+    else:
+        while 0 < cut < len(window) and not (window[cut - 1].isspace() or window[cut].isspace()):
+            cut += 1
+    redacted, (kept,) = _redact_all_tracked(window, [(cut, True)])
+    return redacted[kept:]
 
 
 def _head(text: str, size: int) -> str:
@@ -320,53 +432,95 @@ def _tail(text: str, size: int) -> str:
     return tail[start:]
 
 
+#: One redaction pass's replacements: ``(start, end, replacement)``, in order and
+#: non-overlapping.
+_Edits = list[tuple[int, int, str]]
+
+
 def _redact_all(text: str) -> str:
+    return _redact_all_tracked(text, [])[0]
+
+
+def _redact_all_tracked(text: str, marks: list[tuple[int, bool]]) -> tuple[str, list[int]]:
+    """Redact ``text``; also map each ``(position, keep_after)`` mark into the result.
+
+    A mark inside a replaced span moves past the whole replacement when
+    ``keep_after`` (the text after the mark is kept) and before it otherwise, so a cut
+    at a mark never keeps part of a mask or of the original text it covered.
+    """
+    positions = [pos for pos, _ in marks]
     for name, pattern in REDACTION_PATTERNS:
         guarded = _GUARDED.get(name)
         if guarded is None:
-            text = pattern.sub(_replacer(name, pattern), text)
+            edits = _plain_edits(name, pattern, text)
         else:
-            text = _scan_guarded(name, pattern, *guarded, text)
-    return text
+            edits = _guarded_edits(name, pattern, *guarded, text)
+        if not edits:
+            continue
+        positions = [
+            _map(pos, edits, after) for pos, (_, after) in zip(positions, marks, strict=True)
+        ]
+        text = _apply(text, edits)
+    return text, positions
 
 
-def _replacer(name: str, pattern: re.Pattern[str]) -> Callable[[re.Match[str]], str]:
+def _apply(text: str, edits: _Edits) -> str:
+    out: list[str] = []
+    pos = 0
+    for start, end, replacement in edits:
+        out += (text[pos:start], replacement)
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _map(pos: int, edits: _Edits, after: bool) -> int:
+    """``pos`` in the text once ``edits`` are applied (see :func:`_redact_all_tracked`)."""
+    shift = 0
+    for start, end, replacement in edits:
+        if end <= pos:
+            shift += len(replacement) - (end - start)
+        elif start < pos:  # inside a replaced span
+            return start + shift + (len(replacement) if after else 0)
+        else:
+            break
+    return pos + shift
+
+
+def _plain_edits(name: str, pattern: re.Pattern[str], text: str) -> _Edits:
     mask = f"[REDACTED:{name}]"
     has_keep = "keep" in pattern.groupindex
+    return [
+        (m.start(), m.end(), (m.group("keep") if has_keep else "") + mask)
+        for m in pattern.finditer(text)
+    ]
 
-    def replace(match: re.Match[str]) -> str:
-        return (match.group("keep") if has_keep else "") + mask
 
-    return replace
-
-
-def _scan_guarded(
+def _guarded_edits(
     name: str,
     pattern: re.Pattern[str],
     is_secret: Callable[[re.Match[str]], bool],
-    value_pattern: Callable[[re.Match[str]], re.Pattern[str]],
+    value_end: Callable[[re.Match[str], str], int | None],
     text: str,
-) -> str:
+) -> _Edits:
     """Mask the value after every secret ``name`` + separator match, in linear time.
 
     A match whose name is not secret is kept and the scan resumes right after its
     separator, so the value (which may itself hold ``secret=...``) is scanned too.
     """
     mask = f"[REDACTED:{name}]"
-    out: list[str] = []
+    edits: _Edits = []
     pos = 0
     while (match := pattern.search(text, pos)) is not None:
         end = match.end()
         if is_secret(match) and not _ALREADY_MASKED.match(text, end):
-            value = value_pattern(match).match(text, end)
-            if value is not None and value.end() > end:
-                out += (text[pos : match.start()], match.group("keep"), mask)
-                pos = value.end()
+            stop = value_end(match, text)
+            if stop is not None and stop > end:
+                edits.append((match.start(), stop, match.group("keep") + mask))
+                pos = stop
                 continue
-        out.append(text[pos:end])
         pos = end
-    out.append(text[pos:])
-    return "".join(out)
+    return edits
 
 
 def _as_text(value: bytes | bytearray | memoryview) -> str:
