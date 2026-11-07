@@ -242,7 +242,6 @@ def test_unknown_path_is_denied() -> None:
         ({"CgroupParent": "/"}, "create.field"),
         ({"Runtime": "runc-unsafe"}, "create.field"),
         ({"Sysctls": {"kernel.core_pattern": "|/x"}}, "create.field"),
-        ({"LogConfig": {"Type": "gelf", "Config": {"gelf-address": "udp://x:1"}}}, "create.field"),
         ({"SomeFutureField": {"Escape": True}}, "create.field"),
         ({"ContainerIDFile": "/etc/cron.d/x"}, "create.field"),
         ({"OomScoreAdj": -1000}, "create.field"),
@@ -255,13 +254,95 @@ def test_dangerous_host_config_is_denied(host_config: dict[str, Any], rule: str)
     assert decision.rule == rule, decision.reason
 
 
-def test_volumes_keys_must_be_container_paths() -> None:
-    # Podman parses a Volumes key like a -v flag: "/host:/x" would bind the host path.
-    for key in ["/:/host", "/etc:/x:rw", "relative", "/a/../b"]:
+@pytest.mark.parametrize(
+    "log_config",
+    [
+        # journald writes agent-controlled lines into the host journal.
+        {"Type": "journald"},
+        {"Type": "journald", "Config": {"tag": "sshd"}},
+        # none (with AutoRemove) lets an agent erase its containers' output.
+        {"Type": "none"},
+        # json-file/k8s-file options could lift rotation; the daemon's driver applies.
+        {"Type": "json-file", "Config": {"max-size": "100g"}},
+        {"Type": "json-file"},
+        {"Type": "local"},
+        {"Type": "k8s-file", "Config": {"max-size": "0"}},
+        {"Type": "", "Config": {"max-size": "1g"}},
+        # unknown drivers
+        {"Type": "gelf", "Config": {"gelf-address": "udp://x:1"}},
+        {"Type": "syslog"},
+        {"Type": "fluentd"},
+        {"Config": {"anything": "x"}},
+        # malformed
+        {"Type": 0},
+        {"Type": "", "Config": []},
+        "journald",
+        [],
+    ],
+)
+def test_agent_log_config_is_denied(log_config: Any) -> None:
+    decision = create({"Image": IMG, "HostConfig": {"LogConfig": log_config}})
+    assert not decision.allowed, log_config
+    assert decision.rule == "create.log", decision.reason
+
+
+def test_log_config_shadow_key_is_denied() -> None:
+    decision = create({"Image": IMG, "HostConfig": {"LogConfig": {"Type": "", "type": "none"}}})
+    assert not decision.allowed
+    assert decision.rule == "body.shadow_key"
+
+
+def test_empty_log_config_is_accepted_and_not_forwarded() -> None:
+    # The Docker CLI sends the zero struct; the daemon's default driver applies.
+    for log_config in [None, {}, {"Type": ""}, {"Type": "", "Config": {}}, {"Config": None}]:
+        body = allowed_create({"Image": IMG, "HostConfig": {"LogConfig": log_config}})
+        assert "LogConfig" not in body["HostConfig"], log_config
+    assert "LogConfig" not in allowed_create({"Image": IMG})["HostConfig"]
+
+
+def test_top_level_volumes_are_denied() -> None:
+    # Volumes creates anonymous volumes without the cell's labels (Mounts carries them).
+    # Podman also parses a Volumes key like a -v flag: "/host:/x" would bind the host path.
+    for key in ["/data", "/:/host", "/etc:/x:rw", "relative", "/a/../b"]:
         decision = create({"Image": IMG, "Volumes": {key: {}}})
         assert not decision.allowed, key
         assert decision.rule == "create.mount"
-    assert create({"Image": IMG, "Volumes": {"/data": {}}}).allowed
+    # A target not bound by Binds is an anonymous volume even next to binds.
+    decision = create(
+        {
+            "Image": IMG,
+            "Volumes": {"/s": {}, "/anon": {}},
+            "HostConfig": {"Binds": ["lab-scratch:/s"]},
+        }
+    )
+    assert not decision.allowed
+    assert decision.rule == "create.mount"
+    # A Mounts target does not excuse a Volumes entry (only Binds is mirrored by the SDK).
+    decision = create(
+        {
+            "Image": IMG,
+            "Volumes": {"/m": {}},
+            "HostConfig": {"Mounts": [{"Type": "volume", "Target": "/m"}]},
+        }
+    )
+    assert not decision.allowed
+
+
+def test_empty_or_bind_mirroring_volumes_are_accepted_and_not_forwarded() -> None:
+    for volumes in [None, {}]:
+        body = allowed_create({"Image": IMG, "Volumes": volumes})
+        assert "Volumes" not in body
+    # The Docker SDK mirrors every Binds target into Volumes; that entry creates
+    # nothing (the bind covers the path) and is dropped.
+    body = allowed_create(
+        {
+            "Image": IMG,
+            "Volumes": {"/s": {}, "/w": {}},
+            "HostConfig": {"Binds": ["lab-scratch:/s:rw", "lab-scratch:/w:ro"]},
+        }
+    )
+    assert "Volumes" not in body
+    assert body["HostConfig"]["Binds"] == ["lab-scratch:/s:rw", "lab-scratch:/w:ro"]
 
 
 def test_networking_config_for_another_network_is_denied() -> None:
@@ -732,7 +813,7 @@ def test_forwarded_create_body_is_rebuilt_not_passed_through() -> None:
             "Env": ["A=1"],
             "Healthcheck": {"Test": ["CMD", "true"], "Interval": 1000000000},
             "ExposedPorts": {"80/tcp": {}},
-            "Volumes": {"/data": {}},
+            "Volumes": {},
             "HostConfig": {
                 "Devices": [],
                 "Runtime": "",
@@ -750,7 +831,6 @@ def test_forwarded_create_body_is_rebuilt_not_passed_through() -> None:
         "Env",
         "Healthcheck",
         "ExposedPorts",
-        "Volumes",
         "HostConfig",
         "Labels",
         "NetworkingConfig",
@@ -1943,6 +2023,22 @@ def test_podman_integration(tmp_path: Path) -> None:
             ]["IPAddress"]
             assert resolved.output.split()[0].decode() == web_ip
 
+            # I1: an agent-chosen log driver (journald writes into the host journal)
+            # and M2: top-level Volumes (unlabelled anonymous volumes) are denied before
+            # the daemon sees them; no container appears.
+            before = {c.id for c in real.containers.list(all=True)}
+            marker = f"MARK-{suffix}"
+            journald = {
+                "Cmd": ["echo", marker],
+                "HostConfig": {"LogConfig": {"Type": "journald"}},
+            }
+            status, reply = create_raw(journald)
+            assert status == 403, reply
+            assert b"create.log" in reply
+            status, reply = create_raw({"Volumes": {"/anon": {}}})
+            assert status == 403, reply
+            assert {c.id for c in real.containers.list(all=True)} == before
+
             # X2: runner infrastructure (run label only, e.g. the cell-guard container) is
             # invisible and untouchable.
             infra = real.containers.create(
@@ -2008,7 +2104,13 @@ def test_podman_integration(tmp_path: Path) -> None:
 
     records = [json.loads(x) for x in (tmp_path / DECISIONS_FILE).read_text().splitlines()]
     denied_rules = {r["rule"] for r in records if not r["allowed"]}
-    expected = {"create.privileged", "image.pull", "target.not_owned", "create.mount"}
+    expected = {
+        "create.privileged",
+        "image.pull",
+        "target.not_owned",
+        "create.mount",
+        "create.log",
+    }
     assert expected <= denied_rules
     assert {r["op"] for r in records if r["allowed"]} >= {
         "container.create",

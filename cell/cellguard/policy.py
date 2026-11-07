@@ -27,19 +27,25 @@ What is allowed (everything else is denied):
 * ``POST /containers/create``: the image must be in the ``images.lock`` allow-list (by
   logical name, by repository, or by ``repository@digest``) and is pinned to
   ``image@digest``. Forced: the cell's network (``HostConfig.NetworkMode`` and
-  ``NetworkingConfig``), both ownership labels (also on volume mounts), memory (no
-  swap), CPU and PID limits (a lower request is kept), and the cell's name prefix on
-  ``?name=``. Mounts: only the cell's scratch *named* volume (``<name>:/path[:ro]`` or a
-  ``volume`` mount without subpath), anonymous volumes and tmpfs; **no host path is
-  ever mounted** (a symlink planted in a bind-mounted directory would reach any host
-  path). Denied: privileged; host or container network/PID/IPC/user/UTS/cgroup
-  namespaces; devices; bind mounts; other named volumes; volume subpaths and driver
-  options; capabilities beyond ``NET_RAW`` and ``NET_ADMIN``; any ``SecurityOpt``
-  except ``no-new-privileges``; published ports; ``VolumesFrom``; links; sysctls;
-  runtimes; cgroup parents; masked/read-only path overrides; non-local log drivers;
-  restart policies other than ``no``; ulimits other than ``nofile``/``nproc`` within
-  caps; ``lab.*`` and ``com.docker.*`` labels; and every other field set to a non-zero
-  value;
+  ``NetworkingConfig``), the cell's resolver (``HostConfig.Dns``), both ownership
+  labels (also on volume mounts), memory (no swap), CPU and PID limits (a lower request
+  is kept), and the cell's name prefix on ``?name=``. Every DNS name the container
+  publishes on the cell network carries the cell prefix: network aliases and a
+  non-empty ``Hostname`` must start with it (so none can be ``target``, ``tap`` or
+  ``catcher``). Mounts: only the cell's scratch *named* volume (``<name>:/path[:ro]``
+  or a ``volume`` mount without subpath), anonymous volumes via ``Mounts`` (labelled)
+  and tmpfs; **no host path is ever mounted** (a symlink planted in a bind-mounted
+  directory would reach any host path). Denied: privileged; host or container
+  network/PID/IPC/user/UTS/cgroup namespaces; devices; bind mounts; other named
+  volumes; volume subpaths and driver options; top-level ``Volumes`` (unlabelled
+  anonymous volumes; an entry that only mirrors a ``Binds`` target is dropped);
+  capabilities beyond ``NET_RAW``; any ``SecurityOpt`` except ``no-new-privileges``;
+  published ports; ``VolumesFrom``; links; ``Domainname``; MAC/IP addresses; agent
+  ``Dns``/``DnsSearch``/``DnsOptions``/``ExtraHosts``; sysctls; runtimes; cgroup
+  parents; masked/read-only path overrides; any non-empty ``LogConfig`` (the daemon's
+  log driver applies); restart policies other than ``no``; ulimits other than
+  ``nofile``/``nproc`` within caps; ``lab.*`` and ``com.docker.*`` labels; and every
+  other field set to a non-zero value;
 * start, stop, kill, wait, remove, inspect, logs, attach (incl. websocket), resize,
   exec create/start/resize/inspect: only on containers carrying both ownership labels;
   the path is pinned to the container's full id. A privileged exec is denied;
@@ -776,22 +782,32 @@ def _ulimits(value: Any, where: str, rule: str) -> Any:
     return items
 
 
-_LOG_CONFIG: Final[_Schema] = {
-    "Type": _choice(
-        frozenset({"", "json-file", "local", "k8s-file", "journald", "none"}), "create.field"
-    ),
-    "Config": _strmap,
-}
-_LOG_OPTIONS: Final = frozenset({"max-size", "max-file", "compress", "mode", "max-buffer-size"})
+def _empty_log_type(value: Any, where: str, rule: str) -> Any:
+    if value not in (None, "") or isinstance(value, bool):
+        raise _bad("create.log", where, "must be empty (the daemon's log driver applies)")
+    return _OMIT
+
+
+def _empty_log_options(value: Any, where: str, rule: str) -> Any:
+    if value is not None and value != {}:
+        raise _bad("create.log", where, "must be empty (the daemon's log driver applies)")
+    return _OMIT
+
+
+_LOG_CONFIG: Final[_Schema] = {"Type": _empty_log_type, "Config": _empty_log_options}
 
 
 def _log_config(value: Any, where: str, rule: str) -> Any:
-    log = _obj(_LOG_CONFIG, "create.field")(value, where, "create.field")
-    if log is _OMIT:
-        return _OMIT
-    if not set(log.get("Config", {})) <= _LOG_OPTIONS:
-        raise _Denied("create.field", "log options are not allowed")
-    return log
+    """``LogConfig`` may only be the zero struct (what the Docker CLI sends).
+
+    The daemon's own driver with rotation applies (DEPLOYMENT.md §0.3): ``journald``
+    would write agent text into the host journal, ``none`` would erase evidence, and
+    driver options could lift rotation. Never forwarded.
+    """
+    if value is not None and not isinstance(value, dict):
+        raise _bad("create.log", where, "is not an object")
+    _obj(_LOG_CONFIG, "create.log")(value, where, "create.log")
+    return _OMIT
 
 
 _HEALTHCHECK: Final[_Schema] = {
@@ -967,7 +983,22 @@ _HOST_CONFIG: Final[_Schema] = {
 
 
 def _volumes(value: Any, where: str, rule: str) -> Any:
+    """Top-level ``Volumes`` would create anonymous volumes without the cell's labels.
+
+    Kept (for the check against ``Binds`` after the rebuild) but never forwarded.
+    """
     return _keys(_container_path, "create.mount")(value, where, "create.mount")
+
+
+def _check_volumes(volumes: Mapping[str, Any], binds: list[str]) -> None:
+    """Every ``Volumes`` entry must mirror a ``Binds`` target (the Docker SDK sends
+    both); such an entry creates nothing. Any other entry is an anonymous volume."""
+    bound = {bind.split(":")[1] for bind in binds}
+    for path in volumes:
+        if path not in bound:
+            raise _Denied(
+                "create.mount", f"Volumes entry {path!r} is not allowed (use HostConfig.Mounts)"
+            )
 
 
 _CREATE: Final[_Schema] = {
@@ -1138,6 +1169,7 @@ def _container_create(r: Route, req: DockerRequest, ctx: CellContext) -> Decisio
     body["Labels"] = _labels(body.get("Labels", {}), ctx, "create.labels")
     host = body.setdefault("HostConfig", {})
     _check_binds(host.get("Binds", []), ctx)
+    _check_volumes(body.pop("Volumes", {}), host.get("Binds", []))
     _check_mounts(host.get("Mounts", []), ctx)
     _force_network(body, host, ctx)
     host["Memory"] = host["MemorySwap"] = _cap(host.get("Memory"), ctx.memory_bytes)
