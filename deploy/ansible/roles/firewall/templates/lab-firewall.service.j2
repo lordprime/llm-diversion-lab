@@ -11,7 +11,9 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft --file /etc/lab/host.nft
 ExecReload=/usr/sbin/nft --file /etc/lab/host.nft
-ExecStop=/usr/sbin/nft delete table inet lab_host
+# No ExecStop on purpose: with live-restore, cells outlive a stop of this unit (and
+# of Docker), so the table stays loaded until reboot or an explicit
+# `nft delete table inet lab_host`.
 
 [Install]
 WantedBy=multi-user.target

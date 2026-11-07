@@ -8,9 +8,16 @@
 # Two layers stop run-cell egress: the forward chain below (this table) and the
 # DOCKER-USER rules from lab-cell-egress. A packet dropped by either is dropped.
 #
+# Cells are matched by INGRESS INTERFACE as well as by source address: agents keep
+# NET_RAW (they need raw scans), so a source address alone could be forged. Strict
+# reverse-path filtering on the cell bridges drops forged sources before anything
+# else sees them.
+#
 # Contracts with the runner and the control plane (DEPLOYMENT §0.2):
-# - cell networks are created only inside the cell_nets set (LAB_CELL_NETWORKS in
-#   /srv/lab/host.env is rendered from the same variable);
+# - every cell network is a Docker bridge named `labc<short-id>`
+#   (com.docker.network.bridge.name, at most 15 characters) with a subnet inside
+#   the cell_nets set (LAB_CELL_NETWORKS in /srv/lab/host.env is rendered from the
+#   same variable);
 # - the host never opens connections INTO a cell (replies from a cell to the host
 #   are dropped like any other cell-to-host packet); the runner uses docker exec/cp;
 # - control-plane ports are published on 127.0.0.1 only; Caddy on :443 is the one
@@ -28,12 +35,23 @@ table inet lab_host {
 		elements = { {{ lab_cell_networks | join(', ') }} }
 	}
 
+	# Strict reverse-path check on the cell bridges: a source address that would
+	# not be routed back out of the bridge it arrived on is forged.
+	chain prerouting {
+		type filter hook prerouting priority raw; policy accept;
+
+		iifname "labc*" fib saddr . iif oif missing counter drop comment "lab: forged source on a cell bridge"
+	}
+
 	chain input {
 		type filter hook input priority filter; policy drop;
 
 		iif "lo" accept
+		meta nfproto ipv6 counter drop comment "lab: no IPv6 to the host"
 		# Run cells never reach the LXC itself (a Docker internal network still
 		# lets containers reach host services on the bridge address).
+		iifname "labc*" limit rate 10/minute log prefix "lab-drop cell-to-host "
+		iifname "labc*" counter drop comment "lab: cell bridge to host"
 		ip saddr @cell_nets limit rate 10/minute log prefix "lab-drop cell-to-host "
 		ip saddr @cell_nets counter drop comment "lab: cell to host"
 		ct state established,related accept
@@ -50,11 +68,13 @@ table inet lab_host {
 		type filter hook forward priority filter - 10; policy accept;
 
 		meta nfproto ipv6 counter drop comment "lab: no forwarded IPv6"
-		ip saddr @cell_nets ip daddr @cell_nets accept comment "lab: within the cell networks"
+		iifname "labc*" oifname "labc*" ip saddr @cell_nets ip daddr @cell_nets accept comment "lab: within the cell networks"
 {% if lab_llm_gateway_address %}
-		ip saddr @cell_nets ip daddr {{ lab_llm_gateway_address }} tcp dport {{ lab_llm_gateway_port }} accept comment "lab: cells to the LLM gateway"
+		iifname "labc*" ip saddr @cell_nets ip daddr {{ lab_llm_gateway_address }} tcp dport {{ lab_llm_gateway_port }} accept comment "lab: cells to the LLM gateway"
 {% endif %}
-		ip saddr @cell_nets limit rate 10/minute log prefix "lab-drop cell-egress "
-		ip saddr @cell_nets counter drop comment "lab: cell egress"
+		iifname "labc*" limit rate 10/minute log prefix "lab-drop cell-egress "
+		iifname "labc*" counter drop comment "lab: cell egress"
+		ip saddr @cell_nets limit rate 10/minute log prefix "lab-drop cell-source "
+		ip saddr @cell_nets counter drop comment "lab: cell source off a cell bridge"
 	}
 }

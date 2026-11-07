@@ -35,6 +35,9 @@ lab1:
   allow_containerd_pin: false
   cloudflare_tunnel: false
   max_parallel_cells: 1
+  vars:
+    # Docker's upstream DNS: the LXC's gateway, never a loopback resolver (§0.2).
+    lab_upstream_dns: [192.168.1.1]
 
 # A VM in the sysbox profile (the CISPA upgrade path, DEPLOYMENT §0.6). Not usable in
 # M0: the sysbox role needs sysbox_deb_sha256 and disk formatting is not built.
@@ -47,4 +50,5 @@ lab1:
 #   cloudflare_tunnel: false
 #   max_parallel_cells: 4
 #   vars:
+#     lab_upstream_dns: [192.0.2.1]   # placeholder: a non-loopback resolver
 #     sysbox_deb_sha256: "<published SHA-256 of sysbox-ce 0.7.1>"

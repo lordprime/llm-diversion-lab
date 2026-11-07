@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # {{ ansible_managed }} (role firewall)
 # Run-cell egress rules in Docker's DOCKER-USER chain (DEPLOYMENT §4.3 firewall).
-# This is the SECOND layer: the first is the forward chain in nftables table
-# inet lab_host, which is loaded before Docker can start.
-# Forwarding from the cell networks is dropped, except to the cell networks
-# themselves (Docker's per-network isolation decides there) and to the LLM gateway.
-# Docker preserves DOCKER-USER across restarts; lab-cell-egress.service re-applies
-# it whenever Docker starts.
+# This is the SECOND layer: the first is table inet lab_host (forward and input
+# chains plus a strict reverse-path check), which is loaded before Docker can start.
 #
-#   apply  replace DOCKER-USER atomically (iptables-restore --noflush), then verify
-#   check  verify DOCKER-USER holds exactly these rules and lab_host is loaded
+# Cells are matched by ingress interface (cell bridges are named labc<short-id>) and
+# by source address, so a forged source does not escape. From a cell bridge, only
+# traffic to another cell bridge inside the cell networks (Docker's per-network
+# isolation decides there) and to the LLM gateway, if configured, goes on to
+# Docker's own rules; everything else is dropped. Docker preserves DOCKER-USER
+# across restarts; lab-cell-egress.service re-applies it whenever Docker starts.
+#
+#   apply  replace DOCKER-USER atomically (iptables-restore --noflush), then check
+#   check  DOCKER-USER equals exactly these rules (as `iptables -S` prints them),
+#          FORWARD jumps to it, and table inet lab_host is loaded
 #   show   print the rules in iptables-restore format
 set -Eeuo pipefail
 
@@ -17,46 +21,54 @@ CELL_NETS=({% for net in lab_cell_networks %}{{ net | quote }}{{ ' ' if not loop
 GATEWAY_ADDR={{ lab_llm_gateway_address | quote }}
 GATEWAY_PORT={{ lab_llm_gateway_port | string | quote }}
 TAG={{ firewall_cell_egress_tag | quote }}
+BRIDGES=labc+
 IPT=(iptables --wait 10)
 
-rules() {
-	local src dst
-	echo '*filter'
-	echo ':DOCKER-USER - [0:0]'
+# The rules, written in the exact form `iptables -S` prints them (option order
+# -s -d -i -o -p, then matches), so `check` can compare them line for line.
+rule_lines() {
+	local src dst cmt="-m comment --comment $TAG"
 	for src in "${CELL_NETS[@]}"; do
 		for dst in "${CELL_NETS[@]}"; do
-			echo "-A DOCKER-USER -s $src -d $dst -m comment --comment $TAG -j RETURN"
+			echo "-A DOCKER-USER -s $src -d $dst -i $BRIDGES -o $BRIDGES $cmt -j RETURN"
 		done
 		if [[ -n $GATEWAY_ADDR ]]; then
-			echo "-A DOCKER-USER -s $src -d $GATEWAY_ADDR/32 -p tcp -m tcp --dport $GATEWAY_PORT -m comment --comment $TAG -j RETURN"
+			echo "-A DOCKER-USER -s $src -d $GATEWAY_ADDR/32 -i $BRIDGES -p tcp -m tcp --dport $GATEWAY_PORT $cmt -j RETURN"
 		fi
-		echo "-A DOCKER-USER -s $src -m comment --comment $TAG -j DROP"
+	done
+	echo "-A DOCKER-USER -i $BRIDGES $cmt -j DROP"
+	for src in "${CELL_NETS[@]}"; do
+		echo "-A DOCKER-USER -s $src $cmt -j DROP"
 	done
 	echo '-A DOCKER-USER -j RETURN'
+}
+
+rules() {
+	echo '*filter'
+	echo ':DOCKER-USER - [0:0]'
+	rule_lines
 	echo 'COMMIT'
 }
 
 check() {
 	local want have
-	want=$(rules | grep -c '^-A')
-	have=$("${IPT[@]}" -S DOCKER-USER | grep -c '^-A' || true)
+	want=$(rule_lines)
+	have=$("${IPT[@]}" -S DOCKER-USER | grep '^-A' || true)
 	if [[ $want != "$have" ]]; then
-		echo "DOCKER-USER has $have rules, expected $want" >&2
-		return 1
-	fi
-	if ! "${IPT[@]}" -S DOCKER-USER | grep -q -- "--comment $TAG -j DROP"; then
-		echo "DOCKER-USER lacks the cell DROP rule" >&2
+		echo "DOCKER-USER differs from the lab's rules:" >&2
+		diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") >&2 || true
 		return 1
 	fi
 	if ! "${IPT[@]}" -C FORWARD -j DOCKER-USER 2>/dev/null; then
 		echo "FORWARD does not jump to DOCKER-USER" >&2
 		return 1
 	fi
-	if ! nft list chain inet lab_host forward 2>/dev/null | grep -q '"lab: cell egress"'; then
-		echo "nftables table inet lab_host (forward cell drop) is not loaded" >&2
+	if ! nft list chain inet lab_host forward 2>/dev/null | grep -q '"lab: cell egress"' ||
+		! nft list chain inet lab_host prerouting 2>/dev/null | grep -q 'fib saddr . iif oif missing'; then
+		echo "nftables table inet lab_host (forward drop, reverse-path check) is not loaded" >&2
 		return 1
 	fi
-	echo "OK: cell egress rules in DOCKER-USER for ${CELL_NETS[*]}; host table loaded"
+	echo "OK: cell egress rules in DOCKER-USER for ${CELL_NETS[*]} and $BRIDGES; host table loaded"
 }
 
 case ${1:-apply} in

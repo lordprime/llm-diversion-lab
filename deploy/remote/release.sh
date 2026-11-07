@@ -97,21 +97,32 @@ cmd_pull() {
 }
 
 cmd_compose_pull() {
-	local tree
-	local image unpinned=()
+	local tree images image unpinned=()
 	tree=$(release_tree "$1")
+	# Images are built in CI and pulled by digest; a tag could change under us. With
+	# --allow-build, only services that are built here may use a local tag: every
+	# image that is pulled must still be pinned.
+	if [[ ${2:-} == allow-build ]]; then
+		images=$(compose "$tree" config --format json | python3 -I -c '
+import json, sys
+for service in json.load(sys.stdin)["services"].values():
+    if "build" not in service:
+        print(service.get("image", "(no image)"))
+') || die "could not read the compose configuration"
+	else
+		images=$(compose "$tree" config --images) || die "could not read the compose configuration"
+	fi
+	while IFS= read -r image; do
+		[[ -z $image || $image =~ @sha256:[0-9a-f]{64}$ ]] || unpinned+=("$image")
+	done <<<"$images"
+	((${#unpinned[@]} == 0)) || die "control-plane images not pinned by digest: ${unpinned[*]}"
 	if [[ ${2:-} == allow-build ]]; then
 		compose "$tree" pull --ignore-buildable
 		echo "building control-plane images on this host (--allow-build fallback)"
 		compose "$tree" build
-		return 0
+	else
+		compose "$tree" pull
 	fi
-	# Images are built in CI and pulled by digest; a tag could change under us.
-	while IFS= read -r image; do
-		[[ -z $image || $image =~ @sha256:[0-9a-f]{64}$ ]] || unpinned+=("$image")
-	done < <(compose "$tree" config --images)
-	((${#unpinned[@]} == 0)) || die "control-plane images not pinned by digest: ${unpinned[*]}"
-	compose "$tree" pull
 }
 
 # app_services TREE: every service except the database and the one-shot migrate.
@@ -158,6 +169,9 @@ cmd_migrate() {
 		chmod 0600 "$dump"
 		printf '%s\n' "$dump" >"$STATE/pending-dump"
 		echo "pre-migration dump: $dump"
+	elif [[ -s $STATE/previous ]]; then
+		die "release $(<"$STATE/previous") is deployed but its database is not running:" \
+			"refusing to migrate without a pre-migration dump (start the db service, then retry)"
 	else
 		echo "database not running yet (first deploy): no pre-migration dump"
 		compose "$tree" up -d "${WAIT[@]}" db
@@ -181,28 +195,56 @@ cmd_selftest() {
 	labctl selftest --quick
 }
 
-# rollback: stop writers -> restore the dump -> swap `current` back -> start it.
+# State of a rollback in progress, printed on any failure so the operator knows
+# exactly where the database and `current` stand.
+RB_DB="untouched (no pre-migration dump for this release)"
+RB_DUMP=""
+
+rollback_fail() {
+	{
+		printf 'ERROR: rollback failed: %s\n' "$*"
+		printf '  current -> %s\n' "$(readlink "$LAB/current" 2>/dev/null || echo '(none)')"
+		printf '  database: %s\n' "$RB_DB"
+		[[ -z $RB_DUMP ]] || printf '  pre-migration dump kept at %s\n' "$RB_DUMP"
+	} >&2
+	exit 1
+}
+
+# The database is dropped and recreated, then restored in ONE transaction that
+# stops at the first error: the result is the dump exactly, or an empty database
+# and a non-zero exit, never a half-restored mix of old and new schema.
+# shellcheck disable=SC2016 # expanded inside the db container, not here
+RECREATE_DB='set -e; M="--maintenance-db=template1 -U $POSTGRES_USER"; dropdb $M --if-exists --force "$POSTGRES_DB"; createdb $M -O "$POSTGRES_USER" "$POSTGRES_DB"'
+# shellcheck disable=SC2016 # expanded inside the db container, not here
+RESTORE_DB='pg_restore --single-transaction --exit-on-error --no-owner -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+
+# rollback: stop writers -> recreate + restore the database -> swap back -> start.
 cmd_rollback() {
-	local prev="" dump restored=""
+	local prev=""
 	[[ -f $STATE/previous ]] && prev=$(<"$STATE/previous")
-	stop_writers
+	stop_writers || rollback_fail "could not stop the app services"
 	if [[ -f $STATE/pending-dump && -L $LAB/current ]]; then
-		dump=$(<"$STATE/pending-dump")
-		# shellcheck disable=SC2016 # expanded inside the db container, not here
-		compose "$LAB/current" exec -T db \
-			sh -c 'pg_restore --clean --if-exists -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <"$dump"
+		RB_DUMP=$(<"$STATE/pending-dump")
+		[[ -s $RB_DUMP ]] || rollback_fail "the pre-migration dump is missing or empty"
+		RB_DB="unchanged so far (recreating it failed before the drop, or the drop failed)"
+		compose "$LAB/current" exec -T db sh -c "$RECREATE_DB" ||
+			rollback_fail "could not drop and recreate the database"
+		RB_DB="EMPTY (recreated); restore it by hand from the dump"
+		compose "$LAB/current" exec -T db sh -c "$RESTORE_DB" <"$RB_DUMP" ||
+			rollback_fail "pg_restore failed (single transaction: nothing was restored)"
+		RB_DB="restored from $RB_DUMP"
 		rm -f "$STATE/pending-dump"
-		restored=" (the database was restored from $dump)"
-		echo "database restored from $dump"
+		echo "database restored from $RB_DUMP"
 	fi
 	if [[ -n $prev && -d $prev ]]; then
 		swap_current "$prev"
 		compose "$LAB/current" up -d --remove-orphans --no-build "${WAIT[@]}" ||
-			die "the previous release $prev did not start$restored; check the host (status.sh)"
+			rollback_fail "the previous release $prev did not start; check the host (status.sh)"
 	else
 		echo "no previous release: stopping the failed one"
 		if [[ -L $LAB/current ]]; then
-			compose "$LAB/current" down --remove-orphans
+			compose "$LAB/current" down --remove-orphans ||
+				rollback_fail "could not stop the failed release"
 			rm -f "$LAB/current"
 		fi
 	fi

@@ -18,6 +18,12 @@ lab_cell_networks:
 lab_llm_gateway_address: ""
 lab_llm_gateway_port: 4000
 
+# Upstream resolvers for Docker's embedded DNS (daemon.json "dns"). Required, set
+# per host in hosts.yml `vars:`: non-loopback IPv4 only, so a cell's DNS query is
+# forwarded from the container's namespace and dropped by the cell firewall. The
+# docker role refuses an empty or loopback value.
+lab_upstream_dns: []
+
 # Docker's pools for every other network (control plane, compose defaults). They
 # must not overlap the cell networks, the home LAN (192.168.0.0/16; Docker's
 # built-in defaults include 192.168.0.0/16) or Twingate/CGNAT (100.64.0.0/10).

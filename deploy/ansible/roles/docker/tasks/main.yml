@@ -16,6 +16,24 @@
   changed_when: false
   check_mode: false
 
+# Cell containers resolve through Docker's embedded DNS, which forwards to these
+# upstreams. With an explicit non-loopback upstream the forwarded query leaves from
+# the container's network namespace, so it crosses the forward chain and a cell's
+# query is dropped there. With a loopback resolver (systemd-resolved's 127.0.0.53)
+# dockerd would forward from the host's namespace instead, around the firewall.
+- name: Check the upstream DNS for containers is explicit and not loopback
+  ansible.builtin.assert:
+    that:
+      - lab_upstream_dns | length > 0
+      - lab_upstream_dns | select('match', '^[0-9]{1,3}([.][0-9]{1,3}){3}$') | list | length == lab_upstream_dns | length
+      - lab_upstream_dns | select('match', '^(127|0)[.]') | list | length == 0
+    fail_msg: >-
+      Set lab_upstream_dns (this host's `vars:` in hosts.yml) to one or more IPv4
+      resolvers that are not loopback (127.0.0.0/8), e.g. the LXC's gateway. A
+      loopback resolver makes dockerd forward cell DNS from the host's namespace,
+      around the cell firewall (DEPLOYMENT §0.2).
+    quiet: true
+
 - name: Install the apt repository prerequisites
   ansible.builtin.apt:
     name: [ca-certificates, curl, gnupg]
@@ -29,17 +47,20 @@
     group: root
     mode: "0755"
 
-- name: Download Docker's apt signing key
+# The key is downloaded to a candidate file and checked there; the trusted keyring
+# is only written after the check passes, so a bad download never replaces it.
+- name: Download Docker's apt signing key (candidate)
   ansible.builtin.get_url:
     url: "{{ docker_apt_key_url }}"
-    dest: /etc/apt/keyrings/docker.asc
+    dest: "{{ docker_apt_key_candidate }}"
+    force: true
     owner: root
     group: root
-    mode: "0644"
+    mode: "0600"
 
-- name: Read the key's fingerprint
+- name: Read the candidate key's fingerprints
   ansible.builtin.command:
-    argv: [gpg, --show-keys, --with-colons, /etc/apt/keyrings/docker.asc]
+    argv: [gpg, --show-keys, --with-colons, "{{ docker_apt_key_candidate }}"]
   changed_when: false
   check_mode: false
   register: docker_key_info
@@ -56,9 +77,19 @@
       - docker_key_records | select('match', '^pub:') | list | length == 1
       - (docker_key_records | select('match', '^fpr:') | first).split(':')[9] == docker_apt_key_fingerprint
     fail_msg: >-
-      /etc/apt/keyrings/docker.asc is not exactly Docker's signing key
-      {{ docker_apt_key_fingerprint }}; refusing to trust it.
+      The key from {{ docker_apt_key_url }} is not exactly Docker's signing key
+      {{ docker_apt_key_fingerprint }}; refusing to trust it (the keyring is unchanged).
     quiet: true
+  when: not ansible_check_mode
+
+- name: Install the checked key as the trusted keyring
+  ansible.builtin.copy:
+    src: "{{ docker_apt_key_candidate }}"
+    dest: /etc/apt/keyrings/docker.asc
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
   when: not ansible_check_mode
 
 - name: Add Docker's apt repository

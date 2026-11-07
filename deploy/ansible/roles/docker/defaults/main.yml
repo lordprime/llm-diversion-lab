@@ -11,6 +11,8 @@ docker_compose_min_version: "2.24.0"
 docker_apt_key_url: https://download.docker.com/linux/ubuntu/gpg
 # Docker's release signing key (docs.docker.com/engine/install/ubuntu).
 docker_apt_key_fingerprint: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+# Where the downloaded key waits until its fingerprint is checked.
+docker_apt_key_candidate: /var/cache/lab-docker-apt-key.asc
 docker_apt_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}"
 
 docker_held_packages:
@@ -39,3 +41,5 @@ docker_daemon_config:
   ipv6: false
   ip6tables: false
   default-address-pools: "{{ docker_default_address_pools }}"
+  # Upstream resolvers for Docker's embedded DNS (checked: non-loopback IPv4).
+  dns: "{{ lab_upstream_dns }}"

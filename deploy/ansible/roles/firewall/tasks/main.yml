@@ -98,12 +98,13 @@
     mode: "0644"
   notify: Reload systemd
 
-# Its stop action is `nft flush ruleset`, which would also wipe Docker's rules.
-# Only boot-time enablement is turned off; a running instance is left alone.
-- name: Keep the distribution's nftables.service off at boot
+# Its start runs /etc/nftables.conf (`flush ruleset`) and its stop flushes too,
+# either of which would wipe Docker's rules and the lab's. Masked, so nothing can
+# start or restart it; a running instance is not stopped (that would flush).
+- name: Mask the distribution's nftables.service
   ansible.builtin.systemd_service:
     name: nftables
-    enabled: false
+    masked: true
 
 # A failing nft load fails this task, and the play stops before Docker exists.
 - name: Enable and start the lab firewall units

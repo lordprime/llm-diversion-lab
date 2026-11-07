@@ -65,6 +65,13 @@ def _script_env(**extra: str) -> dict[str, str]:
     return env
 
 
+# The same pins as CI (.github/workflows/ci.yml), for the local uvx fallback.
+ANSIBLE_CORE = "ansible-core==2.22.0"
+ANSIBLE_LINT = "ansible-lint==26.11.0"
+SHELLCHECK_PY = "shellcheck-py==0.11.0.1"
+SHFMT_PY = "shfmt-py==4.2.0"
+
+
 @cache
 def _tool(name: str, uvx_from: str) -> tuple[str, ...] | None:
     """The argv prefix for a linter, or None if it is not available offline."""
@@ -111,7 +118,8 @@ def _netns_prefix() -> tuple[str, ...] | None:
         if shutil.which(prefix[0]) is None:
             continue
         try:
-            if _run([*prefix, "true"]).returncode == 0:
+            # Probe with nft itself: a namespace where nft is denied is no use.
+            if _run([*prefix, "nft", "list", "ruleset"]).returncode == 0:
                 return prefix
         except (OSError, subprocess.TimeoutExpired):
             continue
@@ -176,7 +184,7 @@ def test_script_has_help(script: Path, flag: str) -> None:
 
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
 def test_shellcheck_clean(script: Path) -> None:
-    shellcheck = _require_tool("shellcheck", "shellcheck-py")
+    shellcheck = _require_tool("shellcheck", SHELLCHECK_PY)
     result = _run([*shellcheck, "--external-sources", "--severity=style", str(script)], cwd=DEPLOY)
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -187,7 +195,7 @@ def _helper_scripts() -> list[str]:
 
 
 def test_helper_scripts_shellcheck_clean() -> None:
-    shellcheck = _require_tool("shellcheck", "shellcheck-py")
+    shellcheck = _require_tool("shellcheck", SHELLCHECK_PY)
     files = _helper_scripts()
     assert files, "helper scripts expected under deploy/remote and deploy/ansible"
     result = _run([*shellcheck, "--severity=style", *files])
@@ -201,7 +209,7 @@ def test_remote_script_sets_strict_mode(script: Path) -> None:
 
 
 def test_shfmt_formatted() -> None:
-    shfmt = _require_tool("shfmt", "shfmt-py")
+    shfmt = _require_tool("shfmt", SHFMT_PY)
     result = _run([*shfmt, "-d", *(str(p) for p in SCRIPTS), *_helper_scripts()])
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -667,8 +675,44 @@ def test_docker_cannot_start_without_the_host_firewall() -> None:
     # Fail closed: no "-" prefix, so a failing nft load fails the unit (and Docker).
     assert all(not v.startswith("-") for v in firewall["Service.ExecStart"])
     assert firewall["Service.Type"] == ["oneshot"]
-    tasks = (ANSIBLE / "roles" / "firewall" / "tasks" / "main.yml").read_text(encoding="utf-8")
-    assert "/etc/systemd/system/docker.service.d/" in tasks
+    # No ExecStop: with live-restore, cells outlive a stop of the unit, so the table
+    # must stay loaded until reboot or explicit removal.
+    assert "Service.ExecStop" not in firewall
+    tasks = _load_yaml(ANSIBLE / "roles" / "firewall" / "tasks" / "main.yml")
+    text = (ANSIBLE / "roles" / "firewall" / "tasks" / "main.yml").read_text(encoding="utf-8")
+    assert "/etc/systemd/system/docker.service.d/" in text
+    # The distribution nftables.service would `flush ruleset` on (re)start: masked.
+    mask = next(
+        t for t in tasks if t.get("ansible.builtin.systemd_service", {}).get("name") == "nftables"
+    )
+    assert mask["ansible.builtin.systemd_service"]["masked"] is True
+
+
+def test_docker_dns_upstream_is_explicit_and_not_loopback() -> None:
+    # A loopback resolver would make dockerd forward cell DNS from the host netns,
+    # around the forward drop; an explicit upstream keeps it in the container netns.
+    defaults = _load_yaml(ANSIBLE / "roles" / "docker" / "defaults" / "main.yml")
+    assert defaults["docker_daemon_config"]["dns"] == "{{ lab_upstream_dns }}"
+    assert _load_yaml(ANSIBLE / "group_vars" / "all.yml")["lab_upstream_dns"] == []
+    lab1 = _load_yaml(HOSTS_EXAMPLE)["lab1"]
+    assert lab1["vars"]["lab_upstream_dns"] == ["192.168.1.1"]
+    tasks = (ANSIBLE / "roles" / "docker" / "tasks" / "main.yml").read_text(encoding="utf-8")
+    assert "lab_upstream_dns" in tasks
+    assert "127" in tasks  # loopback refused
+
+
+def test_docker_key_is_checked_before_it_is_trusted() -> None:
+    tasks = _load_yaml(ANSIBLE / "roles" / "docker" / "tasks" / "main.yml")
+    names = [str(t.get("name", "")) for t in tasks]
+    download = next(i for i, t in enumerate(tasks) if "ansible.builtin.get_url" in t)
+    assert tasks[download]["ansible.builtin.get_url"]["dest"] != "/etc/apt/keyrings/docker.asc"
+    check = next(i for i, n in enumerate(names) if "exactly Docker's release key" in n)
+    install = next(
+        i
+        for i, t in enumerate(tasks)
+        if t.get("ansible.builtin.copy", {}).get("dest") == "/etc/apt/keyrings/docker.asc"
+    )
+    assert download < check < install
 
 
 def test_status_runs_the_egress_check() -> None:
@@ -727,8 +771,10 @@ printf '%s\\n' "$*" >>"$FAKE_DOCKER_LOG"
 case "$*" in
 *"config --services"*) printf 'db\\napi\\nworker\\nmigrate\\n' ;;
 *"config --images"*) printf '%s\\n' $FAKE_IMAGES ;;
-*"ps --status running --services"*) echo db ;;
+*"config --format json"*) printf '%s\\n' "$FAKE_CONFIG_JSON" ;;
+*"ps --status running --services"*) [[ ${FAKE_DB_DOWN:-0} == 1 ]] || echo db ;;
 *"pg_dump"*) echo DUMPDATA ;;
+*"pg_restore"*) [[ ${FAKE_RESTORE_FAIL:-0} == 1 ]] && exit 1 ;;
 *" up "*) [[ ${FAKE_UP_FAIL:-0} == 1 ]] && exit 1 ;;
 esac
 exit 0
@@ -788,9 +834,25 @@ def test_migrate_stops_writers_then_dumps_then_migrates_without_deps(
     assert (root / "releases" / ".state" / "pending-dump").is_file()
 
 
-def test_rollback_stops_writers_restores_then_swaps_and_starts(
+def test_migrate_refuses_without_a_dump_when_a_release_is_deployed(
     lab_root: tuple[Path, dict[str, str]],
 ) -> None:
+    root, env = lab_root
+    state = root / "releases" / ".state"
+    state.mkdir()
+    (state / "previous").write_text(f"{root}/releases/v0.0.9\n", encoding="utf-8")
+    result = _run(
+        ["bash", str(DEPLOY / "remote" / "release.sh"), "migrate", "v0.1.0"],
+        env={**env, "FAKE_DB_DOWN": "1"},
+    )
+    assert result.returncode != 0
+    assert "pre-migration dump" in result.stderr
+    assert not any("run --rm --no-deps migrate" in line for line in _docker_log(env))
+
+
+@pytest.fixture
+def failed_release(lab_root: tuple[Path, dict[str, str]]) -> tuple[Path, dict[str, str], Path]:
+    """v0.1.0 is current and failed; v0.0.9 is the rollback target; a dump exists."""
     root, env = lab_root
     (root / "current").unlink()
     (root / "current").symlink_to(root / "releases" / "v0.1.0")
@@ -800,15 +862,38 @@ def test_rollback_stops_writers_restores_then_swaps_and_starts(
     dump = root / "backups" / "pre.dump"
     dump.write_text("DUMP", encoding="utf-8")
     (state / "pending-dump").write_text(f"{dump}\n", encoding="utf-8")
+    return root, env, dump
+
+
+def test_rollback_stops_writers_recreates_db_restores_atomically_then_swaps(
+    failed_release: tuple[Path, dict[str, str], Path],
+) -> None:
+    root, env, _ = failed_release
     result = _run(["bash", str(DEPLOY / "remote" / "release.sh"), "rollback"], env=env)
     assert result.returncode == 0, result.stderr
     log = _docker_log(env)
     stop = _first(log, " stop api worker")
-    restore = _first(log, "exec -T db", "pg_restore")
+    recreate = _first(log, "exec -T db", "dropdb", "createdb")
+    restore = _first(log, "exec -T db", "pg_restore", "--single-transaction", "--exit-on-error")
     up = _first(log, " up -d")
-    assert stop < restore < up
+    assert stop < recreate < restore < up
     assert os.readlink(root / "current") == f"{root}/releases/v0.0.9"
-    assert not (state / "pending-dump").exists()
+    assert not (root / "releases" / ".state" / "pending-dump").exists()
+
+
+def test_rollback_restore_failure_names_the_dump_and_the_state(
+    failed_release: tuple[Path, dict[str, str], Path],
+) -> None:
+    root, env, dump = failed_release
+    result = _run(
+        ["bash", str(DEPLOY / "remote" / "release.sh"), "rollback"],
+        env={**env, "FAKE_RESTORE_FAIL": "1"},
+    )
+    assert result.returncode != 0
+    assert str(dump) in result.stderr
+    assert f"current -> {root}/releases/v0.1.0" in result.stderr
+    assert "database:" in result.stderr
+    assert not any(" up -d" in line for line in _docker_log(env)), "no start on a bad restore"
 
 
 def test_rollback_reports_when_the_old_release_cannot_start(
@@ -841,6 +926,30 @@ def test_compose_pull_requires_pinned_images(
     assert (result.returncode == 0) is ok, result.stderr
     if not ok:
         assert "not pinned by digest" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("services", "ok"),
+    [
+        # A built service may carry a local tag; a pulled one must be pinned.
+        (
+            {"api": {"build": {"context": "."}, "image": "lab/api:dev"}, "db": {"image": PINNED}},
+            True,
+        ),
+        ({"api": {"build": {"context": "."}}, "db": {"image": "postgres:17"}}, False),
+    ],
+)
+def test_allow_build_still_requires_pinned_pulled_images(
+    lab_root: tuple[Path, dict[str, str]], services: dict[str, Any], ok: bool
+) -> None:
+    _, env = lab_root
+    result = _run(
+        ["bash", str(DEPLOY / "remote" / "release.sh"), "compose-pull", "v0.1.0", "allow-build"],
+        env={**env, "FAKE_CONFIG_JSON": json.dumps({"services": services})},
+    )
+    assert (result.returncode == 0) is ok, result.stderr
+    if not ok:
+        assert "postgres:17" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -892,7 +1001,7 @@ RENDER_PLAYBOOK = """\
 
 
 def _render_firewall(out: Path, **extra_vars: Any) -> Path:
-    playbook_cmd = _require_tool("ansible-playbook", "ansible-core")
+    playbook_cmd = _require_tool("ansible-playbook", ANSIBLE_CORE)
     out.mkdir(parents=True, exist_ok=True)
     play = out / "render.yml"
     play.write_text(RENDER_PLAYBOOK.format(ansible=ANSIBLE, out=out), encoding="utf-8")
@@ -953,21 +1062,37 @@ def test_host_nft_ruleset_fails_closed_for_cells(firewall_default: Path) -> None
     listing = result.stdout
     assert "elements = { 10.231.0.0/16 }" in listing
 
+    # Strict reverse-path filter on cell bridges, before conntrack (priority raw): a
+    # cell with NET_RAW cannot forge a source that does not route back via its bridge.
+    prerouting = _chain(listing, "prerouting")
+    assert "type filter hook prerouting priority raw" in prerouting[0]
+    _index(prerouting, 'iifname "labc*"', "fib saddr . iif oif missing", "drop")
+
+    # Cells are matched by ingress interface AND by source address.
     forward = _chain(listing, "forward")
     assert "type filter hook forward" in forward[0]
     v6 = _index(forward, "meta nfproto ipv6", "drop")
-    within = _index(forward, "ip saddr @cell_nets", "ip daddr @cell_nets", "accept")
-    log = _index(forward, "ip saddr @cell_nets", 'log prefix "lab-drop')
-    drop = _index(forward, "ip saddr @cell_nets", "counter", "drop")
-    assert v6 < within < log < drop
+    within = _index(
+        forward,
+        'iifname "labc*" oifname "labc*"',
+        "ip saddr @cell_nets ip daddr @cell_nets",
+        "accept",
+    )
+    log = _index(forward, 'iifname "labc*"', 'log prefix "lab-drop')
+    drop_iface = _index(forward, 'iifname "labc*"', "counter", "drop")
+    drop_addr = _index(forward, "ip saddr @cell_nets", "counter", "drop", "off a cell bridge")
+    assert v6 < within < log < drop_iface < drop_addr
+    assert not any("accept" in r and "labc" not in r for r in forward[1:]), "accepts are per-bridge"
     assert not any("172.20.0.10" in r for r in forward), "no gateway exception by default"
 
     inbound = _chain(listing, "input")
     assert "policy drop" in inbound[0]
-    cell_in = _index(inbound, "ip saddr @cell_nets", "drop")
+    v6_in = _index(inbound, "meta nfproto ipv6", "drop")
+    cell_iface = _index(inbound, 'iifname "labc*"', "counter", "drop")
+    cell_addr = _index(inbound, "ip saddr @cell_nets", "counter", "drop")
     established = _index(inbound, "ct state established,related accept")
     ssh = _index(inbound, "tcp dport")
-    assert cell_in < established < ssh, "cells are dropped before anything is accepted"
+    assert v6_in < cell_iface < cell_addr < established < ssh, "drops before any accept"
     assert any('log prefix "lab-drop' in r for r in inbound)
 
 
@@ -975,8 +1100,10 @@ def test_host_nft_gateway_exception(firewall_gateway: Path) -> None:
     result = _in_netns("nft --file host.nft && nft list table inet lab_host", firewall_gateway)
     assert result.returncode == 0, result.stderr
     forward = _chain(result.stdout, "forward")
-    gateway = _index(forward, "ip saddr @cell_nets", "172.20.0.10", "dport 4000", "accept")
-    drop = _index(forward, "ip saddr @cell_nets", "counter", "drop")
+    gateway = _index(
+        forward, 'iifname "labc*"', "ip saddr @cell_nets", "172.20.0.10", "dport 4000", "accept"
+    )
+    drop = _index(forward, 'iifname "labc*"', "counter", "drop")
     assert gateway < drop
 
 
@@ -997,18 +1124,33 @@ def test_docker_user_layer_applies_atomically_and_idempotently(firewall_gateway:
     assert result.returncode == 0, result.stdout + result.stderr
     rules = [r for r in result.stdout.splitlines() if r.startswith("-A DOCKER-USER")]
     tag = "-m comment --comment lab-cell-egress"
-    gateway = "-d 172.20.0.10/32 -p tcp -m tcp --dport 4000"
+    cells = ("10.231.0.0/16", "10.232.0.0/16")
     expected = []
-    for src in ("10.231.0.0/16", "10.232.0.0/16"):
-        expected += [
-            f"-A DOCKER-USER -s {src} -d 10.231.0.0/16 {tag} -j RETURN",
-            f"-A DOCKER-USER -s {src} -d 10.232.0.0/16 {tag} -j RETURN",
-            f"-A DOCKER-USER -s {src} {gateway} {tag} -j RETURN",
-            f"-A DOCKER-USER -s {src} {tag} -j DROP",
-        ]
+    # Accepts are per cell bridge (ingress interface labc*) AND per cell address.
+    for src in cells:
+        for dst in cells:
+            expected.append(f"-A DOCKER-USER -s {src} -d {dst} -i labc+ -o labc+ {tag} -j RETURN")
+        expected.append(
+            f"-A DOCKER-USER -s {src} -d 172.20.0.10/32 -i labc+ -p tcp -m tcp --dport 4000"
+            f" {tag} -j RETURN"
+        )
+    expected.append(f"-A DOCKER-USER -i labc+ {tag} -j DROP")
+    expected += [f"-A DOCKER-USER -s {src} {tag} -j DROP" for src in cells]
     # The stale ACCEPT rule is gone and nothing is duplicated after two applies.
     assert rules == [*expected, "-A DOCKER-USER -j RETURN"]
     assert "OK: cell egress rules" in result.stdout
+
+
+def test_egress_check_detects_a_changed_docker_user_chain(firewall_default: Path) -> None:
+    script = (
+        "nft --file host.nft && iptables -N DOCKER-USER && iptables -A FORWARD -j DOCKER-USER"
+        " && bash lab-cell-egress.sh apply"
+        " && iptables -R DOCKER-USER 1 -s 10.231.0.0/16 -j ACCEPT"
+        " && bash lab-cell-egress.sh check"
+    )
+    result = _in_netns(script, firewall_default)
+    assert result.returncode != 0
+    assert "DOCKER-USER differs" in result.stderr
 
 
 def test_egress_check_fails_without_the_host_table(firewall_default: Path) -> None:
@@ -1049,14 +1191,14 @@ def test_inventory_rendered_from_hosts_example(rendered_inventory: Path) -> None
 
 
 def test_ansible_syntax_check(rendered_inventory: Path) -> None:
-    playbook = _require_tool("ansible-playbook", "ansible-core")
+    playbook = _require_tool("ansible-playbook", ANSIBLE_CORE)
     env = dict(os.environ, ANSIBLE_CONFIG=str(ANSIBLE / "ansible.cfg"))
     result = _run([*playbook, "--syntax-check", "-i", str(rendered_inventory), str(SITE)], env=env)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_ansible_lint_clean() -> None:
-    lint = _require_tool("ansible-lint", "ansible-lint")
+    lint = _require_tool("ansible-lint", ANSIBLE_LINT)
     env = dict(os.environ, ANSIBLE_CONFIG=str(ANSIBLE / "ansible.cfg"))
     result = _run([*lint, "--offline", "-c", str(ANSIBLE / ".ansible-lint"), str(ANSIBLE)], env=env)
     assert result.returncode == 0, result.stdout + result.stderr
