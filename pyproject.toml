@@ -18,6 +18,12 @@ dependencies = [
     "psycopg[binary]>=3",
 ]
 
+[project.optional-dependencies]
+# In-cell components (LLM tap, surface injector). The control plane never imports these.
+cell = [
+    "mitmproxy==12.3.1",
+]
+
 [dependency-groups]
 dev = [
     "ruff",
