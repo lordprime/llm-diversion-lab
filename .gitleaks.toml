@@ -11,4 +11,7 @@ regexes = [
   '''abcdefgh2345''',
   '''zzzzzz777777''',
   '''probe-secret-[0-9a-f]+''',
+  # AWS's own documentation example secret key, used by the log-redaction tests.
+  '''wJalrXUtnFEMI/K7MDENG/''',
+  '''bPxRfiCYEXAMPLEKEY''',
 ]
