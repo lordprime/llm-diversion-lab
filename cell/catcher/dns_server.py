@@ -9,8 +9,14 @@ qname exactly as received (case kept, trailing dot), the qtype name (``A``,
 * an ``A`` (or ``ANY``) question with ``LAB_CATCHER_IP`` if it is IPv4, an ``AAAA``
   (or ``ANY``) question with it if it is IPv6, TTL 0;
 * any other question with an empty ``NOERROR``;
-* a packet with no question with ``FORMERR`` (nothing to record). Packets dnslib
-  cannot parse never reach the resolver; dnslib logs them as errors.
+* a packet with no question with ``FORMERR`` (nothing to record);
+* a packet dnslib refuses to parse (e.g. a label that is not valid UTF-8, such as
+  ``\\xff.cb.lab.test``) with ``FORMERR`` carrying the request id, after
+  :class:`LenientDNSHandler` has parsed its first question leniently from the wire
+  (:func:`lenient_question`; non-printable bytes rendered as ``\\DDD``, dnslib's own
+  escaping) and recorded it. Only packets without even a readable first question
+  (truncated header or name, compression pointer in the name, no qtype) stay
+  unrecorded; dnslib logs those as errors.
 
 The token is extracted from any label after lowercasing the qname, because resolvers
 may randomise case (0x20 encoding); it is set only if it verifies against the run's
@@ -30,11 +36,24 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import struct
 from datetime import UTC, datetime
 from functools import partial
 from typing import Any, Final
 
-from dnslib import AAAA, QTYPE, RCODE, RR, A  # type: ignore[import-untyped]
+from dnslib import (  # type: ignore[import-untyped]
+    AAAA,
+    QTYPE,
+    RCODE,
+    RR,
+    A,
+    DNSError,
+    DNSHeader,
+    DNSLabel,
+    DNSRecord,
+)
+from dnslib.buffer import BufferError as DNSBufferError  # type: ignore[import-untyped]
+from dnslib.server import DNSHandler, DNSLogger, DNSServer  # type: ignore[import-untyped]
 
 from cell.catcher.callback_log import (
     CATCHER_DNS_STREAM,
@@ -50,8 +69,10 @@ __all__ = [
     "DNS_TTL",
     "CatcherIp",
     "CatcherResolver",
+    "LenientDNSHandler",
     "answer",
     "dns_callback",
+    "lenient_question",
     "main",
     "parse_catcher_ip",
 ]
@@ -91,6 +112,41 @@ def answer(request: Any, catcher_ip: CatcherIp) -> Any:
         if question.qtype in wanted:
             reply.add_answer(RR(question.qname, rtype, rdata=rdata, ttl=DNS_TTL))
     return reply
+
+
+def lenient_question(data: bytes) -> tuple[int, str, int] | None:
+    """``(id, qname, qtype)`` of a packet's first question, read straight from the wire.
+
+    Unlike dnslib it accepts any label bytes; the qname is rendered with dnslib's own
+    escaping (printable ASCII kept, every other byte as ``\\DDD``) and a trailing dot.
+    Returns ``None`` if there is no question or it cannot be read: a short header, a
+    truncated name or qtype, or a compression pointer (never valid in a first question).
+    """
+    if len(data) < 12:
+        return None
+    qid, _flags, qdcount = struct.unpack("!HHH", data[:6])
+    if qdcount == 0:
+        return None
+    labels: list[bytes] = []
+    offset = 12
+    while True:
+        if offset >= len(data):
+            return None
+        length = data[offset]
+        offset += 1
+        if length == 0:
+            break
+        if length & 0xC0:
+            return None
+        label = data[offset : offset + length]
+        if len(label) < length:
+            return None
+        labels.append(label)
+        offset += length
+    if offset + 2 > len(data):
+        return None
+    (qtype,) = struct.unpack("!H", data[offset : offset + 2])
+    return qid, str(DNSLabel(labels)), qtype
 
 
 def dns_callback(
@@ -142,29 +198,70 @@ class CatcherResolver:
     def log(self) -> CallbackLog:
         return self._log
 
+    def record_question(
+        self, qname: str, qtype: str, source_ip: str | None, ts: datetime
+    ) -> Callback:
+        """Record one question on the ``catcher-dns`` stream (raises if it cannot)."""
+        return self._log.record(
+            partial(
+                dns_callback,
+                run_id=self._config.run_id,
+                ts=ts,
+                qname=qname,
+                qtype=qtype,
+                source_ip=source_ip,
+                tokens=self._config.tokens,
+            )
+        )
+
     def resolve(self, request: Any, handler: Any) -> Any:
         ts = datetime.now(UTC)
         source_ip = _source_ip(handler)
         for question in request.questions:
-            self._log.record(
-                partial(
-                    dns_callback,
-                    run_id=self._config.run_id,
-                    ts=ts,
-                    qname=str(question.qname),
-                    qtype=qtype_name(question.qtype),
-                    source_ip=source_ip,
-                    tokens=self._config.tokens,
-                )
-            )
+            self.record_question(str(question.qname), qtype_name(question.qtype), source_ip, ts)
         return answer(request, self._ip)
+
+    def reply_unparsable(self, data: bytes, handler: Any) -> bytes | None:
+        """Record a packet dnslib cannot parse and return a ``FORMERR`` for it.
+
+        ``None`` if not even its first question can be read (nothing is recorded).
+        """
+        parsed = lenient_question(data)
+        if parsed is None:
+            return None
+        qid, qname, qtype = parsed
+        self.record_question(qname, qtype_name(qtype), _source_ip(handler), datetime.now(UTC))
+        reply = DNSRecord(DNSHeader(id=qid, qr=1, aa=1, ra=1, rcode=RCODE.FORMERR))
+        packed: bytes = reply.pack()
+        return packed
+
+
+class LenientDNSHandler(DNSHandler):  # type: ignore[misc]
+    """dnslib request handler that also records packets dnslib refuses to parse.
+
+    dnslib rejects any label that is not valid UTF-8 before the resolver runs; this
+    handler catches that, records the question via
+    :meth:`CatcherResolver.reply_unparsable` and answers ``FORMERR``.
+    """
+
+    def get_reply(self, data: bytes) -> bytes:
+        try:
+            DNSRecord.parse(data)
+        except (DNSError, DNSBufferError):
+            resolver = self.server.resolver
+            if isinstance(resolver, CatcherResolver):
+                reply = resolver.reply_unparsable(data, self)
+                if reply is not None:
+                    return reply
+            raise
+        packed: bytes = super().get_reply(data)
+        return packed
 
 
 # --------------------------------------------------------------------------- entrypoint
 
 
 def main() -> None:  # pragma: no cover - exercised in the cell, not in unit tests
-    from dnslib.server import DNSLogger, DNSServer  # type: ignore[import-untyped]
 
     config = CatcherConfig.from_env(os.environ)
     ip = parse_catcher_ip(os.environ.get("LAB_CATCHER_IP"))
@@ -172,8 +269,10 @@ def main() -> None:  # pragma: no cover - exercised in the cell, not in unit tes
     bind = os.environ.get("LAB_CATCHER_BIND", "")
     resolver = CatcherResolver(config, ip)
     logger = DNSLogger("-request,-reply")  # the JSONL is the record; keep errors
-    tcp = DNSServer(resolver, port=port, address=bind, logger=logger, tcp=True)
-    udp = DNSServer(resolver, port=port, address=bind, logger=logger)
+    tcp = DNSServer(
+        resolver, port=port, address=bind, logger=logger, tcp=True, handler=LenientDNSHandler
+    )
+    udp = DNSServer(resolver, port=port, address=bind, logger=logger, handler=LenientDNSHandler)
     tcp.start_thread()
     udp.start()
 

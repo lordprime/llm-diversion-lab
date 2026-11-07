@@ -3,11 +3,19 @@
 Any method, any path, any Host. For every request it records, on stream
 ``catcher-http`` (:mod:`cell.catcher.callback_log`), one :class:`Callback` with the
 method, the request target exactly as sent (raw path plus ``?query``) in ``url``, the
-query string, the Host, the ordered raw header list, the body (base64) and the
-source IP, and only then answers with one fixed, neutral response, identical across
+query string, the Host, the ordered raw header list, the body and the source IP, and
+only then answers with one fixed, neutral response, identical across
 arms: ``200`` ``{"ok":true}`` (``content-type: application/json``). A WebSocket
 handshake is recorded the same way (method ``GET``) and answered with the same
 response where the server supports it, else closed.
+
+Bodies are bounded: at most :data:`MAX_INLINE_BODY` (64 KiB) is kept inline
+(``body_b64``); the rest is read and discarded, while ``body_size`` and
+``body_sha256`` are computed over the *whole* body and ``body_truncated`` records the
+cut. Token search sees only the inline part. Together with uvicorn's
+``limit_concurrency`` (:data:`LIMIT_CONCURRENCY`; excess connections get 503) this
+bounds memory, so an agent "exfiltrating a dump" to the lab URL is recorded instead of
+getting the catcher OOM-killed.
 
 ``token``/``placement_id`` are set only when a well-formed token verifies against the
 run's manifest (:meth:`~cell.catcher.classify.TokenIndex.find`). Texts are searched in
@@ -32,6 +40,7 @@ all interfaces).
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import socket
 from dataclasses import dataclass
@@ -56,8 +65,12 @@ __all__ = [
     "FIXED_BODY",
     "FIXED_HEADERS",
     "FIXED_STATUS",
+    "LIMIT_CONCURRENCY",
+    "MAX_INLINE_BODY",
+    "BodyReader",
     "CatcherApp",
     "HttpContact",
+    "ReceivedBody",
     "contact_from_scope",
     "http_callback",
     "main",
@@ -71,6 +84,51 @@ FIXED_HEADERS: Final = (
     (b"content-type", b"application/json"),
     (b"content-length", str(len(FIXED_BODY)).encode("ascii")),
 )
+#: Most body bytes kept inline per request; the rest is hashed, counted and dropped.
+MAX_INLINE_BODY: Final = 64 * 1024
+#: uvicorn ``limit_concurrency``: worst-case inline memory is about cap x this.
+LIMIT_CONCURRENCY: Final = 64
+
+
+@dataclass(frozen=True, slots=True)
+class ReceivedBody:
+    """A request body as recorded: the inline prefix plus size and hash of the whole."""
+
+    inline: bytes
+    size: int
+    sha256: str
+
+    @property
+    def truncated(self) -> bool:
+        return self.size > len(self.inline)
+
+    @classmethod
+    def of(cls, data: bytes, cap: int = MAX_INLINE_BODY) -> ReceivedBody:
+        reader = BodyReader(cap)
+        reader.feed(data)
+        return reader.result()
+
+
+class BodyReader:
+    """Incrementally keeps the first ``cap`` bytes and hashes/counts all of them."""
+
+    def __init__(self, cap: int = MAX_INLINE_BODY) -> None:
+        if cap < 0:
+            raise ValueError("cap must be non-negative")
+        self._cap = cap
+        self._inline = bytearray()
+        self._size = 0
+        self._sha = hashlib.sha256()
+
+    def feed(self, chunk: bytes) -> None:
+        self._size += len(chunk)
+        self._sha.update(chunk)
+        room = self._cap - len(self._inline)
+        if room > 0:
+            self._inline += chunk[:room]
+
+    def result(self) -> ReceivedBody:
+        return ReceivedBody(bytes(self._inline), self._size, self._sha.hexdigest())
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +142,7 @@ class HttpContact:
     query: str | None
     host: str | None
     headers: tuple[tuple[str, str], ...]
-    body: bytes
+    body: ReceivedBody
     source_ip: str | None
 
 
@@ -94,7 +152,7 @@ def _latin1(value: object) -> str:
     return str(value)
 
 
-def contact_from_scope(scope: Scope, body: bytes, ts: datetime) -> HttpContact:
+def contact_from_scope(scope: Scope, body: ReceivedBody, ts: datetime) -> HttpContact:
     """Build an :class:`HttpContact` from an ASGI ``http``/``websocket`` scope (pure)."""
     raw_path = scope.get("raw_path")
     path = _latin1(raw_path) if raw_path else str(scope.get("path") or "/")
@@ -116,12 +174,12 @@ def contact_from_scope(scope: Scope, body: bytes, ts: datetime) -> HttpContact:
 
 
 def http_callback(contact: HttpContact, seq: int, *, run_id: str, tokens: TokenIndex) -> Callback:
-    """The :class:`Callback` event for one request (pure)."""
+    """The :class:`Callback` event for one request (pure; tokens from the inline body)."""
     texts = [
         contact.path,
         contact.host or "",
         contact.query or "",
-        contact.body.decode("utf-8", errors="replace"),
+        contact.body.inline.decode("utf-8", errors="replace"),
         *(value for _, value in contact.headers),
     ]
     match = tokens.find(texts)
@@ -139,27 +197,38 @@ def http_callback(contact: HttpContact, seq: int, *, run_id: str, tokens: TokenI
         host=contact.host,
         headers=list(contact.headers),
         query=contact.query,
-        body_b64=base64.b64encode(contact.body).decode("ascii"),
+        body_b64=base64.b64encode(contact.body.inline).decode("ascii"),
+        body_size=contact.body.size,
+        body_sha256=contact.body.sha256,
+        body_truncated=contact.body.truncated,
     )
 
 
-async def _read_body(receive: Receive) -> bytes:
-    chunks: list[bytes] = []
+async def _read_body(receive: Receive, cap: int) -> ReceivedBody:
+    """Read the whole body, keeping at most ``cap`` bytes (a disconnect ends it early)."""
+    reader = BodyReader(cap)
     while True:
         message = await receive()
         if message["type"] == "http.disconnect":
             break
-        chunks.append(message.get("body", b""))
+        reader.feed(message.get("body", b""))
         if not message.get("more_body", False):
             break
-    return b"".join(chunks)
+    return reader.result()
 
 
 class CatcherApp:
     """The catch-all ASGI application for one run."""
 
-    def __init__(self, config: CatcherConfig, log: CallbackLog | None = None) -> None:
+    def __init__(
+        self,
+        config: CatcherConfig,
+        log: CallbackLog | None = None,
+        *,
+        max_inline_body: int = MAX_INLINE_BODY,
+    ) -> None:
         self._config = config
+        self._cap = max_inline_body
         self._log = log or CallbackLog(
             config.run_id, CATCHER_HTTP_STREAM, config.evidence_dir / HTTP_EVENTS_FILE
         )
@@ -174,7 +243,7 @@ class CatcherApp:
             await self._lifespan(receive, send)
         elif kind == "http":
             ts = datetime.now(UTC)
-            body = await _read_body(receive)
+            body = await _read_body(receive, self._cap)
             await self._record(contact_from_scope(scope, body, ts))
             await send(
                 {"type": "http.response.start", "status": FIXED_STATUS, "headers": FIXED_HEADERS}
@@ -183,7 +252,7 @@ class CatcherApp:
         elif kind == "websocket":
             ts = datetime.now(UTC)
             await receive()  # websocket.connect
-            await self._record(contact_from_scope(scope, b"", ts))
+            await self._record(contact_from_scope(scope, ReceivedBody.of(b""), ts))
             if "websocket.http.response" in (scope.get("extensions") or {}):
                 await send(
                     {
@@ -239,6 +308,7 @@ def main() -> None:  # pragma: no cover - exercised in the cell, not in unit tes
             CatcherApp(config),
             lifespan="on",
             proxy_headers=False,  # record the real peer, never X-Forwarded-For
+            limit_concurrency=LIMIT_CONCURRENCY,  # bounds memory: ~cap x concurrency
             server_header=False,
             access_log=False,
             log_level="info",

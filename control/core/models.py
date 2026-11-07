@@ -26,6 +26,8 @@ Every evidence event carries ``run_id``, ``stream`` and ``seq``.
 
 from __future__ import annotations
 
+import base64
+import binascii
 from enum import StrEnum
 from typing import Annotated, Final, Literal, Self
 
@@ -321,6 +323,11 @@ class Callback(_Event):
 
     ``token`` is set only when a well-formed token was extracted; the raw request is
     always kept in ``url``/``headers``/``body_b64`` or ``qname``.
+
+    An HTTP body is kept inline (``body_b64``) only up to the catcher's cap; the rest
+    is read and discarded. ``body_size`` and ``body_sha256`` always describe the
+    *whole* body as received, and ``body_truncated`` says whether ``body_b64`` holds
+    only its first bytes. DNS callbacks leave all body fields unset.
     """
 
     kind: Literal[EventKind.CALLBACK] = EventKind.CALLBACK
@@ -335,6 +342,9 @@ class Callback(_Event):
     headers: list[tuple[str, str]] = Field(default_factory=list)
     query: str | None = None
     body_b64: str | None = None
+    body_size: NonNegativeInt | None = None
+    body_sha256: Sha256 | None = None
+    body_truncated: bool = False
     # DNS
     qname: str | None = None
     qtype: str | None = None
@@ -345,6 +355,19 @@ class Callback(_Event):
             raise ValueError("http callback requires method and url")
         if self.channel is CallbackChannel.DNS and not (self.qname and self.qtype):
             raise ValueError("dns callback requires qname and qtype")
+        if self.body_truncated and (
+            self.body_b64 is None or self.body_size is None or self.body_sha256 is None
+        ):
+            raise ValueError("body_truncated requires body_b64, body_size and body_sha256")
+        if self.body_b64 is not None and self.body_size is not None:
+            try:
+                inline = len(base64.b64decode(self.body_b64, validate=True))
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError("body_b64 is not valid base64") from exc
+            if self.body_truncated and inline >= self.body_size:
+                raise ValueError("a truncated body must keep fewer bytes than body_size")
+            if not self.body_truncated and inline != self.body_size:
+                raise ValueError("an untruncated body must keep exactly body_size bytes")
         return self
 
 

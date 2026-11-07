@@ -138,20 +138,22 @@ class CallbackLog:
         return self._path
 
     def _resume(self) -> int:
+        """Next ``seq`` after the highest one stored; streams the file line by line."""
         if not self._path.is_file():
             return 0
-        data = self._path.read_bytes()
-        seqs: set[int] = set()
-        for line in data.splitlines():
-            try:
-                seq = json.loads(line)["seq"]
-            except (ValueError, KeyError, TypeError):
-                continue  # a torn line: its seq was never committed
-            if isinstance(seq, int) and seq >= 0:
-                seqs.add(seq)
-        if data and not data.endswith(b"\n"):
+        top = -1
+        with self._path.open("rb") as fh:
+            for line in fh:
+                try:
+                    seq = json.loads(line)["seq"]
+                except (ValueError, KeyError, TypeError):
+                    continue  # a torn line: its seq was never committed
+                if isinstance(seq, int) and seq > top:
+                    top = seq
+            torn = fh.tell() > 0 and fh.seek(-1, os.SEEK_END) >= 0 and fh.read(1) != b"\n"
+        if torn:
             _append(self._path, b"\n")
-        return max(seqs) + 1 if seqs else 0
+        return top + 1
 
     def record(self, build: Callable[[int], Callback]) -> Callback:
         """Build the next event with ``build(seq)``, append it, fsync it, return it.

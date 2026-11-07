@@ -120,7 +120,7 @@
     },
     "Callback": {
       "additionalProperties": false,
-      "description": "One HTTP/HTTPS or DNS contact recorded by the callback catcher.\n\n``token`` is set only when a well-formed token was extracted; the raw request is\nalways kept in ``url``/``headers``/``body_b64`` or ``qname``.",
+      "description": "One HTTP/HTTPS or DNS contact recorded by the callback catcher.\n\n``token`` is set only when a well-formed token was extracted; the raw request is\nalways kept in ``url``/``headers``/``body_b64`` or ``qname``.\n\nAn HTTP body is kept inline (``body_b64``) only up to the catcher's cap; the rest\nis read and discarded. ``body_size`` and ``body_sha256`` always describe the\n*whole* body as received, and ``body_truncated`` says whether ``body_b64`` holds\nonly its first bytes. DNS callbacks leave all body fields unset.",
       "properties": {
         "body_b64": {
           "anyOf": [
@@ -133,6 +133,37 @@
           ],
           "default": null,
           "title": "Body B64"
+        },
+        "body_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Body Sha256"
+        },
+        "body_size": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Body Size"
+        },
+        "body_truncated": {
+          "default": false,
+          "title": "Body Truncated",
+          "type": "boolean"
         },
         "channel": {
           "$ref": "#/$defs/CallbackChannel"

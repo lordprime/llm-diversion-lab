@@ -458,6 +458,12 @@ class Callback(EventRow):
     )
     query: Mapped[str | None] = mapped_column(Text)
     body_b64: Mapped[str | None] = mapped_column(Text)
+    #: total bytes received and sha256 of the whole body; ``body_b64`` may hold a prefix
+    body_size: Mapped[int | None] = mapped_column(BigInteger)
+    body_sha256: Mapped[str | None] = mapped_column(_SHA256)
+    body_truncated: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
     qname: Mapped[str | None] = mapped_column(Text)
     qtype: Mapped[str | None] = mapped_column(String(16))
 

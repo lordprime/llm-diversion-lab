@@ -1,3 +1,5 @@
+import base64
+import hashlib
 from datetime import UTC, datetime
 from typing import Any
 
@@ -287,6 +289,31 @@ def test_callback_dns_requires_qname() -> None:
     assert ok.qname == f"{TOKEN}.cb.lab.test"
     with pytest.raises(ValidationError):
         Callback.model_validate(base)
+
+
+def test_callback_body_bounds_consistent() -> None:
+    full = b"0123456789"
+    sha = hashlib.sha256(full).hexdigest()
+    base = dict(EVENT_FIXTURES[Callback])
+    whole = {**base, "body_b64": base64.b64encode(full).decode(), "body_size": 10}
+    truncated = {**base, "body_b64": base64.b64encode(full[:4]).decode(), "body_size": 10}
+    ok = Callback.model_validate({**whole, "body_sha256": sha})
+    assert (ok.body_size, ok.body_truncated) == (10, False)
+    cut = Callback.model_validate({**truncated, "body_sha256": sha, "body_truncated": True})
+    assert cut.body_truncated
+    assert Callback.model_validate(base).body_size is None  # older/DNS-style: unset
+    bad = [
+        {**truncated, "body_sha256": sha},  # prefix but not marked truncated
+        {**whole, "body_sha256": sha, "body_truncated": True},  # marked but whole
+        {**truncated, "body_truncated": True},  # truncated without sha256
+        {**base, "body_b64": None, "body_size": 10, "body_sha256": sha, "body_truncated": True},
+        {**whole, "body_sha256": "nothex"},
+        {**whole, "body_size": -1},
+        {**whole, "body_b64": "!!notbase64!!"},
+    ]
+    for doc in bad:
+        with pytest.raises(ValidationError):
+            Callback.model_validate(doc)
 
 
 def test_funnel_label_constructs() -> None:
