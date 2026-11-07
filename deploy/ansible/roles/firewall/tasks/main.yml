@@ -15,6 +15,26 @@
 # table atomically). `restart` would also restart Docker, through its Requires=.
 # The Proxmox firewall on the container (internet only, never the LAN) is the manual
 # step in §0.1; `labctl doctor` (not built in M0; Task 14b/15b) is to verify it.
+# The cell networks are checked against the host's own addresses and routes, so they
+# are read first (cell bridges, labc*, are skipped: their gateway address is in a
+# cell network by design, and they exist on a re-run).
+- name: Read the host's IPv4 addresses
+  ansible.builtin.command:
+    argv: [ip, -j, "-4", address, show]
+  changed_when: false
+  check_mode: false
+  register: firewall_host_addresses
+
+- name: Read the host's IPv4 routes
+  ansible.builtin.command:
+    argv: [ip, -j, "-4", route, show]
+  changed_when: false
+  check_mode: false
+  register: firewall_host_routes
+
+# Each cell network: an IPv4 network without host bits, private (RFC 1918), at most a
+# /16, overlapping no other cell network, and not covering any address of the host,
+# any route gateway (the LAN gateway) or any network the host is attached to.
 - name: Check the cell networks are IPv4 networks without host bits
   ansible.builtin.command:
     argv:
@@ -23,17 +43,51 @@
       - -c
       - |
         import ipaddress, json, sys
-        nets = json.loads(sys.argv[1])
+        nets, links, routes = (json.loads(arg) for arg in sys.argv[1:4])
         if not isinstance(nets, list) or not nets:
             sys.exit("lab_cell_networks must be a non-empty list")
+        private = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+        cells = []
         for net in nets:
+            if not isinstance(net, str):
+                sys.exit(f"lab_cell_networks: {net!r} is not a CIDR string")
             try:
                 parsed = ipaddress.ip_network(net, strict=True)
             except (TypeError, ValueError) as exc:
                 sys.exit(f"lab_cell_networks: {net!r} is not a network without host bits: {exc}")
             if parsed.version != 4:
                 sys.exit(f"lab_cell_networks: {net!r} is not IPv4 (IPv6 is off in the lab)")
+            if not any(parsed.subnet_of(p) for p in private):
+                sys.exit(f"lab_cell_networks: {net} is not a private (RFC 1918) network")
+            if parsed.prefixlen < 16:
+                sys.exit(f"lab_cell_networks: {net} is larger than a /16")
+            for other in cells:
+                if parsed.overlaps(other):
+                    sys.exit(f"lab_cell_networks: {net} overlaps {other}")
+            cells.append(parsed)
+        host = []
+        try:
+            for link in links:
+                if link["ifname"].startswith("labc"):
+                    continue
+                for addr in link.get("addr_info", []):
+                    host.append((f"address of {link['ifname']}", ipaddress.ip_network(addr["local"])))
+            for route in routes:
+                if route.get("dev", "").startswith("labc"):
+                    continue
+                if "gateway" in route:
+                    host.append((f"gateway via {route.get('dev')}", ipaddress.ip_network(route["gateway"])))
+                if route.get("scope") == "link" and route.get("dst") != "default":
+                    host.append((f"network on {route.get('dev')}", ipaddress.ip_network(route["dst"], strict=False)))
+        except (KeyError, TypeError, AttributeError, ValueError) as exc:
+            sys.exit(f"cannot read the host's addresses and routes: {exc!r}")
+        for cell in cells:
+            for what, net in host:
+                if net.version == 4 and cell.overlaps(net):
+                    sys.exit(f"lab_cell_networks: {cell} covers {net} ({what}) on this host")
       - "{{ lab_cell_networks | to_json }}"
+      - "{{ firewall_host_addresses.stdout | from_json | to_json }}"
+      - "{{ firewall_host_routes.stdout | from_json | to_json }}"
   changed_when: false
   check_mode: false
 

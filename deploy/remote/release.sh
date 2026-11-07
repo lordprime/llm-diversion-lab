@@ -156,21 +156,29 @@ cmd_begin() {
 	echo "rollback target: $(<"$STATE/previous")"
 }
 
+# in_subshell: true inside $(...) or ( ... ). With errtrace (set -E) an ERR trap also
+# fires there; the failure then reaches the main shell, whose trap reports it once.
+in_subshell() {
+	[[ $BASHPID != "$$" ]]
+}
+
 MG_DUMP="(none)"
+MG_DB="untouched (the migration has not started)"
 
 # migrate_fail LINE: the ERR trap of cmd_migrate; release.sh then rolls back.
 migrate_fail() {
+	in_subshell && exit 1
 	{
 		printf 'ERROR: migrate failed (line %s)\n' "$1"
 		printf '  current -> %s\n' "$(readlink "$LAB/current" 2>/dev/null || echo '(none)')"
 		printf '  pre-migration dump: %s\n' "$MG_DUMP"
-		printf '  database: may be partly migrated; release.sh rolls back from the dump\n'
+		printf '  database: %s\n' "$MG_DB"
 	} >&2
 	exit 1
 }
 
 cmd_migrate() {
-	local tree dump services
+	local tree dump services db_up=false
 	trap 'migrate_fail $LINENO' ERR
 	tree=$(release_tree "$1")
 	mkdir -p "$STATE"
@@ -179,8 +187,13 @@ cmd_migrate() {
 		echo "this release has no 'migrate' service: no migrations to run"
 		return 0
 	fi
-	stop_writers
 	if compose "$tree" ps --status running --services | grep -qx db; then
+		db_up=true
+		# Before anything stops: a rollback must be possible for this database.
+		compose "$tree" exec -T db sh -c "$NAME_CHECK_DB" </dev/null
+	fi
+	stop_writers
+	if $db_up; then
 		dump=$LAB/backups/pre-$1-$(date -u +%Y%m%dT%H%M%SZ).dump
 		MG_DUMP="$dump (being written)"
 		# shellcheck disable=SC2016 # expanded inside the db container, not here
@@ -195,6 +208,11 @@ cmd_migrate() {
 	else
 		echo "database not running yet (first deploy): no pre-migration dump"
 		compose "$tree" up -d "${WAIT[@]}" db
+	fi
+	if [[ -n ${dump:-} ]]; then
+		MG_DB="may be partly migrated; release.sh rolls back from the dump"
+	else
+		MG_DB="may be partly migrated (first deploy: there is no dump to roll back from)"
 	fi
 	compose "$tree" run --rm --no-deps migrate
 }
@@ -221,6 +239,7 @@ RB_DB="untouched (no pre-migration dump for this release)"
 RB_DUMP=""
 
 rollback_fail() {
+	in_subshell && exit 1
 	{
 		printf 'ERROR: rollback failed: %s\n' "$*"
 		printf '  current -> %s\n' "$(readlink "$LAB/current" 2>/dev/null || echo '(none)')"
@@ -230,16 +249,25 @@ rollback_fail() {
 	exit 1
 }
 
-# The live database is never touched until a restore has succeeded:
+# The live database is never dropped, and a database always exists under its name:
+# 0. NAME      ${POSTGRES_DB} is at most 59 bytes, so ${POSTGRES_DB}_rb and _old (63
+#              bytes at most) are never truncated by PostgreSQL onto the live name;
 # 1. PRECHECK  `pg_restore --list` reads the whole dump's table of contents;
 # 2. SCRATCH   create ${POSTGRES_DB}_rb with CONNECTION LIMIT 0 (no app can use it;
 #              the superuser restoring it is exempt);
 # 3. RESTORE   into the scratch database, in ONE transaction that stops at the
 #              first error (on failure the scratch database is dropped again);
-# 4. SWAP      drop the live database (WITH (FORCE) ends any connection), rename the
-#              scratch one into its place and lift the connection limit.
-# Each snippet runs inside the db container (official postgres image), where
-# POSTGRES_USER and POSTGRES_DB are set; psql variables quote the identifiers.
+# 4. SWAP      in ONE transaction: end the live database's connections, rename it to
+#              ${POSTGRES_DB}_old, rename the scratch one into its place and lift the
+#              connection limit. A ${POSTGRES_DB}_old left by an earlier run is dropped
+#              first, so the rollback can be run again;
+# 5. CLEANUP   drop ${POSTGRES_DB}_old (a failure only warns: the restore is live).
+# Each snippet runs inside the db container (official postgres image; PostgreSQL >= 13
+# for DROP DATABASE ... WITH (FORCE)), where POSTGRES_USER and POSTGRES_DB are set;
+# psql variables quote the identifiers. Every snippet is one line (one log line).
+read -r -d '' NAME_CHECK_DB <<'SH' || true
+[ -n "$POSTGRES_DB" ] || { echo 'POSTGRES_DB is not set in the db container' >&2; exit 1; }; [ "$(($(printf %s "$POSTGRES_DB" | wc -c)))" -le 59 ] || { echo "POSTGRES_DB is longer than 59 bytes: ${POSTGRES_DB}_rb and ${POSTGRES_DB}_old would be truncated (63 bytes) onto it" >&2; exit 1; }
+SH
 read -r -d '' PRECHECK_DB <<'SH' || true
 pg_restore --list >/dev/null
 SH
@@ -250,11 +278,18 @@ read -r -d '' RESTORE_DB <<'SH' || true
 pg_restore --single-transaction --exit-on-error -U "$POSTGRES_USER" -d "${POSTGRES_DB}_rb"
 SH
 read -r -d '' SWAP_DB <<'SH' || true
-printf '%s\n' 'DROP DATABASE :"db" WITH (FORCE);' 'ALTER DATABASE :"rb" RENAME TO :"db";' 'ALTER DATABASE :"db" CONNECTION LIMIT -1;' | psql -X -q -v ON_ERROR_STOP=1 -v db="$POSTGRES_DB" -v rb="${POSTGRES_DB}_rb" -U "$POSTGRES_USER" -d template1
+printf '%s\n' 'DROP DATABASE IF EXISTS :"old" WITH (FORCE);' 'BEGIN;' "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = :'db' AND pid <> pg_backend_pid();" 'ALTER DATABASE :"db" RENAME TO :"old";' 'ALTER DATABASE :"rb" RENAME TO :"db";' 'ALTER DATABASE :"db" CONNECTION LIMIT -1;' 'COMMIT;' | psql -X -q -v ON_ERROR_STOP=1 -v db="$POSTGRES_DB" -v rb="${POSTGRES_DB}_rb" -v old="${POSTGRES_DB}_old" -U "$POSTGRES_USER" -d template1 >/dev/null
+SH
+read -r -d '' DROP_OLD_DB <<'SH' || true
+printf '%s\n' 'DROP DATABASE IF EXISTS :"old" WITH (FORCE);' | psql -X -q -v ON_ERROR_STOP=1 -v old="${POSTGRES_DB}_old" -U "$POSTGRES_USER" -d template1
 SH
 read -r -d '' DROP_SCRATCH_DB <<'SH' || true
 printf '%s\n' 'DROP DATABASE IF EXISTS :"rb" WITH (FORCE);' | psql -X -q -v ON_ERROR_STOP=1 -v rb="${POSTGRES_DB}_rb" -U "$POSTGRES_USER" -d template1
 SH
+
+# What to run by hand if the swap did not complete (POSTGRES_DB as in the db container).
+# shellcheck disable=SC2016 # printed for the operator, not expanded here
+MANUAL_SWAP='ALTER DATABASE "$POSTGRES_DB" RENAME TO "${POSTGRES_DB}_old"; ALTER DATABASE "${POSTGRES_DB}_rb" RENAME TO "$POSTGRES_DB"; ALTER DATABASE "$POSTGRES_DB" CONNECTION LIMIT -1; then DROP DATABASE "${POSTGRES_DB}_old"'
 
 db_exec() {
 	compose "$LAB/current" exec -T db sh -c "$1"
@@ -270,26 +305,34 @@ restore_failed() {
 # rollback: stop writers -> restore into a scratch db -> swap it in -> swap
 # `current` back -> start the previous release.
 cmd_rollback() {
-	local prev=""
+	local prev="" restore=false
 	trap 'rollback_fail "unexpected error at line $LINENO"' ERR
 	[[ -f $STATE/previous ]] && prev=$(<"$STATE/previous")
-	stop_writers || rollback_fail "could not stop the app services"
+	# Known before anything can fail, so every failure message names the dump.
 	if [[ -f $STATE/pending-dump && -L $LAB/current ]]; then
+		restore=true
 		RB_DUMP=$(<"$STATE/pending-dump")
 		RB_DB="untouched (the live database has not been changed)"
+	fi
+	stop_writers || rollback_fail "could not stop the app services"
+	if $restore; then
 		[[ -s $RB_DUMP ]] || rollback_fail "the pre-migration dump is missing or empty"
+		db_exec "$NAME_CHECK_DB" </dev/null ||
+			rollback_fail "the database name leaves no room for the rollback's scratch names"
 		db_exec "$PRECHECK_DB" <"$RB_DUMP" ||
 			rollback_fail "the dump is unreadable (pg_restore --list failed)"
 		db_exec "$SCRATCH_DB" </dev/null ||
 			restore_failed "could not create the scratch database"
 		db_exec "$RESTORE_DB" <"$RB_DUMP" ||
 			restore_failed "pg_restore into the scratch database failed (nothing was restored)"
-		RB_DB="UNKNOWN: the swap failed part-way; the restored copy is \${POSTGRES_DB}_rb in the db container (rename it by hand)"
+		RB_DB="UNKNOWN, most likely untouched (the swap is one transaction); the restored copy is \${POSTGRES_DB}_rb (CONNECTION LIMIT 0). Run the rollback again, or by hand in psql: $MANUAL_SWAP"
 		db_exec "$SWAP_DB" </dev/null ||
 			rollback_fail "could not swap the restored copy into place"
 		RB_DB="restored from $RB_DUMP"
 		rm -f "$STATE/pending-dump"
 		echo "database restored from $RB_DUMP"
+		db_exec "$DROP_OLD_DB" </dev/null ||
+			echo "WARNING: the replaced database \${POSTGRES_DB}_old could not be dropped (drop it by hand)" >&2
 	fi
 	if [[ -n $prev && -d $prev ]]; then
 		swap_current "$prev"

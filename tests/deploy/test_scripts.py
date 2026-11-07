@@ -717,14 +717,107 @@ def test_module_check_finds_loaded_and_reports_missing_modules() -> None:
         (["fd00::/64"], False),  # IPv4 only
         ([], False),
         (["10.231.0.0/16 , drop"], False),
+        ([167772160], False),  # an integer is not a CIDR string
+        (["172.16.0.0/16", "192.168.200.0/24"], True),
+        (["100.64.0.0/16"], False),  # CGNAT (Twingate), not RFC 1918
+        (["8.8.0.0/16"], False),  # public
+        (["10.0.0.0/8"], False),  # prefix shorter than /16
+        (["172.16.0.0/12"], False),
+        (["10.231.0.0/16", "10.231.4.0/24"], False),  # overlapping
+        (["10.231.0.0/16", "10.231.0.0/16"], False),
     ],
 )
-def test_cell_network_validation_is_strict(networks: list[str], ok: bool) -> None:
+def test_cell_network_validation_is_strict(networks: list[Any], ok: bool) -> None:
     """Run the role's own validation snippet on the given value."""
+    result = _check_cell_networks(networks)
+    assert (result.returncode == 0) is ok, result.stderr
+
+
+def _check_cell_networks(
+    networks: list[Any], addresses: Any = (), routes: Any = ()
+) -> subprocess.CompletedProcess[str]:
+    """The role's validation snippet, given `ip -j -4 address/route show` output."""
     tasks = _load_yaml(ANSIBLE / "roles" / "firewall" / "tasks" / "main.yml")
     task = tasks[_task_index(tasks, lambda t: "strict=True" in json.dumps(t))]
-    code = task["ansible.builtin.command"]["argv"][3]
-    result = _run([sys.executable, "-I", "-c", code, json.dumps(networks)])
+    argv = task["ansible.builtin.command"]["argv"]
+    code = argv[3]
+    # The role feeds the snippet the host's own addresses and routes, read first.
+    check = tasks.index(task)
+    for what in ("address", "route"):
+        reader = _task_index(
+            tasks,
+            lambda t, w=what: (
+                t.get("ansible.builtin.command", {}).get("argv") == ["ip", "-j", "-4", w, "show"]
+            ),
+        )
+        assert reader < check
+        assert tasks[reader].get("check_mode") is False
+    assert len(argv) == 7
+    return _run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            code,
+            json.dumps(networks),
+            json.dumps(list(addresses)),
+            json.dumps(list(routes)),
+        ]
+    )
+
+
+def _link(name: str, *cidrs: str) -> dict[str, Any]:
+    info = [
+        {"family": "inet", "local": c.split("/")[0], "prefixlen": int(c.split("/")[1])}
+        for c in cidrs
+    ]
+    return {"ifname": name, "addr_info": info}
+
+
+LAN_LINKS = [_link("lo", "127.0.0.1/8"), _link("eth0", "192.168.1.111/24")]
+LAN_ROUTES = [
+    {"dst": "default", "gateway": "192.168.1.1", "dev": "eth0"},
+    {"dst": "192.168.1.0/24", "dev": "eth0", "scope": "link", "prefsrc": "192.168.1.111"},
+]
+
+
+@pytest.mark.parametrize(
+    ("networks", "links", "routes", "ok"),
+    [
+        (["10.231.0.0/16"], LAN_LINKS, LAN_ROUTES, True),
+        # A cell bridge's own gateway address is in the cell network by design.
+        (
+            ["10.231.0.0/16"],
+            [*LAN_LINKS, _link("labc1a2b3c", "10.231.0.1/24")],
+            [*LAN_ROUTES, {"dst": "10.231.0.0/24", "dev": "labc1a2b3c", "scope": "link"}],
+            True,
+        ),
+        # The host's own LAN address, the LAN gateway, the LAN itself.
+        (["192.168.0.0/16"], LAN_LINKS, LAN_ROUTES, False),
+        (["192.168.1.0/24"], LAN_LINKS, LAN_ROUTES, False),
+        (["10.231.0.0/16"], [_link("eth0", "10.231.7.9/32")], [], False),
+        (
+            ["10.231.0.0/16"],
+            LAN_LINKS,
+            [{"dst": "default", "gateway": "10.231.0.254", "dev": "eth0"}],
+            False,
+        ),
+        (
+            ["10.231.0.0/16"],
+            LAN_LINKS,
+            [{"dst": "10.0.0.0/8", "dev": "eth1", "scope": "link"}],
+            False,
+        ),
+        # A Docker bridge that is not a cell bridge (br-..., docker0) is the host's.
+        (["10.231.0.0/16"], [_link("docker0", "10.231.0.1/24")], [], False),
+        # Unparseable host data fails closed.
+        (["10.231.0.0/16"], [_link("eth0", "not-an-address/24")], [], False),
+    ],
+)
+def test_cell_networks_never_cover_the_hosts_own_addresses(
+    networks: list[str], links: list[Any], routes: list[Any], ok: bool
+) -> None:
+    result = _check_cell_networks(networks, links, routes)
     assert (result.returncode == 0) is ok, result.stderr
 
 
@@ -837,10 +930,14 @@ case "$*" in
 *"config --images"*) printf '%s\\n' $FAKE_IMAGES ;;
 *"config --format json"*) printf '%s\\n' "$FAKE_CONFIG_JSON" ;;
 *"ps --status running --services"*) [[ ${FAKE_DB_DOWN:-0} == 1 ]] || echo db ;;
-*"pg_dump"*) echo DUMPDATA ;;
+*"longer than 59 bytes"*) [[ ${FAKE_NAME_FAIL:-0} == 1 ]] && exit 1 ;;
+*"pg_dump"*)
+    [[ ${FAKE_DUMP_FAIL:-0} == 1 ]] && exit 1
+    echo DUMPDATA ;;
 *"pg_restore --list"*) [[ ${FAKE_LIST_FAIL:-0} == 1 ]] && exit 1 ;;
 *"pg_restore"*) [[ ${FAKE_RESTORE_FAIL:-0} == 1 ]] && exit 1 ;;
 *"RENAME TO"*) [[ ${FAKE_SWAP_FAIL:-0} == 1 ]] && exit 1 ;;
+*'DROP DATABASE IF EXISTS :"old"'*) [[ ${FAKE_DROP_OLD_FAIL:-0} == 1 ]] && exit 1 ;;
 *"run --rm --no-deps migrate"*) [[ ${FAKE_MIGRATE_FAIL:-0} == 1 ]] && exit 1 ;;
 *" up "*) [[ ${FAKE_UP_FAIL:-0} == 1 ]] && exit 1 ;;
 esac
@@ -972,10 +1069,17 @@ def test_rollback_restores_into_a_scratch_db_before_touching_the_live_one(
     precheck = _first(log, "exec -T db", "pg_restore --list")
     scratch = _first(log, "exec -T db", 'CREATE DATABASE :"rb"', "CONNECTION LIMIT 0")
     restore = _first(log, "exec -T db", "pg_restore --single-transaction --exit-on-error", '_rb"')
-    swap = _first(log, "exec -T db", 'DROP DATABASE :"db"', 'RENAME TO :"db"')
+    swap = _first(log, "exec -T db", 'RENAME TO :"old"', 'RENAME TO :"db"')
+    drop_old = next(
+        i
+        for i, line in enumerate(log)
+        if 'DROP DATABASE IF EXISTS :"old" WITH (FORCE)' in line and "RENAME" not in line
+    )
     up = _first(log, " up -d")
-    assert stop < precheck < scratch < restore < swap < up
+    assert stop < precheck < scratch < restore < swap < drop_old < up
     assert not any("--no-owner" in line for line in log)
+    # The live database is never dropped: it is renamed aside, then the copy dropped.
+    assert not any('DROP DATABASE :"db"' in line for line in log)
     assert os.readlink(root / "current") == f"{root}/releases/v0.0.9"
     assert not (root / "releases" / ".state" / "pending-dump").exists()
 
@@ -1013,7 +1117,189 @@ def test_rollback_swap_failure_points_at_the_restored_copy(
     assert result.returncode != 0
     assert "_rb" in result.stderr
     assert str(dump) in result.stderr
+    # The manual recovery names every step, the connection limit included.
+    assert "CONNECTION LIMIT -1" in result.stderr
     assert not any(" up -d" in line for line in _docker_log(env))
+
+
+def test_rollback_is_rerunnable_after_a_failed_swap(
+    failed_release: tuple[Path, dict[str, str], Path],
+) -> None:
+    root, env, _ = failed_release
+    assert _rollback(env, FAKE_SWAP_FAIL="1").returncode != 0
+    assert (root / "releases" / ".state" / "pending-dump").is_file(), "kept for the re-run"
+    Path(env["FAKE_DOCKER_LOG"]).unlink()
+    result = _rollback(env)
+    assert result.returncode == 0, result.stderr
+    log = _docker_log(env)
+    assert _first(log, 'RENAME TO :"db"') < _first(log, " up -d")
+    assert os.readlink(root / "current") == f"{root}/releases/v0.0.9"
+
+
+def test_rollback_continues_when_the_old_copy_cannot_be_dropped(
+    failed_release: tuple[Path, dict[str, str], Path],
+) -> None:
+    """The restored database is live: a leftover <db>_old must not keep the lab down."""
+    root, env, _ = failed_release
+    result = _rollback(env, FAKE_DROP_OLD_FAIL="1")
+    assert result.returncode == 0, result.stderr
+    assert "_old" in result.stderr
+    assert any(" up -d" in line for line in _docker_log(env))
+    assert os.readlink(root / "current") == f"{root}/releases/v0.0.9"
+
+
+def _snippet(name: str) -> str:
+    """One of the shell snippets release.sh runs inside the db container."""
+    text = (DEPLOY / "remote" / "release.sh").read_text(encoding="utf-8")
+    match = re.search(rf"^read -r -d '' {name} <<'SH' \|\| true\n(.*?)\nSH$", text, re.M | re.S)
+    assert match, f"snippet {name} not found"
+    return match.group(1)
+
+
+def _run_snippet(
+    tmp_path: Path, name: str, db: str = "lab", stdin: str = ""
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Run a db-container snippet with a psql stub; return the SQL fed to psql."""
+    stubs = tmp_path / "stubs"
+    stubs.mkdir(exist_ok=True)
+    sql = tmp_path / "sql.log"
+    for tool in ("psql", "pg_restore"):
+        stub = stubs / tool
+        stub.write_text(
+            f'#!/bin/sh\nprintf "ARGS %s\\n" "$*" >>"{sql}"\ncat >>"{sql}"\n', encoding="utf-8"
+        )
+        stub.chmod(0o755)
+    env = dict(
+        os.environ,
+        PATH=f"{stubs}:{os.environ['PATH']}",
+        POSTGRES_DB=db,
+        POSTGRES_USER="lab",
+        LC_ALL="C.UTF-8",
+    )
+    result = _run(["sh", "-c", _snippet(name)], env=env, stdin=stdin)
+    lines = sql.read_text(encoding="utf-8").splitlines() if sql.exists() else []
+    return result, lines
+
+
+def test_swap_keeps_a_database_under_the_live_name(tmp_path: Path) -> None:
+    """live -> <db>_old and <db>_rb -> live in ONE transaction; a stale _old is dropped."""
+    result, lines = _run_snippet(tmp_path, "SWAP_DB")
+    assert result.returncode == 0, result.stderr
+    assert "old=lab_old" in lines[0] and "rb=lab_rb" in lines[0] and "db=lab" in lines[0]
+    sql = lines[1:]
+    stale = sql.index('DROP DATABASE IF EXISTS :"old" WITH (FORCE);')
+    begin, commit = sql.index("BEGIN;"), sql.index("COMMIT;")
+    aside = sql.index('ALTER DATABASE :"db" RENAME TO :"old";')
+    into = sql.index('ALTER DATABASE :"rb" RENAME TO :"db";')
+    limit = sql.index('ALTER DATABASE :"db" CONNECTION LIMIT -1;')
+    assert stale < begin < aside < into < limit < commit
+    assert not any(line.startswith('DROP DATABASE :"db"') for line in sql)
+    (tmp_path / "drop").mkdir()
+    result, lines = _run_snippet(tmp_path / "drop", "DROP_OLD_DB")
+    assert result.returncode == 0, result.stderr
+    assert "old=lab_old" in lines[0]
+    assert lines[1:] == ['DROP DATABASE IF EXISTS :"old" WITH (FORCE);']
+
+
+@pytest.mark.parametrize(
+    ("db", "ok"),
+    # Bytes, not characters: 30 x "é" is 30 characters but 60 bytes.
+    [
+        ("a" * 59, True),
+        ("a" * 60, False),
+        ("é" * 29 + "a", True),
+        ("é" * 30, False),
+        ("", False),
+    ],
+)
+def test_database_name_leaves_room_for_the_rollback_suffixes(
+    tmp_path: Path, db: str, ok: bool
+) -> None:
+    """<db>_rb / <db>_old must never be truncated (63 bytes) onto the live name."""
+    result, _ = _run_snippet(tmp_path, "NAME_CHECK_DB", db=db)
+    assert (result.returncode == 0) is ok, result.stderr
+    if not ok:
+        assert ("longer than 59 bytes" if db else "not set") in result.stderr
+
+
+def test_migrate_checks_the_database_name_before_touching_anything(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    _, env = lab_root
+    result = _run(
+        ["bash", str(DEPLOY / "remote" / "release.sh"), "migrate", "v0.1.0"],
+        env={**env, "FAKE_NAME_FAIL": "1"},
+    )
+    assert result.returncode != 0
+    assert "database: untouched" in result.stderr
+    log = _docker_log(env)
+    assert not any(" stop " in line or "pg_dump" in line or "--no-deps" in line for line in log)
+
+
+def test_rollback_checks_the_database_name_before_touching_anything(
+    failed_release: tuple[Path, dict[str, str], Path],
+) -> None:
+    _, env, dump = failed_release
+    result = _rollback(env, FAKE_NAME_FAIL="1")
+    assert result.returncode != 0
+    assert "database: untouched" in result.stderr
+    assert str(dump) in result.stderr
+    assert not any("CREATE DATABASE" in line or "RENAME" in line for line in _docker_log(env))
+
+
+def test_rollback_reports_the_dump_when_the_writers_cannot_be_stopped(
+    failed_release: tuple[Path, dict[str, str], Path],
+) -> None:
+    _, env, dump = failed_release
+    result = _rollback(env, FAKE_CONFIG_FAIL="1")
+    assert result.returncode != 0
+    assert "database: untouched" in result.stderr
+    assert "no pre-migration dump" not in result.stderr
+    assert str(dump) in result.stderr
+
+
+@pytest.mark.parametrize("failure", ["FAKE_CONFIG_FAIL", "FAKE_DUMP_FAIL"])
+def test_migrate_failure_before_the_migration_reports_untouched_once(
+    lab_root: tuple[Path, dict[str, str]], failure: str
+) -> None:
+    _, env = lab_root
+    result = _run(
+        ["bash", str(DEPLOY / "remote" / "release.sh"), "migrate", "v0.1.0"],
+        env={**env, failure: "1"},
+    )
+    assert result.returncode != 0
+    assert "database: untouched" in result.stderr
+    assert "partly migrated" not in result.stderr
+    # A failure inside $(...) is reported by the main shell only, once.
+    assert result.stderr.count("migrate failed") == 1, result.stderr
+
+
+def test_migrate_failure_while_migrating_reports_partly_migrated(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    _, env = lab_root
+    result = _run(
+        ["bash", str(DEPLOY / "remote" / "release.sh"), "migrate", "v0.1.0"],
+        env={**env, "FAKE_MIGRATE_FAIL": "1"},
+    )
+    assert result.returncode != 0
+    assert "partly migrated" in result.stderr
+    assert result.stderr.count("migrate failed") == 1, result.stderr
+
+
+def test_rollback_failure_inside_a_substitution_is_reported_once(
+    failed_release: tuple[Path, dict[str, str], Path],
+) -> None:
+    _, env, _ = failed_release
+    result = _rollback(env, FAKE_CONFIG_FAIL="1")
+    assert result.stderr.count("rollback failed") == 1, result.stderr
+
+
+def test_deployment_doc_states_the_postgres_version_rollback_needs() -> None:
+    text = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    assert re.search(r"PostgreSQL ≥ 13\b[^\n]*WITH \(FORCE\)", text), (
+        "rollback uses DROP DATABASE ... WITH (FORCE): document PostgreSQL >= 13"
+    )
 
 
 def test_rollback_reports_when_the_old_release_cannot_start(
