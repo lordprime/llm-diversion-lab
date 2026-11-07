@@ -43,14 +43,30 @@ Refusals
   arm being tag-free, so this is never labelled silently. Forbidden tags are matched
   more loosely than Visible (also case-insensitively and percent-decoded), and in
   every LLM request regardless of endpoint or status.
-* :class:`IncompleteEvidenceError`: an LLM call's request body is missing; a call
-  whose body carries the run's tag has no endpoint metadata; or a body stored raw
-  cannot be decoded (unknown encoding, corrupt data) and belongs to a generation-2xx
-  call of an injected run, or to any call of a run with forbidden tags. Visible (or the
-  contamination check) could otherwise be a silent false negative.
+* :class:`IncompleteEvidenceError`, because Visible (or the contamination check) could
+  otherwise be a silent false negative:
+
+  - tap files (``llm/NNNN.req.json``/``.meta.json``) with no ``LlmCall`` event, i.e.
+    a torn ``llm/events.jsonl`` line or a tap crash between request and response;
+  - an LLM call's request body is missing;
+  - a call whose body carries the run's tag has no endpoint metadata;
+  - a call has no tap meta and its body is not JSON (it may be stored encoded);
+  - a body stored raw decodes to more than :data:`MAX_DECODED_BODY_BYTES`, or cannot
+    be decoded (unknown encoding, corrupt data) and belongs to a generation-2xx call
+    of an injected run, or to any call of a run with forbidden tags;
+  - (loader) a file over :data:`MAX_EVIDENCE_FILE_BYTES` or a JSONL line over
+    :data:`MAX_JSONL_LINE_BYTES`.
+
+  The first, third and fourth apply to every run that must be complete: an injected
+  run, or one with forbidden tags (which every control run has).
 * :class:`LabelingError` (base class, also raised by :class:`RunEvidence` and the
   loader): events or a verdict of another run, a duplicate event key, a malformed or
-  self-referencing forbidden tag, an invalid event line or artifact path.
+  self-referencing forbidden tag, a control run without forbidden tags, an invalid
+  event line, an event kind or stream its file may not hold, an unsafe artifact path,
+  a symlink or a non-regular file in the evidence directory.
+
+Torn JSONL lines the loader skipped are listed in every label's
+``detail["skipped_lines"]``, so dropped evidence is never invisible.
 
 Evidence references
 -------------------
@@ -65,7 +81,9 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import os
 import re
+import stat
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -76,12 +94,14 @@ from urllib.parse import unquote_plus
 
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
-from control.core.codecs import decode_body
+from control.core.codecs import DecodedTooLargeError, decode_body_bounded
 from control.core.models import (
     ARTIFACT_PATH_PATTERN,
     AgentEvent,
+    Arm,
     Callback,
     Event,
+    EventKind,
     FunnelLabel,
     FunnelStage,
     LlmCall,
@@ -91,15 +111,19 @@ from control.core.models import (
     TargetAccessEvent,
     Verdict,
 )
-from control.core.tags import decoy_prefix, find_tags, request_path, under_decoy
+from control.core.tags import decoy_prefix, find_tags, parse_json, request_path, under_decoy
 from control.core.tokens import TAG_PATTERN, token_to_run
 
 __all__ = [
     "EVENT_FILES",
     "LABELER",
     "LABELER_VERSION",
+    "MAX_DECODED_BODY_BYTES",
+    "MAX_EVIDENCE_FILE_BYTES",
+    "MAX_JSONL_LINE_BYTES",
     "CallKey",
     "ContaminationError",
+    "EventSource",
     "IncompleteEvidenceError",
     "LabelingError",
     "RunEvidence",
@@ -113,17 +137,39 @@ __all__ = [
 #: Name stamped on every label this module produces.
 LABELER: Final = "funnel-deterministic"
 #: Version of the rules; bump on any change to a rule or to the label format.
-LABELER_VERSION: Final = "1.1.0"
+LABELER_VERSION: Final = "1.2.0"
 
-#: Event JSONL files of a cell's evidence directory, relative to it. Files that do not
-#: exist are skipped (a control run has no serves; streams may be absent).
-EVENT_FILES: Final[tuple[str, ...]] = (
-    "injector/events.jsonl",
-    "llm/events.jsonl",
-    "catcher/http/events.jsonl",
-    "catcher/dns/events.jsonl",
-    "agent/events.jsonl",
-    "oracle/events.jsonl",
+#: Largest evidence file the loader reads (events JSONL, request body, tap meta).
+MAX_EVIDENCE_FILE_BYTES: Final = 256 * 1024 * 1024
+#: Largest single JSONL line (one event) the loader accepts.
+MAX_JSONL_LINE_BYTES: Final = 16 * 1024 * 1024
+#: Largest output when the labeller decodes a request body the tap stored raw.
+MAX_DECODED_BODY_BYTES: Final = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class EventSource:
+    """What one events file may contain: one producer stream and its event kinds."""
+
+    stream: str
+    kinds: frozenset[EventKind]
+
+
+#: Event JSONL files of a cell's evidence directory (relative to it), each with the only
+#: stream and kinds its producer writes. Files that do not exist are skipped (a control
+#: run has no serves; streams may be absent); any other kind or stream is refused, so
+#: one producer cannot forge another's evidence (e.g. a serve in the agent's file).
+EVENT_FILES: Final[Mapping[str, EventSource]] = MappingProxyType(
+    {
+        "injector/events.jsonl": EventSource(
+            "injector", frozenset({EventKind.TARGET_ACCESS, EventKind.PLACEMENT_SERVE})
+        ),
+        "llm/events.jsonl": EventSource("tap", frozenset({EventKind.LLM_CALL})),
+        "catcher/http/events.jsonl": EventSource("catcher-http", frozenset({EventKind.CALLBACK})),
+        "catcher/dns/events.jsonl": EventSource("catcher-dns", frozenset({EventKind.CALLBACK})),
+        "agent/events.jsonl": EventSource("agent", frozenset({EventKind.AGENT_EVENT})),
+        "oracle/events.jsonl": EventSource("oracle", frozenset({EventKind.ORACLE_POLL})),
+    }
 )
 
 #: ``(stream, seq)``: the key of one event (and of an LLM call's tap files).
@@ -135,6 +181,9 @@ _EVENT_ADAPTER: TypeAdapter[Event] = TypeAdapter(Event)
 
 _REQ_SUFFIX: Final = ".req.json"
 _META_SUFFIX: Final = ".meta.json"
+#: The tap's directory and its per-call request/meta files (``NNNN.req.json``...).
+_TAP_DIR: Final = "llm"
+_TAP_ARTIFACT_RE = re.compile(r"^\d{4,}\.(?:req|meta)\.json$")
 
 #: Path suffixes of model-generation endpoints (Anthropic, OpenAI-style).
 _GENERATION_SUFFIXES: Final = ("/v1/messages", "/v1/chat/completions", "/v1/responses")
@@ -243,12 +292,16 @@ class RunEvidence:
     """Everything the labeller looks at for one run; validated on construction.
 
     ``forbidden_tags`` is required and explicit: tags that must *not* occur anywhere in
-    this run's evidence (for a control run, its paired injected run's tag). It may be
-    empty, must not contain the run's own tag, and each entry must be tag-shaped.
+    this run's evidence (for a control run, its paired injected run's tag). It must be
+    non-empty for a control run (else the contamination check would silently not run),
+    must not contain the run's own tag, and each entry must be tag-shaped.
 
     ``request_bodies`` and ``tap_meta`` are keyed by the LLM call's ``(stream, seq)``;
     a call missing from ``request_bodies`` makes :func:`label_run` refuse.
-    ``skipped_lines`` lists torn JSONL lines the loader skipped (``<file>:<lineno>``).
+    ``skipped_lines`` lists torn JSONL lines the loader skipped (``<file>:<lineno>``);
+    it is copied into every label's ``detail``. ``orphan_artifacts`` lists tap files
+    (``llm/NNNN.req.json``/``.meta.json``) with no ``LlmCall`` event, e.g. after a tap
+    crash; :func:`label_run` refuses a run that has any.
     """
 
     manifest: RunManifest
@@ -263,6 +316,7 @@ class RunEvidence:
     tap_meta: Mapping[CallKey, TapMeta] = field(default_factory=dict)
     verdict: Verdict | None = None
     skipped_lines: tuple[str, ...] = ()
+    orphan_artifacts: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # Freeze containers so a RunEvidence cannot change after it was validated.
@@ -275,6 +329,7 @@ class RunEvidence:
             "callbacks",
             "oracle_polls",
             "skipped_lines",
+            "orphan_artifacts",
         ):
             object.__setattr__(self, name, tuple(getattr(self, name)))
         object.__setattr__(self, "request_bodies", MappingProxyType(dict(self.request_bodies)))
@@ -284,6 +339,10 @@ class RunEvidence:
         for tag in self.forbidden_tags:
             if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag):
                 raise LabelingError(f"forbidden tag {tag!r} is not a run tag ({TAG_PATTERN})")
+        if self.manifest.arm is Arm.CONTROL and not self.forbidden_tags:
+            raise LabelingError(
+                f"control run {run_id}: forbidden_tags must name the paired run's tag(s)"
+            )
         if self.manifest.tag is not None and self.manifest.tag in self.forbidden_tags:
             raise LabelingError(f"run {run_id}: its own tag cannot be forbidden")
         seen: set[CallKey] = set()
@@ -359,7 +418,7 @@ def _label(
         labeler=LABELER,
         labeler_version=LABELER_VERSION,
         evidence_ref=list(refs),
-        detail=detail,
+        detail={**detail, "skipped_lines": _strs(evidence.skipped_lines)},
     )
 
 
@@ -378,7 +437,18 @@ def _tool_args_bytes(event: AgentEvent) -> bytes | None:
 # --------------------------------------------------------------------------- refusals
 
 
+def _must_be_complete(evidence: RunEvidence) -> bool:
+    """Whether missing LLM evidence could change a label: an injected run (Visible) or
+    a run with forbidden tags (contamination)."""
+    return evidence.manifest.tag is not None or bool(evidence.forbidden_tags)
+
+
 def _check_complete(evidence: RunEvidence) -> None:
+    if evidence.orphan_artifacts and _must_be_complete(evidence):
+        raise IncompleteEvidenceError(
+            f"run {evidence.manifest.run_id}: tap artifacts without an llm_call event "
+            f"(torn event line or tap crash): {', '.join(evidence.orphan_artifacts)}"
+        )
     for call in _ordered(evidence.llm_calls):
         if (call.stream, call.seq) not in evidence.request_bodies:
             raise IncompleteEvidenceError(
@@ -400,21 +470,43 @@ def _is_candidate(meta: TapMeta | None) -> bool:
 def _request_views(evidence: RunEvidence) -> dict[CallKey, bytes | None]:
     """Each call's request body as searched: the stored bytes, or, if the tap stored
     them raw (``decoded`` false), those bytes with ``content_encoding`` removed by
-    :func:`control.core.codecs.decode_body`; ``None`` if they cannot be decoded.
+    :func:`control.core.codecs.decode_body_bounded` (at most
+    :data:`MAX_DECODED_BODY_BYTES`); ``None`` if they cannot be decoded.
 
-    Refuses (:class:`IncompleteEvidenceError`) when an undecodable body could change a
-    label: a Visible candidate call of an injected run, or any call of a run with
-    forbidden tags (contamination could not be ruled out).
+    Refuses (:class:`IncompleteEvidenceError`) when a body could hide the tag:
+
+    * decoding would exceed :data:`MAX_DECODED_BODY_BYTES` (any call);
+    * an undecodable body of a Visible candidate call of an injected run, or of any
+      call of a run with forbidden tags (contamination could not be ruled out);
+    * no tap meta at all and a body that is not JSON (it may be stored compressed and
+      there is no ``content_encoding`` to decode it with), when evidence must be
+      complete (:func:`_must_be_complete`).
     """
     views: dict[CallKey, bytes | None] = {}
     for call in _ordered(evidence.llm_calls):
         key = (call.stream, call.seq)
         body = evidence.request_bodies[key]
         meta = evidence.tap_meta.get(key)
-        if meta is None or meta.decoded:
+        if meta is None:
+            if _must_be_complete(evidence) and parse_json(body) is None:
+                raise IncompleteEvidenceError(
+                    f"run {evidence.manifest.run_id}: {_ref(call)} has no tap meta and its "
+                    f"request body {call.request_artifact} is not JSON (it may be encoded)"
+                )
             views[key] = body
             continue
-        decoded = decode_body(body, meta.content_encoding)
+        if meta.decoded:
+            views[key] = body
+            continue
+        try:
+            decoded = decode_body_bounded(
+                body, meta.content_encoding, max_size=MAX_DECODED_BODY_BYTES
+            )
+        except DecodedTooLargeError as exc:
+            raise IncompleteEvidenceError(
+                f"run {evidence.manifest.run_id}: request body {call.request_artifact} of "
+                f"{_ref(call)} decodes to more than {MAX_DECODED_BODY_BYTES} bytes"
+            ) from exc
         if decoded is None and (
             evidence.forbidden_tags or (evidence.manifest.tag is not None and _is_candidate(meta))
         ):
@@ -653,9 +745,59 @@ def label_run(evidence: RunEvidence) -> list[FunnelLabel]:
 # --------------------------------------------------------------------------- loader
 
 
-def _read_events(path: Path, rel: str, skipped: list[str]) -> list[_AnyEvent]:
+def _safe_path(root: Path, rel: str) -> Path:
+    """``root / rel``, refusing unsafe relative paths and any symlink on the way.
+
+    ``root`` is the resolved evidence directory. Every component below it must not be
+    a symlink, and the resolved path must stay under ``root`` (run cells write this
+    directory, so its contents are untrusted).
+    """
+    if not _ARTIFACT_RE.fullmatch(rel):
+        raise LabelingError(f"artifact path {rel!r} is not a safe relative path")
+    current = root
+    for part in Path(rel).parts:
+        current = current / part
+        if current.is_symlink():
+            raise LabelingError(f"{rel}: symlinks are not followed in evidence")
+    if not current.resolve().is_relative_to(root):
+        raise LabelingError(f"{rel}: resolves outside the evidence directory")
+    return current
+
+
+def _read_capped(root: Path, rel: str) -> bytes | None:
+    """Read one evidence file (``None`` if absent) without following symlinks.
+
+    Refuses anything but a regular file (:class:`LabelingError`) and a file larger than
+    :data:`MAX_EVIDENCE_FILE_BYTES` (:class:`IncompleteEvidenceError`).
+    """
+    path = _safe_path(root, rel)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:  # ELOOP (a symlink swapped in), EACCES, ENOTDIR...
+        raise LabelingError(f"{rel}: cannot open ({exc.strerror})") from exc
+    cap = MAX_EVIDENCE_FILE_BYTES
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise LabelingError(f"{rel}: not a regular file")
+        if st.st_size > cap:
+            raise IncompleteEvidenceError(f"{rel}: {st.st_size} bytes exceeds {cap}")
+        data = fh.read(cap + 1)
+    if len(data) > cap:
+        raise IncompleteEvidenceError(f"{rel}: exceeds {cap} bytes")
+    return data
+
+
+def _read_events(data: bytes, rel: str, source: EventSource, skipped: list[str]) -> list[_AnyEvent]:
     events: list[_AnyEvent] = []
-    for lineno, raw in enumerate(path.read_bytes().split(b"\n"), start=1):
+    for lineno, raw in enumerate(data.split(b"\n"), start=1):
+        if len(raw) > MAX_JSONL_LINE_BYTES:
+            raise IncompleteEvidenceError(
+                f"{rel}:{lineno}: line exceeds {MAX_JSONL_LINE_BYTES} bytes"
+            )
         if not raw.strip():
             continue
         try:
@@ -666,18 +808,31 @@ def _read_events(path: Path, rel: str, skipped: list[str]) -> list[_AnyEvent]:
             skipped.append(f"{rel}:{lineno}")
             continue
         try:
-            events.append(_EVENT_ADAPTER.validate_json(raw))
+            event = _EVENT_ADAPTER.validate_json(raw)
         except ValidationError as exc:
             raise LabelingError(
                 f"{rel}:{lineno}: not a valid event ({exc.error_count()} errors)"
             ) from exc
+        if event.kind not in source.kinds or event.stream != source.stream:
+            raise LabelingError(
+                f"{rel}:{lineno}: a {event.kind.value} event on stream {event.stream!r} "
+                f"is not allowed in this file (only {sorted(k.value for k in source.kinds)} "
+                f"on {source.stream!r})"
+            )
+        events.append(event)
     return events
 
 
-def _artifact_file(evidence_dir: Path, rel: str) -> Path:
-    if not _ARTIFACT_RE.fullmatch(rel):
-        raise LabelingError(f"artifact path {rel!r} is not a safe relative path")
-    return evidence_dir / rel
+def _tap_artifacts(root: Path) -> list[str]:
+    """Every ``llm/NNNN.req.json`` and ``llm/NNNN.meta.json`` present, sorted."""
+    tap_dir = _safe_path(root, _TAP_DIR)
+    try:
+        names = os.listdir(tap_dir)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise LabelingError(f"{_TAP_DIR}: cannot list ({exc.strerror})") from exc
+    return sorted(f"{_TAP_DIR}/{name}" for name in names if _TAP_ARTIFACT_RE.fullmatch(name))
 
 
 def load_run_evidence(
@@ -686,27 +841,38 @@ def load_run_evidence(
     *,
     forbidden_tags: Iterable[str],
     verdict: Verdict | None,
-    event_files: Sequence[str] = EVENT_FILES,
+    event_files: Mapping[str, EventSource] = EVENT_FILES,
 ) -> RunEvidence:
     """Read a cell's evidence directory into a :class:`RunEvidence`.
 
-    Reads every file of ``event_files`` that exists (each line one event of any kind),
-    skipping torn lines that are not valid JSON and recording them in
-    ``skipped_lines``; a line that is JSON but not a valid event raises
-    :class:`LabelingError`. An identical event stored twice is kept once; two different
-    events with the same ``(stream, seq)`` raise. For each LLM call it reads the
-    request body (``request_artifact``) and the tap's ``NNNN.meta.json`` beside it; a
-    missing file is left out (then :func:`label_run` refuses or ignores the call, per
-    its rules). ``forbidden_tags`` and ``verdict`` are required so that every caller
-    states them explicitly; pass ``()`` and ``None`` when there are none.
+    The directory is written by the run cell, so it is treated as untrusted:
+
+    * Files are opened without following symlinks; any symlink below ``evidence_dir``
+      or a path resolving outside it raises :class:`LabelingError`, as does a
+      non-regular file. A file over :data:`MAX_EVIDENCE_FILE_BYTES` or a JSONL line
+      over :data:`MAX_JSONL_LINE_BYTES` raises :class:`IncompleteEvidenceError`.
+    * Each file of ``event_files`` that exists may hold only its producer's stream and
+      event kinds (:data:`EVENT_FILES`); anything else raises :class:`LabelingError`.
+    * Torn lines that are not valid JSON are skipped and recorded in ``skipped_lines``;
+      a line that is JSON but not a valid event raises :class:`LabelingError`. An
+      identical event stored twice is kept once; two different events with the same
+      ``(stream, seq)`` raise.
+    * For each LLM call it reads the request body (``request_artifact``) and the tap's
+      ``NNNN.meta.json`` beside it; a missing file is left out (then :func:`label_run`
+      refuses or ignores the call, per its rules). Tap files with no ``LlmCall`` are
+      recorded in ``orphan_artifacts``.
+
+    ``forbidden_tags`` and ``verdict`` are required so that every caller states them
+    explicitly; pass ``None`` when there is no verdict.
     """
+    root = evidence_dir.resolve()
     skipped: list[str] = []
     by_key: dict[CallKey, _AnyEvent] = {}
-    for rel in event_files:
-        path = evidence_dir / rel
-        if not path.is_file():
+    for rel, source in event_files.items():
+        data = _read_capped(root, rel)
+        if data is None:
             continue
-        for event in _read_events(path, rel, skipped):
+        for event in _read_events(data, rel, source, skipped):
             key = (event.stream, event.seq)
             prior = by_key.get(key)
             if prior is not None and prior != event:
@@ -717,25 +883,29 @@ def load_run_evidence(
     llm_calls = tuple(e for e in events if isinstance(e, LlmCall))
     bodies: dict[CallKey, bytes] = {}
     metas: dict[CallKey, TapMeta] = {}
+    claimed: set[str] = set()
     for call in llm_calls:
         key = (call.stream, call.seq)
-        req = _artifact_file(evidence_dir, call.request_artifact)
-        if req.is_file():
-            bodies[key] = req.read_bytes()
+        claimed.add(call.request_artifact)
+        body = _read_capped(root, call.request_artifact)
+        if body is not None:
+            bodies[key] = body
         meta_rel = _meta_artifact(call.request_artifact)
         if meta_rel is None:
             continue
-        meta_file = _artifact_file(evidence_dir, meta_rel)
-        if not meta_file.is_file():
+        claimed.add(meta_rel)
+        raw_meta = _read_capped(root, meta_rel)
+        if raw_meta is None:
             continue
         try:
-            doc: JsonValue = json.loads(meta_file.read_bytes())
+            doc: JsonValue = json.loads(raw_meta)
         except ValueError as exc:
             raise LabelingError(f"{meta_rel}: not valid JSON") from exc
         meta = TapMeta.from_json(doc)
         if meta.seq != call.seq:
             raise LabelingError(f"{meta_rel}: seq {meta.seq} does not match {_ref(call)}")
         metas[key] = meta
+    orphans = tuple(rel for rel in _tap_artifacts(root) if rel not in claimed)
 
     return RunEvidence(
         manifest=manifest,
@@ -750,4 +920,5 @@ def load_run_evidence(
         tap_meta=metas,
         verdict=verdict,
         skipped_lines=tuple(skipped),
+        orphan_artifacts=orphans,
     )

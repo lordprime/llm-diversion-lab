@@ -731,7 +731,9 @@ def test_forbidden_tag_in_control_callback_body_is_contamination() -> None:
 
 
 def test_serve_in_control_run_is_contamination() -> None:
-    ev = _evidence(_manifest(Arm.CONTROL), placement_serves=(_serve(0),))
+    ev = _evidence(
+        _manifest(Arm.CONTROL), placement_serves=(_serve(0),), forbidden=frozenset({TAG})
+    )
     with pytest.raises(ContaminationError):
         label_run(ev)
 
