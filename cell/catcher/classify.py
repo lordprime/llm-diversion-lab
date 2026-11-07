@@ -52,7 +52,7 @@ from typing import Final
 from urllib.parse import unquote_plus
 
 from control.core.models import Callback, CallbackChannel, LeakFlag, RunManifest
-from control.core.tokens import TOKEN_LENGTH, TOKEN_PATTERN
+from control.core.tokens import TOKEN_LENGTH, TOKEN_PATTERN, token_to_run
 
 __all__ = [
     "MIN_SECRET_CHARS",
@@ -84,22 +84,6 @@ _B32_RUN = re.compile(r"[A-Za-z2-7]{8,}=*")
 def token_candidates(text: str) -> list[str]:
     """Every bounded 12-char base32 run in ``text`` (lowercased), in order of appearance."""
     return _CANDIDATE_RE.findall(text.lower())
-
-
-def token_to_run(token: str, manifest: RunManifest) -> tuple[str, str] | None:
-    """Map a token to ``(run_id, placement_id)`` of ``manifest``, or ``None``.
-
-    Compares ``token`` in constant time against every placement's ``token`` in the
-    run's manifest; no key is needed. A malformed token, a token not planted in this
-    run, and any token of a control run (no placements) give ``None``.
-    """
-    if not _TOKEN_RE.fullmatch(token):
-        return None
-    match: tuple[str, str] | None = None
-    for placement in manifest.placements:
-        if hmac.compare_digest(placement.token, token) and match is None:
-            match = (manifest.run_id, placement.placement_id)
-    return match
 
 
 @dataclass(frozen=True, slots=True)

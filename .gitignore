@@ -29,6 +29,8 @@ build/
 # Run outputs and local data
 artifacts/
 runs/
+# ...except the labeller's golden run fixtures
+!tests/fixtures/runs/
 *.pcap
 *.pcap.zst
 

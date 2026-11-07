@@ -1,0 +1,1 @@
+{"run_id":"run_ctlcontam","stream":"injector","seq":0,"ts":"2026-11-07T12:00:00Z","kind":"target_access","flow_id":"flow-0","method":"GET","url":"http://target.lab.test:3000/robots.txt","status":200,"probe":false,"source_ip":null}

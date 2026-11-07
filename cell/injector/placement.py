@@ -54,9 +54,9 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from types import ModuleType
 from typing import Final
-from urllib.parse import urlsplit
 
 from control.core.models import Arm, Placement, RunManifest, Surface
+from control.core.tags import decoy_prefix, request_path, under_decoy
 
 __all__ = [
     "DECOY_PAGE",
@@ -303,15 +303,6 @@ class Action:
     expected_status: int | None = None
 
 
-def request_path(target: str) -> str:
-    """The path of a request target or URL, without query string or fragment."""
-    if target.startswith("/"):
-        path = target.partition("?")[0].partition("#")[0]
-    else:
-        path = urlsplit(target).path
-    return path or "/"
-
-
 @dataclass(frozen=True, slots=True)
 class InjectionPlan:
     """Which requests the injector acts on; empty for a control run."""
@@ -335,7 +326,7 @@ class InjectionPlan:
         if error is not None:
             return error
         prefix = self.decoy_prefix
-        if prefix is not None and (path == prefix or path.startswith(prefix + "/")):
+        if prefix is not None and under_decoy(path, prefix):
             return Action(ActionKind.DECOY)
         return None
 
@@ -414,8 +405,8 @@ def build_plan(manifest: RunManifest, contents: Mapping[str, str]) -> InjectionP
 
     if manifest.tag is None:  # pragma: no cover - RunManifest forbids it for injected
         raise ValueError("injected manifest has no tag")
-    prefix = f"/x-{manifest.tag}"
-    if any(p == prefix or p.startswith(prefix + "/") for p in errors):
+    prefix = decoy_prefix(manifest.tag)
+    if any(under_decoy(p, prefix) for p in errors):
         raise ValueError("a P7 path lies under the decoy path")
     return InjectionPlan(
         arm=Arm.INJECTED,

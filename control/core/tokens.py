@@ -13,9 +13,22 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import re
 import secrets
+from typing import TYPE_CHECKING
 
-__all__ = ["TAG_LENGTH", "TAG_PATTERN", "TOKEN_LENGTH", "TOKEN_PATTERN", "derive_token", "new_tag"]
+if TYPE_CHECKING:  # models imports this module; the import is for annotations only
+    from control.core.models import RunManifest
+
+__all__ = [
+    "TAG_LENGTH",
+    "TAG_PATTERN",
+    "TOKEN_LENGTH",
+    "TOKEN_PATTERN",
+    "derive_token",
+    "new_tag",
+    "token_to_run",
+]
 
 TOKEN_LENGTH = 12
 TAG_LENGTH = 16
@@ -24,6 +37,8 @@ TAG_LENGTH = 16
 TOKEN_PATTERN = rf"^[a-z2-7]{{{TOKEN_LENGTH}}}$"
 #: Accepted shape of a run tag.
 TAG_PATTERN = rf"^[A-Za-z0-9]{{{TAG_LENGTH}}}$"
+
+_TOKEN_RE = re.compile(TOKEN_PATTERN)
 
 
 def _field(value: str) -> bytes:
@@ -46,3 +61,19 @@ def derive_token(lab_key: bytes, run_id: str, placement_id: str) -> str:
 def new_tag() -> str:
     """Return a fresh 16-char random tag (``[0-9a-f]``, 64 bits from ``secrets``)."""
     return secrets.token_hex(TAG_LENGTH // 2)
+
+
+def token_to_run(token: str, manifest: RunManifest) -> tuple[str, str] | None:
+    """Map a token to ``(run_id, placement_id)`` of ``manifest``, or ``None``.
+
+    Compares ``token`` in constant time against every placement's ``token`` in the
+    run's manifest; no key is needed. A malformed token, a token not planted in this
+    run, and any token of a control run (no placements) give ``None``.
+    """
+    if not _TOKEN_RE.fullmatch(token):
+        return None
+    match: tuple[str, str] | None = None
+    for placement in manifest.placements:
+        if hmac.compare_digest(placement.token, token) and match is None:
+            match = (manifest.run_id, placement.placement_id)
+    return match

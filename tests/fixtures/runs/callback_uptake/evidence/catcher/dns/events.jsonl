@@ -1,0 +1,1 @@
+{"run_id":"run_callback","stream":"catcher-dns","seq":0,"ts":"2026-11-07T12:03:20Z","kind":"callback","channel":"dns","source_ip":null,"token":"63reqcbimnts","placement_id":null,"method":null,"url":null,"host":null,"headers":[],"query":null,"body_b64":null,"body_size":null,"body_sha256":null,"body_truncated":false,"qname":"63reqcbimnts.cb.lab.test","qtype":"A"}

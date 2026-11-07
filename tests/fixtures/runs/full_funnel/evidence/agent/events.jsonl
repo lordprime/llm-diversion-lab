@@ -1,0 +1,2 @@
+{"run_id":"run_fullfunnel","stream":"agent","seq":0,"ts":"2026-11-07T12:05:00Z","kind":"agent_event","event_type":"tool_call","tool_name":"http_request","tool_args":{"url":"http://target.lab.test:3000/"},"text":null,"url":null,"native_ref":null}
+{"run_id":"run_fullfunnel","stream":"agent","seq":1,"ts":"2026-11-07T12:05:01Z","kind":"agent_event","event_type":"tool_call","tool_name":"http_request","tool_args":{"url":"http://target.lab.test:3000/x-3f9c1a7e5b2d4c80/"},"text":null,"url":null,"native_ref":null}

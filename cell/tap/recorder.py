@@ -43,7 +43,7 @@ import json
 import os
 import re
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +54,7 @@ from pydantic import JsonValue
 
 from control.core.ids import ID_PATTERN
 from control.core.models import LlmCall, LlmRole
+from control.core.tags import find_tags, parse_json
 from control.core.tokens import TAG_PATTERN
 
 __all__ = [
@@ -113,50 +114,6 @@ _SECRET_PARAMS: Final = frozenset(
 # --------------------------------------------------------------------------- pure functions
 
 
-def _parse_json(body: bytes) -> JsonValue | None:
-    """Parse ``body`` as JSON, or return ``None`` (not JSON, bad encoding, too deep)."""
-    if not body:
-        return None
-    try:
-        doc: JsonValue = json.loads(body)
-    except (ValueError, RecursionError):  # UnicodeDecodeError is a ValueError
-        return None
-    return doc
-
-
-def _json_strings(doc: JsonValue) -> Iterator[str]:
-    """Yield every string in a parsed JSON document: values and object keys."""
-    stack: list[JsonValue] = [doc]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, str):
-            yield node
-        elif isinstance(node, dict):
-            for key, value in node.items():
-                yield key
-                stack.append(value)
-        elif isinstance(node, list):
-            stack.extend(node)
-
-
-def find_tags(body: bytes, tags: list[str]) -> bool:
-    """Return whether any of ``tags`` occurs in a request ``body``.
-
-    Tags are matched exactly as given (case-sensitive). The raw bytes are always
-    searched. In addition, if ``body`` parses as JSON, every string in it (object keys
-    included) is searched *after* JSON decoding, so a tag sent as ``\\u0061...``
-    escapes is still found. The raw search covers what parsing hides: a tag in an
-    earlier duplicate key (``json.loads`` keeps the last) or inside a JSON number.
-    """
-    wanted = [t for t in tags if t]
-    if not wanted or not body:
-        return False
-    if any(t.encode("utf-8") in body for t in wanted):
-        return True
-    doc = _parse_json(body)
-    return doc is not None and any(t in s for s in _json_strings(doc) for t in wanted)
-
-
 def _model_field(doc: JsonValue | None) -> str | None:
     if isinstance(doc, dict):
         model = doc.get("model")
@@ -167,7 +124,7 @@ def _model_field(doc: JsonValue | None) -> str | None:
 
 def extract_requested_model(body: bytes) -> str | None:
     """The ``model`` the agent asked for: the request JSON's top-level ``model``."""
-    return _model_field(_parse_json(body))
+    return _model_field(parse_json(body))
 
 
 def extract_returned_model(body: bytes) -> str | None:
@@ -177,13 +134,13 @@ def extract_returned_model(body: bytes) -> str | None:
     that carries one (Anthropic ``message_start.message.model`` or an OpenAI-style
     chunk's top-level ``model``). Only reported, never compared here.
     """
-    doc = _parse_json(body)
+    doc = parse_json(body)
     if doc is not None:
         return _model_field(doc)
     for line in body.splitlines():
         if not line.startswith(b"data:"):
             continue
-        event = _parse_json(line[5:].strip())
+        event = parse_json(line[5:].strip())
         model = _model_field(event)
         if model is None and isinstance(event, dict):
             model = _model_field(event.get("message"))

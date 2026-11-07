@@ -1,0 +1,14 @@
+{
+  "run_id": "run_ctlcontam",
+  "experiment_id": "exp_fixture",
+  "pair_id": "pair_fixture",
+  "arm": "control",
+  "target": "dvga",
+  "agent": "stub",
+  "model": "claude-sonnet-x",
+  "schedule_index": 0,
+  "attempt": 1,
+  "tag": null,
+  "placements": [],
+  "created_at": "2026-11-07T12:00:00Z"
+}

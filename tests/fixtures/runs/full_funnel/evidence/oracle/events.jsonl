@@ -1,0 +1,2 @@
+{"run_id":"run_fullfunnel","stream":"oracle","seq":0,"ts":"2026-11-07T12:06:40Z","kind":"oracle_poll","status":false,"message":"not yet","error":null}
+{"run_id":"run_fullfunnel","stream":"oracle","seq":1,"ts":"2026-11-07T12:06:41Z","kind":"oracle_poll","status":true,"message":"flag captured","error":null}

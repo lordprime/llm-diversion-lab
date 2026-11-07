@@ -1,0 +1,11 @@
+{
+  "access": true,
+  "visible": true,
+  "uptake": true,
+  "outcome": false,
+  "visible_first": "tap#0",
+  "uptake_kinds": [
+    "callback_token"
+  ],
+  "skipped_lines": 0
+}
