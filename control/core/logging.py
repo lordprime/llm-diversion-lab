@@ -47,9 +47,10 @@ traceback):
   ``Set-Cookie:``) is kept in front of the mask. Every pattern is linear: bounded or
   possessive quantifiers only. The name-dependent ones (``assignment``,
   ``query_param``) match only *name + separator*, check the name in Python (the
-  :func:`is_sensitive_key` rule for assignments) and consume the value only when the
-  name is secret; a rejected match resumes right after its separator, so a value like
-  ``DB_PASSWORD=x`` in ``msg=DB_PASSWORD=x`` is still scanned. An assigned value may be
+  :func:`is_sensitive_key` rule for assignments) and mask the value only when the
+  name is secret; every match, masked or not, resumes the scan right after its
+  separator, so a value like ``DB_PASSWORD=x`` in ``msg=DB_PASSWORD=x``, or a secret a
+  masked value ran into, is still scanned (overlapping masks merge). An assigned value may be
   quoted (backslash escapes honoured, an optional ``b``/``r``/``u`` string prefix, an
   escaped ``\"`` quote for JSON inside a JSON string, the first element of a ``[...]``
   list), a YAML block scalar (``password: |`` and the deeper-indented lines after it,
@@ -262,6 +263,8 @@ _ESCAPED_QUOTED_VALUE = {
 }
 #: A quote in an unquoted value, escaped (``\\"``, JSON inside a JSON string) or not.
 _QUOTE_TOKEN = re.compile(r"\\?[\"']")
+#: Characters that may follow a string's closing quote inside a larger value.
+_VALUE_CLOSERS = frozenset(",;}])&")
 #: A value assigned to a name containing ``authorization`` runs to the end of the line
 #: (``Authorization: Key x``, AWS4 ``Credential=..., Signature=x``).
 _TO_END_OF_LINE = re.compile(r"[^\r\n]++")
@@ -281,8 +284,37 @@ def _end(pattern: re.Pattern[str], text: str, pos: int) -> int | None:
     return value.end() if value is not None else None
 
 
-def _assignment_value(match: re.Match[str], text: str) -> int | None:
-    """Where the value assigned by ``match`` ends (``None``: no value)."""
+class _Runs:
+    """One pass's text, with the last end found for each run pattern remembered.
+
+    The run patterns (:data:`_UNQUOTED_VALUE`, :data:`_TO_END_OF_LINE`,
+    :data:`_QUERY_VALUE`) are one possessive character class, so a run found from ``a``
+    to ``b`` also ends at ``b`` from any start inside it: values that start inside a
+    run already scanned (nested ``password=password=...``) cost O(1), keeping a scan
+    that resumes inside masked values linear.
+    """
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self._last: dict[re.Pattern[str], tuple[int, int]] = {}
+
+    def end(self, pattern: re.Pattern[str], pos: int) -> int | None:
+        start, stop = self._last.get(pattern, (0, -1))
+        if start <= pos < stop:
+            return stop
+        found = _end(pattern, self.text, pos)
+        if found is not None and found > pos:
+            self._last[pattern] = (pos, found)
+        return found
+
+
+def _assignment_value(match: re.Match[str], runs: _Runs, inner: bool) -> int | None:
+    """Where the value assigned by ``match`` ends (``None``: no value).
+
+    ``inner``: the match starts inside a value already masked; its unquoted value is
+    then not extended over an open quote (the enclosing value was).
+    """
+    text = runs.text
     end = match.end()
     quote = match.group("quote")
     if quote:
@@ -291,21 +323,27 @@ def _assignment_value(match: re.Match[str], text: str) -> int | None:
     if (block := _YAML_BLOCK.match(text, end)) is not None:
         return _yaml_block_end(text, match.start(), block.end())
     if "authorization" in match.group("aname").lower():
-        return _end(_TO_END_OF_LINE, text, end)
-    stop = _end(_UNQUOTED_VALUE, text, end)
-    return None if stop is None else _close_open_quote(text, end, stop)
+        return runs.end(_TO_END_OF_LINE, end)
+    stop = runs.end(_UNQUOTED_VALUE, end)
+    if stop is None or inner:
+        return stop
+    return _close_open_quote(runs, end, stop)
 
 
-def _close_open_quote(text: str, start: int, stop: int) -> int:
+def _close_open_quote(runs: _Runs, start: int, stop: int) -> int:
     """``stop``, or past the rest of a quoted string the value ``text[start:stop]`` opened.
 
     An unquoted value runs to whitespace, so in compact JSON (``"password":null,
     "secret":"a b"``) it can swallow the opening quote of a following quoted secret and
     stop inside it. If the span holds an odd number of one kind of quote (``"``, ``'``,
     ``\\"`` or ``\\'``), the last one opened a string: the value extends, with the
-    bounded quoted grammar, up to that string's closing quote. Linear: the span is
-    consumed by the mask, and the extension is bounded.
+    bounded quoted grammar, up to that string's closing quote. If that quote is not
+    followed by whitespace, the end, or one of ``,;}])&`` it was really the opening
+    quote of a following value (``password=it's api_key='x'``), so the mask runs on
+    over one more unquoted run (no further parity step). Linear: the span is consumed
+    by the mask, and the extension is bounded.
     """
+    text = runs.text
     counts: dict[str, int] = {}
     last: dict[str, int] = {}
     for token in _QUOTE_TOKEN.finditer(text, start, stop):
@@ -318,7 +356,14 @@ def _close_open_quote(text: str, start: int, stop: int) -> int:
     kind = max(open_kinds, key=last.__getitem__)
     table = _ESCAPED_QUOTED_VALUE if len(kind) == 2 else _QUOTED_VALUE
     rest = _end(table[kind[-1]], text, stop)
-    return stop if rest is None else rest
+    if rest is None:
+        return stop
+    after = rest + len(kind)
+    if not text.startswith(kind, rest) or after >= len(text):
+        return rest
+    if text[after].isspace() or text[after] in _VALUE_CLOSERS:
+        return rest
+    return runs.end(_UNQUOTED_VALUE, after) or rest
 
 
 def _yaml_block_end(text: str, key_start: int, pos: int) -> int:
@@ -354,12 +399,15 @@ def _yaml_block_end(text: str, key_start: int, pos: int) -> int:
 #: pattern for the value that follows when the name is secret.
 _GUARDED: dict[
     str,
-    tuple[Callable[[re.Match[str]], bool], Callable[[re.Match[str], str], int | None]],
+    tuple[
+        Callable[[re.Match[str]], bool],
+        Callable[[re.Match[str], _Runs, bool], int | None],
+    ],
 ] = {
     "assignment": (_assigned_is_secret, _assignment_value),
     "query_param": (
         _query_name_is_secret,
-        lambda match, text: _end(_QUERY_VALUE, text, match.end()),
+        lambda match, runs, _inner: runs.end(_QUERY_VALUE, match.end()),
     ),
 }
 
@@ -541,26 +589,34 @@ def _guarded_edits(
     name: str,
     pattern: re.Pattern[str],
     is_secret: Callable[[re.Match[str]], bool],
-    value_end: Callable[[re.Match[str], str], int | None],
+    value_end: Callable[[re.Match[str], _Runs, bool], int | None],
     text: str,
 ) -> _Edits:
     """Mask the value after every secret ``name`` + separator match, in linear time.
 
-    A match whose name is not secret is kept and the scan resumes right after its
-    separator, so the value (which may itself hold ``secret=...``) is scanned too.
+    The scan always resumes right after a match's separator, never past its value: a
+    value (even a masked one, which can run over a following ``name=`` and stop inside
+    that name's quoted value) may hold another ``secret=...``. A secret match that
+    starts inside the current mask extends it if its value ends later, so masks never
+    overlap and a second secret is never stranded.
     """
     mask = f"[REDACTED:{name}]"
+    runs = _Runs(text)
     edits: _Edits = []
     pos = 0
     while (match := pattern.search(text, pos)) is not None:
-        end = match.end()
-        if is_secret(match) and not _ALREADY_MASKED.match(text, end):
-            stop = value_end(match, text)
-            if stop is not None and stop > end:
-                edits.append((match.start(), stop, match.group("keep") + mask))
-                pos = stop
-                continue
-        pos = end
+        end = pos = match.end()
+        if not is_secret(match) or _ALREADY_MASKED.match(text, end):
+            continue
+        inner = bool(edits) and match.start() < edits[-1][1]
+        stop = value_end(match, runs, inner)
+        if stop is None or stop <= end:
+            continue
+        if not inner:
+            edits.append((match.start(), stop, match.group("keep") + mask))
+        elif stop > edits[-1][1]:
+            start, _, replacement = edits[-1]
+            edits[-1] = (start, stop, replacement)
     return edits
 
 

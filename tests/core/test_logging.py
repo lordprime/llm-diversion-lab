@@ -6,13 +6,15 @@ a credential to a secret scanner.
 
 from __future__ import annotations
 
+import collections
 import copy
 import io
 import json
 import logging
 import logging.config
+import re
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from types import MappingProxyType
 from typing import Any
 
@@ -496,25 +498,57 @@ ADVERSARIAL = {
 }
 
 
+def _best_time(fn: Callable[[], object], runs: int = 3) -> float:
+    """The fastest of ``runs`` timings of ``fn()``, in seconds (robust to load)."""
+    best = float("inf")
+    for _ in range(runs):
+        start = time.perf_counter()
+        fn()
+        best = min(best, time.perf_counter() - start)
+    return best
+
+
+def _assert_fast(fn: Callable[[], object], limit: float = 3.0) -> None:
+    """``fn()`` finishes within ``limit`` seconds (the fastest of 3 runs).
+
+    A generous absolute bound: catastrophic backtracking on 64 KiB takes minutes, so it
+    still trips this, while a loaded CI machine does not.
+    """
+    elapsed = _best_time(fn)
+    assert elapsed < limit, f"took {elapsed:.2f}s (limit {limit}s)"
+
+
+def _assert_scales_linearly(run: Callable[[str], object], text: str) -> None:
+    """4x the input takes less than 10x the time (fastest of 3 runs each).
+
+    Measured below :data:`MAX_INPUT_CHARS`, where nothing is windowed; a 1 ms floor
+    on the small input absorbs timer noise. Quadratic work would take ~16x.
+    """
+    small = text[: len(text) // 4]
+    t_small = max(_best_time(lambda: run(small)), 1e-3)
+    t_big = _best_time(lambda: run(text))
+    assert t_big < 10 * t_small, f"4x input took {t_big / t_small:.1f}x the time"
+
+
+def _drain(pattern: re.Pattern[str]) -> Callable[[str], object]:
+    return lambda text: collections.deque(pattern.finditer(text), maxlen=0)
+
+
 @pytest.mark.parametrize("shape", sorted(ADVERSARIAL))
 @pytest.mark.parametrize("name", [n for n, _ in REDACTION_PATTERNS])
 def test_every_pattern_is_linear_on_adversarial_64k_input(name: str, shape: str) -> None:
     """No pattern backtracks catastrophically, even without the input cap."""
-    pattern = dict(REDACTION_PATTERNS)[name]
+    run = _drain(dict(REDACTION_PATTERNS)[name])
     text = ADVERSARIAL[shape]
     assert len(text) >= _64K - 16
-    start = time.perf_counter()
-    for _ in pattern.finditer(text):
-        pass
-    elapsed = time.perf_counter() - start
-    assert elapsed < 0.5, f"{name} took {elapsed:.2f}s on {shape}"
+    _assert_fast(lambda: run(text))
+    _assert_scales_linearly(run, text)
 
 
 @pytest.mark.parametrize("shape", sorted(ADVERSARIAL))
 def test_redact_text_is_fast_on_adversarial_input(shape: str) -> None:
-    start = time.perf_counter()
-    redact_text(ADVERSARIAL[shape])
-    assert time.perf_counter() - start < 0.5
+    _assert_fast(lambda: redact_text(ADVERSARIAL[shape]))
+    _assert_scales_linearly(redact_text, ADVERSARIAL[shape])
 
 
 def test_long_strings_keep_head_and_tail_after_redaction() -> None:
@@ -679,9 +713,8 @@ CHAINS = {
 
 @pytest.mark.parametrize("shape", sorted(CHAINS))
 def test_redact_text_is_fast_on_rejected_name_chains(shape: str) -> None:
-    start = time.perf_counter()
-    redact_text(CHAINS[shape])
-    assert time.perf_counter() - start < 0.5
+    _assert_fast(lambda: redact_text(CHAINS[shape]))
+    _assert_scales_linearly(redact_text, CHAINS[shape])
 
 
 def test_bounded_patterns_still_mask_what_they_should() -> None:
@@ -1049,18 +1082,15 @@ ROUND4_ADVERSARIAL = {
 @pytest.mark.parametrize("shape", sorted(ROUND4_ADVERSARIAL))
 @pytest.mark.parametrize("name", [n for n, _ in REDACTION_PATTERNS])
 def test_every_pattern_is_linear_on_round4_shapes(name: str, shape: str) -> None:
-    pattern = dict(REDACTION_PATTERNS)[name]
-    start = time.perf_counter()
-    for _ in pattern.finditer(ROUND4_ADVERSARIAL[shape]):
-        pass
-    assert time.perf_counter() - start < 0.5
+    run = _drain(dict(REDACTION_PATTERNS)[name])
+    _assert_fast(lambda: run(ROUND4_ADVERSARIAL[shape]))
+    _assert_scales_linearly(run, ROUND4_ADVERSARIAL[shape])
 
 
 @pytest.mark.parametrize("shape", sorted(ROUND4_ADVERSARIAL))
 def test_redact_text_is_fast_on_round4_shapes(shape: str) -> None:
-    start = time.perf_counter()
-    redact_text(ROUND4_ADVERSARIAL[shape])
-    assert time.perf_counter() - start < 0.5
+    _assert_fast(lambda: redact_text(ROUND4_ADVERSARIAL[shape]))
+    _assert_scales_linearly(redact_text, ROUND4_ADVERSARIAL[shape])
 
 
 @pytest.mark.parametrize("shape", sorted({**ADVERSARIAL, **ROUND4_ADVERSARIAL, **CHAINS}))
@@ -1068,9 +1098,7 @@ def test_redact_text_is_fast_above_the_ceiling(shape: str) -> None:
     """Windowed redaction (two windows with their margins) on 4x the ceiling."""
     text = {**ADVERSARIAL, **ROUND4_ADVERSARIAL, **CHAINS}[shape] * 4
     assert len(text) > MAX_INPUT_CHARS
-    start = time.perf_counter()
-    redact_text(text)
-    assert time.perf_counter() - start < 0.5
+    _assert_fast(lambda: redact_text(text))
 
 
 # --------------------------------------------------------------------- fix round 5
@@ -1159,6 +1187,35 @@ ROUND5_ADVERSARIAL = {
 @pytest.mark.parametrize("shape", sorted(ROUND5_ADVERSARIAL))
 def test_redact_text_is_fast_on_round5_shapes(shape: str) -> None:
     for text in (ROUND5_ADVERSARIAL[shape], ROUND5_ADVERSARIAL[shape] * 4):
-        start = time.perf_counter()
-        redact_text(text)
-        assert time.perf_counter() - start < 0.5
+        _assert_fast(lambda text=text: redact_text(text))
+    _assert_scales_linearly(redact_text, ROUND5_ADVERSARIAL[shape])
+
+
+#: LB-A: a quote extension that stops on the next value's opening quote.
+NEXT_SECRET_AFTER_OPEN_QUOTE = [
+    "password=it's api_key='" + _X + "'",
+    'password=p"w secret="' + _X + '"',
+    "secret=it's;pwd=x y;password=\"it's " + _X + '"',
+]
+
+
+@pytest.mark.parametrize("text", NEXT_SECRET_AFTER_OPEN_QUOTE)
+def test_a_quote_extension_never_strands_the_next_secret(text: str) -> None:
+    out = redact_text(text)
+    assert "SECRET" not in out, out
+
+
+#: Nested secret names inside masked values (the scan resumes after each separator).
+NESTED_ADVERSARIAL = {
+    "nested_unquoted": _fill("password="),
+    "nested_quoted": _fill('password="password='),
+    "nested_auth": _fill("authorization=password="),
+    "nested_query": _fill("?key="),
+    "nested_open_quotes": _fill("password=it's secret='"),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(NESTED_ADVERSARIAL))
+def test_redact_text_is_linear_on_nested_secret_names(shape: str) -> None:
+    _assert_fast(lambda: redact_text(NESTED_ADVERSARIAL[shape]))
+    _assert_scales_linearly(redact_text, NESTED_ADVERSARIAL[shape])
