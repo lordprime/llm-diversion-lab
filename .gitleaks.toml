@@ -1,0 +1,14 @@
+# gitleaks configuration for llm-diversion-lab.
+# Keeps the full default ruleset and allows only known synthetic test values.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic test data: golden run fixtures (generated callback tokens, tags, ids) and fixed unit-test values (fixture tokens, a per-test probe secret). None are credentials."
+paths = ['''^tests/fixtures/runs/''']
+regexes = [
+  '''abcdefgh2345''',
+  '''zzzzzz777777''',
+  '''probe-secret-[0-9a-f]+''',
+]
