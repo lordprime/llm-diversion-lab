@@ -12,20 +12,26 @@ Configuration is read from the environment once, at script load
 ``LAB_PAYLOADS``, ``LAB_PROBE_SECRET``, ``LAB_EVIDENCE_DIR``, ``LAB_RUN_ID``); a bad
 configuration is logged as an error, which makes ``mitmdump`` exit at startup.
 
+The injector never answers a request itself: every request reaches the app. In an
+injected run it transforms the app's own response to the few ``GET`` requests it acts
+on (rules in :mod:`cell.injector.placement`), keeping the app's headers (``Date``,
+``Server``, cookies...) so planted responses have the app's shape. When a body changes,
+Content-Length is fixed (unless Transfer-Encoding is used), an ETag is recomputed
+(quoted digest, ``W/`` kept) and ``Digest``/``Repr-Digest``/``Content-Digest``/
+``Content-MD5`` are dropped. 204, 206 (or any ``Content-Range``) and 304 are never
+planted into.
+
 Hooks:
 
 * ``request``: decides probe or not, removes every ``x-lab-probe`` header (so it never
-  reaches the app), and answers the planted surfaces itself (robots.txt, P7 paths and
-  the decoy path in an injected run). Any other request is forwarded untouched.
-* ``response``: appends to ``<evidence>/injector/events.jsonl`` one
-  :class:`TargetAccessEvent` for the request and, if the response carried planted
-  bytes, one :class:`PlacementServe` per placement in it; the served wire bytes go to
-  the write-once ``<evidence>/injector/NNNN.body`` (``NNNN`` = the access event's
-  ``seq``). Responses are never modified, except that a request whose evidence cannot
-  be written is answered with ``502`` instead (fail closed, like the tap).
+  reaches the app), and notes the planned action. The request is forwarded untouched
+  otherwise.
+* ``response``: applies the action, then logs a :class:`TargetAccessEvent` and, for
+  robots.txt and P7 requests, one :class:`PlacementServe` per placement plus the served
+  body and its meta (see :mod:`cell.injector.serve_log`). Any other response is
+  forwarded byte-for-byte. A request whose evidence cannot be written (or whose
+  transform fails) is answered with ``502`` instead (fail closed, like the tap).
 * ``error``: a request that ended without a response is still logged (``status`` null).
-
-Evidence formats are described in :mod:`cell.injector.serve_log`.
 """
 
 from __future__ import annotations
@@ -34,29 +40,79 @@ import logging
 import os
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from http import HTTPStatus
 from typing import Final
 
 from mitmproxy import http
+from pydantic import JsonValue
 
 from cell.injector.placement import (
+    DECOY_PAGE,
+    DEFAULT_ROBOTS_BASE,
     PROBE_HEADER,
+    Action,
+    ActionKind,
     InjectionPlan,
-    SyntheticResponse,
+    Planted,
     build_plan,
+    decode_body,
+    encode_body,
     is_probe,
     plant_into_body,
+    recompute_etag,
+    render_robots,
 )
 from cell.injector.serve_log import AccessRecord, InjectorConfig, ServedBody, ServeLog
 
-__all__ = ["SurfaceInjector", "plant_into_response"]
+__all__ = ["SurfaceInjector", "plant_into_response", "plantable"]
 
 log = logging.getLogger(__name__)
 
 _METADATA_KEY: Final = "lab_injector"
 _WITHHELD: Final = b"Bad Gateway\n"
+_TEXT_PLAIN: Final = "text/plain; charset=utf-8"
+_TEXT_HTML: Final = "text/html; charset=utf-8"
+_UNPLANTABLE_STATUS: Final = frozenset({204, 206, 304})
+_STALE_DIGESTS: Final = ("digest", "repr-digest", "content-digest", "content-md5")
 
 
-# --------------------------------------------------------------------------- headers
+# --------------------------------------------------------------------------- response edits
+
+
+def plantable(response: http.Response) -> bool:
+    """Whether a response's body may be planted into (not 204/206/304, no range)."""
+    return (
+        response.raw_content is not None
+        and response.status_code not in _UNPLANTABLE_STATUS
+        and "content-range" not in response.headers
+    )
+
+
+def _replace_body(response: http.Response, wire: bytes) -> None:
+    """Set new wire bytes and fix every header that described the old ones."""
+    headers = response.headers
+    response.raw_content = wire
+    if "transfer-encoding" not in headers:
+        headers["content-length"] = str(len(wire))
+    etag = headers.get("etag")
+    if etag is not None:
+        headers["etag"] = recompute_etag(etag, wire)
+    for name in _STALE_DIGESTS:
+        if name in headers:
+            del headers[name]
+
+
+def _replace_representation(
+    response: http.Response, status: int, content_type: str, body: bytes
+) -> None:
+    """Give a response a new status and identity-encoded body, keeping other headers."""
+    response.status_code = status
+    response.reason = HTTPStatus(status).phrase
+    for name in ("content-encoding", "content-range"):
+        if name in response.headers:
+            del response.headers[name]
+    response.headers["content-type"] = content_type
+    _replace_body(response, body)
 
 
 def plant_into_response(
@@ -64,26 +120,75 @@ def plant_into_response(
 ) -> tuple[int, bool]:
     """Plant ``payload`` into an app response in its own Content-Encoding.
 
-    On success the wire body is replaced, Content-Length is set to the new length
-    (unless the response uses Transfer-Encoding) and the now stale ETag and
-    Content-MD5 are removed; returns ``(offset in the decoded body, True)``. On failure
-    the response is left exactly as it was and ``(-1, False)`` is returned.
+    Status and headers are kept, except the ones that described the old body (see the
+    module docstring). Returns ``(offset in the decoded body, True)``; if the response
+    is not :func:`plantable` or its body cannot be decoded and re-encoded, it is left
+    exactly as it was and ``(-1, False)`` is returned. The caller only plants on GET.
     """
     raw = response.raw_content
-    if raw is None:
+    if raw is None or not plantable(response):
         return -1, False
     wire, offset, ok = plant_into_body(
         raw, response.headers.get("content-encoding"), payload, before=before
     )
     if not ok:
         return -1, False
-    response.raw_content = wire
-    if "transfer-encoding" not in response.headers:
-        response.headers["content-length"] = str(len(wire))
-    for stale in ("etag", "content-md5"):
-        if stale in response.headers:
-            del response.headers[stale]
+    _replace_body(response, wire)
     return offset, True
+
+
+def _not_planted(action: Action) -> tuple[Planted, ...]:
+    return tuple(Planted(plant, None, False) for plant in action.plants)
+
+
+def _apply_robots(
+    response: http.Response, action: Action
+) -> tuple[tuple[Planted, ...], dict[str, JsonValue]]:
+    status = response.status_code
+    meta: dict[str, JsonValue] = {"synthesized_base": False}
+    if status == 404:
+        # The app has no robots.txt: serve the minimal base plus the P1 lines, as 200.
+        body, offsets = render_robots(DEFAULT_ROBOTS_BASE.encode(), action.plants)
+        _replace_representation(response, 200, _TEXT_PLAIN, body)
+        meta["synthesized_base"] = True
+        return tuple(Planted(p, o, True) for p, o in zip(action.plants, offsets, strict=True)), meta
+    if status != 200 or not plantable(response):
+        meta["note"] = f"app answered {status}; robots.txt not planted"
+        return _not_planted(action), meta
+    encoding = response.headers.get("content-encoding")
+    decoded = decode_body(response.raw_content or b"", encoding)
+    if decoded is None:
+        meta["note"] = f"cannot decode content-encoding {encoding!r}"
+        return _not_planted(action), meta
+    body, offsets = render_robots(decoded, action.plants)
+    wire = encode_body(body, encoding)
+    if wire is None:
+        meta["note"] = f"cannot re-encode content-encoding {encoding!r}"
+        return _not_planted(action), meta
+    _replace_body(response, wire)
+    return tuple(Planted(p, o, True) for p, o in zip(action.plants, offsets, strict=True)), meta
+
+
+def _apply_error(
+    response: http.Response, action: Action
+) -> tuple[tuple[Planted, ...], dict[str, JsonValue]]:
+    status = response.status_code
+    meta: dict[str, JsonValue] = {"expected_status": action.expected_status}
+    if not 400 <= status < 500:
+        meta["note"] = f"app answered {status}, not 4xx; nothing planted"
+        return _not_planted(action), meta
+    if status != action.expected_status:
+        meta["note"] = f"expected {action.expected_status}, app answered {status}"
+    (plant,) = action.plants
+    offset, ok = plant_into_response(response, plant.content, before=b"</body>")
+    if not ok:
+        meta["note"] = "app error body cannot be planted into (encoding or range)"
+        return _not_planted(action), meta
+    return (Planted(plant, offset, True),), meta
+
+
+def _apply_decoy(response: http.Response) -> None:
+    _replace_representation(response, 200, _TEXT_HTML, DECOY_PAGE.encode())
 
 
 # --------------------------------------------------------------------------- addon
@@ -92,11 +197,11 @@ def plant_into_response(
 class _FlowState:
     """Per-flow decision, kept in ``flow.metadata`` (a plain class: see serve_log)."""
 
-    __slots__ = ("logged", "probe", "synthetic")
+    __slots__ = ("action", "logged", "probe")
 
-    def __init__(self, probe: bool, synthetic: SyntheticResponse | None) -> None:
+    def __init__(self, probe: bool, action: Action | None) -> None:
         self.probe = probe
-        self.synthetic = synthetic
+        self.action = action
         self.logged = False
 
 
@@ -104,21 +209,12 @@ def _ts(timestamp: float | None) -> datetime:
     return datetime.fromtimestamp(timestamp, tz=UTC) if timestamp else datetime.now(UTC)
 
 
-def _make_response(synthetic: SyntheticResponse, *, head: bool) -> http.Response:
-    resp = http.Response.make(
-        synthetic.status, b"" if head else synthetic.body, {"content-type": synthetic.content_type}
-    )
-    if head:
-        resp.headers["content-length"] = str(len(synthetic.body))
-    return resp
-
-
 def _refuse(flow: http.HTTPFlow) -> None:
     flow.response = http.Response.make(502, _WITHHELD, {"content-type": "text/plain"})
 
 
 class SurfaceInjector:
-    """Plants a run's surfaces and logs every request to the target."""
+    """Plants a run's surfaces into the app's responses and logs every request."""
 
     def __init__(self, plan: InjectionPlan, serve_log: ServeLog, probe_secret: str) -> None:
         self._plan = plan
@@ -165,42 +261,55 @@ class SurfaceInjector:
         )
 
     def request(self, flow: http.HTTPFlow) -> None:
-        state = self._classify(flow)
-        flow.metadata[_METADATA_KEY] = state
-        if state.synthetic is not None:
-            head = flow.request.method.upper() == "HEAD"
-            flow.response = _make_response(state.synthetic, head=head)
+        flow.metadata[_METADATA_KEY] = self._classify(flow)
 
-    def _served(self, flow: http.HTTPFlow, state: _FlowState) -> ServedBody | None:
-        synthetic, resp = state.synthetic, flow.response
-        if synthetic is None or not synthetic.plants or resp is None:
+    def _apply(self, response: http.Response, action: Action) -> ServedBody | None:
+        """Transform the app's response; return what to log for planted surfaces."""
+        app_status = response.status_code
+        if action.kind is ActionKind.DECOY:
+            _apply_decoy(response)
             return None
-        if flow.request.method.upper() == "HEAD":
-            return None  # headers only: no planted bytes reached the client
-        wire = resp.raw_content or b""
+        if action.kind is ActionKind.ROBOTS:
+            planted, meta = _apply_robots(response, action)
+        else:
+            planted, meta = _apply_error(response, action)
+        wire = response.raw_content or b""
         try:
-            decoded, decodable = resp.get_content(strict=True) or b"", True
-        except ValueError:
-            decoded, decodable = wire, False
-        plants = tuple(
-            (
-                plant,
-                decodable
-                and resp.status_code == synthetic.status
-                and decoded[plant.offset : plant.offset + len(plant.content)] == plant.content,
-            )
-            for plant in synthetic.plants
+            decoded = response.get_content(strict=True) or b""
+        except ValueError:  # cannot happen after a successful plant; record raw bytes
+            decoded = wire
+        checked = tuple(
+            p
+            if p.insert_ok
+            and p.offset is not None
+            and decoded[p.offset : p.offset + len(p.plant.content)] == p.plant.content
+            else Planted(p.plant, None, False)
+            for p in planted
         )
-        return ServedBody(wire, decoded, resp.status_code, _ts(resp.timestamp_start), plants)
+        meta.update(
+            action=action.kind.value,
+            app_status=app_status,
+            content_encoding=response.headers.get("content-encoding"),
+        )
+        return ServedBody(
+            wire, decoded, response.status_code, _ts(response.timestamp_start), checked, meta
+        )
 
     def response(self, flow: http.HTTPFlow) -> None:
         state = self._state(flow)
         if state.logged:
             return
         state.logged = True
+        served: ServedBody | None = None
+        if state.action is not None and flow.response is not None:
+            try:
+                served = self._apply(flow.response, state.action)
+            except Exception:
+                log.exception("injector: cannot transform flow %s; withholding it", flow.id)
+                _refuse(flow)
         status = flow.response.status_code if flow.response is not None else None
         try:
-            self._log.record(self._access(flow, state, status), self._served(flow, state))
+            self._log.record(self._access(flow, state, status), served)
         except Exception:
             log.exception("injector: cannot record flow %s; withholding the response", flow.id)
             _refuse(flow)

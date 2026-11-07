@@ -22,15 +22,20 @@ Configuration (:meth:`InjectorConfig.from_env`):
 Evidence (:class:`ServeLog`):
 
 * ``<evidence>/injector/events.jsonl``: per request one :class:`TargetAccessEvent`,
-  followed, if the response carried planted bytes, by one :class:`PlacementServe` per
-  placement in it. Both kinds share the ``injector`` stream and one ``seq`` counter,
-  which resumes after a restart. Each line is exactly ``model_dump_json()`` of its
-  event; producers re-ship stored lines byte-for-byte. A flow's lines are appended in
-  one write and fsynced. A torn last line left by a crash is closed with a newline so
-  new lines never join it, and its ``seq`` is never reused; shippers must skip lines
-  that do not parse.
-* ``<evidence>/injector/NNNN.body``: the exact wire bytes of each planted response,
-  write-once (``NNNN`` = its access event's ``seq``, zero-padded to four digits).
+  followed, if the request was one the injector plants on (``GET`` robots.txt or a P7
+  path in an injected run), by one :class:`PlacementServe` per placement, whether or
+  not the plant succeeded (``insert_ok``). Both kinds share the ``injector`` stream
+  and one ``seq`` counter, which resumes after a restart. Each line is exactly
+  ``model_dump_json()`` of its event; producers re-ship stored lines byte-for-byte.
+  A flow's lines are appended in one write and fsynced. A torn last line left by a
+  crash is closed with a newline so new lines never join it, and its ``seq`` is never
+  reused; shippers must skip lines that do not parse.
+* ``<evidence>/injector/NNNN.body``: the exact wire bytes served for each such
+  request, and ``NNNN.meta.json`` beside it: the action, the app's status, the served
+  status, the expected status (P7), whether the robots.txt base was synthesized because
+  the app had none, the served Content-Encoding, a note on why nothing was planted, and
+  each placement's offset and ``insert_ok``. Both are write-once (``NNNN`` = the access
+  event's ``seq``, zero-padded to four digits).
 """
 
 from __future__ import annotations
@@ -46,9 +51,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Final
 
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
-from cell.injector.placement import INJECTOR_STREAM, Plant
+from cell.injector.placement import INJECTOR_STREAM, Planted
 from control.core.models import Arm, PlacementServe, RunManifest, TargetAccessEvent
 
 __all__ = [
@@ -67,7 +72,7 @@ INJECTOR_DIR: Final = "injector"
 #: The injector's JSONL events file, relative to the evidence dir.
 EVENTS_FILE: Final = f"{INJECTOR_DIR}/events.jsonl"
 
-_BODY_NAME = re.compile(r"^(\d{4,})\.body$")
+_EVIDENCE_NAME = re.compile(r"^(\d{4,})\.(?:body|meta\.json)$")
 
 
 # --------------------------------------------------------------------------- config
@@ -142,13 +147,31 @@ class AccessRecord:
 
 @dataclass(frozen=True, slots=True)
 class ServedBody:
-    """A response that carried planted bytes, as sent on the wire."""
+    """The response to a request the injector plants on, as sent on the wire."""
 
     wire: bytes
     decoded: bytes
     status: int
     ts: datetime
-    plants: tuple[tuple[Plant, bool], ...]  # (plant, insert_ok)
+    plants: tuple[Planted, ...]
+    #: Extra facts for ``NNNN.meta.json`` (action, app/expected status, ...).
+    meta: Mapping[str, JsonValue] = field(default_factory=dict)
+
+    def meta_json(self, seq: int) -> bytes:
+        doc: dict[str, JsonValue] = {
+            **self.meta,
+            "seq": seq,
+            "served_status": self.status,
+            "placements": [
+                {
+                    "placement_id": p.plant.placement.placement_id,
+                    "byte_offset": p.offset if p.insert_ok else None,
+                    "insert_ok": p.insert_ok,
+                }
+                for p in self.plants
+            ],
+        }
+        return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
 
 
 def _write_once(path: Path, data: bytes) -> None:
@@ -170,7 +193,7 @@ class ServeLog:
     """The injector's evidence for one run; safe to call from several threads.
 
     On construction it resumes from an existing evidence directory: numbering
-    continues after the highest ``seq`` in the events file or ``NNNN.body`` name, and
+    continues after the highest ``seq`` in the events file or ``NNNN.*`` name, and
     a torn last line is closed with a newline so new lines never join it.
     """
 
@@ -185,7 +208,7 @@ class ServeLog:
     def _resume(self) -> int:
         seqs: set[int] = set()
         for entry in self._dir.iterdir():
-            match = _BODY_NAME.fullmatch(entry.name)
+            match = _EVIDENCE_NAME.fullmatch(entry.name)
             if match:
                 seqs.add(int(match.group(1)))
         if self._events.is_file():
@@ -204,9 +227,9 @@ class ServeLog:
     def record(
         self, access: AccessRecord, served: ServedBody | None = None
     ) -> list[TargetAccessEvent | PlacementServe]:
-        """Log one request (and its planted bytes, if any); return the events written.
+        """Log one request (and what was planted, if anything); return the events written.
 
-        If the served body cannot be stored, the request is logged as answered ``502``
+        If the served body or its meta cannot be stored, the request is logged as answered ``502``
         with no serve events, and the storage error is raised afterwards so the caller
         withholds the planted response. A failed write still consumes its ``seq``s.
         """
@@ -218,6 +241,7 @@ class ServeLog:
             if served is not None:
                 try:
                     _write_once(self._dir / f"{seq:04d}.body", served.wire)
+                    _write_once(self._dir / f"{seq:04d}.meta.json", served.meta_json(seq))
                 except OSError as exc:
                     failure, served, status = exc, None, 502
             events: list[TargetAccessEvent | PlacementServe] = [
@@ -237,22 +261,22 @@ class ServeLog:
             if served is not None:
                 decoded_sha256 = hashlib.sha256(served.decoded).hexdigest()
                 wire_sha256 = hashlib.sha256(served.wire).hexdigest()
-                for i, (plant, insert_ok) in enumerate(served.plants, start=1):
+                for i, planted in enumerate(served.plants, start=1):
                     events.append(
                         PlacementServe(
                             run_id=self._run_id,
                             stream=INJECTOR_STREAM,
                             seq=seq + i,
                             ts=served.ts,
-                            placement_id=plant.placement.placement_id,
-                            surface=plant.placement.surface,
+                            placement_id=planted.plant.placement.placement_id,
+                            surface=planted.plant.placement.surface,
                             flow_id=access.flow_id,
                             url=access.url,
                             status=served.status,
                             decoded_sha256=decoded_sha256,
                             wire_sha256=wire_sha256,
-                            byte_offset=plant.offset if insert_ok else None,
-                            insert_ok=insert_ok,
+                            byte_offset=planted.offset if planted.insert_ok else None,
+                            insert_ok=planted.insert_ok,
                             probe=access.probe,
                         )
                     )

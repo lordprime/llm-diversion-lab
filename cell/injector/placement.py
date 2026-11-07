@@ -2,34 +2,43 @@
 
 :mod:`cell.injector.addon` is the thin mitmproxy shell around this module. Here we
 decide, from a run's :class:`~control.core.models.RunManifest` and the rendered text of
-its placements, what the injector answers itself and with which bytes.
+its placements, which requests to the target get an :class:`Action`, and we compute the
+bytes the addon plants into the app's response.
 
-Arms (DEVELOPMENT_PLAN section 4.4):
+The injector never fabricates a response. Every request goes to the app; in an
+injected run the addon then transforms the app's *own* response for ``GET`` requests
+only, keeping the app's status line and headers wherever the rules below allow, so
+the arms differ only by the planted content (DEVELOPMENT_PLAN section 4.4):
 
-* **injected**: ``GET``/``HEAD /robots.txt`` is answered with a synthetic file (a fixed
-  allow-all base followed by every P1 placement's text, in manifest order); each P7
-  placement's path is answered, for any method, with its configured 403/404 status
-  and an error page carrying the placement's text; the decoy path ``/x-<tag>`` (and
-  anything below ``/x-<tag>/``) is answered with a neutral HTML 200 page
-  (:data:`DECOY_PAGE`). Everything else goes to the app untouched.
-* **control**: nothing is planted and nothing is answered here; robots.txt, the P7
-  paths and ``/x-...`` reach the unmodified app (control = the clean site).
+* ``GET /robots.txt`` (P1): if the app answers 200, every P1 text is appended to its
+  body as a line, in manifest order, in the body's own Content-Encoding. If the app
+  answers 404 (it has no robots.txt), that response becomes a 200 ``text/plain`` whose
+  body is :data:`DEFAULT_ROBOTS_BASE` followed by the P1 lines, keeping the app's other
+  headers; the serve log records ``synthesized_base``. Any other status: nothing is
+  planted (``insert_ok`` false).
+* ``GET`` on a P7 path: if the app answers 4xx, the P7 text is planted into the app's
+  own error body, before ``</body>`` if present, else appended; status and headers are
+  kept. The locator's 403/404 is the *expected* status; the serve log records expected
+  and actual. If the app does not answer 4xx, nothing is planted (``insert_ok`` false:
+  a placement-map error the pre-flight probe catches).
+* ``GET`` on the decoy path ``/x-<tag>`` or below ``/x-<tag>/``: the app's response
+  becomes a 200 with :data:`DECOY_PAGE` as its body, keeping the app's other headers.
+* control: no action at all; every response passes through untouched.
 
-Placement text never lives in this code. The runner renders each placement and pins
-its UTF-8 bytes in the manifest as ``Placement.content_sha256``; the rendered text is
-handed to the injector separately (see :mod:`cell.injector.addon`) and
-:func:`build_plan` refuses any text whose hash differs or that lacks the run's tag.
+``HEAD`` and every other method are never planted. Placement text never lives in this
+code. The runner renders each placement and pins its UTF-8 bytes in the manifest as
+``Placement.content_sha256``; the rendered text is handed to the injector separately
+(see :mod:`cell.injector.serve_log`) and :func:`build_plan` refuses any text whose hash
+differs or that lacks the run's tag.
 
 Locators understood in M0:
 
 * P1: ``robots.txt:append`` and a ``url`` whose path is ``/robots.txt``.
-* P7: ``error:403`` or ``error:404`` and a ``url`` whose path is the probed path.
+* P7: ``error:403`` or ``error:404`` (the expected status) and a ``url`` whose path is
+  the probed path.
 
 Any other surface or locator is rejected, so a manifest never silently plants less
 than it promises.
-
-:func:`plant_into_body` plants into an existing (possibly compressed) body. M0 builds
-every planted body itself, so it is used for page surfaces (P3-P6) later on.
 """
 
 from __future__ import annotations
@@ -42,7 +51,7 @@ import re
 import zlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from http import HTTPStatus
+from enum import StrEnum
 from types import ModuleType
 from typing import Final
 from urllib.parse import urlsplit
@@ -58,14 +67,17 @@ __all__ = [
     "PROBE_HEADER",
     "ROBOTS_LOCATOR",
     "ROBOTS_PATH",
+    "Action",
+    "ActionKind",
     "InjectionPlan",
     "Plant",
-    "SyntheticResponse",
+    "Planted",
     "build_plan",
+    "decode_body",
+    "encode_body",
     "is_probe",
     "plant_into_body",
-    "render_decoy",
-    "render_error",
+    "recompute_etag",
     "render_robots",
     "request_path",
 ]
@@ -79,7 +91,7 @@ PROBE_HEADER: Final = "x-lab-probe"
 ROBOTS_PATH: Final = "/robots.txt"
 ROBOTS_LOCATOR: Final = "robots.txt:append"
 P7_LOCATOR_PATTERN: Final = r"^error:(403|404)$"
-#: Lines of the synthetic robots.txt that precede the P1 text (allow everything).
+#: robots.txt lines placed before the P1 text when the app has no robots.txt.
 DEFAULT_ROBOTS_BASE: Final = "User-agent: *\nDisallow:\n"
 #: The neutral page served at the decoy path; versioned with the payload library.
 DECOY_PAGE: Final = (
@@ -89,9 +101,6 @@ DECOY_PAGE: Final = (
 DECOY_PAGE_VERSION: Final = "1"
 
 _P7_LOCATOR = re.compile(P7_LOCATOR_PATTERN)
-_TEXT_PLAIN: Final = "text/plain; charset=utf-8"
-_TEXT_HTML: Final = "text/html; charset=utf-8"
-_ROBOTS_METHODS: Final = frozenset({"GET", "HEAD"})
 
 
 # --------------------------------------------------------------------------- codecs
@@ -176,120 +185,122 @@ def _rfind_ci(haystack: bytes, needle: bytes) -> int:
     return haystack.lower().rfind(needle.lower())
 
 
+def decode_body(body: bytes, encoding: str | None) -> bytes | None:
+    """``body`` with Content-Encoding ``encoding`` removed, or ``None`` if impossible.
+
+    Supported: identity/none, ``gzip``, ``x-gzip``, ``deflate``, ``br``, ``zstd``.
+    Stacked encodings (``gzip, br``) are not supported.
+    """
+    codec = _codec(encoding)
+    if codec is None:
+        return None
+    try:
+        return codec[0](body)
+    except Exception:  # any codec failure
+        return None
+
+
+def encode_body(decoded: bytes, encoding: str | None) -> bytes | None:
+    """``decoded`` encoded with Content-Encoding ``encoding``, or ``None`` if impossible.
+
+    The result is checked by decoding it again.
+    """
+    codec = _codec(encoding)
+    if codec is None:
+        return None
+    try:
+        wire = codec[1](decoded)
+        return wire if codec[0](wire) == decoded else None
+    except Exception:  # any codec failure
+        return None
+
+
 def plant_into_body(
     body: bytes, encoding: str | None, payload: bytes, *, before: bytes | None = None
 ) -> tuple[bytes, int, bool]:
     """Insert ``payload`` into a body sent with Content-Encoding ``encoding``.
 
-    The body is decoded (``identity``/none, ``gzip``, ``deflate``, ``br``, ``zstd``),
-    ``payload`` is inserted before the last occurrence of ``before`` (ASCII
-    case-insensitive) or appended when ``before`` is ``None`` or absent, and the result
-    is re-encoded with the same encoding and checked by decoding it again.
+    The body is decoded (:func:`decode_body`), ``payload`` is inserted before the last
+    occurrence of ``before`` (ASCII case-insensitive) or appended when ``before`` is
+    ``None`` or absent, and the result is re-encoded with the same encoding.
 
     Returns ``(new wire bytes, offset of payload in the decoded body, True)``. If the
-    encoding is unsupported (including stacked encodings such as ``gzip, br``) or the
-    body cannot be decoded or re-encoded, returns ``(body, -1, False)`` unchanged.
-    The caller must fix Content-Length and drop a stale ETag.
+    encoding is unsupported or the body cannot be decoded or re-encoded, returns
+    ``(body, -1, False)`` unchanged. The caller must fix the framing headers.
     """
     if not payload:
         raise ValueError("payload must be non-empty")
-    codec = _codec(encoding)
-    if codec is None:
+    decoded = decode_body(body, encoding)
+    if decoded is None:
         return body, -1, False
-    decode, encode = codec
-    try:
-        decoded = decode(body)
-        offset = _rfind_ci(decoded, before) if before else -1
-        if offset < 0:
-            offset = len(decoded)
-        planted = decoded[:offset] + payload + decoded[offset:]
-        wire = encode(planted)
-        ok = decode(wire)[offset : offset + len(payload)] == payload
-    except Exception:  # any codec failure: leave the body alone
-        return body, -1, False
-    if not ok:
+    offset = _rfind_ci(decoded, before) if before else -1
+    if offset < 0:
+        offset = len(decoded)
+    wire = encode_body(decoded[:offset] + payload + decoded[offset:], encoding)
+    if wire is None:
         return body, -1, False
     return wire, offset, True
 
 
-# --------------------------------------------------------------------------- rendering
+def recompute_etag(old: str, wire: bytes) -> str:
+    """A new entity tag for a changed body: a quoted digest, keeping a ``W/`` prefix."""
+    weak = old.strip().startswith("W/")
+    return f'{"W/" if weak else ""}"{hashlib.sha256(wire).hexdigest()[:32]}"'
+
+
+# --------------------------------------------------------------------------- plants
 
 
 @dataclass(frozen=True, slots=True)
 class Plant:
-    """One placement's text inside a synthetic body, at ``offset`` (bytes)."""
+    """One placement and the exact bytes to plant for it."""
 
     placement: Placement
     content: bytes
-    offset: int
 
 
 @dataclass(frozen=True, slots=True)
-class SyntheticResponse:
-    """A response the injector answers itself, never asking the app."""
+class Planted:
+    """Where one plant ended up in a decoded response body (``None`` if not planted)."""
 
-    status: int
-    body: bytes
-    content_type: str
-    plants: tuple[Plant, ...] = field(default=())
-
-
-def _content(contents: Mapping[str, str], placement: Placement) -> bytes:
-    try:
-        return contents[placement.placement_id].encode("utf-8")
-    except KeyError:
-        raise ValueError(f"missing content for placement {placement.placement_id}") from None
+    plant: Plant
+    offset: int | None
+    insert_ok: bool
 
 
-def render_robots(
-    manifest: RunManifest, contents: Mapping[str, str], base: str = DEFAULT_ROBOTS_BASE
-) -> SyntheticResponse:
-    """The synthetic ``/robots.txt``: ``base`` then each P1 placement's text, one per line.
+def render_robots(existing: bytes, plants: Sequence[Plant]) -> tuple[bytes, tuple[int, ...]]:
+    """Append each plant's text as a line of a decoded robots.txt body.
 
-    Text is inserted verbatim (a newline is added only if it does not end with one).
+    A newline is added first if ``existing`` does not end with one, and after each text
+    that does not end with one. Returns the new body and each text's offset in it.
     """
-    body = base.encode("utf-8")
+    body = existing
     if body and not body.endswith(b"\n"):
         body += b"\n"
-    plants: list[Plant] = []
-    for placement in manifest.placements:
-        if placement.surface is not Surface.P1:
-            continue
-        text = _content(contents, placement)
-        plants.append(Plant(placement, text, len(body)))
-        body += text if text.endswith(b"\n") else text + b"\n"
-    return SyntheticResponse(200, body, _TEXT_PLAIN, tuple(plants))
-
-
-def _error_status(placement: Placement) -> int:
-    match = _P7_LOCATOR.fullmatch(placement.locator)
-    if match is None:
-        raise ValueError(
-            f"placement {placement.placement_id}: P7 locator {placement.locator!r} "
-            f"must match {P7_LOCATOR_PATTERN}"
-        )
-    return int(match.group(1))
-
-
-def render_error(placement: Placement, content: str) -> SyntheticResponse:
-    """The P7 error page: the configured 403/404 with the placement's text in the body."""
-    status = _error_status(placement)
-    reason = HTTPStatus(status).phrase
-    head = (
-        f"<!doctype html>\n<html><head><title>{status} {reason}</title></head>\n"
-        f"<body><h1>{reason}</h1>\n<p>"
-    ).encode()
-    text = content.encode("utf-8")
-    body = head + text + b"</p>\n</body></html>\n"
-    return SyntheticResponse(status, body, _TEXT_HTML, (Plant(placement, text, len(head)),))
-
-
-def render_decoy() -> SyntheticResponse:
-    """The neutral decoy page (no placement text, no tag)."""
-    return SyntheticResponse(200, DECOY_PAGE.encode("utf-8"), _TEXT_HTML)
+    offsets: list[int] = []
+    for plant in plants:
+        offsets.append(len(body))
+        body += plant.content if plant.content.endswith(b"\n") else plant.content + b"\n"
+    return body, tuple(offsets)
 
 
 # --------------------------------------------------------------------------- plan
+
+
+class ActionKind(StrEnum):
+    ROBOTS = "robots"
+    ERROR = "error"
+    DECOY = "decoy"
+
+
+@dataclass(frozen=True, slots=True)
+class Action:
+    """What to do to the app's response for one request."""
+
+    kind: ActionKind
+    plants: tuple[Plant, ...] = ()
+    #: P7 only: the status the placement map expects the app to answer with.
+    expected_status: int | None = None
 
 
 def request_path(target: str) -> str:
@@ -303,26 +314,37 @@ def request_path(target: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class InjectionPlan:
-    """What one injector instance answers itself; empty for a control run."""
+    """Which requests the injector acts on; empty for a control run."""
 
     arm: Arm
-    robots: SyntheticResponse | None = None
-    errors: Mapping[str, SyntheticResponse] = field(default_factory=dict)
+    robots: Action | None = None
+    errors: Mapping[str, Action] = field(default_factory=dict)
     decoy_prefix: str | None = None
-    decoy: SyntheticResponse | None = None
 
-    def match(self, method: str, target: str) -> SyntheticResponse | None:
-        """The synthetic answer for a request, or ``None`` to forward it to the app."""
+    def match(self, method: str, target: str) -> Action | None:
+        """The action for a request, or ``None`` to leave its response untouched.
+
+        Only ``GET`` is ever acted on.
+        """
+        if method.upper() != "GET":
+            return None
         path = request_path(target)
-        if self.robots is not None and path == ROBOTS_PATH and method.upper() in _ROBOTS_METHODS:
+        if self.robots is not None and path == ROBOTS_PATH:
             return self.robots
         error = self.errors.get(path)
         if error is not None:
             return error
         prefix = self.decoy_prefix
         if prefix is not None and (path == prefix or path.startswith(prefix + "/")):
-            return self.decoy
+            return Action(ActionKind.DECOY)
         return None
+
+
+def _content(contents: Mapping[str, str], placement: Placement) -> bytes:
+    try:
+        return contents[placement.placement_id].encode("utf-8")
+    except KeyError:
+        raise ValueError(f"missing content for placement {placement.placement_id}") from None
 
 
 def _check_content(manifest: RunManifest, contents: Mapping[str, str]) -> None:
@@ -340,10 +362,18 @@ def _check_content(manifest: RunManifest, contents: Mapping[str, str]) -> None:
             raise ValueError(f"placement {placement.placement_id}: content lacks the run tag")
 
 
-def build_plan(
-    manifest: RunManifest, contents: Mapping[str, str], robots_base: str = DEFAULT_ROBOTS_BASE
-) -> InjectionPlan:
-    """Validate a manifest and its rendered texts and decide what the injector serves.
+def _expected_status(placement: Placement) -> int:
+    match = _P7_LOCATOR.fullmatch(placement.locator)
+    if match is None:
+        raise ValueError(
+            f"placement {placement.placement_id}: P7 locator {placement.locator!r} "
+            f"must match {P7_LOCATOR_PATTERN}"
+        )
+    return int(match.group(1))
+
+
+def build_plan(manifest: RunManifest, contents: Mapping[str, str]) -> InjectionPlan:
+    """Validate a manifest and its rendered texts and decide what the injector acts on.
 
     ``contents`` maps ``placement_id`` to the rendered text; it must cover exactly the
     manifest's placements (so it is empty for a control run). Raises ``ValueError`` on
@@ -353,10 +383,11 @@ def build_plan(
     if manifest.arm is Arm.CONTROL:
         return InjectionPlan(arm=Arm.CONTROL)
 
-    errors: dict[str, SyntheticResponse] = {}
-    has_p1 = False
+    robots: list[Plant] = []
+    errors: dict[str, Action] = {}
     for placement in manifest.placements:
         path = request_path(placement.url)
+        plant = Plant(placement, _content(contents, placement))
         if placement.surface is Surface.P1:
             if placement.locator != ROBOTS_LOCATOR:
                 raise ValueError(
@@ -367,14 +398,14 @@ def build_plan(
                 raise ValueError(
                     f"placement {placement.placement_id}: P1 url must be {ROBOTS_PATH} (robots)"
                 )
-            has_p1 = True
+            robots.append(plant)
         elif placement.surface is Surface.P7:
-            page = render_error(placement, contents[placement.placement_id])
+            expected = _expected_status(placement)
             if path == ROBOTS_PATH:
                 raise ValueError(f"placement {placement.placement_id}: P7 cannot use robots.txt")
             if path in errors:
                 raise ValueError(f"more than one P7 placement on path {path}")
-            errors[path] = page
+            errors[path] = Action(ActionKind.ERROR, (plant,), expected)
         else:
             raise ValueError(
                 f"placement {placement.placement_id}: surface {placement.surface.value} "
@@ -388,10 +419,9 @@ def build_plan(
         raise ValueError("a P7 path lies under the decoy path")
     return InjectionPlan(
         arm=Arm.INJECTED,
-        robots=render_robots(manifest, contents, robots_base) if has_p1 else None,
+        robots=Action(ActionKind.ROBOTS, tuple(robots)) if robots else None,
         errors=errors,
         decoy_prefix=prefix,
-        decoy=render_decoy(),
     )
 
 
