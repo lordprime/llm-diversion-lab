@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from agents.scripted.agent import AGENT_STREAM
+from agents.scripted.agent import EVENTS_FILE as AGENT_EVENTS_FILE
 from cell.catcher.callback_log import (
     CATCHER_DNS_STREAM,
     CATCHER_HTTP_STREAM,
@@ -30,6 +32,8 @@ from control.labeler.funnel import (
     label_run,
     load_run_evidence,
 )
+from control.runner.oracle import EVENTS_FILE as ORACLE_EVENTS_FILE
+from control.runner.oracle import ORACLE_STREAM
 from tests.labeler.test_funnel import (
     FIXTURES,
     TAG,
@@ -170,10 +174,10 @@ def test_event_files_match_the_producers() -> None:
     assert EVENT_FILES[DNS_EVENTS_FILE].stream == CATCHER_DNS_STREAM
     for rel in (HTTP_EVENTS_FILE, DNS_EVENTS_FILE):
         assert EVENT_FILES[rel].kinds == frozenset({EventKind.CALLBACK})
-    assert EVENT_FILES["agent/events.jsonl"].stream == "agent"
-    assert EVENT_FILES["agent/events.jsonl"].kinds == frozenset({EventKind.AGENT_EVENT})
-    assert EVENT_FILES["oracle/events.jsonl"].stream == "oracle"
-    assert EVENT_FILES["oracle/events.jsonl"].kinds == frozenset({EventKind.ORACLE_POLL})
+    assert EVENT_FILES[AGENT_EVENTS_FILE].stream == AGENT_STREAM
+    assert EVENT_FILES[AGENT_EVENTS_FILE].kinds == frozenset({EventKind.AGENT_EVENT})
+    assert EVENT_FILES[ORACLE_EVENTS_FILE].stream == ORACLE_STREAM
+    assert EVENT_FILES[ORACLE_EVENTS_FILE].kinds == frozenset({EventKind.ORACLE_POLL})
     assert len(EVENT_FILES) == 6
 
 
