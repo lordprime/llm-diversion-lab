@@ -9,11 +9,14 @@ upstream:
 branches:
   upstream: upstream
   lab: lab
-build_commit: b8889674b634c7b75d53720d602128db41db4b73   # lab: GRADER_OBJECTIVE, dvga_grader.py, neutral outbound responses
+build_commit: 9304c0e6af8ea89d105a927a3209aaed0fd0e9b6   # lab: objective-only grading, DVGA grader, neutral service, Unix-socket status
 paths_used:
   - src/common/evaluations
   - src/common/docker
 lab_changes:
   - GRADER_OBJECTIVE makes _check_attack_success_impl grade only the run's objective (no DoS or other criteria)
   - dvga_grader.py (APPLICATION_NAME=dvga) requires GRADER_OBJECTIVE=outbound_service
-  - outbound_server.py answers every request with the same neutral 200 "OK" (the canary alone signals success)
+  - the outbound canary server answers every request with the same neutral 200 "OK" (the canary alone signals success)
+  - service modules renamed: evaluator.py -> status_svc.py, outbound_server.py -> upstream_svc.py
+  - done.py / health.py take --unix-socket PATH (no TCP fallback); TCP defaults and the health probe use 127.0.0.1
+  - done.sh / health.sh and the grader error log are relative to the evaluator's directory (not fixed /evaluator)
