@@ -53,7 +53,9 @@ traceback):
   quoted (backslash escapes honoured, an optional ``b``/``r``/``u`` string prefix, an
   escaped ``\"`` quote for JSON inside a JSON string, the first element of a ``[...]``
   list), a YAML block scalar (``password: |`` and the deeper-indented lines after it,
-  at most 64 lines / 4 KiB) or unquoted, running to whitespace;
+  at most 64 lines / 4 KiB) or unquoted, running to whitespace and, if it opened a
+  quoted string (an odd count of one kind of quote), on to that string's closing
+  quote. A name containing ``authorization`` masks its unquoted value to end of line;
 * redaction runs on the **whole** string before any cut (up to
   :data:`MAX_INPUT_CHARS`; beyond that, on a head and a tail window, each redacted
   with a :data:`MARGIN_CHARS` margin of context at its cut edge that is then
@@ -73,7 +75,9 @@ traceback):
 A name is sensitive if, with camelCase split (``accessToken`` → ``access_token``),
 lowercased and ``-`` read as ``_``, it *contains* one of :data:`SENSITIVE_KEY_PARTS`
 (``password``, ``secret``, ``api_key``, ``authorization``, ``cookie``, ``credential``...)
-or *ends with* ``_token``, unless it is in :data:`NON_SECRET_KEYS`: ``token`` and
+or *ends with* ``_token``, or is (or ends with ``_`` +) ``pass`` / ``pwd`` (never a bare
+``pass`` substring: ``passed``, ``bypass`` stay readable), unless it is in
+:data:`NON_SECRET_KEYS`: ``token`` and
 ``callback_token`` are the run's callback token, which is evidence the analysis relies
 on (it is an HMAC of the run id, not a credential), so it stays readable. ``*_url`` /
 ``*_dsn`` values are not masked as a whole (they are useful), but their
@@ -226,7 +230,7 @@ _QUERY_PARTS = (
     "signature",
     "credential",
 )
-_QUERY_NAMES = frozenset({"key", "sig", "token", "auth", "code"})
+_QUERY_NAMES = frozenset({"key", "sig", "token", "auth", "code", "pass", "pwd"})
 
 
 def _compact(name: str) -> str:
@@ -256,6 +260,11 @@ _ESCAPED_QUOTED_VALUE = {
     q: re.compile(rf"(?:\\{{4}}|\\{{3}}{q}|\\[^{q}\r\n]|[^\\{q}\r\n]){{1,4096}}+")
     for q in ("'", '"')
 }
+#: A quote in an unquoted value, escaped (``\\"``, JSON inside a JSON string) or not.
+_QUOTE_TOKEN = re.compile(r"\\?[\"']")
+#: A value assigned to a name containing ``authorization`` runs to the end of the line
+#: (``Authorization: Key x``, AWS4 ``Credential=..., Signature=x``).
+_TO_END_OF_LINE = re.compile(r"[^\r\n]++")
 #: A YAML block scalar indicator (``|``, ``>-``, ``|2+``...) ending its line.
 _YAML_BLOCK = re.compile(r"[|>][1-9+\-]{0,2}+[ \t]{0,64}+(?:#[^\r\n]{0,256}+)?(?=\r?\n)")
 _YAML_LINE = re.compile(r"\r?\n(?P<indent>[ \t]*+)(?P<body>[^\r\n]*+)")
@@ -281,7 +290,35 @@ def _assignment_value(match: re.Match[str], text: str) -> int | None:
         return _end(table[quote[-1]], text, end)
     if (block := _YAML_BLOCK.match(text, end)) is not None:
         return _yaml_block_end(text, match.start(), block.end())
-    return _end(_UNQUOTED_VALUE, text, end)
+    if "authorization" in match.group("aname").lower():
+        return _end(_TO_END_OF_LINE, text, end)
+    stop = _end(_UNQUOTED_VALUE, text, end)
+    return None if stop is None else _close_open_quote(text, end, stop)
+
+
+def _close_open_quote(text: str, start: int, stop: int) -> int:
+    """``stop``, or past the rest of a quoted string the value ``text[start:stop]`` opened.
+
+    An unquoted value runs to whitespace, so in compact JSON (``"password":null,
+    "secret":"a b"``) it can swallow the opening quote of a following quoted secret and
+    stop inside it. If the span holds an odd number of one kind of quote (``"``, ``'``,
+    ``\\"`` or ``\\'``), the last one opened a string: the value extends, with the
+    bounded quoted grammar, up to that string's closing quote. Linear: the span is
+    consumed by the mask, and the extension is bounded.
+    """
+    counts: dict[str, int] = {}
+    last: dict[str, int] = {}
+    for token in _QUOTE_TOKEN.finditer(text, start, stop):
+        kind = token.group()
+        counts[kind] = counts.get(kind, 0) + 1
+        last[kind] = token.start()
+    open_kinds = [kind for kind, n in counts.items() if n % 2]
+    if not open_kinds:
+        return stop
+    kind = max(open_kinds, key=last.__getitem__)
+    table = _ESCAPED_QUOTED_VALUE if len(kind) == 2 else _QUOTED_VALUE
+    rest = _end(table[kind[-1]], text, stop)
+    return stop if rest is None else rest
 
 
 def _yaml_block_end(text: str, key_start: int, pos: int) -> int:
@@ -338,7 +375,11 @@ SENSITIVE_KEY_PARTS: tuple[str, ...] = (
     "private_key",
     "credential",
     "session_key",
+    "passphrase",
 )
+#: Exact names, and ``_``-suffixes, that are sensitive although too short to match as a
+#: substring: a bare ``pass`` would mask ``passed``, ``bypass``, ``passthrough``.
+_SENSITIVE_SHORT_NAMES: tuple[str, ...] = ("pass", "pwd")
 #: Field names that look sensitive but are evidence (the callback token), never masked.
 NON_SECRET_KEYS: frozenset[str] = frozenset({"token", "callback_token"})
 
@@ -537,6 +578,10 @@ def is_sensitive_key(key: object) -> bool:
     name = name.replace(" ", "_")
     if name in NON_SECRET_KEYS:
         return False
+    if name in _SENSITIVE_SHORT_NAMES or name.endswith(
+        tuple(f"_{n}" for n in _SENSITIVE_SHORT_NAMES)
+    ):
+        return True
     return name.endswith("_token") or any(part in name for part in SENSITIVE_KEY_PARTS)
 
 

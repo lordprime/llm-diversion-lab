@@ -1071,3 +1071,94 @@ def test_redact_text_is_fast_above_the_ceiling(shape: str) -> None:
     start = time.perf_counter()
     redact_text(text)
     assert time.perf_counter() - start < 0.5
+
+
+# --------------------------------------------------------------------- fix round 5
+
+_X = "hunter2" + "SECRET"
+#: LB-1: an unquoted value that runs into a following quoted secret's opening quote.
+QUOTE_SWALLOW = [
+    '{"password":null,"client_secret":"correct horse ' + _X + '"}',
+    '{"password":123,"secret":"a ' + _X + '"}',
+    'password=a;api_key="correct horse ' + _X + '"',
+    "password=a,secret='x " + _X + "'",
+    'DB_PASSWORD=x&API_KEY="y ' + _X + '"',
+    '{\\"password\\":null,\\"secret\\":\\"a ' + _X + '\\"}',
+    'password=x;api_key=\\"a ' + _X + '\\"',
+    'password=it\'s,"secret":"a ' + _X + '"',
+]
+
+
+@pytest.mark.parametrize("text", QUOTE_SWALLOW)
+def test_an_unquoted_value_never_strands_a_following_quoted_secret(text: str) -> None:
+    out = redact_text(text)
+    assert "SECRET" not in out, out
+    assert "[REDACTED:assignment]" in out
+
+
+def test_the_quote_extension_stops_at_the_closing_quote() -> None:
+    assert redact_text('{"password":null,"secret":"a b","user":"bob"}') == (
+        '{"password":[REDACTED:assignment]","user":"bob"}'
+    )
+    # a stray quote: the extension runs to the end of the line (at most 4096 characters)
+    assert redact_text('password=x"y next\nline') == "password=[REDACTED:assignment]\nline"
+    assert redact_text('password=a"b"c next') == "password=[REDACTED:assignment] next"
+
+
+@pytest.mark.parametrize(
+    "name", ["pass", "pwd", "passphrase", "DB_PASS", "db_pwd", "dbPass", "ssh_passphrase_file"]
+)
+def test_pass_pwd_and_passphrase_names_are_sensitive(name: str) -> None:
+    assert is_sensitive_key(name)
+    assert "hunter2" not in redact_text(f"{name}=hunter2")
+
+
+@pytest.mark.parametrize("query", ["/login?pass=hunter2", "/login?pwd=hunter2&x=1"])
+def test_pass_and_pwd_query_parameters_are_masked(query: str) -> None:
+    assert "hunter2" not in redact_text(query)
+
+
+@pytest.mark.parametrize(
+    "name", ["passed", "bypass", "passthrough", "tests_passed", "compass", "passage", "pwdx"]
+)
+def test_words_containing_pass_stay_readable(name: str) -> None:
+    """Evidence fields (``passed``, ``bypass``...) are never masked by a bare ``pass``."""
+    assert not is_sensitive_key(name)
+    assert redact_text(f"{name}=true") == f"{name}=true"
+    out = redact(None, "info", {"event": "x", name: "true"})
+    assert out[name] == "true"
+    assert redact_text(f"/x?{name}=1") == f"/x?{name}=1"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Authorization: Key hunter2 more",
+        "Authorization: ApiKey hunter2",
+        "Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/x, Signature=hunter2",
+        "Proxy-Authorization: Custom a b hunter2",
+    ],
+)
+def test_authorization_names_mask_to_end_of_line(text: str) -> None:
+    out = redact_text(text + "\nnext: line")
+    assert "hunter2" not in out, out
+    assert out.endswith("\nnext: line")
+
+
+#: Round-5 adversarial shapes for the quote extension and the to-end-of-line names.
+ROUND5_ADVERSARIAL = {
+    "unq_quote_run": _fill('password=a"'),
+    "unq_quote_open": _fill('password=a" b '),
+    "unq_esc_quote_run": _fill('password=a\\" '),
+    "unq_sq_run": _fill("password=it's "),
+    "auth_eol_run": _fill("authorization=x "),
+    "auth_eol_long": "authorization: " + "x " * (_64K // 2 - 8),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(ROUND5_ADVERSARIAL))
+def test_redact_text_is_fast_on_round5_shapes(shape: str) -> None:
+    for text in (ROUND5_ADVERSARIAL[shape], ROUND5_ADVERSARIAL[shape] * 4):
+        start = time.perf_counter()
+        redact_text(text)
+        assert time.perf_counter() - start < 0.5
