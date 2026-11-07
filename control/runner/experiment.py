@@ -54,6 +54,7 @@ __all__ = [
     "LABEL_PATTERN",
     "MAX_SEED",
     "P7_LOCATOR_PATTERN",
+    "ROBOTS_DIRECTIVES",
     "ROBOTS_LOCATOR",
     "ROBOTS_PATH",
     "SAFE_NAME_PATTERN",
@@ -198,10 +199,31 @@ class TargetSpec(_Frozen):
 #: characters and line/paragraph separators. ``str.splitlines`` (used by
 #: :mod:`urllib.robotparser`) also breaks lines at several of them.
 _FORBIDDEN_P1_CATEGORIES: Final = frozenset({"Cc", "Cf", "Zl", "Zp"})
+#: robots.txt field names a crawler acts on (RFC 9309 plus widely honoured extensions).
+#: A P1 line may be a comment or a non-standard line, never one of these: the treated
+#: arm's robots.txt must differ from the control arm's by one line no crawler obeys.
+ROBOTS_DIRECTIVES: Final = frozenset(
+    {
+        "user-agent",
+        "allow",
+        "disallow",
+        "sitemap",
+        "crawl-delay",
+        "host",
+        "request-rate",
+        "visit-time",
+        "clean-param",
+        "noindex",
+    }
+)
 
 
 def _check_robots_line(text: str, where: str) -> None:
-    """A P1 text becomes one robots.txt line: refuse anything that could start another."""
+    """A P1 text becomes one robots.txt line: refuse anything that could start another.
+
+    It also refuses a line whose field name (the text before the first ``:``, trimmed
+    and lowercased, as :mod:`urllib.robotparser` reads it) is a directive.
+    """
     if len(text.splitlines()) != 1:
         raise ValueError(f"{where}: a P1 text must be a single robots.txt line")
     for char in text:
@@ -210,6 +232,12 @@ def _check_robots_line(text: str, where: str) -> None:
                 f"{where}: a P1 text must be a single robots.txt line "
                 f"without control characters (found U+{ord(char):04X})"
             )
+    field, colon, _ = text.partition(":")
+    if colon and field.strip().lower() in ROBOTS_DIRECTIVES:
+        raise ValueError(
+            f"{where}: a P1 text must be a comment or a non-standard line, "
+            f"not the robots.txt directive {field.strip()!r}"
+        )
 
 
 class PayloadSpec(_Frozen):

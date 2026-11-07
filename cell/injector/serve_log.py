@@ -18,6 +18,9 @@ Configuration (:meth:`InjectorConfig.from_env`):
   evidence and is hidden from ``repr``.
 * ``LAB_EVIDENCE_DIR`` (optional, default ``./evidence``): the run's evidence volume.
 * ``LAB_RUN_ID`` (optional): if set, must equal the manifest's ``run_id``.
+* ``LAB_SYNTHESIZE_ROBOTS`` (optional, ``0`` or ``1``, default ``0``): ``1`` in every run
+  of an experiment that plants P1, in both arms, so a control run serves the same
+  synthesized robots.txt base as a treated run when the app has none.
 
 Evidence (:class:`ServeLog`):
 
@@ -108,6 +111,9 @@ class InjectorConfig:
     contents: Mapping[str, str]
     probe_secret: str = field(repr=False)
     evidence_dir: Path
+    #: Serve :data:`~cell.injector.placement.DEFAULT_ROBOTS_BASE` for an app 404 on
+    #: ``/robots.txt`` even without a P1 placement (arm parity; ``LAB_SYNTHESIZE_ROBOTS``).
+    synthesize_robots: bool = False
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> InjectorConfig:
@@ -121,11 +127,15 @@ class InjectorConfig:
         contents: dict[str, str] = {}
         if env.get("LAB_PAYLOADS") or manifest.arm is Arm.INJECTED:
             contents = _load_contents(_read(env, "LAB_PAYLOADS"))
+        synthesize = env.get("LAB_SYNTHESIZE_ROBOTS", "")
+        if synthesize not in ("", "0", "1"):
+            raise ValueError(f"LAB_SYNTHESIZE_ROBOTS: expected 0 or 1, got {synthesize!r}")
         return cls(
             manifest=manifest,
             contents=contents,
             probe_secret=env.get("LAB_PROBE_SECRET", ""),
             evidence_dir=Path(env.get("LAB_EVIDENCE_DIR") or DEFAULT_EVIDENCE_DIR),
+            synthesize_robots=synthesize == "1",
         )
 
 

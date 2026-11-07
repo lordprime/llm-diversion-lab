@@ -152,6 +152,10 @@ def _apply_robots(
         _replace_representation(response, 200, _TEXT_PLAIN, body)
         meta["synthesized_base"] = True
         return tuple(Planted(p, o, True) for p, o in zip(action.plants, offsets, strict=True)), meta
+    if not action.plants:
+        # Base only (control arm, or a run without P1): the app's own file is served as is.
+        meta["note"] = f"app answered {status}; served unchanged"
+        return (), meta
     if status != 200 or not plantable(response):
         meta["note"] = f"app answered {status}; robots.txt not planted"
         return _not_planted(action), meta
@@ -227,7 +231,9 @@ class SurfaceInjector:
 
     @classmethod
     def from_config(cls, config: InjectorConfig) -> SurfaceInjector:
-        plan = build_plan(config.manifest, config.contents)
+        plan = build_plan(
+            config.manifest, config.contents, synthesize_robots=config.synthesize_robots
+        )
         return cls(plan, ServeLog(config.manifest.run_id, config.evidence_dir), config.probe_secret)
 
     @classmethod

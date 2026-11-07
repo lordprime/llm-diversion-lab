@@ -2,9 +2,14 @@
 
 Configuration (:meth:`CatcherConfig.from_env`):
 
-* ``LAB_MANIFEST`` (required): path of the run's :class:`RunManifest` JSON. Its
-  placements' tokens are the only ones a callback can verify against; a control run
-  has none, so its callbacks are recorded with ``token`` ``None``.
+* ``LAB_TOKENS`` (what the runner sets): path of a token-only JSON file,
+  ``{"run_id": ..., "callback_domain": ..., "tokens": [{"token": ...,
+  "placement_id": ...}, ...]}`` (``control.runner.render.render_catcher_file``). These
+  tokens are the only ones a callback can verify against; a control run has none, so
+  its callbacks are recorded with ``token`` ``None``. The catcher never sees the
+  manifest's tag, payload texts or anything else.
+* ``LAB_MANIFEST`` (alternative, exclusive with ``LAB_TOKENS``; tests and tools): path
+  of the run's :class:`RunManifest` JSON, from which only the tokens are taken.
 * No key. Tokens are verified against the manifest's own placement tokens
   (:class:`~cell.catcher.classify.TokenIndex`); the lab-wide HMAC key never enters a
   run cell. The catcher refuses to start if a placement token is malformed or repeated.
@@ -65,6 +70,10 @@ HTTP_EVENTS_FILE: Final = f"{CATCHER_DIR}/http/events.jsonl"
 DNS_EVENTS_FILE: Final = f"{CATCHER_DIR}/dns/events.jsonl"
 
 _ID_RE = re.compile(ID_PATTERN)
+_DOMAIN_RE = re.compile(
+    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$"
+)
+_TOKENS_KEYS: Final = frozenset({"run_id", "callback_domain", "tokens"})
 
 
 # --------------------------------------------------------------------------- config
@@ -81,32 +90,80 @@ def parse_port(value: str, name: str) -> int:
     return port
 
 
+def _read_tokens_file(path: str) -> tuple[TokenIndex, str]:
+    """Parse a ``LAB_TOKENS`` file (see the module docstring for its exact shape)."""
+    try:
+        doc = json.loads(Path(path).read_bytes())
+    except OSError as exc:
+        raise ValueError(f"LAB_TOKENS: cannot read {path!r}: {exc}") from exc
+    except ValueError as exc:
+        raise ValueError(f"LAB_TOKENS: not JSON: {exc}") from exc
+    if not isinstance(doc, dict) or set(doc) != _TOKENS_KEYS:
+        keys = sorted(doc) if isinstance(doc, dict) else type(doc).__name__
+        raise ValueError(f"LAB_TOKENS: unexpected document {keys}; expected {sorted(_TOKENS_KEYS)}")
+    run_id, domain, entries = doc["run_id"], doc["callback_domain"], doc["tokens"]
+    if not isinstance(run_id, str) or not _ID_RE.fullmatch(run_id):
+        raise ValueError(f"LAB_TOKENS: malformed run_id {run_id!r}")
+    if not isinstance(domain, str) or not _DOMAIN_RE.fullmatch(domain):
+        raise ValueError(f"LAB_TOKENS: malformed callback_domain {domain!r}")
+    if not isinstance(entries, list):
+        raise ValueError("LAB_TOKENS: tokens must be a list")
+    pairs: list[tuple[str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"token", "placement_id"}:
+            raise ValueError(f"LAB_TOKENS: unexpected token entry {entry!r}")
+        pairs.append((entry["token"], entry["placement_id"]))
+    try:
+        return TokenIndex.from_pairs(run_id, pairs), domain
+    except ValueError as exc:
+        raise ValueError(f"LAB_TOKENS: {exc}") from exc
+
+
+def _read_manifest(path: str) -> TokenIndex:
+    try:
+        manifest = RunManifest.model_validate_json(Path(path).read_bytes())
+    except OSError as exc:
+        raise ValueError(f"LAB_MANIFEST: cannot read {path!r}: {exc}") from exc
+    except ValidationError as exc:
+        raise ValueError(f"LAB_MANIFEST: invalid manifest: {exc}") from exc
+    return TokenIndex.build(manifest)
+
+
 @dataclass(frozen=True, slots=True)
 class CatcherConfig:
-    """One catcher instance: the run it records for, its verified tokens, evidence dir."""
+    """One catcher instance: the run it records for, its verified tokens, evidence dir.
+
+    ``callback_domain`` is the DNS zone the run's payloads name (``LAB_TOKENS`` only).
+    The catcher answers every name, so it is recorded for the run, never used to filter.
+    """
 
     run_id: str
     tokens: TokenIndex
     evidence_dir: Path
+    callback_domain: str | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> CatcherConfig:
-        path = env.get("LAB_MANIFEST", "")
-        if not path:
-            raise ValueError("LAB_MANIFEST: not set")
-        try:
-            manifest = RunManifest.model_validate_json(Path(path).read_bytes())
-        except OSError as exc:
-            raise ValueError(f"LAB_MANIFEST: cannot read {path!r}: {exc}") from exc
-        except ValidationError as exc:
-            raise ValueError(f"LAB_MANIFEST: invalid manifest: {exc}") from exc
+        tokens_path, manifest_path = env.get("LAB_TOKENS", ""), env.get("LAB_MANIFEST", "")
+        if tokens_path and manifest_path:
+            raise ValueError(
+                "LAB_TOKENS and LAB_MANIFEST are exclusive; the runner sets LAB_TOKENS"
+            )
+        domain: str | None = None
+        if tokens_path:
+            tokens, domain = _read_tokens_file(tokens_path)
+        elif manifest_path:
+            tokens = _read_manifest(manifest_path)
+        else:
+            raise ValueError("LAB_TOKENS: not set (nor LAB_MANIFEST)")
         run_id = env.get("LAB_RUN_ID")
-        if run_id and run_id != manifest.run_id:
-            raise ValueError(f"LAB_RUN_ID {run_id!r} differs from manifest {manifest.run_id!r}")
+        if run_id and run_id != tokens.run_id:
+            raise ValueError(f"LAB_RUN_ID {run_id!r} differs from the tokens' {tokens.run_id!r}")
         return cls(
-            run_id=manifest.run_id,
-            tokens=TokenIndex.build(manifest),
+            run_id=tokens.run_id,
+            tokens=tokens,
             evidence_dir=Path(env.get("LAB_EVIDENCE_DIR") or DEFAULT_EVIDENCE_DIR),
+            callback_domain=domain,
         )
 
 

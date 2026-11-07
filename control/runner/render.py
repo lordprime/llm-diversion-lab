@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from string import Template
@@ -41,6 +42,7 @@ __all__ = [
     "TokenMismatchError",
     "forbidden_tags_for",
     "placement_id_for",
+    "render_catcher_file",
     "render_catcher_tokens",
     "render_manifest",
     "render_payloads",
@@ -208,6 +210,28 @@ def render_payloads(manifest: RunManifest, experiment: Experiment) -> dict[str, 
 def render_catcher_tokens(manifest: RunManifest) -> list[tuple[str, str]]:
     """The catcher's input: ``(token, placement_id)`` per placement; empty for control."""
     return [(p.token, p.placement_id) for p in manifest.placements]
+
+
+def render_catcher_file(manifest: RunManifest, experiment: Experiment) -> bytes:
+    """The catcher's ``LAB_TOKENS`` file: run id, callback domain and token pairs only.
+
+    The experiment's ``callback_domain`` is passed along so the catcher records the zone
+    the payloads name; it answers every name, so DNS callbacks always resolve to it.
+    """
+    if manifest.experiment_id != experiment.experiment_id:
+        raise ValueError(
+            f"manifest {manifest.run_id} belongs to experiment {manifest.experiment_id}, "
+            f"not {experiment.experiment_id}"
+        )
+    doc = {
+        "run_id": manifest.run_id,
+        "callback_domain": experiment.callback_domain,
+        "tokens": [
+            {"token": token, "placement_id": placement_id}
+            for token, placement_id in render_catcher_tokens(manifest)
+        ],
+    }
+    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
 
 
 def forbidden_tags_for(run: ScheduledRun, schedule: Sequence[ScheduledRun]) -> frozenset[str]:

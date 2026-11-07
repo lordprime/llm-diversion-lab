@@ -6,6 +6,7 @@ are driven with mitmproxy's in-memory test flows.
 
 from __future__ import annotations
 
+import difflib
 import gzip
 import hashlib
 import json
@@ -621,6 +622,81 @@ def test_control_arm_passes_everything_through(tmp_path: Path, path: str) -> Non
     assert not (tmp_path / "injector" / "0000.body").exists()
 
 
+def _control_injector(path: Path, *, synthesize: bool = True) -> SurfaceInjector:
+    return SurfaceInjector.from_config(
+        InjectorConfig(
+            manifest=_manifest(arm=Arm.CONTROL),
+            contents={},
+            probe_secret=SECRET,
+            evidence_dir=path,
+            synthesize_robots=synthesize,
+        )
+    )
+
+
+def test_control_arm_synthesizes_the_same_robots_base_when_the_app_has_none(
+    tmp_path: Path,
+) -> None:
+    resp = _serve(_control_injector(tmp_path), _flow("/robots.txt"), _app(404, WERKZEUG_404))
+    assert resp.status_code == 200 and resp.reason == "OK"
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert resp.raw_content == DEFAULT_ROBOTS_BASE.encode()
+    _assert_app_headers(resp)
+    (access,) = _events(tmp_path)  # nothing is planted: no PlacementServe
+    assert isinstance(access, TargetAccessEvent) and access.status == 200
+    meta = _meta(tmp_path)
+    assert meta["synthesized_base"] is True and meta["placements"] == []
+    assert (meta["app_status"], meta["served_status"]) == (404, 200)
+
+
+def test_control_arm_serves_the_apps_own_robots_unchanged(tmp_path: Path) -> None:
+    app = _app(200, APP_ROBOTS, content_type="text/plain", etag='"r1"')
+    before = (app.raw_content, app.headers.fields, app.status_code)
+    resp = _serve(_control_injector(tmp_path), _flow("/robots.txt"), app)
+    assert (resp.raw_content, resp.headers.fields, resp.status_code) == before
+    (access,) = _events(tmp_path)
+    assert access.status == 200
+    assert _meta(tmp_path)["synthesized_base"] is False
+
+
+@pytest.mark.parametrize("path", [P7_PATH, f"/x-{TAG}/"])
+def test_control_arm_with_a_robots_base_still_passes_other_paths_through(
+    tmp_path: Path, path: str
+) -> None:
+    app = _app(404, WERKZEUG_404)
+    before = (app.raw_content, app.headers.fields, app.status_code)
+    resp = _serve(_control_injector(tmp_path), _flow(path), app)
+    assert (resp.raw_content, resp.headers.fields, resp.status_code) == before
+
+
+@pytest.mark.parametrize(
+    ("status", "body"), [(404, WERKZEUG_404), (200, APP_ROBOTS), (200, b"User-agent: *")]
+)
+def test_robots_txt_of_the_two_arms_differs_by_exactly_the_planted_line(
+    tmp_path: Path, status: int, body: bytes
+) -> None:
+    """Arm parity: control and treated robots.txt differ by one line, the P1 text."""
+    control = _serve(
+        _control_injector(tmp_path / "control"),
+        _flow("/robots.txt"),
+        _app(status, body, content_type="text/plain"),
+    )
+    treated = _serve(
+        _injector(tmp_path / "treated"),
+        _flow("/robots.txt"),
+        _app(status, body, content_type="text/plain"),
+    )
+    assert control.status_code == treated.status_code == 200
+    control_lines = (control.get_content() or b"").decode().splitlines()
+    treated_lines = (treated.get_content() or b"").decode().splitlines()
+    diff = [
+        line
+        for line in difflib.ndiff(control_lines, treated_lines)
+        if line.startswith(("+ ", "- "))
+    ]
+    assert diff == [f"+ {P1_TEXT}"]
+
+
 def test_unrelated_path_is_forwarded_byte_identical(tmp_path: Path) -> None:
     injector = _injector(tmp_path)
     flow = _flow("/graphql", method="POST", headers={"content-type": "application/json"})
@@ -775,6 +851,23 @@ def test_config_control_needs_no_payload_file(tmp_path: Path) -> None:
     config = InjectorConfig.from_env(env)
     assert config.contents == {}
     assert SurfaceInjector.from_config(config).plan.arm is Arm.CONTROL
+
+
+@pytest.mark.parametrize(("value", "expected"), [("1", True), ("0", False), ("", False)])
+def test_config_robots_base_switch(tmp_path: Path, value: str, expected: bool) -> None:
+    manifest = _manifest(arm=Arm.CONTROL)
+    env = _write_env(tmp_path, manifest, {}) | {"LAB_SYNTHESIZE_ROBOTS": value}
+    config = InjectorConfig.from_env(env)
+    assert config.synthesize_robots is expected
+    plan = SurfaceInjector.from_config(config).plan
+    assert (plan.robots is not None) is expected
+    assert plan.robots is None or plan.robots.plants == ()
+
+
+def test_config_robots_base_switch_refuses_other_values(tmp_path: Path) -> None:
+    env = _write_env(tmp_path, _manifest(arm=Arm.CONTROL), {})
+    with pytest.raises(ValueError, match="LAB_SYNTHESIZE_ROBOTS"):
+        InjectorConfig.from_env(env | {"LAB_SYNTHESIZE_ROBOTS": "yes"})
 
 
 def test_config_rejects_bad_environment(tmp_path: Path) -> None:

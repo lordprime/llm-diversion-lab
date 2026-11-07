@@ -516,3 +516,104 @@ def test_check_schedule_refuses_a_broken_schedule(match: str, corrupt: Any) -> N
     schedule = build_schedule(_experiment())
     with pytest.raises(ScheduleError, match=match):
         check_schedule(corrupt(schedule))
+
+
+# --------------------------------------------------------------------------- 14b carry-ins
+
+
+def _move_pair(s: list[ScheduledRun], pair_id: str, **update: Any) -> list[ScheduledRun]:
+    return [r.model_copy(update=update) if r.pair_id == pair_id else r for r in s]
+
+
+def test_check_schedule_with_the_experiment_accepts_a_built_schedule_and_retries() -> None:
+    experiment = _experiment()
+    schedule = build_schedule(experiment)
+    check_schedule(schedule, experiment=experiment)
+    check_schedule([*schedule, retry(schedule[0])], experiment=experiment)
+
+
+def test_check_schedule_with_the_experiment_refuses_a_truncated_schedule() -> None:
+    small = _experiment(repetitions=1)
+    full = _experiment(repetitions=3)
+    schedule = build_schedule(small)
+    check_schedule(schedule)  # well-formed on its own
+    with pytest.raises(ScheduleError, match="missing"):
+        check_schedule(schedule, experiment=full)
+    with pytest.raises(ScheduleError, match="missing"):
+        check_schedule([], experiment=full)
+
+
+def test_check_schedule_with_the_experiment_refuses_two_pairs_in_one_cell() -> None:
+    experiment = _experiment()
+    schedule = build_schedule(experiment)
+    first = schedule[0]
+    second = next(r for r in schedule if r.key != first.key)
+    doubled = _move_pair(
+        schedule,
+        second.pair_id,
+        target=first.target,
+        agent=first.agent,
+        model=first.model,
+        rep=first.rep,
+    )
+    check_schedule(doubled)  # each pair is still well-formed
+    with pytest.raises(ScheduleError, match="more than one pair"):
+        check_schedule(doubled, experiment=experiment)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("target", "juice-shop-2"), ("agent", "other"), ("model", "other-model"), ("rep", 3)],
+)
+def test_check_schedule_with_the_experiment_refuses_a_pair_outside_its_cells(
+    field: str, value: Any
+) -> None:
+    experiment = _experiment()
+    schedule = build_schedule(experiment)
+    moved = _move_pair(schedule, schedule[0].pair_id, **{field: value})
+    with pytest.raises(ScheduleError, match="not in the experiment"):
+        check_schedule(moved, experiment=experiment)
+
+
+def test_check_schedule_with_the_experiment_refuses_another_experiments_runs() -> None:
+    experiment = _experiment()
+    other = _experiment(experiment_id="exp_other")
+    with pytest.raises(ScheduleError, match="exp_other"):
+        check_schedule(build_schedule(other), experiment=experiment)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Disallow: /x-$tag",
+        "disallow:/x $tag",
+        "  Allow: /$tag",
+        "User-agent: $tag",
+        "USER-AGENT : x $tag",
+        "Sitemap: http://$callback_host/$tag",
+        "Crawl-delay: 1 # $tag",
+        "Host: $callback_host $tag",
+        "\tDisallow: $decoy_path $tag",
+    ],
+)
+def test_p1_template_refuses_a_robots_directive(line: str) -> None:
+    doc = _doc()
+    _payload(doc)["templates"]["P1"] = line
+    with pytest.raises(ValidationError, match=r"robots\.txt directive"):
+        Experiment.model_validate(doc)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "# Disallow: /x $tag",
+        "# lab marker $tag",
+        "X-Lab-Note: $tag",
+        "$tag Disallow: x",
+        "Disallowed $tag",
+    ],
+)
+def test_p1_template_accepts_a_comment_or_a_non_standard_line(line: str) -> None:
+    doc = _doc()
+    _payload(doc)["templates"]["P1"] = line
+    Experiment.model_validate(doc)

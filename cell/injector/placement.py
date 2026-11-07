@@ -23,7 +23,10 @@ the arms differ only by the planted content (DEVELOPMENT_PLAN section 4.4):
   a placement-map error the pre-flight probe catches).
 * ``GET`` on the decoy path ``/x-<tag>`` or below ``/x-<tag>/``: the app's response
   becomes a 200 with :data:`DECOY_PAGE` as its body, keeping the app's other headers.
-* control: no action at all; every response passes through untouched.
+* control: no planting at all; every response passes through untouched, except that
+  in an experiment that plants P1 (``synthesize_robots``) a 404 for ``/robots.txt``
+  becomes the same synthesized :data:`DEFAULT_ROBOTS_BASE` a treated run gets, so the
+  arms' robots.txt differ by exactly the planted line (arm parity).
 
 ``HEAD`` and every other method are never planted. Placement text never lives in this
 code. The runner renders each placement and pins its UTF-8 bytes in the manifest as
@@ -256,16 +259,25 @@ def _expected_status(placement: Placement) -> int:
     return int(match.group(1))
 
 
-def build_plan(manifest: RunManifest, contents: Mapping[str, str]) -> InjectionPlan:
+def build_plan(
+    manifest: RunManifest, contents: Mapping[str, str], *, synthesize_robots: bool = False
+) -> InjectionPlan:
     """Validate a manifest and its rendered texts and decide what the injector acts on.
 
     ``contents`` maps ``placement_id`` to the rendered text; it must cover exactly the
     manifest's placements (so it is empty for a control run). Raises ``ValueError`` on
     any mismatch, unsupported surface or malformed locator.
+
+    ``synthesize_robots`` (set for every run of an experiment that plants P1, in both
+    arms) adds a robots action with no plants where the run has none: if the app has
+    no robots.txt (404) the injector serves :data:`DEFAULT_ROBOTS_BASE`, exactly the
+    base a treated run gets, so the arms' robots.txt differ only by the planted line.
+    An app's own robots.txt is then served unchanged.
     """
     _check_content(manifest, contents)
+    base_only = Action(ActionKind.ROBOTS) if synthesize_robots else None
     if manifest.arm is Arm.CONTROL:
-        return InjectionPlan(arm=Arm.CONTROL)
+        return InjectionPlan(arm=Arm.CONTROL, robots=base_only)
 
     robots: list[Plant] = []
     errors: dict[str, Action] = {}
@@ -303,7 +315,7 @@ def build_plan(manifest: RunManifest, contents: Mapping[str, str]) -> InjectionP
         raise ValueError("a P7 path lies under the decoy path")
     return InjectionPlan(
         arm=Arm.INJECTED,
-        robots=Action(ActionKind.ROBOTS, tuple(robots)) if robots else None,
+        robots=Action(ActionKind.ROBOTS, tuple(robots)) if robots else base_only,
         errors=errors,
         decoy_prefix=prefix,
     )

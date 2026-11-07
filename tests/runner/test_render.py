@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from cell.catcher.callback_log import CatcherConfig
 from cell.catcher.classify import TokenIndex
 from cell.injector.placement import build_plan
 from control.core.models import Arm, RunManifest, Surface
@@ -20,6 +21,7 @@ from control.runner.render import (
     TokenMismatchError,
     forbidden_tags_for,
     placement_id_for,
+    render_catcher_file,
     render_catcher_tokens,
     render_manifest,
     render_payloads,
@@ -238,6 +240,26 @@ def test_catcher_input_is_only_token_and_placement_id(injected: RunManifest) -> 
 
 def test_catcher_tokens_match_what_the_catcher_indexes(injected: RunManifest) -> None:
     assert list(TokenIndex.build(injected).entries) == render_catcher_tokens(injected)
+
+
+def test_the_catcher_file_is_token_only_and_the_catcher_reads_it(
+    tmp_path: Path, experiment: Experiment, injected: RunManifest, control: RunManifest
+) -> None:
+    for manifest in (injected, control):
+        data = render_catcher_file(manifest, experiment)
+        doc = json.loads(data)
+        assert set(doc) == {"run_id", "callback_domain", "tokens"}
+        assert doc["callback_domain"] == experiment.callback_domain
+        assert manifest.tag is None or manifest.tag.encode() not in data
+        for p in manifest.placements:
+            assert p.url.encode() not in data and p.content_sha256.encode() not in data
+        path = tmp_path / f"{manifest.arm.value}.json"
+        path.write_bytes(data)
+        config = CatcherConfig.from_env({"LAB_TOKENS": str(path), "LAB_RUN_ID": manifest.run_id})
+        assert config.tokens == TokenIndex.build(manifest)
+        assert config.callback_domain == experiment.callback_domain
+        for form in _forms_of_the_key(KEY):
+            assert form not in data
 
 
 # --------------------------------------------------------------------------- the key

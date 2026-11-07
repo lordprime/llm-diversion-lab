@@ -276,7 +276,12 @@ class _SpyEnv(dict[str, str]):
 
 
 def test_config_has_no_key_and_never_reads_one(tmp_path: Path) -> None:
-    assert {f.name for f in fields(CatcherConfig)} == {"run_id", "tokens", "evidence_dir"}
+    assert {f.name for f in fields(CatcherConfig)} == {
+        "run_id",
+        "tokens",
+        "evidence_dir",
+        "callback_domain",
+    }
     assert {f.name for f in fields(TokenIndex)} == {"run_id", "entries"}
     env = _SpyEnv(_env_files(tmp_path, _manifest()))
     CatcherConfig.from_env(env)
@@ -322,6 +327,76 @@ def test_config_control_run(tmp_path: Path) -> None:
     config = CatcherConfig.from_env(_env_files(tmp_path, _manifest(injected=False)))
     assert config.tokens.entries == ()
     assert config.tokens.lookup(_token(P1_ID)) is None
+
+
+def _tokens_doc(manifest: RunManifest, domain: str = "cb.lab.test") -> dict[str, Any]:
+    return {
+        "run_id": manifest.run_id,
+        "callback_domain": domain,
+        "tokens": [{"token": p.token, "placement_id": p.placement_id} for p in manifest.placements],
+    }
+
+
+def _token_env(tmp_path: Path, doc: Any) -> dict[str, str]:
+    path = tmp_path / "tokens.json"
+    path.write_text(json.dumps(doc))
+    return {"LAB_TOKENS": str(path), "LAB_EVIDENCE_DIR": str(tmp_path / "ev")}
+
+
+def test_config_from_a_token_only_file(tmp_path: Path) -> None:
+    manifest = _manifest()
+    config = CatcherConfig.from_env(_token_env(tmp_path, _tokens_doc(manifest)))
+    assert config.run_id == RUN_ID
+    assert config.callback_domain == "cb.lab.test"
+    assert config.tokens == TokenIndex.build(manifest)
+    assert config.tokens.lookup(_token(P7_ID)) == (_token(P7_ID), P7_ID)
+
+
+def test_config_from_a_token_only_file_for_a_control_run(tmp_path: Path) -> None:
+    config = CatcherConfig.from_env(_token_env(tmp_path, _tokens_doc(_manifest(injected=False))))
+    assert config.tokens.entries == ()
+
+
+def test_config_token_file_and_manifest_are_exclusive(tmp_path: Path) -> None:
+    manifest = _manifest()
+    env = _token_env(tmp_path, _tokens_doc(manifest)) | _env_files(tmp_path, manifest)
+    with pytest.raises(ValueError, match="LAB_TOKENS"):
+        CatcherConfig.from_env(env)
+    with pytest.raises(ValueError, match="LAB_TOKENS"):
+        CatcherConfig.from_env({"LAB_EVIDENCE_DIR": str(tmp_path)})
+
+
+def test_config_token_file_checks_the_run_id(tmp_path: Path) -> None:
+    env = _token_env(tmp_path, _tokens_doc(_manifest())) | {"LAB_RUN_ID": new_id("run")}
+    with pytest.raises(ValueError, match="LAB_RUN_ID"):
+        CatcherConfig.from_env(env)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda d: d["tokens"].append(dict(d["tokens"][0])), "duplicate callback token"),
+        (lambda d: d["tokens"][0].update(token="NOT-A-TOKEN"), "token"),  # noqa: S106
+        (lambda d: d["tokens"][0].update(placement_id="../x"), "placement"),
+        (lambda d: d.update(run_id="run 1"), "run_id"),
+        (lambda d: d.update(callback_domain="Not A Domain"), "callback_domain"),
+        (lambda d: d.update(manifest={}), "unexpected"),
+        (lambda d: d["tokens"][0].update(tag="0123456789abcdef"), "unexpected"),
+        (lambda d: d.update(tokens="x"), "tokens"),
+    ],
+)
+def test_config_token_file_is_validated(tmp_path: Path, mutate: Any, match: str) -> None:
+    doc = _tokens_doc(_manifest())
+    mutate(doc)
+    with pytest.raises(ValueError, match=match):
+        CatcherConfig.from_env(_token_env(tmp_path, doc))
+
+
+def test_config_token_file_that_is_not_json_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "tokens.json"
+    path.write_text("{not json")
+    with pytest.raises(ValueError, match="LAB_TOKENS"):
+        CatcherConfig.from_env({"LAB_TOKENS": str(path)})
 
 
 # --------------------------------------------------------------------------- HTTP

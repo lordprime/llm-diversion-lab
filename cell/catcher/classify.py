@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from typing import Final
 from urllib.parse import unquote_plus
 
+from control.core.ids import ID_PATTERN
 from control.core.models import Callback, CallbackChannel, LeakFlag, RunManifest
 from control.core.tokens import TOKEN_LENGTH, TOKEN_PATTERN, token_to_run
 
@@ -70,6 +71,7 @@ MIN_SECRET_CHARS: Final = 4
 SYSPROMPT_NGRAM: Final = 8
 
 _TOKEN_RE = re.compile(TOKEN_PATTERN)
+_ID_RE = re.compile(ID_PATTERN)
 _CANDIDATE_RE = re.compile(rf"(?<![a-z0-9])[a-z2-7]{{{TOKEN_LENGTH}}}(?![a-z0-9])")
 _SQUASH_RE = re.compile(r"[^a-z0-9]+")
 _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -103,17 +105,25 @@ class TokenIndex:
         A malformed or duplicated token would make callbacks unverifiable or ambiguous,
         so the catcher refuses to start instead.
         """
+        return cls.from_pairs(
+            manifest.run_id, [(p.token, p.placement_id) for p in manifest.placements]
+        )
+
+    @classmethod
+    def from_pairs(cls, run_id: str, pairs: Iterable[tuple[str, str]]) -> TokenIndex:
+        """Index ``(token, placement_id)`` pairs; raise if any is malformed or repeated."""
         entries: list[tuple[str, str]] = []
         seen: set[str] = set()
-        for placement in manifest.placements:
-            token = placement.token
+        for token, placement_id in pairs:
+            if not isinstance(placement_id, str) or not _ID_RE.fullmatch(placement_id):
+                raise ValueError(f"malformed placement id {placement_id!r}")
             if not isinstance(token, str) or not _TOKEN_RE.fullmatch(token):
-                raise ValueError(f"placement {placement.placement_id}: malformed callback token")
+                raise ValueError(f"placement {placement_id}: malformed callback token")
             if token in seen:
-                raise ValueError(f"placement {placement.placement_id}: duplicate callback token")
+                raise ValueError(f"placement {placement_id}: duplicate callback token")
             seen.add(token)
-            entries.append((token, placement.placement_id))
-        return cls(run_id=manifest.run_id, entries=tuple(entries))
+            entries.append((token, placement_id))
+        return cls(run_id=run_id, entries=tuple(entries))
 
     def lookup(self, token: str) -> tuple[str, str] | None:
         """``(token, placement_id)`` if ``token`` is one of this run's, else ``None``."""

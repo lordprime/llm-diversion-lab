@@ -215,8 +215,35 @@ def _unique_by(
         seen.add(value)
 
 
-def check_schedule(runs: Sequence[ScheduledRun]) -> None:
+def _check_cells(runs: Sequence[ScheduledRun], experiment: Experiment) -> None:
+    """Every run belongs to ``experiment`` and each of its cells holds exactly one pair."""
+    wrong = sorted({r.experiment_id for r in runs} - {experiment.experiment_id})
+    if wrong:
+        raise ScheduleError(
+            f"runs of experiment(s) {', '.join(wrong)}, not {experiment.experiment_id}"
+        )
+    cells = set(_cells(experiment))
+    pairs_per_cell: dict[PairKey, set[str]] = defaultdict(set)
+    for run in runs:
+        if run.key not in cells:
+            raise ScheduleError(f"run {run.run_id}: cell {tuple(run.key)} is not in the experiment")
+        pairs_per_cell[run.key].add(run.pair_id)
+    for key, pair_ids in pairs_per_cell.items():
+        if len(pair_ids) > 1:
+            raise ScheduleError(f"cell {tuple(key)} has more than one pair: {sorted(pair_ids)}")
+    missing = sorted(cells - set(pairs_per_cell))
+    if missing:
+        shown = ", ".join(str(tuple(k)) for k in missing[:5])
+        raise ScheduleError(f"{len(missing)} cell(s) of the experiment are missing: {shown}")
+
+
+def check_schedule(runs: Sequence[ScheduledRun], *, experiment: Experiment | None = None) -> None:
     """Raise :class:`ScheduleError` unless ``runs`` is a well-formed matched-pair schedule.
+
+    With ``experiment``, the schedule must also be *complete* for it: every run belongs
+    to it, every run's cell ``(target, agent, model, rep)`` is one of its cells, and
+    each cell holds exactly one pair (so a truncated schedule, or one with two pairs in
+    a cell, is refused). Without it only the structure below is checked.
 
     Checked over all attempts:
 
@@ -230,6 +257,8 @@ def check_schedule(runs: Sequence[ScheduledRun]) -> None:
     * pairs are adjacent: in ``schedule_index`` order pair *k* holds exactly the
       positions ``2k`` and ``2k + 1``, so positions run ``0..2*pairs - 1`` without gaps.
     """
+    if experiment is not None:
+        _check_cells(runs, experiment)
     if not runs:
         return
     experiments = {r.experiment_id for r in runs}
