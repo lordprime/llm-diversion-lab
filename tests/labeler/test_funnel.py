@@ -8,8 +8,10 @@ cell's ``evidence/`` directory exactly as the cell components lay it out.
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import json
+import zlib
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -414,6 +416,123 @@ def test_tagged_call_without_meta_is_incomplete_evidence() -> None:
     ev = _evidence(calls=[(_body(TAG), None)])
     with pytest.raises(IncompleteEvidenceError):
         label_run(ev)
+
+
+# --------------------------------------------------------------------------- raw (undecoded) bodies
+
+
+def _raw_meta(seq: int, encoding: str | None, **kwargs: Any) -> TapMeta:
+    """Tap meta of a request the tap could not decode, so it stored the wire bytes."""
+    return replace(_meta(seq, **kwargs), content_encoding=encoding, decoded=False)
+
+
+def test_raw_gzip_request_with_tag_is_decoded_and_visible() -> None:
+    wire = gzip.compress(_body(f"robots.txt: {TAG}"))
+    assert TAG.encode() not in wire
+    ev = _evidence(calls=[(wire, _raw_meta(0, "gzip"))])
+    visible = _by_stage(label_run(ev))[FunnelStage.VISIBLE]
+    assert visible.value is True
+    assert visible.detail["first_seq"] == 0
+    assert visible.detail["decoded_by_labeler"] is True
+
+
+def test_raw_deflate_request_with_tag_is_visible() -> None:
+    ev = _evidence(calls=[(zlib.compress(_body(TAG)), _raw_meta(0, "deflate"))])
+    assert _by_stage(label_run(ev))[FunnelStage.VISIBLE].value is True
+
+
+def test_raw_brotli_request_with_tag_is_visible() -> None:
+    brotli = pytest.importorskip("brotli")
+    ev = _evidence(calls=[(brotli.compress(_body(TAG)), _raw_meta(0, "br"))])
+    assert _by_stage(label_run(ev))[FunnelStage.VISIBLE].value is True
+
+
+def test_raw_zstd_request_with_tag_is_visible() -> None:
+    zstd = pytest.importorskip("backports.zstd")
+    ev = _evidence(calls=[(zstd.compress(_body(TAG)), _raw_meta(0, "zstd"))])
+    assert _by_stage(label_run(ev))[FunnelStage.VISIBLE].value is True
+
+
+def test_raw_gzip_request_without_tag_is_not_visible() -> None:
+    ev = _evidence(calls=[(gzip.compress(_body("nothing")), _raw_meta(0, "gzip"))])
+    assert _by_stage(label_run(ev))[FunnelStage.VISIBLE].value is False
+
+
+@pytest.mark.parametrize(
+    ("wire", "encoding"),
+    [
+        (b"definitely not gzip", "gzip"),
+        (gzip.compress(b"truncated body")[:-6], "gzip"),
+        (b"\x00\x01garbage", "deflate"),
+        (gzip.compress(b"x"), "x-unknown"),
+        (gzip.compress(b"x"), "gzip, br"),
+    ],
+)
+def test_undecodable_raw_generation_request_is_incomplete_evidence(
+    wire: bytes, encoding: str
+) -> None:
+    ev = _evidence(calls=[(_body("plain first call"), _meta(0)), (wire, _raw_meta(1, encoding))])
+    with pytest.raises(IncompleteEvidenceError) as exc:
+        label_run(ev)
+    assert "tap#1" in str(exc.value)
+
+
+def test_undecodable_raw_request_refused_even_after_an_earlier_visible_call() -> None:
+    ev = _evidence(calls=[(_body(TAG), _meta(0)), (b"not gzip", _raw_meta(1, "gzip"))])
+    with pytest.raises(IncompleteEvidenceError):
+        label_run(ev)
+
+
+def test_undecodable_raw_non_candidate_request_is_ignored() -> None:
+    # count_tokens and a 429 can never make Visible true, so their bytes do not matter
+    ev = _evidence(
+        calls=[
+            (b"not gzip", _raw_meta(0, "gzip", path="/v1/messages/count_tokens")),
+            (b"not gzip", _raw_meta(1, "gzip", status=429)),
+        ]
+    )
+    assert _by_stage(label_run(ev))[FunnelStage.VISIBLE].value is False
+
+
+def test_undecodable_raw_request_in_run_with_forbidden_tags_is_incomplete() -> None:
+    # contamination cannot be ruled out on bytes we cannot read
+    ev = _evidence(
+        _manifest(Arm.CONTROL),
+        calls=[(b"not gzip", _raw_meta(0, "gzip", path="/v1/messages/count_tokens"))],
+        forbidden=frozenset({TAG}),
+    )
+    with pytest.raises(IncompleteEvidenceError):
+        label_run(ev)
+
+
+def test_raw_gzip_request_with_forbidden_tag_is_contamination() -> None:
+    ev = _evidence(
+        _manifest(Arm.CONTROL),
+        calls=[(gzip.compress(_body(TAG)), _raw_meta(0, "gzip"))],
+        forbidden=frozenset({TAG}),
+    )
+    with pytest.raises(ContaminationError):
+        label_run(ev)
+
+
+def test_loader_reads_encoding_and_decoded_flag(tmp_path: Path) -> None:
+    evidence_dir = _copy_fixture("served_not_visible", tmp_path)
+    req = evidence_dir / "llm" / "0001.req.json"
+    req.write_bytes(gzip.compress(_body(f"robots.txt: {TAG}")))
+    meta_file = evidence_dir / "llm" / "0001.meta.json"
+    meta = json.loads(meta_file.read_text())
+    meta["request"]["content_encoding"] = "gzip"
+    meta["request"]["decoded"] = False
+    meta_file.write_text(json.dumps(meta))
+    evidence = load_run_evidence(
+        evidence_dir, _manifest_of("served_not_visible"), forbidden_tags=[], verdict=None
+    )
+    assert evidence.tap_meta[("tap", 1)].content_encoding == "gzip"
+    assert evidence.tap_meta[("tap", 1)].decoded is False
+    assert evidence.tap_meta[("tap", 0)].decoded is True
+    visible = _by_stage(label_run(evidence))[FunnelStage.VISIBLE]
+    assert visible.value is True
+    assert visible.evidence_ref[0] == "tap#1"
 
 
 def test_call_without_request_body_is_incomplete_evidence() -> None:
