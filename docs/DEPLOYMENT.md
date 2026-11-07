@@ -98,16 +98,17 @@ It is **deny by default** and allows only the following:
 
 | Request | Rule |
 |---|---|
-| Create a container | **Image:** must be in the `images.lock` allow-list. **Forced:** the network is the cell's internal network; label `lab.run_id`; memory, CPU and PID limits. **Denied:** privileged, host network/PID/IPC/user namespace, devices, bind mounts outside the cell's scratch volume, capabilities beyond `NET_RAW`/`NET_ADMIN`, unconfined seccomp or AppArmor. |
-| Start, stop, kill, wait, remove, inspect, logs, attach, exec | Only on containers carrying this cell's `lab.run_id` |
+| Create a container | **Image:** must be in the `images.lock` allow-list; pinned to its digest. **Forced:** the network is the cell's internal network; labels `lab.run_id=<run>` and `lab.origin=cellguard`; memory, CPU and PID limits; the cell resolver as the only DNS server; the cell name prefix on the container name. **Names:** every network alias and the hostname must start with the cell prefix (`<run id lowercased>-`), so an agent container can never publish a cell service name (`target`, `tap`, `catcher`). **Denied:** privileged, host network/PID/IPC/user namespace, devices, any host-path (bind) mount (the only persistent mount is the cell's scratch named volume, without subpath), capabilities beyond `NET_RAW`, unconfined seccomp or AppArmor, agent-chosen DNS servers/search/options, extra hosts entries, links, domain name, MAC address, static endpoint addresses, reserved labels (`lab.*`, `com.docker.*`). |
+| Start, stop, kill, wait, remove, inspect, logs, attach, exec | Only on containers carrying both `lab.run_id=<run>` and `lab.origin=cellguard`, i.e. created through this cell's guard. Runner-created infrastructure (agent, target, oracle, the cell-guard container) never carries `lab.origin=cellguard` and is untouchable. |
 | List or inspect images | Allowed (read-only). Pull, build, push and import are denied. |
-| Networks and volumes | List or inspect own only. Volume create gets a forced label. Network create and connect are denied. |
+| Networks and volumes | List or inspect own only. Volume create gets the forced labels and name prefix. Network create and connect are denied. |
 | Everything else (swarm, plugins, system prune, events of other containers, …) | Denied |
 
 - **Logging:** every request is logged as allowed or denied into the run's evidence. A denial is a containment signal: it shows on the Containment dashboard, and an attempted escape pattern triggers the containment alert.
 - **Streams:** it must pass HTTP connection upgrades through, for attach and exec streams.
 - **Build plan:** built in M0 with tests. Existing pieces (`mikesir87/docker-socket-proxy`, the OPA Docker authorization plugin) are evaluated first as a base.
 - **Who needs it:** HackingBuddyGPT, PentestGPT and RedAmon's minimal stack never need the socket.
+- **Known limit (accepted for M0): ARP spoofing on the cell bridge.** Agent containers keep `NET_RAW` (Docker's default; agents need raw scans), so on the shared cell network an agent container can ARP-spoof another container on that network (for example to intercept traffic meant for the target or the catcher). `NET_ADMIN` and static IP/MAC addresses are denied, so it cannot simply take over another container's address. Evidence integrity does not rest on the network: the catcher verifies every callback's token against the run manifest, and a spoofed callback cannot carry a valid token for another run. Separate agent, target and catcher networks per cell are an M1 design item.
 
 ### 0.4 Sizing and parallelism
 

@@ -41,6 +41,8 @@ Configuration (:meth:`CellGuardConfig.from_env`):
 * ``LAB_RUN_ID`` (required): the run the cell belongs to.
 * ``LAB_CELLGUARD_NETWORK`` (required): the cell's internal network.
 * ``LAB_CELLGUARD_IMAGES_LOCK`` (required): path of ``images.lock`` (YAML or JSON).
+* ``LAB_CELLGUARD_DNS`` (required): IP address of the cell resolver (the catcher's
+  DNS), forced as every created container's only nameserver.
 * ``LAB_CELLGUARD_LISTEN`` (default ``/run/cellguard/docker.sock``): socket to serve.
 * ``LAB_CELLGUARD_UPSTREAM`` (default ``/var/run/docker.sock``; ``unix://`` accepted).
 * ``LAB_CELLGUARD_SCRATCH_VOLUME`` (optional): the cell's scratch named volume, the one
@@ -76,6 +78,7 @@ from cell.cellguard.policy import (
     DEFAULT_MEMORY_BYTES,
     DEFAULT_NANO_CPUS,
     DEFAULT_PIDS_LIMIT,
+    RUN_ID_PATTERN,
     RUN_LABEL,
     CellContext,
     Decision,
@@ -86,7 +89,6 @@ from cell.cellguard.policy import (
     load_images_lock,
     route,
 )
-from control.core.ids import ID_PATTERN
 
 __all__ = [
     "CELLGUARD_DIR",
@@ -120,7 +122,7 @@ _REQUEST_TIMEOUT_S: Final = 60.0
 DEFAULT_MAX_CONNECTIONS: Final = 32
 _LOOKUP_TIMEOUT_S: Final = 30.0
 
-_ID_RE = re.compile(ID_PATTERN)
+_RUN_ID_RE = re.compile(RUN_ID_PATTERN)
 _DECIMAL_RE = re.compile(r"[0-9]{1,12}")
 _METHOD_RE = re.compile(r"^[A-Z]{1,16}$")
 _TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -159,7 +161,7 @@ class DecisionLog:
     """Appends one JSON record per decision; safe to call from several threads."""
 
     def __init__(self, run_id: str, path: Path) -> None:
-        if not _ID_RE.fullmatch(run_id):
+        if not _RUN_ID_RE.fullmatch(run_id):
             raise ValueError(f"malformed run id {run_id!r}")
         self._run_id = run_id
         self._path = path
@@ -257,7 +259,12 @@ class CellGuardConfig:
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> CellGuardConfig:
-        for required in ("LAB_RUN_ID", "LAB_CELLGUARD_NETWORK", "LAB_CELLGUARD_IMAGES_LOCK"):
+        for required in (
+            "LAB_RUN_ID",
+            "LAB_CELLGUARD_NETWORK",
+            "LAB_CELLGUARD_IMAGES_LOCK",
+            "LAB_CELLGUARD_DNS",
+        ):
             if not env.get(required):
                 raise ValueError(f"{required}: not set")
         if env.get("LAB_CELLGUARD_SCRATCH_DIR"):
@@ -268,6 +275,7 @@ class CellGuardConfig:
         context = CellContext(
             run_id=env["LAB_RUN_ID"],
             network=env["LAB_CELLGUARD_NETWORK"],
+            dns=env["LAB_CELLGUARD_DNS"].strip(),
             images=load_images_lock(Path(env["LAB_CELLGUARD_IMAGES_LOCK"])),
             scratch_volume=env.get("LAB_CELLGUARD_SCRATCH_VOLUME") or None,
             name_prefix=env.get("LAB_CELLGUARD_NAME_PREFIX") or None,

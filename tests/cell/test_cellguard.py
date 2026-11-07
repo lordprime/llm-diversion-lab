@@ -52,6 +52,8 @@ from control.core.ids import new_id
 DIGEST_A = "sha256:" + "a" * 64
 DIGEST_B = "sha256:" + "b" * 64
 NETWORK = "lab-cell-net"
+#: The cell resolver (the catcher's DNS) every agent container is forced to use.
+CELL_DNS = "10.89.0.53"
 RUN = new_id("run")
 OTHER_RUN = new_id("run")
 CID = "c" * 64
@@ -62,6 +64,7 @@ def make_ctx(**overrides: Any) -> CellContext:
     values: dict[str, Any] = {
         "run_id": RUN,
         "network": NETWORK,
+        "dns": CELL_DNS,
         "images": (
             AllowedImage("strix-sandbox-0.1", "ghcr.io/usestrix/strix-sandbox", DIGEST_A),
             AllowedImage("alpine-3", "docker.io/library/alpine", DIGEST_B),
@@ -304,7 +307,7 @@ def test_allowed_capabilities_and_safe_options_pass() -> None:
         {
             "Image": IMG,
             "HostConfig": {
-                "CapAdd": ["NET_RAW", "CAP_NET_ADMIN"],
+                "CapAdd": ["NET_RAW", "CAP_NET_RAW"],
                 "CapDrop": ["ALL"],
                 "SecurityOpt": ["no-new-privileges", "no-new-privileges:true"],
                 "NetworkMode": "default",
@@ -320,7 +323,7 @@ def test_allowed_capabilities_and_safe_options_pass() -> None:
             },
         }
     )
-    assert body["HostConfig"]["CapAdd"] == ["NET_RAW", "CAP_NET_ADMIN"]
+    assert body["HostConfig"]["CapAdd"] == ["NET_RAW", "CAP_NET_RAW"]
     assert body["HostConfig"]["NetworkMode"] == NETWORK
 
 
@@ -338,17 +341,18 @@ def test_lower_requested_limits_are_kept() -> None:
 
 
 def test_endpoint_config_for_cell_network_keeps_aliases_only() -> None:
+    alias = f"{CTX.prefix}sandbox"
     body = allowed_create(
         {
             "Image": IMG,
             "NetworkingConfig": {
                 "EndpointsConfig": {
-                    NETWORK: {"Aliases": ["sandbox"], "IPAMConfig": {"IPv4Address": "1.2.3.4"}}
+                    NETWORK: {"Aliases": [alias], "NetworkID": "x", "EndpointID": "y"}
                 }
             },
         }
     )
-    assert body["NetworkingConfig"] == {"EndpointsConfig": {NETWORK: {"Aliases": ["sandbox"]}}}
+    assert body["NetworkingConfig"] == {"EndpointsConfig": {NETWORK: {"Aliases": [alias]}}}
 
 
 @pytest.mark.parametrize(
@@ -759,6 +763,7 @@ def test_forwarded_create_body_is_rebuilt_not_passed_through() -> None:
         "MemorySwap",
         "NanoCpus",
         "PidsLimit",
+        "Dns",
     }
     assert body["Image"] == ALP
     assert not create({"Image": IMG, "Healthcheck": {"Test": ["x"], "Escape": 1}}).allowed
@@ -1111,11 +1116,22 @@ def test_lists_require_both_labels() -> None:
 # --------------------------------------------------------------------------- review 2: names
 
 
-def test_run_ids_with_dashes_and_bad_prefixes_are_rejected() -> None:
-    # Prefix boundaries: run "r" owns "r-*"; a run "r-x" (prefix "r-x-") would collide.
-    assert make_ctx(run_id="r").prefix == "r-"
-    with pytest.raises(ValueError):
-        make_ctx(run_id="r-x")
+def test_only_canonical_run_ids_and_bad_prefixes_are_rejected() -> None:
+    # Prefix boundaries: only canonical ids (run_ + 26 uppercase Crockford chars) are
+    # accepted, so no run's prefix is a prefix of another's.
+    canonical = "run_01HZY5V8QJ7K2M3N4P5R6S7T8V"
+    assert make_ctx(run_id=canonical).prefix == canonical.lower() + "-"
+    for bad in [
+        "r",
+        "r-x",
+        canonical.lower(),
+        canonical + "X",
+        canonical[:-1],
+        "run_01HZY5V8QJ7K2M3N4P5R6S7T8I",  # I is not Crockford
+        "exp_01HZY5V8QJ7K2M3N4P5R6S7T8V",
+    ]:
+        with pytest.raises(ValueError):
+            make_ctx(run_id=bad)
     for prefix in ["abc", "a-b-", "-", "c7_", "UPPER-x"]:
         with pytest.raises(ValueError):
             make_ctx(name_prefix=prefix)
@@ -1136,6 +1152,94 @@ def test_volume_create_query_params_are_denied() -> None:
     decision = evaluate(DockerRequest("POST", "/volumes/create?name=x", b"{}"), CTX)
     assert not decision.allowed
     assert decision.rule == "volume.query"
+
+
+# --------------------------------------------------------------------------- review 3: names
+
+
+def endpoint(**config: Any) -> dict[str, Any]:
+    return {"NetworkingConfig": {"EndpointsConfig": {NETWORK: config}}}
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        # N1: names an agent container could publish in the cell network's DNS.
+        endpoint(Aliases=["target"]),
+        endpoint(Aliases=["tap", f"{RUN.lower()}-ok"]),
+        endpoint(Aliases=["catcher"]),
+        endpoint(Aliases=[f"x{RUN.lower()}-sbx"]),
+        endpoint(Aliases=[f"{RUN.lower()}-../x"]),
+        endpoint(DNSNames=["target"]),
+        endpoint(Links=["target:target"]),
+        {"Hostname": "catcher"},
+        {"Hostname": "target"},
+        {"Domainname": "lab"},
+        {"HostConfig": {"Links": ["target:target"]}},
+        # N2a: no cloning of an infrastructure container's MAC or IP.
+        {"MacAddress": "02:42:ac:11:00:02"},
+        endpoint(MacAddress="02:42:ac:11:00:02"),
+        endpoint(IPAddress="10.89.0.2"),
+        endpoint(GlobalIPv6Address="fd00::2"),
+        endpoint(IPAMConfig={"IPv4Address": "10.89.0.2"}),
+        endpoint(IPAMConfig={"LinkLocalIPs": ["169.254.0.2"]}),
+        endpoint(DriverOpts={"com.docker.network.endpoint.sysctls": "x"}),
+        # N5: the agent may not choose its resolver or shadow names via /etc/hosts.
+        {"HostConfig": {"Dns": ["8.8.8.8"]}},
+        {"HostConfig": {"DnsSearch": ["evil.example"]}},
+        {"HostConfig": {"DnsOptions": ["ndots:9"]}},
+        {"HostConfig": {"ExtraHosts": ["target:10.89.0.66"]}},
+        # N2b: NET_ADMIN would let an agent take another container's IP.
+        {"HostConfig": {"CapAdd": ["NET_ADMIN"]}},
+        {"HostConfig": {"CapAdd": ["CAP_NET_ADMIN"]}},
+        # N3: SELinux relabel flags are not accepted on binds.
+        {"HostConfig": {"Binds": ["lab-scratch:/s:z"]}},
+        {"HostConfig": {"Binds": ["lab-scratch:/s:Z"]}},
+    ],
+)
+def test_names_addresses_and_resolvers_are_not_the_agents_to_choose(
+    fields: dict[str, Any],
+) -> None:
+    decision = create({"Image": IMG, **fields})
+    assert not decision.allowed, fields
+
+
+def test_prefixed_names_are_allowed_and_dns_is_forced() -> None:
+    prefix = CTX.prefix
+    body = allowed_create(
+        {
+            "Image": IMG,
+            "Hostname": f"{prefix}box",
+            "Domainname": "",
+            "MacAddress": "",
+            **endpoint(Aliases=[f"{prefix}web", f"{prefix}api"], DNSNames=[], MacAddress=""),
+            "HostConfig": {
+                "Dns": [],
+                "DnsSearch": [],
+                "DnsOptions": [],
+                "ExtraHosts": None,
+                "CapAdd": ["NET_RAW"],
+                "Binds": ["lab-scratch:/s:ro", "lab-scratch:/n:nocopy", "lab-scratch:/w:rw"],
+            },
+        }
+    )
+    assert body["Hostname"] == f"{prefix}box"
+    assert body["NetworkingConfig"]["EndpointsConfig"][NETWORK] == {
+        "Aliases": [f"{prefix}web", f"{prefix}api"]
+    }
+    assert body["HostConfig"]["Dns"] == [CELL_DNS]
+    assert not {"DnsSearch", "DnsOptions", "ExtraHosts"} & set(body["HostConfig"])
+    # Without a hostname the daemon uses the short id: fine.
+    assert "Hostname" not in allowed_create({"Image": IMG, "Hostname": ""})
+    assert allowed_create({"Image": IMG})["HostConfig"]["Dns"] == [CELL_DNS]
+    assert "HostConfig.Dns" in create({"Image": IMG}).forced
+
+
+def test_cell_dns_must_be_an_ip_address() -> None:
+    for bad in ["", "catcher", "10.0.0", "10.0.0.1:53"]:
+        with pytest.raises(ValueError):
+            make_ctx(dns=bad)
+    assert make_ctx(dns="fd00::53").dns == "fd00::53"
 
 
 # --------------------------------------------------------------------------- images.lock
@@ -1243,6 +1347,7 @@ def test_config_from_env(tmp_path: Path) -> None:
         "LAB_CELLGUARD_LISTEN": str(tmp_path / "guard.sock"),
         "LAB_CELLGUARD_UPSTREAM": "/var/run/docker.sock",
         "LAB_CELLGUARD_NETWORK": NETWORK,
+        "LAB_CELLGUARD_DNS": CELL_DNS,
         "LAB_CELLGUARD_IMAGES_LOCK": str(lock),
         "LAB_CELLGUARD_SCRATCH_VOLUME": "lab-scratch",
         "LAB_CELLGUARD_MEMORY": "268435456",
@@ -1265,7 +1370,15 @@ def test_config_from_env(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         CellGuardConfig.from_env({**env, "LAB_CELLGUARD_NAME_PREFIX": "a-b-"})
     assert config.listen == tmp_path / "guard.sock"
-    for missing in ["LAB_RUN_ID", "LAB_CELLGUARD_NETWORK", "LAB_CELLGUARD_IMAGES_LOCK"]:
+    assert config.context.dns == CELL_DNS
+    with pytest.raises(ValueError):
+        CellGuardConfig.from_env({**env, "LAB_CELLGUARD_DNS": "not-an-ip"})
+    for missing in [
+        "LAB_RUN_ID",
+        "LAB_CELLGUARD_NETWORK",
+        "LAB_CELLGUARD_IMAGES_LOCK",
+        "LAB_CELLGUARD_DNS",
+    ]:
         with pytest.raises(ValueError):
             CellGuardConfig.from_env({k: v for k, v in env.items() if k != missing})
     with pytest.raises(ValueError):
@@ -1679,6 +1792,9 @@ def test_podman_integration(tmp_path: Path) -> None:
         pytest.skip(f"{ALPINE} has no repo digest")
     suffix = uuid.uuid4().hex[:8]
     network = real.networks.create(f"cg-test-{suffix}", internal=True)
+    # Stand-in for the catcher's DNS (TEST-NET-1, never answers). The network's embedded
+    # resolver still answers names on the cell network and forwards the rest to it.
+    cell_dns = "192.0.2.53"
     # The runner's scratch volume: labelled with the run only (runner infrastructure).
     scratch = real.volumes.create(f"cg-scratch-{suffix}", labels={RUN_LABEL: RUN})
     volumes: list[str] = [scratch.name]
@@ -1686,6 +1802,7 @@ def test_podman_integration(tmp_path: Path) -> None:
         network=network.name,
         images=(AllowedImage("alpine-3.20", "docker.io/library/alpine", digests[0]),),
         scratch_volume=scratch.name,
+        dns=cell_dns,
         memory_bytes=64 << 20,
         nano_cpus=500_000_000,
         pids_limit=64,
@@ -1794,6 +1911,38 @@ def test_podman_integration(tmp_path: Path) -> None:
             assert reader.wait(timeout=30)["StatusCode"] == 0
             assert reader.logs().strip() == b"from-a"
 
+            # N5: the resolver is forced to the cell's.
+            assert real.api.inspect_container(sbx.id)["HostConfig"]["Dns"] == [cell_dns]
+
+            # N1: cell service names cannot be claimed as an alias or a hostname...
+            def create_raw(extra: dict[str, Any], query: str = "") -> tuple[int, bytes]:
+                doc = {"Image": ALPINE, "Cmd": ["sleep", "300"], **extra}
+                return raw_request(listen, "POST", f"/v1.44/containers/create{query}", doc)
+
+            alias_target = {
+                "NetworkingConfig": {"EndpointsConfig": {network.name: {"Aliases": ["target"]}}}
+            }
+            for hijack in (alias_target, {"Hostname": "catcher"}):
+                status, reply = create_raw(hijack)
+                assert status == 403, reply
+            # ...while a prefixed alias is allowed and resolves through the cell resolver.
+            alias = f"{ctx.prefix}web"
+            prefixed = {
+                "NetworkingConfig": {"EndpointsConfig": {network.name: {"Aliases": [alias]}}}
+            }
+            status, reply = create_raw(prefixed, "?name=web")
+            assert status == 201, reply
+            web = real.containers.get(f"{ctx.prefix}web")
+            created.append(web.id)
+            client.api.start(web.id)
+            # getent, not busybox nslookup (which fails with EMSGSIZE on rootless Podman).
+            resolved = sbx.exec_run(["getent", "hosts", alias])
+            assert resolved.exit_code == 0, resolved.output
+            web_ip = real.api.inspect_container(web.id)["NetworkSettings"]["Networks"][
+                network.name
+            ]["IPAddress"]
+            assert resolved.output.split()[0].decode() == web_ip
+
             # X2: runner infrastructure (run label only, e.g. the cell-guard container) is
             # invisible and untouchable.
             infra = real.containers.create(
@@ -1816,7 +1965,7 @@ def test_podman_integration(tmp_path: Path) -> None:
             assert out.strip() == b"through-the-guard"
 
             # Own containers are listed; the runner's are not.
-            assert {c.id for c in client.containers.list(all=True)} == {sbx.id, reader.id}
+            assert {c.id for c in client.containers.list(all=True)} == {sbx.id, reader.id, web.id}
 
             # Privileged create and pull are denied with 403.
             with pytest.raises(docker.errors.APIError) as denied:
@@ -1839,6 +1988,13 @@ def test_podman_integration(tmp_path: Path) -> None:
             created.remove(sbx.id)
         finally:
             client.close()
+            # Also sweep anything labelled with this test's run: a create that succeeded
+            # but whose start failed never reached ``created``.
+            with contextlib.suppress(Exception):
+                mine = real.containers.list(all=True, filters={"label": f"{RUN_LABEL}={RUN}"})
+                created.extend(c.id for c in mine if c.id not in created)
+                own_volumes = real.volumes.list(filters={"label": f"{RUN_LABEL}={RUN}"})
+                volumes.extend(v.name for v in own_volumes if v.name not in volumes)
             for cid in created:
                 with contextlib.suppress(Exception):
                     real.api.remove_container(cid, force=True)

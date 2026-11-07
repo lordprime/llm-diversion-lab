@@ -55,6 +55,7 @@ What is allowed (everything else is denied):
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -65,8 +66,6 @@ from urllib.parse import parse_qsl, urlencode
 
 import yaml
 
-from control.core.ids import ID_PATTERN
-
 __all__ = [
     "ALLOWED_CAPS",
     "DEFAULT_MEMORY_BYTES",
@@ -76,6 +75,7 @@ __all__ = [
     "MIN_API_VERSION",
     "ORIGIN",
     "ORIGIN_LABEL",
+    "RUN_ID_PATTERN",
     "RUN_LABEL",
     "ULIMIT_CAPS",
     "AllowedImage",
@@ -103,7 +103,13 @@ ORIGIN: Final = "cellguard"
 #: spoof compose ownership). Only the forced ``lab.*`` values themselves are accepted.
 _RESERVED_LABEL_PREFIXES: Final = ("lab.", "com.docker.")
 #: Capabilities a created container may add.
-ALLOWED_CAPS: Final = frozenset({"NET_RAW", "NET_ADMIN"})
+#: NET_RAW is Docker's default and agents need raw scans; NET_ADMIN would let an agent
+#: container take another container's address, so it is not allowed.
+ALLOWED_CAPS: Final = frozenset({"NET_RAW"})
+#: A canonical run id, as ``control.core.ids.new_id("run")`` makes it (``run_`` plus a
+#: 26-character uppercase Crockford ULID). Nothing else is accepted, so one cell's name
+#: prefix (``<run id lowercased>-``) can never be a prefix of another cell's.
+RUN_ID_PATTERN: Final = r"^run_[0-9A-HJKMNP-TV-Z]{26}$"
 #: Ulimits a created container may set, and the cap on each one's hard limit.
 ULIMIT_CAPS: Final[Mapping[str, int]] = {"nofile": 65536, "nproc": 4096}
 #: Oldest Docker API version accepted on a version-prefixed path.
@@ -115,7 +121,7 @@ DEFAULT_NANO_CPUS: Final = 2_000_000_000
 DEFAULT_PIDS_LIMIT: Final = 512
 
 _DIGEST_RE = re.compile(DIGEST_PATTERN)
-_ID_RE = re.compile(ID_PATTERN)
+_RUN_ID_RE = re.compile(RUN_ID_PATTERN)
 _REPO_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*(?::[0-9]+)?(?:/[a-z0-9][a-z0-9._-]*)*$")
 _TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 _LOGICAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@-]*$")
@@ -251,6 +257,9 @@ class CellContext:
     run_id: str
     network: str
     images: tuple[AllowedImage, ...]
+    #: The cell resolver (the catcher's DNS); forced as every created container's only
+    #: nameserver, so callbacks cannot bypass the catcher.
+    dns: str
     #: The one named volume a created container may mount (the cell's scratch volume).
     #: Host paths are never mounted.
     scratch_volume: str | None = None
@@ -263,8 +272,12 @@ class CellContext:
     name_prefix: str | None = None
 
     def __post_init__(self) -> None:
-        if not _ID_RE.fullmatch(self.run_id) or "-" in self.run_id:
-            raise ValueError(f"malformed run id {self.run_id!r} (no '-' allowed)")
+        if not _RUN_ID_RE.fullmatch(self.run_id):
+            raise ValueError(f"malformed run id {self.run_id!r} (expected {RUN_ID_PATTERN})")
+        try:
+            ipaddress.ip_address(self.dns)
+        except ValueError:
+            raise ValueError(f"cell DNS must be an IP address, got {self.dns!r}") from None
         if not _NAME_RE.fullmatch(self.network):
             raise ValueError(f"malformed network name {self.network!r}")
         if self.scratch_volume is not None and not _NAME_RE.fullmatch(self.scratch_volume):
@@ -815,27 +828,35 @@ _MOUNT: Final[_Schema] = {
     "ClusterOptions": _zero("create.mount"),
 }
 #: Options of a ``<scratch volume>:/path[:opts]`` bind (propagation is never accepted).
-_BIND_FLAGS: Final = frozenset({"ro", "rw", "nocopy", "z", "Z"})
+_BIND_FLAGS: Final = frozenset({"ro", "rw", "nocopy"})
 
 _ENDPOINT: Final[_Schema] = {
+    # Every alias must carry the cell prefix (checked against the cell after the rebuild).
     "Aliases": _strlist,
-    # Known fields that are never forwarded: the endpoint is forced to the cell network.
+    # Names, addresses and options an agent could use to impersonate cell services or
+    # clone an infrastructure container's address: must stay unset.
+    **{
+        key: _zero("create.network")
+        for key in (
+            "DNSNames",
+            "Links",
+            "MacAddress",
+            "IPAMConfig",
+            "IPAddress",
+            "GlobalIPv6Address",
+            "DriverOpts",
+        )
+    },
+    # Read-only or advisory fields some clients echo back: accepted, never forwarded.
     **{
         key: _drop
         for key in (
-            "IPAMConfig",
-            "Links",
-            "MacAddress",
-            "DriverOpts",
             "NetworkID",
             "EndpointID",
             "Gateway",
-            "IPAddress",
             "IPPrefixLen",
             "IPv6Gateway",
-            "GlobalIPv6Address",
             "GlobalIPv6PrefixLen",
-            "DNSNames",
             "GwPriority",
         )
     },
@@ -894,10 +915,11 @@ _HOST_CONFIG: Final[_Schema] = {
     "ReadonlyRootfs": _bool,
     "Init": _bool,
     "OomKillDisable": _bool,
-    "Dns": _strlist,
-    "DnsOptions": _strlist,
-    "DnsSearch": _strlist,
-    "ExtraHosts": _strlist,
+    # The resolver is forced to the cell's; /etc/hosts entries could shadow cell names.
+    "Dns": _zero("create.field"),
+    "DnsOptions": _zero("create.field"),
+    "DnsSearch": _zero("create.field"),
+    "ExtraHosts": _zero("create.field"),
     "GroupAdd": _strlist,
     "ShmSize": _uint,
     "Isolation": _choice(frozenset({"", "default"})),
@@ -953,8 +975,9 @@ _CREATE: Final[_Schema] = {
     "Labels": _strmap,
     "HostConfig": _obj(_HOST_CONFIG),
     "NetworkingConfig": _obj(_NETWORKING, "create.network"),
+    # Published as a DNS name on the cell network: checked for the cell prefix.
     "Hostname": _str,
-    "Domainname": _str,
+    "Domainname": _zero("create.name"),
     "User": _str,
     "AttachStdin": _bool,
     "AttachStdout": _bool,
@@ -971,7 +994,7 @@ _CREATE: Final[_Schema] = {
     "WorkingDir": _str,
     "Entrypoint": _strslice,
     "NetworkDisabled": _bool,
-    "MacAddress": _str,
+    "MacAddress": _zero("create.network"),
     "StopSignal": _str,
     "StopTimeout": _int,
     "Shell": _strlist,
@@ -1079,7 +1102,16 @@ def _force_network(body: dict[str, Any], host: dict[str, Any], ctx: CellContext)
         if name != ctx.network:
             raise _Denied("create.network", f"network {name!r} is not the cell network")
         endpoint = config
+    for alias in endpoint.get("Aliases", []):
+        _check_dns_name(alias, ctx, "create.network", "alias")
     body["NetworkingConfig"] = {"EndpointsConfig": {ctx.network: endpoint}}
+
+
+def _check_dns_name(name: str, ctx: CellContext, rule: str, what: str) -> None:
+    """A name the container publishes in the cell network's DNS must carry the cell
+    prefix, so it can never be a cell service name (``target``, ``tap``, ``catcher``)."""
+    if not _NAME_RE.fullmatch(name) or not name.startswith(ctx.prefix):
+        raise _Denied(rule, f"{what} {name!r} must start with {ctx.prefix!r}")
 
 
 def _create_query(r: Route, ctx: CellContext) -> str:
@@ -1111,6 +1143,11 @@ def _container_create(r: Route, req: DockerRequest, ctx: CellContext) -> Decisio
     host["Memory"] = host["MemorySwap"] = _cap(host.get("Memory"), ctx.memory_bytes)
     host["NanoCpus"] = _cap(host.get("NanoCpus"), ctx.nano_cpus)
     host["PidsLimit"] = _cap(host.get("PidsLimit"), ctx.pids_limit)
+    host["Dns"] = [ctx.dns]
+    if body.get("Hostname"):
+        _check_dns_name(body["Hostname"], ctx, "create.name", "hostname")
+    else:
+        body.pop("Hostname", None)  # the daemon uses the short id
     query = _create_query(r, ctx)
     forced = (
         "Image",
@@ -1121,6 +1158,7 @@ def _container_create(r: Route, req: DockerRequest, ctx: CellContext) -> Decisio
         "HostConfig.MemorySwap",
         "HostConfig.NanoCpus",
         "HostConfig.PidsLimit",
+        "HostConfig.Dns",
         "name",
     )
     return _allow(
