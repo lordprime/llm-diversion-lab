@@ -817,6 +817,7 @@
           }
         ]
       },
+      "maxItems": 5000,
       "title": "Events",
       "type": "array"
     },

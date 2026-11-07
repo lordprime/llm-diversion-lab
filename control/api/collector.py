@@ -23,20 +23,26 @@ Status codes
 * ``409`` ``conflict``: contradicts stored evidence (or, for a manifest, the run row).
   For events and artifacts, every non-conflicting item in the body **was stored**; the
   response lists only the conflicting keys.
-* ``422``: ``invalid`` (not JSON / fails the schema), ``run_id_mismatch``,
-  ``unknown_placement`` (an event names a placement not planned for this run) or
-  ``constraint`` (schema-valid but refused by the database; nothing stored).
+* ``422``: ``invalid`` (not JSON / fails the schema, incl. more than
+  ``MAX_EVENTS_PER_BATCH`` events or ``MAX_ARTIFACTS_PER_BATCH`` files),
+  ``run_id_mismatch``, ``unknown_placement`` (an event names a placement not planned
+  for this run) or ``constraint`` (schema-valid but refused by the database; nothing
+  stored).
+* ``500`` ``db_error``: any other database failure while storing. The storing
+  transaction is rolled back (nothing stored) and the body is kept in a fresh one.
 """
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, JsonValue, ValidationError
 from sqlalchemy import Engine
-from sqlalchemy.exc import DataError, IntegrityError
+from sqlalchemy.exc import DataError, DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
 from control.core import models as m
@@ -54,6 +60,8 @@ __all__ = [
     "get_db_engine",
     "router",
 ]
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/runs/{run_id}", tags=["collector"])
 
@@ -126,6 +134,7 @@ _REJECTIONS: dict[int | str, dict[str, Any]] = {
     404: {"model": Rejection, "description": "Unknown run (body kept)."},
     409: {"model": Rejection, "description": "Conflicts with stored evidence (body kept)."},
     422: {"model": Rejection, "description": "Invalid or unstorable body (body kept)."},
+    500: {"model": Rejection, "description": "Database error (nothing stored, body kept)."},
 }
 
 _MESSAGES: dict[RejectReason, str] = {
@@ -135,6 +144,7 @@ _MESSAGES: dict[RejectReason, str] = {
     RejectReason.UNKNOWN_PLACEMENT: "event references a placement not planned for this run",
     RejectReason.CONFLICT: "conflicts with evidence already stored",
     RejectReason.CONSTRAINT: "the database refused the body",
+    RejectReason.DB_ERROR: "database error while storing; nothing stored, body kept",
 }
 
 _STATUS: dict[RejectReason, int] = {
@@ -144,6 +154,7 @@ _STATUS: dict[RejectReason, int] = {
     RejectReason.UNKNOWN_PLACEMENT: 422,
     RejectReason.CONFLICT: 409,
     RejectReason.CONSTRAINT: 422,
+    RejectReason.DB_ERROR: 500,
 }
 
 
@@ -208,9 +219,24 @@ class _Intake:
             return self.reject(engine, RejectReason.RUN_ID_MISMATCH, ids, **ids)
         return payload
 
-    def storage_error(self, engine: Engine, exc: IntegrityError | DataError) -> JSONResponse:
-        error = str(exc.orig) if exc.orig is not None else str(exc)
-        return self.reject(engine, RejectReason.CONSTRAINT, {"error": error}, error=error)
+    def store[R](self, engine: Engine, work: Callable[[Session], R]) -> R | JSONResponse:
+        """Run ``work`` in one transaction; on a database failure keep the body instead.
+
+        ``IntegrityError``/``DataError`` (the body cannot be stored) answer ``422
+        constraint``; any other ``DBAPIError`` answers ``500 db_error``. Either way the
+        storing transaction is rolled back and the body is kept in a fresh transaction.
+        """
+        try:
+            with session_scope(engine) as session:
+                return work(session)
+        except _STORAGE_ERRORS as exc:
+            error = _db_message(exc)
+            return self.reject(engine, RejectReason.CONSTRAINT, {"error": error}, error=error)
+        except DBAPIError as exc:
+            log.exception("collector %s: database error for run %r", self.endpoint, self.run_id)
+            error = _db_message(exc)
+            detail: JsonValue = {"error": error, "type": type(exc).__name__}
+            return self.reject(engine, RejectReason.DB_ERROR, detail, error=error)
 
     def write_result(self, session: Session, result: WriteResult) -> WriteAck | JSONResponse:
         """Map a write-once :class:`WriteResult` to a response."""
@@ -225,6 +251,10 @@ class _Intake:
         return WriteAck(run_id=self.run_id, result=result_value)
 
 
+def _db_message(exc: DBAPIError) -> str:
+    return str(exc.orig) if exc.orig is not None else str(exc)
+
+
 # --------------------------------------------------------------------- routes
 
 
@@ -235,11 +265,10 @@ def post_manifest(run_id: str, body: BodyDep, engine: EngineDep) -> WriteAck | J
     manifest = intake.parse(m.RunManifest, engine)
     if isinstance(manifest, JSONResponse):
         return manifest
-    try:
-        with session_scope(engine) as session:
-            return intake.write_result(session, repo.record_manifest(session, manifest))
-    except _STORAGE_ERRORS as exc:
-        return intake.storage_error(engine, exc)
+    return intake.store(
+        engine,
+        lambda session: intake.write_result(session, repo.record_manifest(session, manifest)),
+    )
 
 
 @router.post("/events:batch", response_model=EventBatchAck, responses=_REJECTIONS)
@@ -253,46 +282,43 @@ def post_events(run_id: str, body: BodyDep, engine: EngineDep) -> EventBatchAck 
     batch = intake.parse(m.EventBatch, engine)
     if isinstance(batch, JSONResponse):
         return batch
-    try:
-        with session_scope(engine) as session:
-            if not repo.run_exists(session, run_id):
-                return intake.reject_in(session, RejectReason.UNKNOWN_RUN, {"run_id": run_id})
-            referenced = [
-                ev.placement_id
-                for ev in batch.events
-                if isinstance(ev, m.PlacementServe | m.Callback) and ev.placement_id is not None
-            ]
-            missing = repo.foreign_placements(session, run_id, referenced)
-            if missing:
-                ids: list[JsonValue] = list(missing)
-                return intake.reject_in(
-                    session,
-                    RejectReason.UNKNOWN_PLACEMENT,
-                    {"placement_ids": ids},
-                    placement_ids=ids,
-                )
-            result = repo.insert_events(session, batch.events)
-            conflicts: list[JsonValue] = [
-                {"stream": k.stream, "seq": k.seq, "kind": k.kind.value} for k in result.conflicts
-            ]
-            if conflicts:
-                return intake.reject_in(
-                    session,
-                    RejectReason.CONFLICT,
-                    conflicts,
-                    run_id=run_id,
-                    inserted=result.inserted,
-                    duplicates=result.duplicates,
-                    conflicts=conflicts,
-                )
-            return EventBatchAck(
+
+    def work(session: Session) -> EventBatchAck | JSONResponse:
+        if not repo.run_exists(session, run_id):
+            return intake.reject_in(session, RejectReason.UNKNOWN_RUN, {"run_id": run_id})
+        referenced = [
+            ev.placement_id
+            for ev in batch.events
+            if isinstance(ev, m.PlacementServe | m.Callback) and ev.placement_id is not None
+        ]
+        missing = repo.foreign_placements(session, run_id, referenced)
+        if missing:
+            ids: list[JsonValue] = list(missing)
+            return intake.reject_in(
+                session,
+                RejectReason.UNKNOWN_PLACEMENT,
+                {"placement_ids": ids},
+                placement_ids=ids,
+            )
+        result = repo.insert_events(session, batch.events)
+        conflicts: list[JsonValue] = [
+            {"stream": k.stream, "seq": k.seq, "kind": k.kind.value} for k in result.conflicts
+        ]
+        if conflicts:
+            return intake.reject_in(
+                session,
+                RejectReason.CONFLICT,
+                conflicts,
                 run_id=run_id,
                 inserted=result.inserted,
                 duplicates=result.duplicates,
-                conflicts=[],
+                conflicts=conflicts,
             )
-    except _STORAGE_ERRORS as exc:
-        return intake.storage_error(engine, exc)
+        return EventBatchAck(
+            run_id=run_id, inserted=result.inserted, duplicates=result.duplicates, conflicts=[]
+        )
+
+    return intake.store(engine, work)
 
 
 @router.post("/artifacts", response_model=ArtifactAck, responses=_REJECTIONS)
@@ -302,30 +328,27 @@ def post_artifacts(run_id: str, body: BodyDep, engine: EngineDep) -> ArtifactAck
     batch = intake.parse(m.ArtifactBatch, engine)
     if isinstance(batch, JSONResponse):
         return batch
-    try:
-        with session_scope(engine) as session:
-            if not repo.run_exists(session, run_id):
-                return intake.reject_in(session, RejectReason.UNKNOWN_RUN, {"run_id": run_id})
-            result = repo.register_artifacts(session, batch)
-            if result.conflicts:
-                paths: list[JsonValue] = list(result.conflicts)
-                return intake.reject_in(
-                    session,
-                    RejectReason.CONFLICT,
-                    paths,
-                    run_id=run_id,
-                    inserted=result.inserted,
-                    duplicates=result.duplicates,
-                    conflicts=paths,
-                )
-            return ArtifactAck(
+
+    def work(session: Session) -> ArtifactAck | JSONResponse:
+        if not repo.run_exists(session, run_id):
+            return intake.reject_in(session, RejectReason.UNKNOWN_RUN, {"run_id": run_id})
+        result = repo.register_artifacts(session, batch)
+        if result.conflicts:
+            paths: list[JsonValue] = list(result.conflicts)
+            return intake.reject_in(
+                session,
+                RejectReason.CONFLICT,
+                paths,
                 run_id=run_id,
                 inserted=result.inserted,
                 duplicates=result.duplicates,
-                conflicts=[],
+                conflicts=paths,
             )
-    except _STORAGE_ERRORS as exc:
-        return intake.storage_error(engine, exc)
+        return ArtifactAck(
+            run_id=run_id, inserted=result.inserted, duplicates=result.duplicates, conflicts=[]
+        )
+
+    return intake.store(engine, work)
 
 
 @router.post("/verdict", response_model=WriteAck, responses=_REJECTIONS)
@@ -335,11 +358,9 @@ def post_verdict(run_id: str, body: BodyDep, engine: EngineDep) -> WriteAck | JS
     verdict = intake.parse(m.Verdict, engine)
     if isinstance(verdict, JSONResponse):
         return verdict
-    try:
-        with session_scope(engine) as session:
-            return intake.write_result(session, repo.record_verdict(session, verdict))
-    except _STORAGE_ERRORS as exc:
-        return intake.storage_error(engine, exc)
+    return intake.store(
+        engine, lambda session: intake.write_result(session, repo.record_verdict(session, verdict))
+    )
 
 
 @router.post("/status", response_model=WriteAck, responses=_REJECTIONS)
@@ -349,10 +370,10 @@ def post_status(run_id: str, body: BodyDep, engine: EngineDep) -> WriteAck | JSO
     heartbeat = intake.parse(m.RunHeartbeat, engine)
     if isinstance(heartbeat, JSONResponse):
         return heartbeat
-    try:
-        with session_scope(engine) as session:
-            if not repo.run_exists(session, run_id):
-                return intake.reject_in(session, RejectReason.UNKNOWN_RUN, {"run_id": run_id})
-            return intake.write_result(session, repo.record_heartbeat(session, heartbeat))
-    except _STORAGE_ERRORS as exc:
-        return intake.storage_error(engine, exc)
+
+    def work(session: Session) -> WriteAck | JSONResponse:
+        if not repo.run_exists(session, run_id):
+            return intake.reject_in(session, RejectReason.UNKNOWN_RUN, {"run_id": run_id})
+        return intake.write_result(session, repo.record_heartbeat(session, heartbeat))
+
+    return intake.store(engine, work)

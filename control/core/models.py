@@ -48,6 +48,8 @@ from control.core.tokens import TAG_PATTERN, TOKEN_PATTERN
 __all__ = [
     "ALL_MODELS",
     "ARTIFACT_PATH_PATTERN",
+    "MAX_ARTIFACTS_PER_BATCH",
+    "MAX_EVENTS_PER_BATCH",
     "SCHEMA_VERSION",
     "STREAM_PATTERN",
     "AgentEvent",
@@ -82,6 +84,11 @@ __all__ = [
 
 #: Version of the Collector API envelope format; bump on any breaking model change.
 SCHEMA_VERSION: Final = 1
+
+#: Most events one :class:`EventBatch` may carry; ship more as several batches.
+MAX_EVENTS_PER_BATCH: Final = 5_000
+#: Most files one :class:`ArtifactBatch` may register; ship more as several batches.
+MAX_ARTIFACTS_PER_BATCH: Final = 10_000
 
 # --------------------------------------------------------------------------- types
 
@@ -420,7 +427,7 @@ class EventBatch(_Model):
 
     schema_version: Literal[1] = SCHEMA_VERSION
     run_id: Id
-    events: list[Event]
+    events: Annotated[list[Event], Field(max_length=MAX_EVENTS_PER_BATCH)]
 
     @model_validator(mode="after")
     def _events_consistent(self) -> Self:
@@ -479,7 +486,7 @@ class ArtifactBatch(_Model):
 
     schema_version: Literal[1] = SCHEMA_VERSION
     run_id: Id
-    artifacts: list[ArtifactFile]
+    artifacts: Annotated[list[ArtifactFile], Field(max_length=MAX_ARTIFACTS_PER_BATCH)]
 
     @model_validator(mode="after")
     def _paths_unique(self) -> Self:
@@ -529,6 +536,8 @@ class RejectReason(StrEnum):
     CONFLICT = "conflict"
     #: schema-valid but refused by a database constraint (length, NUL byte, uniqueness)
     CONSTRAINT = "constraint"
+    #: any other database failure while storing (answered 500; the body is still kept)
+    DB_ERROR = "db_error"
 
 
 #: Every model with a generated JSON Schema in ``schemas/``.

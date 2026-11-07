@@ -12,7 +12,14 @@ from control.core.ids import new_id
 from control.core.models import Arm, Event, RunStatus
 from control.db import tables as t
 from control.db.engine import session_scope
-from control.db.repo import EventKey, InsertResult, claim_next_run, insert_events
+from control.db.repo import (
+    ArtifactResult,
+    EventKey,
+    InsertResult,
+    claim_next_run,
+    insert_events,
+    register_artifacts,
+)
 
 TS = datetime(2026, 11, 7, 12, 0, tzinfo=UTC)
 SHA = "a" * 64
@@ -531,3 +538,53 @@ def test_claim_next_run_is_fifo_across_transactions(engine: Engine) -> None:
         assert run is not None
         claimed.append(run.run_id)
     assert claimed == [earlier, later]
+
+
+# --------------------------------------------------------------------- bulk (chunking)
+
+#: Postgres caps one statement at 65,535 bind parameters.
+PG_MAX_PARAMS = 65_535
+
+
+def test_insert_events_beyond_one_statement_param_limit(engine: Engine) -> None:
+    """15,000 target_access events: one INSERT for the kind table (10 params/row) or the
+    ledger claim (5 params/row) would exceed one statement's bind-parameter limit."""
+    n = 15_000
+    assert n * 5 > PG_MAX_PARAMS
+    ids = seed_experiment(engine)
+    run_id = add_run(engine, ids, schedule_index=0)
+    events: list[Event] = [
+        m.TargetAccessEvent(
+            run_id=run_id, stream="injector", seq=i, ts=TS, flow_id=f"f{i}", method="GET", url="/"
+        )
+        for i in range(n)
+    ]
+    with session_scope(engine) as s:
+        assert insert_events(s, events) == InsertResult(inserted=n)
+    assert _count(engine, t.TargetAccess) == n
+    assert len(_ledger(engine)) == n
+
+    with session_scope(engine) as s:
+        assert insert_events(s, events) == InsertResult(duplicates=n)
+    assert _count(engine, t.TargetAccess) == n
+
+
+def test_register_artifacts_beyond_one_statement_param_limit(engine: Engine) -> None:
+    """14,000 artifacts at 5 params/row exceed one statement's bind-parameter limit."""
+    n = 14_000
+    assert n * 5 > PG_MAX_PARAMS
+    ids = seed_experiment(engine)
+    run_id = add_run(engine, ids, schedule_index=0)
+    # model_construct: the repo must be safe even beyond the envelope's max_length
+    batch = m.ArtifactBatch.model_construct(
+        run_id=run_id,
+        artifacts=[
+            m.ArtifactFile(path=f"agent/native/{i}.json", sha256=SHA, size_bytes=i)
+            for i in range(n)
+        ],
+    )
+    with session_scope(engine) as s:
+        assert register_artifacts(s, batch) == ArtifactResult(inserted=n)
+    assert _count(engine, t.Artifact) == n
+    with session_scope(engine) as s:
+        assert register_artifacts(s, batch) == ArtifactResult(duplicates=n)

@@ -14,11 +14,13 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, func, select
+from sqlalchemy.exc import OperationalError
 
 from control.api.app import create_app
 from control.core import models as m
 from control.core.ids import new_id
 from control.core.models import Arm, EndStatus, Event
+from control.db import repo
 from control.db import tables as t
 from control.db.engine import create_db_engine, session_scope
 from tests.db.test_repo import SHA, TAG, TOKEN, TS, _events, add_run, seed_experiment
@@ -520,3 +522,64 @@ def test_api_exposes_no_way_to_update_or_delete_evidence() -> None:
             url = path.replace("{run_id}", run_id)
             for method in ("PUT", "PATCH", "DELETE"):
                 assert c.request(method, url).status_code == 405, (method, url)
+
+
+# --------------------------------------------------------------------- limits and failures
+
+
+def test_oversized_batch_is_422_and_persisted(client: TestClient, engine: Engine) -> None:
+    run_id, _ = _injected_run(engine)
+    n = m.MAX_EVENTS_PER_BATCH + 1
+    events = [
+        m.OraclePoll(run_id=run_id, stream="oracle", seq=i, ts=TS, status=False).model_dump(
+            mode="json"
+        )
+        for i in range(n)
+    ]
+    body = json.dumps({"schema_version": 1, "run_id": run_id, "events": events}).encode()
+
+    r = client.post(f"/v1/runs/{run_id}/events:batch", content=body)
+
+    assert r.status_code == 422, r.text
+    assert r.json()["reason"] == "invalid"
+    assert _event_rows(engine) == 0
+    [rejected] = _rejected(engine)
+    assert rejected.reason is m.RejectReason.INVALID
+    assert rejected.body == body
+
+
+def test_oversized_artifact_batch_is_422(client: TestClient, engine: Engine) -> None:
+    run_id, _ = _injected_run(engine)
+    files = [
+        {"path": f"f/{i}", "sha256": SHA, "size_bytes": 1}
+        for i in range(m.MAX_ARTIFACTS_PER_BATCH + 1)
+    ]
+    body = json.dumps({"run_id": run_id, "artifacts": files})
+    r = client.post(f"/v1/runs/{run_id}/artifacts", content=body)
+    assert r.status_code == 422
+    assert [x.reason for x in _rejected(engine)] == [m.RejectReason.INVALID]
+
+
+def test_unexpected_db_error_is_500_and_body_kept(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*_: Any, **__: Any) -> Any:
+        raise OperationalError("INSERT ...", {}, Exception("server closed the connection"))
+
+    monkeypatch.setattr(repo, "insert_events", broken)
+    run_id, _ = _injected_run(engine)
+    body = _batch_json(
+        run_id, [m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=True)]
+    )
+
+    with TestClient(create_app(engine), raise_server_exceptions=False) as c:
+        r = c.post(f"/v1/runs/{run_id}/events:batch", content=body)
+
+    assert r.status_code == 500
+    assert r.json()["reason"] == "db_error"
+    assert _event_rows(engine) == 0
+    [rejected] = _rejected(engine)
+    assert rejected.id == r.json()["rejected_id"]
+    assert rejected.reason is m.RejectReason.DB_ERROR
+    assert rejected.endpoint is m.CollectorEndpoint.EVENTS
+    assert rejected.body == body.encode()

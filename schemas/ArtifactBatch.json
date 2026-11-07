@@ -51,6 +51,7 @@
       "items": {
         "$ref": "#/$defs/ArtifactFile"
       },
+      "maxItems": 10000,
       "title": "Artifacts",
       "type": "array"
     },

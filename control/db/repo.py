@@ -9,13 +9,13 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Final
 
 from pydantic import BaseModel, JsonValue
-from sqlalchemy import func, select, tuple_, update
+from sqlalchemy import BigInteger, String, column, func, select, update, values
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -39,6 +39,7 @@ from control.db.tables import (
 )
 
 __all__ = [
+    "BULK_CHUNK_ROWS",
     "ArtifactResult",
     "EventKey",
     "InsertResult",
@@ -56,6 +57,17 @@ __all__ = [
     "register_artifacts",
     "run_exists",
 ]
+
+
+#: Rows per multi-row statement. Postgres allows at most 65,535 bind parameters in one
+#: statement; the widest event table binds about 20 per row, so 1,000 rows stay far
+#: below the limit. Chunks of one call all run in the caller's transaction.
+BULK_CHUNK_ROWS: Final = 1_000
+
+
+def _chunks[T](items: Sequence[T], size: int = BULK_CHUNK_ROWS) -> Iterator[Sequence[T]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
 def claim_next_run(session: Session) -> Run | None:
@@ -155,27 +167,37 @@ def insert_events(session: Session, events: Iterable[Event]) -> InsertResult:
     if not first:
         return result
 
-    claim = (
-        pg_insert(EventKeyEntry)
-        .values(
-            [
-                {
-                    "run_id": ev.run_id,
-                    "stream": ev.stream,
-                    "seq": ev.seq,
-                    "kind": ev.kind,
-                    "content_sha256": digest,
-                }
-                for ev, digest in first.values()
-            ]
+    claimed: set[tuple[str, str, int]] = set()
+    for chunk in _chunks(list(first.values())):
+        claim = (
+            pg_insert(EventKeyEntry)
+            .values(
+                [
+                    {
+                        "run_id": ev.run_id,
+                        "stream": ev.stream,
+                        "seq": ev.seq,
+                        "kind": ev.kind,
+                        "content_sha256": digest,
+                    }
+                    for ev, digest in chunk
+                ]
+            )
+            .on_conflict_do_nothing()
+            .returning(EventKeyEntry.run_id, EventKeyEntry.stream, EventKeyEntry.seq)
         )
-        .on_conflict_do_nothing()
-        .returning(EventKeyEntry.run_id, EventKeyEntry.stream, EventKeyEntry.seq)
-    )
-    claimed = {(r.run_id, r.stream, r.seq) for r in session.execute(claim)}
+        claimed.update((r.run_id, r.stream, r.seq) for r in session.execute(claim))
 
     existing_keys = [k for k in first if k not in claimed]
-    if existing_keys:
+    for chunk_keys in _chunks(existing_keys):
+        # join against a VALUES list (hash join) rather than a row-value IN list, which
+        # Postgres plans as one OR branch per key
+        keys = values(
+            column("run_id", String),
+            column("stream", String),
+            column("seq", BigInteger),
+            name="k",
+        ).data(list(chunk_keys))
         stored = session.execute(
             select(
                 EventKeyEntry.run_id,
@@ -183,10 +205,11 @@ def insert_events(session: Session, events: Iterable[Event]) -> InsertResult:
                 EventKeyEntry.seq,
                 EventKeyEntry.kind,
                 EventKeyEntry.content_sha256,
-            ).where(
-                tuple_(EventKeyEntry.run_id, EventKeyEntry.stream, EventKeyEntry.seq).in_(
-                    existing_keys
-                )
+            ).join(
+                keys,
+                (EventKeyEntry.run_id == keys.c.run_id)
+                & (EventKeyEntry.stream == keys.c.stream)
+                & (EventKeyEntry.seq == keys.c.seq),
             )
         )
         for row in stored:
@@ -194,13 +217,14 @@ def insert_events(session: Session, events: Iterable[Event]) -> InsertResult:
             _classify(result, event, row.kind, row.content_sha256, digest)
 
     rows: defaultdict[type[EventRow], list[dict[str, Any]]] = defaultdict(list)
-    for key in claimed:
-        event = first[key][0]
-        rows[EVENT_TABLES[event.kind]].append(event.model_dump(exclude={"kind"}))
+    for key, (event, _) in first.items():  # batch order, not set order
+        if key in claimed:
+            rows[EVENT_TABLES[event.kind]].append(event.model_dump(exclude={"kind"}))
     # Plain INSERT: the per-table unique (run_id, stream, seq) constraint raises if a
     # row exists without its ledger entry, which would be a bug, not a re-ship.
-    for table, values in rows.items():
-        session.execute(pg_insert(table).values(values))
+    for table, table_rows in rows.items():
+        for chunk_rows in _chunks(table_rows):
+            session.execute(pg_insert(table).values(list(chunk_rows)))
     result.inserted = len(claimed)
     return result
 
@@ -354,30 +378,33 @@ def register_artifacts(session: Session, batch: m.ArtifactBatch) -> ArtifactResu
     if not batch.artifacts:
         return result
     files = {a.path: a for a in batch.artifacts}
-    claimed = set(
-        session.scalars(
-            pg_insert(Artifact)
-            .values([{"run_id": batch.run_id, **a.model_dump()} for a in batch.artifacts])
-            .on_conflict_do_nothing()
-            .returning(Artifact.path)
+    claimed: set[str] = set()
+    for chunk in _chunks(batch.artifacts):
+        claimed.update(
+            session.scalars(
+                pg_insert(Artifact)
+                .values([{"run_id": batch.run_id, **a.model_dump()} for a in chunk])
+                .on_conflict_do_nothing()
+                .returning(Artifact.path)
+            )
         )
-    )
     existing = [p for p in files if p not in claimed]
-    if existing:
-        stored = {
-            row.path: (row.sha256, row.size_bytes, row.media_type)
+    stored: dict[str, tuple[str, int, str | None]] = {}
+    for chunk_paths in _chunks(existing):
+        stored.update(
+            (row.path, (row.sha256, row.size_bytes, row.media_type))
             for row in session.execute(
                 select(
                     Artifact.path, Artifact.sha256, Artifact.size_bytes, Artifact.media_type
-                ).where(Artifact.run_id == batch.run_id, Artifact.path.in_(existing))
+                ).where(Artifact.run_id == batch.run_id, Artifact.path.in_(chunk_paths))
             )
-        }
-        for path in existing:
-            a = files[path]
-            if stored.get(path) == (a.sha256, a.size_bytes, a.media_type):
-                result.duplicates += 1
-            else:
-                result.conflicts.append(path)
+        )
+    for path in existing:
+        a = files[path]
+        if stored.get(path) == (a.sha256, a.size_bytes, a.media_type):
+            result.duplicates += 1
+        else:
+            result.conflicts.append(path)
     result.inserted = len(claimed)
     return result
 

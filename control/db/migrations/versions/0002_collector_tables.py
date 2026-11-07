@@ -46,6 +46,7 @@ def upgrade() -> None:
                 "unknown_placement",
                 "conflict",
                 "constraint",
+                "db_error",
                 name="reason",
                 native_enum=False,
                 create_constraint=True,
