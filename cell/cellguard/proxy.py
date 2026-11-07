@@ -43,8 +43,11 @@ Configuration (:meth:`CellGuardConfig.from_env`):
 * ``LAB_CELLGUARD_IMAGES_LOCK`` (required): path of ``images.lock`` (YAML or JSON).
 * ``LAB_CELLGUARD_LISTEN`` (default ``/run/cellguard/docker.sock``): socket to serve.
 * ``LAB_CELLGUARD_UPSTREAM`` (default ``/var/run/docker.sock``; ``unix://`` accepted).
-* ``LAB_CELLGUARD_SCRATCH_VOLUME``, ``LAB_CELLGUARD_SCRATCH_DIR`` (optional): the
-  cell's scratch volume name and its host directory.
+* ``LAB_CELLGUARD_SCRATCH_VOLUME`` (optional): the cell's scratch named volume, the one
+  persistent mount a created container may use. Host paths are never mounted, so the
+  former ``LAB_CELLGUARD_SCRATCH_DIR`` is refused if set.
+* ``LAB_CELLGUARD_NAME_PREFIX`` (default ``<run id lowercased>-``): prefix forced on
+  container and volume names the agent chooses; ends with ``-``, holds no other ``-``.
 * ``LAB_CELLGUARD_MEMORY`` (bytes), ``LAB_CELLGUARD_NANO_CPUS``, ``LAB_CELLGUARD_PIDS``
   (optional): limits forced on created containers.
 * ``LAB_CELLGUARD_SOCKET_MODE`` (octal, default ``660``).
@@ -257,12 +260,17 @@ class CellGuardConfig:
         for required in ("LAB_RUN_ID", "LAB_CELLGUARD_NETWORK", "LAB_CELLGUARD_IMAGES_LOCK"):
             if not env.get(required):
                 raise ValueError(f"{required}: not set")
+        if env.get("LAB_CELLGUARD_SCRATCH_DIR"):
+            raise ValueError(
+                "LAB_CELLGUARD_SCRATCH_DIR: host-path mounts were removed; "
+                "use LAB_CELLGUARD_SCRATCH_VOLUME"
+            )
         context = CellContext(
             run_id=env["LAB_RUN_ID"],
             network=env["LAB_CELLGUARD_NETWORK"],
             images=load_images_lock(Path(env["LAB_CELLGUARD_IMAGES_LOCK"])),
             scratch_volume=env.get("LAB_CELLGUARD_SCRATCH_VOLUME") or None,
-            scratch_dir=env.get("LAB_CELLGUARD_SCRATCH_DIR") or None,
+            name_prefix=env.get("LAB_CELLGUARD_NAME_PREFIX") or None,
             memory_bytes=_positive_int(env, "LAB_CELLGUARD_MEMORY", DEFAULT_MEMORY_BYTES),
             nano_cpus=_positive_int(env, "LAB_CELLGUARD_NANO_CPUS", DEFAULT_NANO_CPUS),
             pids_limit=_positive_int(env, "LAB_CELLGUARD_PIDS", DEFAULT_PIDS_LIMIT),
@@ -399,6 +407,7 @@ _REASONS: Final = {
 class _State:
     """What is known about a connection's request, for the fail-closed error path."""
 
+    method: str = ""
     path: str = ""
     op: str = "malformed"
     recorded: bool = False
@@ -476,8 +485,10 @@ class CellGuard:
             return False
         return True
 
-    async def _refuse(self, writer: asyncio.StreamWriter, decision: Decision, status: int) -> None:
-        await self._record(DockerRequest("", decision.path), decision)
+    async def _refuse(
+        self, writer: asyncio.StreamWriter, decision: Decision, status: int, method: str = ""
+    ) -> None:
+        await self._record(DockerRequest(method, decision.path), decision)
         with contextlib.suppress(Exception):
             writer.write(_response(status, _REASONS[status], decision.reason))
             await writer.drain()
@@ -508,7 +519,7 @@ class CellGuard:
             else:
                 reason = f"internal error: {type(exc).__name__}"
                 decision = Decision(False, state.op, "http.500", reason, state.path, b"")
-                await self._refuse(writer, decision, 500)
+                await self._refuse(writer, decision, 500, state.method)
         finally:
             self._active -= 1
             _close(writer)
@@ -528,7 +539,8 @@ class CellGuard:
                 except asyncio.LimitOverrunError:
                     raise _BadRequest(400, "request head too large") from None
                 head = _parse_head(raw)
-                state.path, state.op = head.target, route(head.method, head.target).op
+                state.method, state.path = head.method, head.target
+                state.op = route(head.method, head.target).op
                 body = await _read_body(head, reader, writer)
         except _BadRequest as bad:
             method, path = (head.method, head.target) if head else ("", "")
@@ -574,7 +586,11 @@ class CellGuard:
             return
         try:
             lines = [f"{head.method} {decision.path} HTTP/1.1", "Host: docker"]
-            lines += [f"{n}: {v}" for n, v in head.headers if n.lower() not in _HOP_BY_HOP]
+            dropped = _HOP_BY_HOP | {"content-type"} if decision.body else _HOP_BY_HOP
+            lines += [f"{n}: {v}" for n, v in head.headers if n.lower() not in dropped]
+            if decision.body:
+                # The body is the policy's own JSON, whatever the client declared.
+                lines.append("Content-Type: application/json")
             if decision.body or head.method in ("POST", "PUT"):
                 lines.append(f"Content-Length: {len(decision.body)}")
             upgrade = head.get("upgrade")

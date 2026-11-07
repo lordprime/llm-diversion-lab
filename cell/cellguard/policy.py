@@ -16,37 +16,46 @@ a known field is reported as ``body.shadow_key``), and only validated values are
 re-encoded. Nested objects are rebuilt the same way. Operations that take no body must
 send none, and API versions below 1.40 are denied.
 
+Ownership: everything cell-guard creates carries two forced labels,
+``lab.run_id=<run>`` and ``lab.origin=cellguard``; an object it may act on must carry
+both. Runner infrastructure (the agent, target, oracle and cell-guard containers, the
+scratch volume) is labelled with the run only and so is untouchable.
+
 What is allowed (everything else is denied):
 
 * handshake: ``GET/HEAD /_ping``, ``GET /version``;
 * ``POST /containers/create``: the image must be in the ``images.lock`` allow-list (by
   logical name, by repository, or by ``repository@digest``) and is pinned to
   ``image@digest``. Forced: the cell's network (``HostConfig.NetworkMode`` and
-  ``NetworkingConfig``), the ``lab.run_id`` label, memory (no swap), CPU and PID limits
-  (a lower request is kept), and the cell's name prefix on ``?name=``. Denied:
-  privileged; host or container network/PID/IPC/user/UTS/cgroup namespaces; devices;
-  bind mounts outside the cell's scratch directory; named volumes other than the cell's
-  scratch volume; volume driver options; capabilities beyond ``NET_RAW`` and
-  ``NET_ADMIN``; any ``SecurityOpt`` except ``no-new-privileges``; published ports;
-  ``VolumesFrom``; links; sysctls; runtimes; cgroup parents; masked/read-only path
-  overrides; non-local log drivers; restart policies other than ``no``; ulimits other
-  than ``nofile``/``nproc`` within caps; and every other field set to a non-zero value;
+  ``NetworkingConfig``), both ownership labels (also on volume mounts), memory (no
+  swap), CPU and PID limits (a lower request is kept), and the cell's name prefix on
+  ``?name=``. Mounts: only the cell's scratch *named* volume (``<name>:/path[:ro]`` or a
+  ``volume`` mount without subpath), anonymous volumes and tmpfs; **no host path is
+  ever mounted** (a symlink planted in a bind-mounted directory would reach any host
+  path). Denied: privileged; host or container network/PID/IPC/user/UTS/cgroup
+  namespaces; devices; bind mounts; other named volumes; volume subpaths and driver
+  options; capabilities beyond ``NET_RAW`` and ``NET_ADMIN``; any ``SecurityOpt``
+  except ``no-new-privileges``; published ports; ``VolumesFrom``; links; sysctls;
+  runtimes; cgroup parents; masked/read-only path overrides; non-local log drivers;
+  restart policies other than ``no``; ulimits other than ``nofile``/``nproc`` within
+  caps; ``lab.*`` and ``com.docker.*`` labels; and every other field set to a non-zero
+  value;
 * start, stop, kill, wait, remove, inspect, logs, attach (incl. websocket), resize,
-  exec create/start/resize/inspect: only on containers labelled with this cell's run;
+  exec create/start/resize/inspect: only on containers carrying both ownership labels;
   the path is pinned to the container's full id. A privileged exec is denied;
-* container, network and volume lists: forced to the ``lab.run_id`` label filter;
+* container and volume lists: forced to both ownership label filters; network list:
+  forced to the ``lab.run_id`` filter;
 * image list and inspect (read-only); pull, import, build, push, tag, export and
   remove are denied;
-* network inspect: the cell's network or a network labelled with this run; volume
-  inspect: the scratch volume or a volume labelled with this run;
-* volume create: local driver without options; the ``lab.run_id`` label and the
-  cell's name prefix are forced.
+* network inspect: the cell's network only; volume inspect: the scratch volume or a
+  volume carrying both ownership labels;
+* volume create: local driver without options or query parameters; both ownership
+  labels and the cell's name prefix are forced.
 """
 
 from __future__ import annotations
 
 import json
-import posixpath
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -65,6 +74,8 @@ __all__ = [
     "DEFAULT_PIDS_LIMIT",
     "DIGEST_PATTERN",
     "MIN_API_VERSION",
+    "ORIGIN",
+    "ORIGIN_LABEL",
     "RUN_LABEL",
     "ULIMIT_CAPS",
     "AllowedImage",
@@ -84,8 +95,13 @@ __all__ = [
 
 #: Label every container (and volume) the cell creates carries; ownership is this label.
 RUN_LABEL: Final = "lab.run_id"
-#: Label namespace reserved for the lab; an agent may not set other ``lab.*`` labels.
-_LAB_PREFIX: Final = "lab."
+#: Second ownership label: only objects cell-guard itself created carry it, so runner
+#: infrastructure labelled with the run (agent, target, oracle, cell-guard) is untouchable.
+ORIGIN_LABEL: Final = "lab.origin"
+ORIGIN: Final = "cellguard"
+#: Label namespaces an agent may not set (``lab.*`` is the lab's; ``com.docker.*`` would
+#: spoof compose ownership). Only the forced ``lab.*`` values themselves are accepted.
+_RESERVED_LABEL_PREFIXES: Final = ("lab.", "com.docker.")
 #: Capabilities a created container may add.
 ALLOWED_CAPS: Final = frozenset({"NET_RAW", "NET_ADMIN"})
 #: Ulimits a created container may set, and the cap on each one's hard limit.
@@ -105,6 +121,7 @@ _TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 _LOGICAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@-]*$")
 _NAME = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
 _NAME_RE = re.compile(f"^{_NAME}$")
+_PREFIX_RE = re.compile(r"^[a-z0-9][a-z0-9_.]*-$")
 _IMAGE = r"[A-Za-z0-9][A-Za-z0-9_.:@/-]*"
 _PATH_RE = re.compile(r"^/[A-Za-z0-9_.:@/-]*$")
 _VERSION_RE = re.compile(r"^/v(?P<v>[0-9]{1,3}\.[0-9]{1,3})(?P<rest>/.*)$")
@@ -234,32 +251,28 @@ class CellContext:
     run_id: str
     network: str
     images: tuple[AllowedImage, ...]
-    #: Named volume a created container may mount (the cell's scratch volume).
+    #: The one named volume a created container may mount (the cell's scratch volume).
+    #: Host paths are never mounted.
     scratch_volume: str | None = None
-    #: Host directory under which bind mounts are allowed (the scratch volume's path).
-    scratch_dir: str | None = None
     memory_bytes: int = DEFAULT_MEMORY_BYTES
     nano_cpus: int = DEFAULT_NANO_CPUS
     pids_limit: int = DEFAULT_PIDS_LIMIT
     #: Prefix forced on container and volume names the agent chooses; default
-    #: ``<run_id lowercased>-``.
+    #: ``<run_id lowercased>-``. It ends with ``-`` and holds no other ``-``, and run
+    #: ids hold none, so one cell's prefix is never a prefix of another's.
     name_prefix: str | None = None
 
     def __post_init__(self) -> None:
-        if not _ID_RE.fullmatch(self.run_id):
-            raise ValueError(f"malformed run id {self.run_id!r}")
+        if not _ID_RE.fullmatch(self.run_id) or "-" in self.run_id:
+            raise ValueError(f"malformed run id {self.run_id!r} (no '-' allowed)")
         if not _NAME_RE.fullmatch(self.network):
             raise ValueError(f"malformed network name {self.network!r}")
         if self.scratch_volume is not None and not _NAME_RE.fullmatch(self.scratch_volume):
             raise ValueError(f"malformed scratch volume {self.scratch_volume!r}")
-        if self.name_prefix is not None and not _NAME_RE.fullmatch(self.name_prefix):
-            raise ValueError(f"malformed name prefix {self.name_prefix!r}")
-        if self.scratch_dir is not None and (
-            not self.scratch_dir.startswith("/")
-            or posixpath.normpath(self.scratch_dir) != self.scratch_dir
-            or self.scratch_dir == "/"
-        ):
-            raise ValueError(f"scratch dir must be a normalized absolute path: {self.scratch_dir}")
+        if self.name_prefix is not None and not _PREFIX_RE.fullmatch(self.name_prefix):
+            raise ValueError(
+                f"malformed name prefix {self.name_prefix!r}: [a-z0-9][a-z0-9_.]* then one '-'"
+            )
         for limit in (self.memory_bytes, self.nano_cpus, self.pids_limit):
             if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
                 raise ValueError(f"limits must be positive integers, got {limit!r}")
@@ -777,18 +790,12 @@ _HEALTHCHECK: Final[_Schema] = {
     "Retries": _uint,
 }
 
-_BIND_OPTIONS: Final[_Schema] = {
-    "Propagation": _choice(frozenset({"", "private", "rprivate"}), "create.mount"),
-    "NonRecursive": _bool,
-    "CreateMountpoint": _bool,
-    "ReadOnlyNonRecursive": _bool,
-    "ReadOnlyForceRecursive": _bool,
-}
 _VOLUME_OPTIONS: Final[_Schema] = {
     "NoCopy": _bool,
     "Labels": _strmap,
     "DriverConfig": _null("create.mount"),
-    "Subpath": _str,
+    # A subpath would let a symlink planted in the volume reach any host path.
+    "Subpath": _zero("create.mount"),
 }
 _TMPFS_OPTIONS: Final[_Schema] = {
     "SizeBytes": _uint,
@@ -796,20 +803,19 @@ _TMPFS_OPTIONS: Final[_Schema] = {
     "Options": _zero("create.mount"),
 }
 _MOUNT: Final[_Schema] = {
-    "Type": _choice(frozenset({"bind", "volume", "tmpfs"}), "create.mount"),
+    "Type": _choice(frozenset({"volume", "tmpfs"}), "create.mount"),
     "Source": _str,
     "Target": _str,
     "ReadOnly": _bool,
     "Consistency": _str,
-    "BindOptions": _obj(_BIND_OPTIONS, "create.mount"),
+    "BindOptions": _null("create.mount"),
     "VolumeOptions": _obj(_VOLUME_OPTIONS, "create.mount"),
     "TmpfsOptions": _obj(_TMPFS_OPTIONS, "create.mount"),
     "ImageOptions": _zero("create.mount"),
     "ClusterOptions": _zero("create.mount"),
 }
-_BIND_FLAGS: Final = frozenset(
-    {"ro", "rw", "z", "Z", "nocopy", "private", "rprivate", "consistent", "cached", "delegated"}
-)
+#: Options of a ``<scratch volume>:/path[:opts]`` bind (propagation is never accepted).
+_BIND_FLAGS: Final = frozenset({"ro", "rw", "nocopy", "z", "Z"})
 
 _ENDPOINT: Final[_Schema] = {
     "Aliases": _strlist,
@@ -830,6 +836,7 @@ _ENDPOINT: Final[_Schema] = {
             "GlobalIPv6Address",
             "GlobalIPv6PrefixLen",
             "DNSNames",
+            "GwPriority",
         )
     },
 }
@@ -972,56 +979,45 @@ _CREATE: Final[_Schema] = {
 }
 
 
-def _bind_source_ok(source: str, ctx: CellContext) -> bool:
-    if ctx.scratch_dir is None or ".." in source.split("/"):
-        return False
-    path = posixpath.normpath(source)
-    return path == ctx.scratch_dir or path.startswith(ctx.scratch_dir + "/")
-
-
-def _volume_source_ok(source: str | None, ctx: CellContext) -> bool:
-    return not source or source == ctx.scratch_volume
+def _scratch_source_ok(source: str | None, ctx: CellContext) -> bool:
+    """A volume source: anonymous, or exactly the cell's scratch volume (never a path)."""
+    return not source or (ctx.scratch_volume is not None and source == ctx.scratch_volume)
 
 
 def _check_binds(binds: list[str], ctx: CellContext) -> None:
+    """Only ``<scratch volume>:/path[:opts]``; a host path is never bound (X1)."""
     for bind in binds:
         parts = bind.split(":")
         if len(parts) not in (2, 3) or not parts[0] or not _container_path(parts[1]):
             raise _Denied("create.mount", f"malformed bind {bind!r}")
-        source = parts[0]
-        ok = (
-            _bind_source_ok(source, ctx)
-            if source.startswith("/")
-            else _volume_source_ok(source, ctx)
-        )
-        if not ok:
-            raise _Denied("create.mount", f"mount source {source!r} is outside the cell scratch")
+        if "/" in parts[0] or not _scratch_source_ok(parts[0], ctx):
+            raise _Denied("create.mount", f"mount source {parts[0]!r} is not the cell scratch")
         if len(parts) == 3 and not set(parts[2].split(",")) <= _BIND_FLAGS:
             raise _Denied("create.mount", f"bind options {parts[2]!r} are not allowed")
 
 
 def _check_mounts(mounts: list[dict[str, Any]], ctx: CellContext) -> None:
+    """Volume (anonymous or the scratch volume) and tmpfs mounts only.
+
+    Volume mounts get the cell's ownership labels in ``VolumeOptions.Labels`` (Docker
+    applies them to a volume it creates for the mount, e.g. an anonymous one).
+    """
     for mount in mounts:
         kind, source, target = mount.get("Type"), mount.get("Source"), mount.get("Target")
         if not isinstance(target, str) or not _container_path(target):
             raise _Denied("create.mount", f"mount target {target!r} is not a container path")
-        if kind == "bind":
-            if not source or not _bind_source_ok(source, ctx):
-                raise _Denied("create.mount", f"bind source {source!r} is outside the cell scratch")
-        elif kind == "volume":
-            if not _volume_source_ok(source, ctx):
+        if kind == "volume":
+            if (source and "/" in source) or not _scratch_source_ok(source, ctx):
                 raise _Denied("create.mount", f"volume {source!r} is not the cell scratch")
-            subpath = mount.get("VolumeOptions", {}).get("Subpath")
-            if subpath is not None and ".." in subpath.split("/"):
-                raise _Denied("create.mount", "volume subpath is not allowed")
+            options = mount.setdefault("VolumeOptions", {})
+            options["Labels"] = _labels(options.get("Labels", {}), ctx, "create.mount")
         elif kind == "tmpfs":
             if source:
                 raise _Denied("create.mount", "a tmpfs mount takes no source")
+            if "VolumeOptions" in mount:
+                raise _Denied("create.mount", "VolumeOptions on a tmpfs mount")
         else:
             raise _Denied("create.mount", f"mount type {kind!r} is not allowed")
-        for options, allowed in (("BindOptions", "bind"), ("VolumeOptions", "volume")):
-            if options in mount and kind != allowed:
-                raise _Denied("create.mount", f"{options} on a {kind} mount")
         if "TmpfsOptions" in mount and kind != "tmpfs":
             raise _Denied("create.mount", f"TmpfsOptions on a {kind} mount")
 
@@ -1030,11 +1026,18 @@ def _cap(value: Any, limit: int) -> int:
     return value if isinstance(value, int) and 0 < value < limit else limit
 
 
+def _forced_labels(ctx: CellContext) -> dict[str, str]:
+    return {RUN_LABEL: ctx.run_id, ORIGIN_LABEL: ORIGIN}
+
+
 def _labels(labels: Mapping[str, str], ctx: CellContext, rule: str) -> dict[str, str]:
+    """``labels`` plus the forced ownership labels; reserved namespaces are denied."""
+    forced = _forced_labels(ctx)
     for key, val in labels.items():
-        if key.casefold().startswith(_LAB_PREFIX) and not (key == RUN_LABEL and val == ctx.run_id):
-            raise _Denied(rule, f"label {key}={val!r} is reserved for the lab")
-    return {**labels, RUN_LABEL: ctx.run_id}
+        reserved = key.casefold().startswith(_RESERVED_LABEL_PREFIXES)
+        if reserved and forced.get(key) != val:
+            raise _Denied(rule, f"label {key}={val!r} is reserved")
+    return {**labels, **forced}
 
 
 def _scoped_name(name: str, ctx: CellContext, rule: str) -> str:
@@ -1156,15 +1159,20 @@ _UPGRADE_OPS: Final = frozenset({"container.attach", "exec.start"})
 
 
 def _owned(target: Target | None, kind: str, ctx: CellContext) -> bool:
+    """Whether this cell may act on ``target``.
+
+    Containers, execs (via their container) and volumes must carry BOTH
+    ``lab.run_id=<run>`` and ``lab.origin=cellguard``: only what this guard created.
+    Runner infrastructure (labelled with the run alone) is untouchable. The cell
+    network and the scratch volume are recognised by name or id (read-only inspect).
+    """
     if target is None or target.kind != kind:
         return False
-    if target.labels.get(RUN_LABEL) == ctx.run_id:
-        return True
     if kind == "network":
         return ctx.network in (target.name, target.id)
-    if kind == "volume":
-        return ctx.scratch_volume is not None and target.name == ctx.scratch_volume
-    return False
+    if kind == "volume" and ctx.scratch_volume is not None and target.name == ctx.scratch_volume:
+        return True
+    return all(target.labels.get(k) == v for k, v in _forced_labels(ctx).items())
 
 
 def _targeted(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
@@ -1206,7 +1214,7 @@ def _targeted(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
 
 
 def _own_list(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
-    """A list, restricted to objects carrying this cell's run label."""
+    """A list, restricted to objects carrying this cell's ownership labels."""
     pairs = parse_qsl(r.query, keep_blank_values=True)
     raw = [v for k, v in pairs if k == "filters"]
     if len(raw) > 1:
@@ -1226,10 +1234,13 @@ def _own_list(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
                 filters[key] = list(value)
             else:
                 raise _Denied("list.filters", f"filter {key!r} is malformed")
-    own = f"{RUN_LABEL}={ctx.run_id}"
+    # Networks are created by the runner (labelled with the run only); containers and
+    # volumes must also carry the origin label, so runner infrastructure is not listed.
+    owned = {RUN_LABEL: ctx.run_id} if r.op == "network.list" else _forced_labels(ctx)
     labels = filters.setdefault("label", [])
-    if own not in labels:
-        labels.append(own)
+    for key, value in owned.items():
+        if f"{key}={value}" not in labels:
+            labels.append(f"{key}={value}")
     query = urlencode(
         [(k, v) for k, v in pairs if k != "filters"]
         + [("filters", json.dumps(filters, separators=(",", ":")))]
@@ -1238,6 +1249,8 @@ def _own_list(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
 
 
 def _volume_create(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
+    if r.query:
+        raise _Denied("volume.query", "volume create takes no query parameters")
     body = _rebuild(_json_object(req.body, "volume.body"), _VOLUME_CREATE, "", "volume.field")
     forced = ["Labels"]
     if body.get("Name"):

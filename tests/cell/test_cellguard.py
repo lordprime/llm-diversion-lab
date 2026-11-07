@@ -18,6 +18,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
@@ -27,6 +28,8 @@ from urllib.parse import parse_qs, quote, urlsplit
 import pytest
 
 from cell.cellguard.policy import (
+    ORIGIN,
+    ORIGIN_LABEL,
     RUN_LABEL,
     AllowedImage,
     CellContext,
@@ -64,7 +67,6 @@ def make_ctx(**overrides: Any) -> CellContext:
             AllowedImage("alpine-3", "docker.io/library/alpine", DIGEST_B),
         ),
         "scratch_volume": "lab-scratch",
-        "scratch_dir": "/srv/lab/scratch/cell1",
         "memory_bytes": 1 << 30,
         "nano_cpus": 1_000_000_000,
         "pids_limit": 256,
@@ -87,12 +89,18 @@ def allowed_create(body: dict[str, Any]) -> dict[str, Any]:
     return forwarded
 
 
+#: Labels of what this cell's guard created; runner infrastructure has only the run label.
+MINE = {RUN_LABEL: RUN, ORIGIN_LABEL: ORIGIN}
+INFRA = {RUN_LABEL: RUN}
+
+
 def own(kind: str = "container", ident: str = CID, name: str = "mine") -> Target:
-    return Target(kind=kind, id=ident, name=name, labels={RUN_LABEL: RUN})
+    return Target(kind=kind, id=ident, name=name, labels=MINE)
 
 
 def foreign(kind: str = "container", ident: str = OTHER_CID, name: str = "theirs") -> Target:
-    return Target(kind=kind, id=ident, name=name, labels={RUN_LABEL: OTHER_RUN})
+    labels = {RUN_LABEL: OTHER_RUN, ORIGIN_LABEL: ORIGIN}
+    return Target(kind=kind, id=ident, name=name, labels=labels)
 
 
 IMG = f"ghcr.io/usestrix/strix-sandbox@{DIGEST_A}"
@@ -126,7 +134,7 @@ def test_allowed_image_gets_network_labels_and_limits_forced() -> None:
     )
     assert body["Image"] == IMG
     assert body["Cmd"] == ["sleep", "60"]
-    assert body["Labels"] == {"purpose": "sandbox", RUN_LABEL: RUN}
+    assert body["Labels"] == {"purpose": "sandbox", **MINE}
     host = body["HostConfig"]
     assert host["NetworkMode"] == NETWORK
     assert host["Memory"] == 1 << 30
@@ -303,14 +311,11 @@ def test_allowed_capabilities_and_safe_options_pass() -> None:
                 "IpcMode": "private",
                 "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
                 "LogConfig": {"Type": "", "Config": {}},
-                "Binds": [
-                    "lab-scratch:/scratch",
-                    "/srv/lab/scratch/cell1/work:/work:ro",
-                ],
+                "Binds": ["lab-scratch:/scratch", "lab-scratch:/work:ro"],
                 "Mounts": [
                     {"Type": "tmpfs", "Target": "/tmp"},  # noqa: S108
                     {"Type": "volume", "Target": "/anon"},
-                    {"Type": "bind", "Source": "/srv/lab/scratch/cell1", "Target": "/s"},
+                    {"Type": "volume", "Source": "lab-scratch", "Target": "/s"},
                 ],
             },
         }
@@ -521,7 +526,7 @@ def test_privileged_exec_is_denied() -> None:
 
 def test_exec_operations_follow_the_owning_container() -> None:
     exec_id = "e" * 64
-    mine = Target(kind="exec", id=exec_id, name=None, labels={RUN_LABEL: RUN})
+    mine = Target(kind="exec", id=exec_id, name=None, labels=MINE)
     theirs = Target(kind="exec", id=exec_id, name=None, labels={RUN_LABEL: OTHER_RUN})
     for method, path, op in [
         ("POST", f"/v1.44/exec/{exec_id}/start", "exec.start"),
@@ -535,18 +540,21 @@ def test_exec_operations_follow_the_owning_container() -> None:
         assert not evaluate(DockerRequest(method, path, body, target=theirs), CTX).allowed
 
 
+OWN_FILTER = [f"{RUN_LABEL}={RUN}", f"{ORIGIN_LABEL}={ORIGIN}"]
+
+
 def test_container_list_is_forced_to_own_label() -> None:
     decision = evaluate(DockerRequest("GET", "/v1.44/containers/json?all=1"), CTX)
     assert decision.allowed
     query = parse_qs(urlsplit(decision.path).query)
     assert query["all"] == ["1"]
-    assert json.loads(query["filters"][0]) == {"label": [f"{RUN_LABEL}={RUN}"]}
+    assert json.loads(query["filters"][0]) == {"label": OWN_FILTER}
 
     filters = quote(json.dumps({"label": {"purpose=x": True}, "name": ["sbx"]}))
     decision = evaluate(DockerRequest("GET", f"/containers/json?filters={filters}"), CTX)
     assert decision.allowed
     forced = json.loads(parse_qs(urlsplit(decision.path).query)["filters"][0])
-    assert forced == {"label": ["purpose=x", f"{RUN_LABEL}={RUN}"], "name": ["sbx"]}
+    assert forced == {"label": ["purpose=x", *OWN_FILTER], "name": ["sbx"]}
 
     bad = evaluate(DockerRequest("GET", "/containers/json?filters=notjson"), CTX)
     assert not bad.allowed
@@ -600,7 +608,7 @@ def test_networks() -> None:
 
 def test_volumes() -> None:
     assert evaluate(DockerRequest("GET", "/v1.44/volumes"), CTX).allowed
-    mine = Target(kind="volume", id="v1", name="v1", labels={RUN_LABEL: RUN})
+    mine = Target(kind="volume", id="v1", name="v1", labels=MINE)
     assert evaluate(DockerRequest("GET", "/volumes/v1", target=mine), CTX).allowed
     theirs = Target(kind="volume", id="v2", name="v2", labels={RUN_LABEL: OTHER_RUN})
     assert not evaluate(DockerRequest("GET", "/volumes/v2", target=theirs), CTX).allowed
@@ -609,7 +617,7 @@ def test_volumes() -> None:
         DockerRequest("POST", "/v1.44/volumes/create", json.dumps({"Name": "work"}).encode()), CTX
     )
     assert made.allowed
-    assert json.loads(made.body)["Labels"] == {RUN_LABEL: RUN}
+    assert json.loads(made.body)["Labels"] == MINE
     for body in [
         {"Name": "w", "Driver": "nfs"},
         {"Name": "w", "DriverOpts": {"type": "none", "o": "bind", "device": "/"}},
@@ -825,7 +833,7 @@ def test_exec_bodies_are_rebuilt() -> None:
     assert ok.allowed
     assert json.loads(ok.body) == {"Cmd": ["id"]}
     exec_id = "e" * 64
-    mine = Target(kind="exec", id=exec_id, name=None, labels={RUN_LABEL: RUN})
+    mine = Target(kind="exec", id=exec_id, name=None, labels=MINE)
     start = f"/v1.44/exec/{exec_id}/start"
     assert not evaluate(DockerRequest("POST", start, b'{"detach": true}', mine), CTX).allowed
     assert not evaluate(DockerRequest("POST", start, b'{"Escape": 1}', mine), CTX).allowed
@@ -938,6 +946,196 @@ def test_repository_with_several_digests_matches_by_name_or_digest_only() -> Non
     assert image_of("python:3.12") is None
     assert image_of("py-b") == f"docker.io/library/python@{DIGEST_B}"
     assert image_of(f"python@{DIGEST_A}") == f"docker.io/library/python@{DIGEST_A}"
+
+
+# --------------------------------------------------------------------------- review 2: mounts
+
+
+@pytest.mark.parametrize(
+    "host_config",
+    [
+        # X1: a symlink planted in a bind-mounted scratch dir made <scratch>/root = host /.
+        {"Binds": ["/srv/lab/scratch/cell1:/s"]},
+        {"Binds": ["/srv/lab/scratch/cell1/root:/host"]},
+        {"Binds": ["/var/lib/docker/volumes/lab-scratch/_data/root:/host"]},
+        {"Binds": ["lab-scratch/root:/host"]},
+        {"Binds": ["lab-scratch:/s:rshared"]},
+        {"Binds": ["other-volume:/s"]},
+        {"Mounts": [{"Type": "bind", "Source": "/srv/lab/scratch/cell1", "Target": "/s"}]},
+        {
+            "Mounts": [
+                {
+                    "Type": "volume",
+                    "Source": "lab-scratch",
+                    "Target": "/s",
+                    "VolumeOptions": {"Subpath": "root"},
+                }
+            ]
+        },
+        {
+            "Mounts": [
+                {
+                    "Type": "volume",
+                    "Source": "lab-scratch",
+                    "Target": "/s",
+                    "BindOptions": {"Propagation": "private"},
+                }
+            ]
+        },
+        {"Mounts": [{"Type": "volume", "Source": "lab-scratch/root", "Target": "/s"}]},
+        {"Mounts": [{"Type": "volume", "Source": "/srv/lab/scratch", "Target": "/s"}]},
+    ],
+)
+def test_host_paths_and_subpaths_are_never_mounted(host_config: dict[str, Any]) -> None:
+    decision = create({"Image": IMG, "HostConfig": host_config})
+    assert not decision.allowed, host_config
+    assert decision.rule in ("create.mount", "body.shadow_key"), decision.reason
+
+
+def test_scratch_named_volume_and_anonymous_volumes_are_mounted_with_forced_labels() -> None:
+    body = allowed_create(
+        {
+            "Image": IMG,
+            "HostConfig": {
+                "Binds": ["lab-scratch:/s", "lab-scratch:/r:ro", "lab-scratch:/n:nocopy"],
+                "Mounts": [
+                    {"Type": "volume", "Source": "lab-scratch", "Target": "/m"},
+                    {
+                        "Type": "volume",
+                        "Target": "/anon",
+                        "VolumeOptions": {"NoCopy": True, "Labels": {"purpose": "cache"}},
+                    },
+                    {"Type": "tmpfs", "Target": "/t", "TmpfsOptions": {"SizeBytes": 1 << 20}},
+                ],
+            },
+        }
+    )
+    mounts = body["HostConfig"]["Mounts"]
+    assert mounts[0]["VolumeOptions"]["Labels"] == MINE
+    assert mounts[1]["VolumeOptions"] == {"NoCopy": True, "Labels": {"purpose": "cache", **MINE}}
+    assert "VolumeOptions" not in mounts[2]
+    no_scratch = make_ctx(scratch_volume=None)
+    decision = evaluate(
+        DockerRequest(
+            "POST",
+            "/containers/create",
+            json.dumps({"Image": IMG, "HostConfig": {"Binds": ["lab-scratch:/s"]}}).encode(),
+        ),
+        no_scratch,
+    )
+    assert not decision.allowed
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        {"lab.run_id": RUN},  # anonymous-volume labels follow the same rules
+        {"lab.origin": "runner"},
+        {"com.docker.compose.project": "x"},
+    ],
+)
+def test_volume_option_labels_follow_label_rules(labels: dict[str, str]) -> None:
+    mount = {"Type": "volume", "Target": "/a", "VolumeOptions": {"Labels": labels}}
+    if labels == {"lab.run_id": RUN}:
+        assert create({"Image": IMG, "HostConfig": {"Mounts": [mount]}}).allowed
+    else:
+        assert not create({"Image": IMG, "HostConfig": {"Mounts": [mount]}}).allowed
+
+
+# --------------------------------------------------------------------------- review 2: origin
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        {ORIGIN_LABEL: "runner"},
+        {ORIGIN_LABEL: ORIGIN, RUN_LABEL: OTHER_RUN},
+        {"com.docker.compose.project": "lab"},
+        {"COM.DOCKER.compose.service": "agent"},
+        {"Lab.Origin": ORIGIN},
+    ],
+)
+def test_reserved_labels_cannot_be_set_by_the_agent(labels: dict[str, str]) -> None:
+    decision = create({"Image": IMG, "Labels": labels})
+    assert not decision.allowed
+    assert decision.rule == "create.labels"
+    volume = evaluate(
+        DockerRequest("POST", "/volumes/create", json.dumps({"Labels": labels}).encode()), CTX
+    )
+    assert not volume.allowed
+
+
+def test_created_objects_carry_the_origin_label() -> None:
+    assert allowed_create({"Image": IMG})["Labels"] == MINE
+    # Setting the forced values explicitly is harmless.
+    assert allowed_create({"Image": IMG, "Labels": dict(MINE)})["Labels"] == MINE
+
+
+@pytest.mark.parametrize(("method", "template", "op"), LIFECYCLE)
+def test_runner_infrastructure_is_untouchable(method: str, template: str, op: str) -> None:
+    # The runner labels the agent, target, oracle and cell-guard containers with the
+    # run id but never with lab.origin=cellguard.
+    infra = Target(kind="container", id=OTHER_CID, name="guard", labels=INFRA)
+    decision = evaluate(DockerRequest(method, template.format(ref="guard"), target=infra), CTX)
+    assert not decision.allowed
+    assert decision.rule == "target.not_owned"
+
+
+def test_runner_infrastructure_is_untouchable_through_exec_and_volumes() -> None:
+    infra = Target(kind="container", id=OTHER_CID, name="guard", labels=INFRA)
+    body = b'{"Cmd": ["cat", "/var/run/docker.sock"]}'
+    path = "/v1.44/containers/guard/exec"
+    assert not evaluate(DockerRequest("POST", path, body, infra), CTX).allowed
+    exec_id = "e" * 64
+    infra_exec = Target(kind="exec", id=exec_id, name=None, labels=INFRA)
+    for method, sub in [("POST", "start"), ("POST", "resize?h=1&w=1"), ("GET", "json")]:
+        body = b"{}" if sub == "start" else b""
+        request = DockerRequest(method, f"/v1.44/exec/{exec_id}/{sub}", body, infra_exec)
+        assert not evaluate(request, CTX).allowed, sub
+    infra_volume = Target(kind="volume", id="runner-vol", name="runner-vol", labels=INFRA)
+    assert not evaluate(
+        DockerRequest("GET", "/volumes/runner-vol", target=infra_volume), CTX
+    ).allowed
+    # The scratch volume stays inspectable: it is the one volume the cell may mount.
+    scratch = Target(kind="volume", id="lab-scratch", name="lab-scratch", labels=INFRA)
+    assert evaluate(DockerRequest("GET", "/volumes/lab-scratch", target=scratch), CTX).allowed
+
+
+def test_lists_require_both_labels() -> None:
+    for path in ["/v1.44/containers/json", "/v1.44/volumes"]:
+        decision = evaluate(DockerRequest("GET", path), CTX)
+        filters = json.loads(parse_qs(urlsplit(decision.path).query)["filters"][0])
+        assert filters["label"] == OWN_FILTER, path
+
+
+# --------------------------------------------------------------------------- review 2: names
+
+
+def test_run_ids_with_dashes_and_bad_prefixes_are_rejected() -> None:
+    # Prefix boundaries: run "r" owns "r-*"; a run "r-x" (prefix "r-x-") would collide.
+    assert make_ctx(run_id="r").prefix == "r-"
+    with pytest.raises(ValueError):
+        make_ctx(run_id="r-x")
+    for prefix in ["abc", "a-b-", "-", "c7_", "UPPER-x"]:
+        with pytest.raises(ValueError):
+            make_ctx(name_prefix=prefix)
+    assert make_ctx(name_prefix="cell7-").prefix == "cell7-"
+
+
+# --------------------------------------------------------------------------- review 2: minors
+
+
+def test_gw_priority_is_accepted_and_dropped() -> None:
+    body = allowed_create(
+        {"Image": IMG, "NetworkingConfig": {"EndpointsConfig": {NETWORK: {"GwPriority": 5}}}}
+    )
+    assert body["NetworkingConfig"] == {"EndpointsConfig": {NETWORK: {}}}
+
+
+def test_volume_create_query_params_are_denied() -> None:
+    decision = evaluate(DockerRequest("POST", "/volumes/create?name=x", b"{}"), CTX)
+    assert not decision.allowed
+    assert decision.rule == "volume.query"
 
 
 # --------------------------------------------------------------------------- images.lock
@@ -1059,7 +1257,13 @@ def test_config_from_env(tmp_path: Path) -> None:
     assert config.max_connections == 8
     assert config.context.memory_bytes == 268435456
     assert config.context.pids_limit == 128
-    assert config.context.scratch_dir is None
+    assert config.context.prefix == f"{RUN.lower()}-"
+    prefixed = CellGuardConfig.from_env({**env, "LAB_CELLGUARD_NAME_PREFIX": "c7-"})
+    assert prefixed.context.prefix == "c7-"
+    with pytest.raises(ValueError):  # host-path scratch binds are gone
+        CellGuardConfig.from_env({**env, "LAB_CELLGUARD_SCRATCH_DIR": "/srv/scratch"})
+    with pytest.raises(ValueError):
+        CellGuardConfig.from_env({**env, "LAB_CELLGUARD_NAME_PREFIX": "a-b-"})
     assert config.listen == tmp_path / "guard.sock"
     for missing in ["LAB_RUN_ID", "LAB_CELLGUARD_NETWORK", "LAB_CELLGUARD_IMAGES_LOCK"]:
         with pytest.raises(ValueError):
@@ -1087,9 +1291,10 @@ class FakeDaemon:
     def __init__(self, sock: Path) -> None:
         self.sock = sock
         self.requests: list[tuple[str, str, dict[str, str], bytes]] = []
+        self.raw_heads: list[bytes] = []
         self.containers: dict[str, dict[str, Any]] = {
-            "mine": {"Id": CID, "Name": "/mine", "Config": {"Labels": {RUN_LABEL: RUN}}},
-            CID: {"Id": CID, "Name": "/mine", "Config": {"Labels": {RUN_LABEL: RUN}}},
+            "mine": {"Id": CID, "Name": "/mine", "Config": {"Labels": MINE}},
+            CID: {"Id": CID, "Name": "/mine", "Config": {"Labels": MINE}},
             "theirs": {
                 "Id": OTHER_CID,
                 "Name": "/theirs",
@@ -1110,6 +1315,7 @@ class FakeDaemon:
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             head = await reader.readuntil(b"\r\n\r\n")
+            self.raw_heads.append(head)
             lines = head.decode().split("\r\n")
             method, target, _ = lines[0].split(" ")
             headers = {
@@ -1370,7 +1576,7 @@ async def test_proxy_resolves_agent_names_with_the_cell_prefix(tmp_path: Path) -
         prefixed = {
             "Id": "f" * 64,
             "Name": f"/{CTX.prefix}sbx",
-            "Config": {"Labels": {RUN_LABEL: RUN}},
+            "Config": {"Labels": MINE},
         }
         daemon.containers[f"{CTX.prefix}sbx"] = prefixed
         # An unprefixed container of that name exists too (not this cell's): the
@@ -1379,6 +1585,37 @@ async def test_proxy_resolves_agent_names_with_the_cell_prefix(tmp_path: Path) -
         resp = await call(sock, req("POST", "/v1.44/containers/sbx/start"))
         assert resp.startswith(b"HTTP/1.1 200")
         assert daemon.requests[-1][1] == "/v1.44/containers/" + "f" * 64 + "/start"
+
+
+async def test_proxy_forces_json_content_type_on_bodies(tmp_path: Path) -> None:
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        body = json.dumps({"Image": IMG}).encode()
+        extra = "Content-Type: text/plain\r\nX-Other: kept\r\n"
+        resp = await call(sock, req("POST", "/v1.44/containers/create", body, extra))
+        assert resp.startswith(b"HTTP/1.1 201")
+        _m, _t, headers, _b = daemon.requests[-1]
+        assert headers["content-type"] == "application/json"
+        assert headers["x-other"] == "kept"
+        raw_head = daemon.raw_heads[-1].lower()
+        assert raw_head.count(b"content-type:") == 1
+
+
+async def test_proxy_failure_records_carry_the_method(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(request: DockerRequest, ctx: CellContext) -> Decision:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("cell.cellguard.proxy.evaluate", broken)
+    async with running_guard(tmp_path) as (_guard, _daemon, sock):
+        resp = await call(sock, req("DELETE", "/v1.44/containers/mine"))
+        assert resp.startswith(b"HTTP/1.1 500")
+    [record] = records_of(tmp_path)
+    assert (record["method"], record["rule"], record["op"]) == (
+        "DELETE",
+        "http.500",
+        "container.remove",
+    )
 
 
 # --------------------------------------------------------------------------- podman integration
@@ -1442,16 +1679,18 @@ def test_podman_integration(tmp_path: Path) -> None:
         pytest.skip(f"{ALPINE} has no repo digest")
     suffix = uuid.uuid4().hex[:8]
     network = real.networks.create(f"cg-test-{suffix}", internal=True)
+    # The runner's scratch volume: labelled with the run only (runner infrastructure).
+    scratch = real.volumes.create(f"cg-scratch-{suffix}", labels={RUN_LABEL: RUN})
+    volumes: list[str] = [scratch.name]
     ctx = make_ctx(
         network=network.name,
         images=(AllowedImage("alpine-3.20", "docker.io/library/alpine", digests[0]),),
-        scratch_dir=None,
+        scratch_volume=scratch.name,
         memory_bytes=64 << 20,
         nano_cpus=500_000_000,
         pids_limit=64,
     )
     created: list[str] = []
-    volumes: list[str] = []
     with short_tmp() as d:
         listen = d / "guard.sock"
         guard = CellGuard(ctx, str(PODMAN_SOCK), DecisionLog(RUN, tmp_path / DECISIONS_FILE))
@@ -1460,12 +1699,20 @@ def test_podman_integration(tmp_path: Path) -> None:
         try:
             assert client.ping()
             # Allowed create: forced network, label and limits are visible on the daemon.
+            # Container A mounts the scratch named volume and plants the reviewer's
+            # symlink (X1 step A): <scratch>/root -> /.
+            plant = "ln -s / /s/root && echo from-a > /s/marker && sleep 300"
             sbx = client.containers.run(
-                ALPINE, ["sleep", "300"], detach=True, name=f"cg-sbx-{suffix}"
+                ALPINE,
+                ["sh", "-c", plant],
+                detach=True,
+                name=f"cg-sbx-{suffix}",
+                volumes={scratch.name: {"bind": "/s", "mode": "rw"}},
             )
             created.append(sbx.id)
             attrs = real.api.inspect_container(sbx.id)
             assert attrs["Config"]["Labels"][RUN_LABEL] == RUN
+            assert attrs["Config"]["Labels"][ORIGIN_LABEL] == ORIGIN
             assert network.name in attrs["NetworkSettings"]["Networks"]
             assert attrs["HostConfig"]["Memory"] == 64 << 20
             assert attrs["HostConfig"]["NanoCpus"] == 500_000_000
@@ -1502,14 +1749,74 @@ def test_podman_integration(tmp_path: Path) -> None:
             volumes.append(volume.name)
             assert volume.name == f"{ctx.prefix}cg-vol-{suffix}"
             assert real.volumes.get(volume.name).attrs["Labels"][RUN_LABEL] == RUN
+            assert real.volumes.get(volume.name).attrs["Labels"][ORIGIN_LABEL] == ORIGIN
+
+            for _ in range(50):
+                if sbx.exec_run(["test", "-L", "/s/root"]).exit_code == 0:
+                    break
+                time.sleep(0.1)
+            else:
+                pytest.fail("container A did not plant the symlink")
+
+            # X1 step B: binding the symlink's host path, or the volume with a subpath,
+            # is denied before the daemon sees it.
+            mountpoint = real.volumes.get(scratch.name).attrs["Mountpoint"]
+            with pytest.raises(docker.errors.APIError) as step_b:
+                client.containers.create(
+                    ALPINE, ["ls", "/host/etc"], volumes={f"{mountpoint}/root": {"bind": "/host"}}
+                )
+            assert step_b.value.status_code == 403
+            subpath = {
+                "Image": ALPINE,
+                "Cmd": ["ls", "/host/etc"],
+                "HostConfig": {
+                    "Mounts": [
+                        {
+                            "Type": "volume",
+                            "Source": scratch.name,
+                            "Target": "/host",
+                            "VolumeOptions": {"Subpath": "root"},
+                        }
+                    ]
+                },
+            }
+            status, reply = raw_request(listen, "POST", "/v1.44/containers/create", subpath)
+            assert status == 403, reply
+
+            # The scratch named volume itself works: a second container reads A's file.
+            reader = client.containers.run(
+                ALPINE,
+                ["cat", "/s/marker"],
+                detach=True,
+                volumes={scratch.name: {"bind": "/s", "mode": "ro"}},
+            )
+            created.append(reader.id)
+            assert reader.wait(timeout=30)["StatusCode"] == 0
+            assert reader.logs().strip() == b"from-a"
+
+            # X2: runner infrastructure (run label only, e.g. the cell-guard container) is
+            # invisible and untouchable.
+            infra = real.containers.create(
+                ALPINE, ["sleep", "300"], labels={RUN_LABEL: RUN}, network=network.name
+            )
+            created.append(infra.id)
+            for attempt in (
+                lambda: client.api.inspect_container(infra.id),
+                lambda: client.api.exec_create(infra.id, ["true"]),
+                lambda: client.api.remove_container(infra.id, force=True),
+            ):
+                with pytest.raises(docker.errors.APIError) as untouchable:
+                    attempt()
+                assert untouchable.value.status_code == 403
+            assert infra.id not in {c.id for c in client.containers.list(all=True)}
 
             # Streams through exec work (upgrade passthrough).
             code, out = sbx.exec_run(["echo", "through-the-guard"])
             assert code == 0
             assert out.strip() == b"through-the-guard"
 
-            # Own container is listed; inspect via the guard works.
-            assert [c.id for c in client.containers.list()] == [sbx.id]
+            # Own containers are listed; the runner's are not.
+            assert {c.id for c in client.containers.list(all=True)} == {sbx.id, reader.id}
 
             # Privileged create and pull are denied with 403.
             with pytest.raises(docker.errors.APIError) as denied:
@@ -1545,7 +1852,8 @@ def test_podman_integration(tmp_path: Path) -> None:
 
     records = [json.loads(x) for x in (tmp_path / DECISIONS_FILE).read_text().splitlines()]
     denied_rules = {r["rule"] for r in records if not r["allowed"]}
-    assert {"create.privileged", "image.pull", "target.not_owned"} <= denied_rules
+    expected = {"create.privileged", "image.pull", "target.not_owned", "create.mount"}
+    assert expected <= denied_rules
     assert {r["op"] for r in records if r["allowed"]} >= {
         "container.create",
         "container.start",
