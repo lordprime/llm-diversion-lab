@@ -14,7 +14,11 @@ Every connection carries exactly one request (the proxy answers with
    *before* anything is forwarded; if it cannot be recorded, nothing is forwarded;
 5. answers a denial with ``403`` and a JSON ``message`` (the daemon never sees it), or
    forwards the decided path and body with ``Connection: close`` and relays the
-   response byte-for-byte until the daemon closes.
+   response byte-for-byte until the daemon closes. The body forwarded is the one the
+   policy rebuilt (never the client's bytes); body-less operations forward none.
+
+Names: container and volume names the agent chooses get the cell's prefix at create
+time, so a lookup of an unprefixed name tries the prefixed name first.
 
 Connection upgrades (attach, exec start): the client's ``Upgrade`` header is
 forwarded. When the daemon answers ``101`` (or ``200`` with a Docker raw or
@@ -44,6 +48,7 @@ Configuration (:meth:`CellGuardConfig.from_env`):
 * ``LAB_CELLGUARD_MEMORY`` (bytes), ``LAB_CELLGUARD_NANO_CPUS``, ``LAB_CELLGUARD_PIDS``
   (optional): limits forced on created containers.
 * ``LAB_CELLGUARD_SOCKET_MODE`` (octal, default ``660``).
+* ``LAB_CELLGUARD_MAX_CONNECTIONS`` (default 32): concurrent connections before ``503``.
 * ``LAB_EVIDENCE_DIR`` (default ``./evidence``): the run's evidence volume.
 """
 
@@ -85,6 +90,7 @@ __all__ = [
     "CELLGUARD_STREAM",
     "DECISIONS_FILE",
     "DEFAULT_EVIDENCE_DIR",
+    "DEFAULT_MAX_CONNECTIONS",
     "MAX_BODY",
     "MAX_HEAD",
     "CellGuard",
@@ -107,9 +113,12 @@ MAX_BODY: Final = 4 * 1024 * 1024
 _MAX_LOOKUP: Final = 16 * 1024 * 1024
 #: Time a client has to send its whole request, and a lookup has to complete.
 _REQUEST_TIMEOUT_S: Final = 60.0
+#: Concurrent client connections served before new ones are refused with ``503``.
+DEFAULT_MAX_CONNECTIONS: Final = 32
 _LOOKUP_TIMEOUT_S: Final = 30.0
 
 _ID_RE = re.compile(ID_PATTERN)
+_DECIMAL_RE = re.compile(r"[0-9]{1,12}")
 _METHOD_RE = re.compile(r"^[A-Z]{1,16}$")
 _TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _HOP_BY_HOP: Final = frozenset(
@@ -237,6 +246,7 @@ class CellGuardConfig:
     upstream: str
     evidence_dir: Path
     socket_mode: int = 0o660
+    max_connections: int = DEFAULT_MAX_CONNECTIONS
 
     @property
     def log_path(self) -> Path:
@@ -264,6 +274,9 @@ class CellGuardConfig:
             upstream=upstream.removeprefix("unix://"),
             evidence_dir=Path(env.get("LAB_EVIDENCE_DIR") or DEFAULT_EVIDENCE_DIR),
             socket_mode=_positive_int(env, "LAB_CELLGUARD_SOCKET_MODE", 0o660, base=8),
+            max_connections=_positive_int(
+                env, "LAB_CELLGUARD_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS
+            ),
         )
 
 
@@ -353,7 +366,7 @@ async def _read_body(
     length = 0
     if lengths:
         text = lengths.pop()
-        if not text.isdigit() or len(text) > 12:
+        if not _DECIMAL_RE.fullmatch(text):
             raise _BadRequest(400, "malformed Content-Length")
         length = int(text)
         if length > MAX_BODY:
@@ -374,7 +387,21 @@ def _response(status: int, reason: str, message: str) -> bytes:
     ).encode() + body
 
 
-_REASONS: Final = {400: "Bad Request", 413: "Content Too Large", 500: "Internal Server Error"}
+_REASONS: Final = {
+    400: "Bad Request",
+    413: "Content Too Large",
+    500: "Internal Server Error",
+    503: "Service Unavailable",
+}
+
+
+@dataclass(slots=True)
+class _State:
+    """What is known about a connection's request, for the fail-closed error path."""
+
+    path: str = ""
+    op: str = "malformed"
+    recorded: bool = False
 
 
 async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -417,10 +444,18 @@ def _close(writer: asyncio.StreamWriter) -> None:
 class CellGuard:
     """The proxy for one cell: decides, records, then forwards or denies each request."""
 
-    def __init__(self, context: CellContext, upstream: str, log: DecisionLog) -> None:
+    def __init__(
+        self,
+        context: CellContext,
+        upstream: str,
+        log: DecisionLog,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
+    ) -> None:
         self._ctx = context
         self._upstream = upstream
         self._log = log
+        self._max_connections = max_connections
+        self._active = 0
 
     async def serve(self, path: Path, mode: int = 0o660) -> asyncio.Server:
         """Listen on Unix socket ``path`` (a stale socket there is replaced)."""
@@ -441,16 +476,46 @@ class CellGuard:
             return False
         return True
 
+    async def _refuse(self, writer: asyncio.StreamWriter, decision: Decision, status: int) -> None:
+        await self._record(DockerRequest("", decision.path), decision)
+        with contextlib.suppress(Exception):
+            writer.write(_response(status, _REASONS[status], decision.reason))
+            await writer.drain()
+
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        """Serve one client connection: one request, then close."""
+        """Serve one client connection: one request, then close.
+
+        Over :attr:`max_connections` concurrent connections, a connection is refused
+        with a recorded ``503``. Any unexpected error before the request's decision is
+        recorded is itself recorded as an ``http.500`` denial (fail closed).
+        """
+        if self._active >= self._max_connections:
+            reason = f"more than {self._max_connections} concurrent connections"
+            await self._refuse(
+                writer, Decision(False, "connection", "http.503", reason, "", b""), 503
+            )
+            _close(writer)
+            return
+        self._active += 1
+        state = _State()
         try:
-            await self._handle(reader, writer)
+            await self._handle(reader, writer, state)
         except (ConnectionError, asyncio.IncompleteReadError, TimeoutError):
             pass
+        except Exception as exc:
+            if state.recorded:
+                print(f"cell-guard: error after the decision: {exc!r}", file=sys.stderr)
+            else:
+                reason = f"internal error: {type(exc).__name__}"
+                decision = Decision(False, state.op, "http.500", reason, state.path, b"")
+                await self._refuse(writer, decision, 500)
         finally:
+            self._active -= 1
             _close(writer)
 
-    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _handle(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, state: _State
+    ) -> None:
         head: _Head | None = None
         try:
             async with asyncio.timeout(_REQUEST_TIMEOUT_S):
@@ -463,13 +528,14 @@ class CellGuard:
                 except asyncio.LimitOverrunError:
                     raise _BadRequest(400, "request head too large") from None
                 head = _parse_head(raw)
+                state.path, state.op = head.target, route(head.method, head.target).op
                 body = await _read_body(head, reader, writer)
         except _BadRequest as bad:
             method, path = (head.method, head.target) if head else ("", "")
             op = route(method, path).op if head else "malformed"
             request = DockerRequest(method, path)
             decision = Decision(False, op, f"http.{bad.status}", bad.message, path, b"")
-            await self._record(request, decision)
+            state.recorded = await self._record(request, decision)
             writer.write(_response(bad.status, _REASONS.get(bad.status, "Error"), bad.message))
             await writer.drain()
             return
@@ -479,7 +545,8 @@ class CellGuard:
         if r.target_kind is not None:
             request = replace(request, target=await self._resolve(r))
         decision = evaluate(request, self._ctx)
-        if not await self._record(request, decision):
+        state.recorded = await self._record(request, decision)
+        if not state.recorded:
             writer.write(_response(500, _REASONS[500], "decision could not be recorded"))
             await writer.drain()
             return
@@ -529,7 +596,7 @@ class CellGuard:
                 await self._splice(reader, writer, up_reader, up_writer)
                 return
             length = _header(response_head, "content-length")
-            if length is not None and length.isdigit():
+            if length is not None and _DECIMAL_RE.fullmatch(length):
                 await _copy_exact(up_reader, writer, int(length))
             else:
                 await _pump(up_reader, writer)
@@ -576,7 +643,9 @@ class CellGuard:
                 else:
                     body = await _read_to_eof(up_reader, _MAX_LOOKUP)
                     length = _header(response_head, "content-length")
-                    if length is not None and (not length.isdigit() or int(length) != len(body)):
+                    if length is not None and (
+                        not _DECIMAL_RE.fullmatch(length) or int(length) != len(body)
+                    ):
                         return None
             finally:
                 _close(up_writer)
@@ -623,8 +692,16 @@ class CellGuard:
         if r.target_kind is None or r.ref is None:  # pragma: no cover
             return None
         prefix = f"/v{r.version}" if r.version else ""
+        refs = [r.ref]
+        if r.target_kind in ("container", "volume") and not r.ref.startswith(self._ctx.prefix):
+            # Names the agent chose were given the cell prefix at create time.
+            refs.insert(0, self._ctx.scoped(r.ref))
         try:
-            return await self._lookup(prefix, r.target_kind, r.ref)
+            for ref in refs:
+                found = await self._lookup(prefix, r.target_kind, ref)
+                if found is not None:
+                    return found
+            return None
         except (OSError, ValueError, TimeoutError, asyncio.IncompleteReadError):
             return None
         except asyncio.LimitOverrunError:
@@ -647,7 +724,7 @@ def _target(kind: str, ident: Any, name: Any, labels: Any) -> Target | None:
 
 async def _serve_forever(config: CellGuardConfig) -> None:
     log = DecisionLog(config.context.run_id, config.log_path)
-    guard = CellGuard(config.context, config.upstream, log)
+    guard = CellGuard(config.context, config.upstream, log, config.max_connections)
     server = await guard.serve(config.listen, config.socket_mode)
     print(
         f"cell-guard: run {config.context.run_id} on {config.listen} -> {config.upstream}",

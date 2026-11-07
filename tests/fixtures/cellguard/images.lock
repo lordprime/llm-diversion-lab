@@ -1,0 +1,6 @@
+# Copy of deploy/images.lock (branch m0-skeleton) as of task 13 review 1, for cell-guard tests.
+images:
+  - name: python-3.10-bookworm
+    image: docker.io/library/python
+    digest: sha256:f72a86806f92fe13a49f49aeca1db0b19ea5cf4a0470b842a01b0e14314945b8
+    expect_tools: [curl, bash]

@@ -7,20 +7,30 @@ exact path and body to forward (rewrites and forced fields are part of the decis
 It does no I/O. Ownership of the object a request names (a container, an exec, a
 network, a volume) is looked up by the proxy and passed in as :attr:`DockerRequest.target`.
 
+**Bodies are rebuilt, never passed through.** Docker and Podman decode JSON with Go's
+``encoding/json``, which matches object keys to struct fields case-insensitively (last
+one wins), so ``"memory": 0`` after ``"Memory": 1`` would undo a forced limit. Every
+forwarded body is therefore rebuilt from exact-key schemas: a key that is not exactly a
+known field is denied whatever its value (a key whose Go-style case fold collides with
+a known field is reported as ``body.shadow_key``), and only validated values are
+re-encoded. Nested objects are rebuilt the same way. Operations that take no body must
+send none, and API versions below 1.40 are denied.
+
 What is allowed (everything else is denied):
 
 * handshake: ``GET/HEAD /_ping``, ``GET /version``;
-* ``POST /containers/create``: the image must be in the ``images.lock`` allow-list
-  (by digest, or by a listed name, which is then pinned to its digest). Forced: the
-  cell's network (``HostConfig.NetworkMode`` and ``NetworkingConfig``), the
-  ``lab.run_id`` label, memory (no swap), CPU and PID limits (a lower request is kept).
-  Denied: privileged; host or container network/PID/IPC/user/UTS/cgroup namespaces;
-  devices; bind mounts outside the cell's scratch directory; named volumes other than
-  the cell's scratch volume; volume driver options; capabilities beyond ``NET_RAW`` and
-  ``NET_ADMIN``; any ``SecurityOpt`` except ``no-new-privileges`` (so no unconfined
-  seccomp/AppArmor/SELinux/systempaths); published ports; ``VolumesFrom``; links;
-  sysctls; runtimes; cgroup parents; masked/read-only path overrides; non-local log
-  drivers; and any field this module does not know that is set to a non-zero value;
+* ``POST /containers/create``: the image must be in the ``images.lock`` allow-list (by
+  logical name, by repository, or by ``repository@digest``) and is pinned to
+  ``image@digest``. Forced: the cell's network (``HostConfig.NetworkMode`` and
+  ``NetworkingConfig``), the ``lab.run_id`` label, memory (no swap), CPU and PID limits
+  (a lower request is kept), and the cell's name prefix on ``?name=``. Denied:
+  privileged; host or container network/PID/IPC/user/UTS/cgroup namespaces; devices;
+  bind mounts outside the cell's scratch directory; named volumes other than the cell's
+  scratch volume; volume driver options; capabilities beyond ``NET_RAW`` and
+  ``NET_ADMIN``; any ``SecurityOpt`` except ``no-new-privileges``; published ports;
+  ``VolumesFrom``; links; sysctls; runtimes; cgroup parents; masked/read-only path
+  overrides; non-local log drivers; restart policies other than ``no``; ulimits other
+  than ``nofile``/``nproc`` within caps; and every other field set to a non-zero value;
 * start, stop, kill, wait, remove, inspect, logs, attach (incl. websocket), resize,
   exec create/start/resize/inspect: only on containers labelled with this cell's run;
   the path is pinned to the container's full id. A privileged exec is denied;
@@ -29,7 +39,8 @@ What is allowed (everything else is denied):
   remove are denied;
 * network inspect: the cell's network or a network labelled with this run; volume
   inspect: the scratch volume or a volume labelled with this run;
-* volume create: local driver without options, with the ``lab.run_id`` label forced.
+* volume create: local driver without options; the ``lab.run_id`` label and the
+  cell's name prefix are forced.
 """
 
 from __future__ import annotations
@@ -53,7 +64,9 @@ __all__ = [
     "DEFAULT_NANO_CPUS",
     "DEFAULT_PIDS_LIMIT",
     "DIGEST_PATTERN",
+    "MIN_API_VERSION",
     "RUN_LABEL",
+    "ULIMIT_CAPS",
     "AllowedImage",
     "CellContext",
     "Decision",
@@ -62,6 +75,7 @@ __all__ = [
     "Route",
     "Target",
     "evaluate",
+    "go_fold",
     "load_images_lock",
     "match_image",
     "parse_image_ref",
@@ -74,6 +88,10 @@ RUN_LABEL: Final = "lab.run_id"
 _LAB_PREFIX: Final = "lab."
 #: Capabilities a created container may add.
 ALLOWED_CAPS: Final = frozenset({"NET_RAW", "NET_ADMIN"})
+#: Ulimits a created container may set, and the cap on each one's hard limit.
+ULIMIT_CAPS: Final[Mapping[str, int]] = {"nofile": 65536, "nproc": 4096}
+#: Oldest Docker API version accepted on a version-prefixed path.
+MIN_API_VERSION: Final = (1, 40)
 DIGEST_PATTERN: Final = r"^sha256:[0-9a-f]{64}$"
 #: Limits forced on created containers unless the cell configures others.
 DEFAULT_MEMORY_BYTES: Final = 2 << 30
@@ -84,11 +102,13 @@ _DIGEST_RE = re.compile(DIGEST_PATTERN)
 _ID_RE = re.compile(ID_PATTERN)
 _REPO_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*(?::[0-9]+)?(?:/[a-z0-9][a-z0-9._-]*)*$")
 _TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+_LOGICAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@-]*$")
 _NAME = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
 _NAME_RE = re.compile(f"^{_NAME}$")
 _IMAGE = r"[A-Za-z0-9][A-Za-z0-9_.:@/-]*"
 _PATH_RE = re.compile(r"^/[A-Za-z0-9_.:@/-]*$")
-_VERSION_RE = re.compile(r"^/v(?P<v>[0-9]+\.[0-9]+)(?P<rest>/.*)$")
+_VERSION_RE = re.compile(r"^/v(?P<v>[0-9]{1,3}\.[0-9]{1,3})(?P<rest>/.*)$")
+_PORT_RE = re.compile(r"^[0-9]{1,5}(?:-[0-9]{1,5})?(?:/(?:tcp|udp|sctp))?$")
 
 MALFORMED: Final = "malformed"
 UNKNOWN: Final = "unknown"
@@ -136,27 +156,40 @@ def parse_image_ref(ref: str) -> ImageRef | None:
 
 @dataclass(frozen=True, slots=True)
 class AllowedImage:
-    """One ``images.lock`` entry: the image ``name`` and the ``digest`` it is pinned to."""
+    """One ``images.lock`` entry.
+
+    ``name`` is a logical name (``python-3.10-bookworm``), ``image`` the repository
+    (``docker.io/library/python``) and ``digest`` the manifest digest it is pinned to.
+    """
 
     name: str
+    image: str
     digest: str
     expect_tools: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if not _LOGICAL_RE.fullmatch(self.name):
+            raise ValueError(f"images.lock: malformed logical name {self.name!r}")
         if not _DIGEST_RE.fullmatch(self.digest):
             raise ValueError(f"images.lock: malformed digest {self.digest!r}")
-        ref = parse_image_ref(self.name)
+        ref = parse_image_ref(self.image)
         if ref is None:
-            raise ValueError(f"images.lock: malformed image name {self.name!r}")
+            raise ValueError(f"images.lock: malformed image {self.image!r}")
         if ref.digest is not None and ref.digest != self.digest:
-            raise ValueError(f"images.lock: {self.name!r} names another digest")
+            raise ValueError(f"images.lock: {self.image!r} names another digest")
 
     @property
-    def ref(self) -> ImageRef:
-        ref = parse_image_ref(self.name)
+    def repo(self) -> str:
+        """The normalized repository."""
+        ref = parse_image_ref(self.image)
         if ref is None:  # pragma: no cover - checked in __post_init__
-            raise ValueError(f"images.lock: malformed image name {self.name!r}")
-        return ref
+            raise ValueError(f"images.lock: malformed image {self.image!r}")
+        return ref.repo
+
+    @property
+    def pinned(self) -> str:
+        """The reference forwarded to the daemon: ``image@digest``."""
+        return f"{self.repo}@{self.digest}"
 
 
 def load_images_lock(
@@ -164,8 +197,9 @@ def load_images_lock(
 ) -> tuple[AllowedImage, ...]:
     """Load the allow-list from an ``images.lock`` file (YAML or JSON) or parsed data.
 
-    The document is a list of ``{name, digest, expect_tools}`` entries, or a mapping
-    holding that list under ``images``. Anything malformed raises :class:`ValueError`.
+    The document maps ``images`` to a list of ``{name, image, digest, expect_tools}``
+    entries (a bare list is accepted too); ``expect_tools`` is optional. Anything
+    malformed raises :class:`ValueError`.
     """
     data: Any = source
     if isinstance(source, Path | str):
@@ -181,12 +215,15 @@ def load_images_lock(
     for entry in data:
         if not isinstance(entry, Mapping):
             raise ValueError(f"images.lock: entry is not a mapping: {entry!r}")
-        name, digest, tools = entry.get("name"), entry.get("digest"), entry.get("expect_tools", [])
-        if not isinstance(name, str) or not name or not isinstance(digest, str):
-            raise ValueError(f"images.lock: entry needs a name and a digest: {entry!r}")
+        name, image, digest = entry.get("name"), entry.get("image"), entry.get("digest")
+        tools = entry.get("expect_tools", [])
+        if not all(isinstance(v, str) and v for v in (name, image, digest)):
+            raise ValueError(f"images.lock: entry needs a name, an image and a digest: {entry!r}")
         if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
             raise ValueError(f"images.lock: expect_tools must be a list of strings: {entry!r}")
-        images.append(AllowedImage(name, digest, tuple(tools)))
+        images.append(AllowedImage(str(name), str(image), str(digest), tuple(tools)))
+    if len({i.name for i in images}) != len(images):
+        raise ValueError("images.lock: duplicate logical name")
     return tuple(images)
 
 
@@ -204,6 +241,9 @@ class CellContext:
     memory_bytes: int = DEFAULT_MEMORY_BYTES
     nano_cpus: int = DEFAULT_NANO_CPUS
     pids_limit: int = DEFAULT_PIDS_LIMIT
+    #: Prefix forced on container and volume names the agent chooses; default
+    #: ``<run_id lowercased>-``.
+    name_prefix: str | None = None
 
     def __post_init__(self) -> None:
         if not _ID_RE.fullmatch(self.run_id):
@@ -212,6 +252,8 @@ class CellContext:
             raise ValueError(f"malformed network name {self.network!r}")
         if self.scratch_volume is not None and not _NAME_RE.fullmatch(self.scratch_volume):
             raise ValueError(f"malformed scratch volume {self.scratch_volume!r}")
+        if self.name_prefix is not None and not _NAME_RE.fullmatch(self.name_prefix):
+            raise ValueError(f"malformed name prefix {self.name_prefix!r}")
         if self.scratch_dir is not None and (
             not self.scratch_dir.startswith("/")
             or posixpath.normpath(self.scratch_dir) != self.scratch_dir
@@ -221,6 +263,15 @@ class CellContext:
         for limit in (self.memory_bytes, self.nano_cpus, self.pids_limit):
             if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
                 raise ValueError(f"limits must be positive integers, got {limit!r}")
+
+    @property
+    def prefix(self) -> str:
+        """The name prefix of this cell's containers and volumes."""
+        return self.name_prefix or f"{self.run_id.lower()}-"
+
+    def scoped(self, name: str) -> str:
+        """``name`` with this cell's prefix (unchanged if it already has it)."""
+        return name if name.startswith(self.prefix) else f"{self.prefix}{name}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,7 +310,7 @@ class Decision:
     reason: str
     #: Path and query to forward (rewritten if the decision pins or filters it).
     path: str
-    #: Body to forward (rewritten if the decision forces fields).
+    #: Body to forward (rebuilt for operations that take one; empty otherwise).
     body: bytes
     #: Fields this decision forced or rewrote.
     forced: tuple[str, ...] = ()
@@ -396,12 +447,16 @@ class _Denied(Exception):
         self.reason = reason
 
 
+def _no_constants(name: str) -> Any:
+    raise ValueError(f"{name} is not JSON")
+
+
 def _json_object(raw: bytes, rule: str, *, empty_ok: bool = False) -> dict[str, Any]:
     if empty_ok and not raw.strip():
         return {}
     try:
-        doc = json.loads(raw)
-    except (ValueError, UnicodeDecodeError):
+        doc = json.loads(raw, parse_constant=_no_constants)
+    except (ValueError, UnicodeDecodeError, RecursionError):
         raise _Denied(rule, "body is not JSON") from None
     if not isinstance(doc, dict):
         raise _Denied(rule, "body is not a JSON object")
@@ -416,178 +471,505 @@ def _truthy(value: str) -> bool:
     return value.strip().lower() not in ("", "0", "false", "no")
 
 
-def _mapping(value: Any, what: str, rule: str) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise _Denied(rule, f"{what} is not an object")
-    return value
+def go_fold(key: str) -> str:
+    """Case fold as Go's ``encoding/json`` compares keys to field names.
 
-
-def _strings(value: Any, what: str, rule: str) -> list[str]:
-    if value is None:
-        return []
-    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-        raise _Denied(rule, f"{what} is not a list of strings")
-    return value
-
-
-def _reject_unknown(doc: Mapping[str, Any], known: frozenset[str], where: str, rule: str) -> None:
-    """Deny any field outside ``known`` that is set to a non-zero value."""
-    for key, value in doc.items():
-        if key not in known and value:
-            raise _Denied(rule, f"{where}{key} is not allowed")
-
-
-def _labels(value: Any, ctx: CellContext, rule: str) -> dict[str, str]:
-    labels = _mapping(value, "Labels", rule)
-    for key, val in labels.items():
-        if not isinstance(val, str):
-            raise _Denied(rule, f"label {key!r} is not a string")
-        if key.startswith(_LAB_PREFIX) and not (key == RUN_LABEL and val == ctx.run_id):
-            raise _Denied(rule, f"label {key}={val!r} is reserved for the lab")
-    return {**labels, RUN_LABEL: ctx.run_id}
-
-
-def match_image(image: str, images: Sequence[AllowedImage]) -> str | None:
-    """The reference to forward for ``image``, or ``None`` if it is not allowed.
-
-    A reference with a digest is allowed if that digest is listed for the same
-    repository and is forwarded unchanged. A reference without one is allowed if it
-    names a listed entry (same repository and tag; an entry without a tag matches any
-    tag) and is pinned to that entry's digest.
+    Lowercase plus Unicode simple folding; the long s (U+017F) folds to ``s`` and the Kelvin
+    sign (U+212A) to ``k``, which ``str.casefold`` also does.
     """
-    ref = parse_image_ref(image)
-    if ref is None:
-        return None
-    if ref.digest is not None:
-        ok = any(i.digest == ref.digest and i.ref.repo == ref.repo for i in images)
-        return image if ok else None
-    candidates = [i for i in images if i.ref.repo == ref.repo]
-    chosen = [i for i in candidates if i.ref.tag is not None and i.ref.tag == (ref.tag or "latest")]
-    if not chosen:
-        chosen = [i for i in candidates if i.ref.tag is None]
-    digests = {i.digest for i in chosen}
-    if len(digests) != 1:
-        return None
-    return f"{ref.repo}@{digests.pop()}"
+    return key.casefold()
 
 
-# --------------------------------------------------------------------------- container create
+# --------------------------------------------------------------------------- body schemas
+#
+# A schema maps each exact field name to a validator ``(value, where, rule) -> value``.
+# A validator returns the value to forward, or ``_OMIT`` to forward nothing; it raises
+# ``_Denied`` to deny. ``_rebuild`` denies every key that is not exactly in the schema.
 
-#: Container config fields that are harmless at any value.
-_CONFIG_SAFE: Final = frozenset(
-    {
-        "Hostname",
-        "Domainname",
-        "User",
-        "AttachStdin",
-        "AttachStdout",
-        "AttachStderr",
-        "ExposedPorts",
-        "Tty",
-        "OpenStdin",
-        "StdinOnce",
-        "Env",
-        "Cmd",
-        "Healthcheck",
-        "ArgsEscaped",
-        "Volumes",
-        "WorkingDir",
-        "Entrypoint",
-        "NetworkDisabled",
-        "MacAddress",
-        "OnBuild",
-        "StopSignal",
-        "StopTimeout",
-        "Shell",
-        # checked or forced below
-        "Image",
-        "Labels",
-        "HostConfig",
-        "NetworkingConfig",
-    }
-)
+_OMIT: Final = object()
+_Check = Callable[[Any, str, str], Any]
+_Schema = Mapping[str, _Check]
 
-#: Host config fields that are harmless at any value, plus those checked or forced below.
-#: Every other field must be unset or zero.
-_HOST_KNOWN: Final = frozenset(
-    {
-        "CpuShares",
-        "BlkioWeight",
-        "CpusetCpus",
-        "CpusetMems",
-        "MemoryReservation",
-        "MemorySwappiness",
-        "OomKillDisable",
-        "OomScoreAdj",
-        "Init",
-        "Ulimits",
-        "CpuCount",
-        "CpuPercent",
-        "IOMaximumIOps",
-        "IOMaximumBandwidth",
-        "RestartPolicy",
-        "AutoRemove",
-        "ConsoleSize",
-        "CapDrop",
-        "Dns",
-        "DnsOptions",
-        "DnsSearch",
-        "ExtraHosts",
-        "GroupAdd",
-        "ReadonlyRootfs",
-        "Tmpfs",
-        "ShmSize",
-        "Isolation",
-        # checked or forced below
-        "Privileged",
-        "NetworkMode",
-        "PidMode",
-        "IpcMode",
-        "UsernsMode",
-        "UTSMode",
-        "CgroupnsMode",
-        "CapAdd",
-        "SecurityOpt",
-        "Binds",
-        "Mounts",
-        "LogConfig",
-        "Memory",
-        "MemorySwap",
-        "NanoCpus",
-        "CpuPeriod",
-        "CpuQuota",
-        "PidsLimit",
-        "MaskedPaths",
-        "ReadonlyPaths",
-    }
-)
 
-_NAMESPACE_MODES: Final[Mapping[str, frozenset[str]]] = {
-    "PidMode": frozenset({""}),
-    "IpcMode": frozenset({"", "private", "none", "shareable"}),
-    "UsernsMode": frozenset({""}),
-    "UTSMode": frozenset({""}),
-    "CgroupnsMode": frozenset({"", "private"}),
+def _rebuild(doc: Any, schema: _Schema, where: str, rule: str) -> dict[str, Any]:
+    """Rebuild ``doc`` from ``schema``: exact keys only, every value validated."""
+    if doc is None:
+        return {}
+    if not isinstance(doc, dict):
+        raise _Denied(rule, f"{where or 'body'} is not an object")
+    folded = {go_fold(k): k for k in schema}
+    out: dict[str, Any] = {}
+    for key, value in doc.items():
+        check = schema.get(key)
+        if check is None:
+            twin = folded.get(go_fold(key))
+            if twin is not None:
+                raise _Denied("body.shadow_key", f"{where}{key!r} shadows {where}{twin}")
+            raise _Denied(rule, f"{where}{key} is not an allowed field")
+        cleaned = check(value, f"{where}{key}", rule)
+        if cleaned is not _OMIT:
+            out[key] = cleaned
+    return out
+
+
+def _obj(schema: _Schema, rule: str | None = None) -> _Check:
+    def check(value: Any, where: str, outer: str) -> Any:
+        if value is None:
+            return _OMIT
+        return _rebuild(value, schema, f"{where}.", rule or outer)
+
+    return check
+
+
+def _bad(rule: str, where: str, what: str) -> _Denied:
+    return _Denied(rule, f"{where} {what}")
+
+
+def _str(value: Any, where: str, rule: str) -> Any:
+    if value is None:
+        return _OMIT
+    if not isinstance(value, str):
+        raise _bad(rule, where, "is not a string")
+    return value
+
+
+def _bool(value: Any, where: str, rule: str) -> Any:
+    if value is None:
+        return _OMIT
+    if not isinstance(value, bool):
+        raise _bad(rule, where, "is not a boolean")
+    return value
+
+
+def _int(value: Any, where: str, rule: str) -> Any:
+    if value is None:
+        return _OMIT
+    if isinstance(value, bool) or not isinstance(value, int) or abs(value) >= 1 << 63:
+        raise _bad(rule, where, "is not an integer")
+    return value
+
+
+def _uint(value: Any, where: str, rule: str) -> Any:
+    value = _int(value, where, rule)
+    if value is not _OMIT and value < 0:
+        raise _bad(rule, where, "is negative")
+    return value
+
+
+def _strlist(value: Any, where: str, rule: str) -> Any:
+    if value is None:
+        return _OMIT
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise _bad(rule, where, "is not a list of strings")
+    return list(value)
+
+
+def _strslice(value: Any, where: str, rule: str) -> Any:
+    """A string or a list of strings (Docker's ``StrSlice``)."""
+    if isinstance(value, str):
+        return value
+    return _strlist(value, where, rule)
+
+
+def _strmap(value: Any, where: str, rule: str) -> Any:
+    if value is None:
+        return _OMIT
+    if not isinstance(value, dict) or not all(isinstance(v, str) for v in value.values()):
+        raise _bad(rule, where, "is not a map of strings")
+    return dict(value)
+
+
+def _zero(rule: str | None = None) -> _Check:
+    """The field may only be unset or zero; it is never forwarded."""
+
+    def check(value: Any, where: str, outer: str) -> Any:
+        if value:
+            raise _bad(rule or outer, where, "is not allowed")
+        return _OMIT
+
+    return check
+
+
+def _null(rule: str | None = None) -> _Check:
+    """The field may only be absent or ``null`` (even ``[]`` changes behaviour)."""
+
+    def check(value: Any, where: str, outer: str) -> Any:
+        if value is not None:
+            raise _bad(rule or outer, where, "is not allowed")
+        return _OMIT
+
+    return check
+
+
+def _drop(value: Any, where: str, rule: str) -> Any:
+    """A known field that is deliberately not forwarded (it is forced or irrelevant)."""
+    return _OMIT
+
+
+def _choice(allowed: frozenset[str], rule: str | None = None) -> _Check:
+    def check(value: Any, where: str, outer: str) -> Any:
+        if value is None:
+            return _OMIT
+        if not isinstance(value, str) or value not in allowed:
+            raise _bad(rule or outer, where, f"={value!r} is not allowed")
+        return value
+
+    return check
+
+
+def _list_of(item: _Check) -> _Check:
+    def check(value: Any, where: str, rule: str) -> Any:
+        if value is None:
+            return _OMIT
+        if not isinstance(value, list):
+            raise _bad(rule, where, "is not a list")
+        out = [item(v, f"{where}[{i}]", rule) for i, v in enumerate(value)]
+        return [v for v in out if v is not _OMIT]
+
+    return check
+
+
+def _keys(pattern: re.Pattern[str] | Callable[[str], bool], rule: str | None = None) -> _Check:
+    """A map whose keys are checked and whose values must be empty objects."""
+
+    def ok(key: str) -> bool:
+        return bool(pattern.fullmatch(key)) if isinstance(pattern, re.Pattern) else pattern(key)
+
+    def check(value: Any, where: str, outer: str) -> Any:
+        if value is None:
+            return _OMIT
+        if not isinstance(value, dict):
+            raise _bad(rule or outer, where, "is not an object")
+        for key, val in value.items():
+            if not ok(key) or val not in (None, {}):
+                raise _bad(rule or outer, where, f"entry {key!r} is not allowed")
+        return {key: {} for key in value}
+
+    return check
+
+
+def _container_path(path: str) -> bool:
+    """A plain absolute container path (Podman parses ``Volumes`` keys like ``-v``)."""
+    return (
+        path.startswith("/") and ":" not in path and "," not in path and ".." not in path.split("/")
+    )
+
+
+def _console_size(value: Any, where: str, rule: str) -> Any:
+    if value is None:
+        return _OMIT
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or not all(
+            isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 1 << 16 for v in value
+        )
+    ):
+        raise _bad(rule, where, "is not two sizes")
+    return value
+
+
+# --------------------------------------------------------------------------- create checks
+
+
+def _privileged(rule: str) -> _Check:
+    def check(value: Any, where: str, outer: str) -> Any:
+        if value:
+            raise _Denied(rule, f"{where} is set")
+        return _OMIT
+
+    return check
+
+
+def _cap_add(value: Any, where: str, rule: str) -> Any:
+    caps = _strlist(value, where, "create.capabilities")
+    if caps is _OMIT:
+        return _OMIT
+    for cap in caps:
+        if cap.strip().upper().removeprefix("CAP_") not in ALLOWED_CAPS:
+            raise _Denied("create.capabilities", f"capability {cap!r} is not allowed")
+    return caps
+
+
+def _security_opt(value: Any, where: str, rule: str) -> Any:
+    opts = _strlist(value, where, "create.security_opt")
+    if opts is _OMIT:
+        return _OMIT
+    for opt in opts:
+        key, _, val = opt.strip().replace("=", ":", 1).partition(":")
+        if key != "no-new-privileges" or val not in ("", "true"):
+            raise _Denied("create.security_opt", f"security option {opt!r} is not allowed")
+    return opts
+
+
+def _oom_score(value: Any, where: str, rule: str) -> Any:
+    value = _int(value, where, rule)
+    if value is not _OMIT and value < 0:
+        raise _Denied("create.field", f"a negative {where} is not allowed")
+    return value
+
+
+def _swappiness(value: Any, where: str, rule: str) -> Any:
+    value = _int(value, where, rule)
+    if value is not _OMIT and not -1 <= value <= 100:
+        raise _bad(rule, where, "is out of range")
+    return value
+
+
+def _tmpfs(value: Any, where: str, rule: str) -> Any:
+    tmpfs = _strmap(value, where, "create.mount")
+    if tmpfs is _OMIT:
+        return _OMIT
+    for path in tmpfs:
+        if not _container_path(path):
+            raise _Denied("create.mount", f"{where} entry {path!r} is not a container path")
+    return tmpfs
+
+
+_RESTART: Final[_Schema] = {
+    "Name": _choice(frozenset({"", "no"}), "create.restart"),
+    "MaximumRetryCount": _zero("create.restart"),
 }
-_LOG_DRIVERS: Final = frozenset({"", "json-file", "local", "k8s-file", "journald", "none"})
+
+_ULIMIT: Final[_Schema] = {"Name": _str, "Soft": _int, "Hard": _int}
+
+
+def _ulimits(value: Any, where: str, rule: str) -> Any:
+    items = _list_of(_obj(_ULIMIT, "create.ulimits"))(value, where, "create.ulimits")
+    if items is _OMIT:
+        return _OMIT
+    for item in items:
+        name, soft, hard = item.get("Name"), item.get("Soft"), item.get("Hard")
+        cap = ULIMIT_CAPS.get(name) if isinstance(name, str) else None
+        if cap is None:
+            raise _Denied("create.ulimits", f"ulimit {name!r} is not allowed")
+        if not (isinstance(soft, int) and isinstance(hard, int) and 0 <= soft <= hard <= cap):
+            raise _Denied(
+                "create.ulimits", f"ulimit {name} must satisfy 0 <= Soft <= Hard <= {cap}"
+            )
+    return items
+
+
+_LOG_CONFIG: Final[_Schema] = {
+    "Type": _choice(
+        frozenset({"", "json-file", "local", "k8s-file", "journald", "none"}), "create.field"
+    ),
+    "Config": _strmap,
+}
 _LOG_OPTIONS: Final = frozenset({"max-size", "max-file", "compress", "mode", "max-buffer-size"})
-_BIND_OPTIONS: Final = frozenset(
+
+
+def _log_config(value: Any, where: str, rule: str) -> Any:
+    log = _obj(_LOG_CONFIG, "create.field")(value, where, "create.field")
+    if log is _OMIT:
+        return _OMIT
+    if not set(log.get("Config", {})) <= _LOG_OPTIONS:
+        raise _Denied("create.field", "log options are not allowed")
+    return log
+
+
+_HEALTHCHECK: Final[_Schema] = {
+    "Test": _strlist,
+    "Interval": _uint,
+    "Timeout": _uint,
+    "StartPeriod": _uint,
+    "StartInterval": _uint,
+    "Retries": _uint,
+}
+
+_BIND_OPTIONS: Final[_Schema] = {
+    "Propagation": _choice(frozenset({"", "private", "rprivate"}), "create.mount"),
+    "NonRecursive": _bool,
+    "CreateMountpoint": _bool,
+    "ReadOnlyNonRecursive": _bool,
+    "ReadOnlyForceRecursive": _bool,
+}
+_VOLUME_OPTIONS: Final[_Schema] = {
+    "NoCopy": _bool,
+    "Labels": _strmap,
+    "DriverConfig": _null("create.mount"),
+    "Subpath": _str,
+}
+_TMPFS_OPTIONS: Final[_Schema] = {
+    "SizeBytes": _uint,
+    "Mode": _uint,
+    "Options": _zero("create.mount"),
+}
+_MOUNT: Final[_Schema] = {
+    "Type": _choice(frozenset({"bind", "volume", "tmpfs"}), "create.mount"),
+    "Source": _str,
+    "Target": _str,
+    "ReadOnly": _bool,
+    "Consistency": _str,
+    "BindOptions": _obj(_BIND_OPTIONS, "create.mount"),
+    "VolumeOptions": _obj(_VOLUME_OPTIONS, "create.mount"),
+    "TmpfsOptions": _obj(_TMPFS_OPTIONS, "create.mount"),
+    "ImageOptions": _zero("create.mount"),
+    "ClusterOptions": _zero("create.mount"),
+}
+_BIND_FLAGS: Final = frozenset(
     {"ro", "rw", "z", "Z", "nocopy", "private", "rprivate", "consistent", "cached", "delegated"}
 )
-_MOUNT_KEYS: Final = frozenset(
-    {
-        "Target",
-        "Source",
-        "Type",
-        "ReadOnly",
-        "Consistency",
-        "BindOptions",
-        "VolumeOptions",
-        "TmpfsOptions",
+
+_ENDPOINT: Final[_Schema] = {
+    "Aliases": _strlist,
+    # Known fields that are never forwarded: the endpoint is forced to the cell network.
+    **{
+        key: _drop
+        for key in (
+            "IPAMConfig",
+            "Links",
+            "MacAddress",
+            "DriverOpts",
+            "NetworkID",
+            "EndpointID",
+            "Gateway",
+            "IPAddress",
+            "IPPrefixLen",
+            "IPv6Gateway",
+            "GlobalIPv6Address",
+            "GlobalIPv6PrefixLen",
+            "DNSNames",
+        )
+    },
+}
+
+
+def _endpoints(value: Any, where: str, rule: str) -> Any:
+    if value is None:
+        return _OMIT
+    if not isinstance(value, dict):
+        raise _Denied("create.network", f"{where} is not an object")
+    return {
+        name: _rebuild(config, _ENDPOINT, f"{where}.{name}.", "create.network")
+        for name, config in value.items()
     }
-)
+
+
+_NETWORKING: Final[_Schema] = {"EndpointsConfig": _endpoints}
+
+
+def _namespace(allowed: frozenset[str]) -> _Check:
+    return _choice(allowed, "create.namespace")
+
+
+_HOST_CONFIG: Final[_Schema] = {
+    # checked by the schema itself
+    "Privileged": _privileged("create.privileged"),
+    "PidMode": _namespace(frozenset({""})),
+    "IpcMode": _namespace(frozenset({"", "private", "none", "shareable"})),
+    "UsernsMode": _namespace(frozenset({""})),
+    "UTSMode": _namespace(frozenset({""})),
+    "CgroupnsMode": _namespace(frozenset({"", "private"})),
+    "CapAdd": _cap_add,
+    "CapDrop": _strlist,
+    "SecurityOpt": _security_opt,
+    "OomScoreAdj": _oom_score,
+    "Tmpfs": _tmpfs,
+    "RestartPolicy": _obj(_RESTART, "create.restart"),
+    "Ulimits": _ulimits,
+    "LogConfig": _log_config,
+    "ConsoleSize": _console_size,
+    "MaskedPaths": _null("create.field"),
+    "ReadonlyPaths": _null("create.field"),
+    # checked against the cell after the rebuild
+    "Binds": _strlist,
+    "Mounts": _list_of(_obj(_MOUNT, "create.mount")),
+    "NetworkMode": _str,
+    "Memory": _int,
+    "MemorySwap": _int,
+    "NanoCpus": _int,
+    "PidsLimit": _int,
+    "CpuPeriod": _drop,
+    "CpuQuota": _drop,
+    # harmless values
+    "AutoRemove": _bool,
+    "ReadonlyRootfs": _bool,
+    "Init": _bool,
+    "OomKillDisable": _bool,
+    "Dns": _strlist,
+    "DnsOptions": _strlist,
+    "DnsSearch": _strlist,
+    "ExtraHosts": _strlist,
+    "GroupAdd": _strlist,
+    "ShmSize": _uint,
+    "Isolation": _choice(frozenset({"", "default"})),
+    "CpuShares": _uint,
+    "CpusetCpus": _str,
+    "CpusetMems": _str,
+    "BlkioWeight": _uint,
+    "MemoryReservation": _uint,
+    "MemorySwappiness": _swappiness,
+    "CpuCount": _uint,
+    "CpuPercent": _uint,
+    "IOMaximumIOps": _uint,
+    "IOMaximumBandwidth": _uint,
+    # known fields that must stay unset or zero
+    **{
+        key: _zero("create.field")
+        for key in (
+            "ContainerIDFile",
+            "PortBindings",
+            "PublishAllPorts",
+            "VolumeDriver",
+            "VolumesFrom",
+            "Annotations",
+            "Cgroup",
+            "Links",
+            "StorageOpt",
+            "Sysctls",
+            "Runtime",
+            "CgroupParent",
+            "BlkioWeightDevice",
+            "BlkioDeviceReadBps",
+            "BlkioDeviceWriteBps",
+            "BlkioDeviceReadIOps",
+            "BlkioDeviceWriteIOps",
+            "CpuRealtimePeriod",
+            "CpuRealtimeRuntime",
+            "Devices",
+            "DeviceCgroupRules",
+            "DeviceRequests",
+            "KernelMemory",
+            "KernelMemoryTCP",
+        )
+    },
+}
+
+
+def _volumes(value: Any, where: str, rule: str) -> Any:
+    return _keys(_container_path, "create.mount")(value, where, "create.mount")
+
+
+_CREATE: Final[_Schema] = {
+    "Image": _str,
+    "Labels": _strmap,
+    "HostConfig": _obj(_HOST_CONFIG),
+    "NetworkingConfig": _obj(_NETWORKING, "create.network"),
+    "Hostname": _str,
+    "Domainname": _str,
+    "User": _str,
+    "AttachStdin": _bool,
+    "AttachStdout": _bool,
+    "AttachStderr": _bool,
+    "ExposedPorts": _keys(_PORT_RE),
+    "Tty": _bool,
+    "OpenStdin": _bool,
+    "StdinOnce": _bool,
+    "Env": _strlist,
+    "Cmd": _strslice,
+    "Healthcheck": _obj(_HEALTHCHECK),
+    "ArgsEscaped": _bool,
+    "Volumes": _volumes,
+    "WorkingDir": _str,
+    "Entrypoint": _strslice,
+    "NetworkDisabled": _bool,
+    "MacAddress": _str,
+    "StopSignal": _str,
+    "StopTimeout": _int,
+    "Shell": _strlist,
+    "OnBuild": _zero(),
+}
 
 
 def _bind_source_ok(source: str, ctx: CellContext) -> bool:
@@ -601,10 +983,10 @@ def _volume_source_ok(source: str | None, ctx: CellContext) -> bool:
     return not source or source == ctx.scratch_volume
 
 
-def _check_binds(value: Any, ctx: CellContext) -> None:
-    for bind in _strings(value, "HostConfig.Binds", "create.mount"):
+def _check_binds(binds: list[str], ctx: CellContext) -> None:
+    for bind in binds:
         parts = bind.split(":")
-        if len(parts) not in (2, 3) or not parts[0] or not parts[1]:
+        if len(parts) not in (2, 3) or not parts[0] or not _container_path(parts[1]):
             raise _Denied("create.mount", f"malformed bind {bind!r}")
         source = parts[0]
         ok = (
@@ -614,90 +996,73 @@ def _check_binds(value: Any, ctx: CellContext) -> None:
         )
         if not ok:
             raise _Denied("create.mount", f"mount source {source!r} is outside the cell scratch")
-        if len(parts) == 3 and not set(parts[2].split(",")) <= _BIND_OPTIONS:
+        if len(parts) == 3 and not set(parts[2].split(",")) <= _BIND_FLAGS:
             raise _Denied("create.mount", f"bind options {parts[2]!r} are not allowed")
 
 
-def _check_mounts(value: Any, ctx: CellContext) -> None:
-    if value is None:
-        return
-    if not isinstance(value, list):
-        raise _Denied("create.mount", "HostConfig.Mounts is not a list")
-    for mount in value:
-        if not isinstance(mount, dict):
-            raise _Denied("create.mount", "mount is not an object")
-        _reject_unknown(mount, _MOUNT_KEYS, "mount field ", "create.mount")
-        kind, source = mount.get("Type"), mount.get("Source")
-        if source is not None and not isinstance(source, str):
-            raise _Denied("create.mount", "mount source is not a string")
+def _check_mounts(mounts: list[dict[str, Any]], ctx: CellContext) -> None:
+    for mount in mounts:
+        kind, source, target = mount.get("Type"), mount.get("Source"), mount.get("Target")
+        if not isinstance(target, str) or not _container_path(target):
+            raise _Denied("create.mount", f"mount target {target!r} is not a container path")
         if kind == "bind":
-            options = _mapping(mount.get("BindOptions"), "BindOptions", "create.mount")
             if not source or not _bind_source_ok(source, ctx):
                 raise _Denied("create.mount", f"bind source {source!r} is outside the cell scratch")
-            if options.get("Propagation") not in (None, "", "private", "rprivate"):
-                raise _Denied("create.mount", "bind propagation is not allowed")
         elif kind == "volume":
-            options = _mapping(mount.get("VolumeOptions"), "VolumeOptions", "create.mount")
             if not _volume_source_ok(source, ctx):
                 raise _Denied("create.mount", f"volume {source!r} is not the cell scratch")
-            if options.get("DriverConfig"):
-                raise _Denied("create.mount", "volume driver options are not allowed")
-            subpath = options.get("Subpath")
-            if subpath is not None and (not isinstance(subpath, str) or ".." in subpath):
+            subpath = mount.get("VolumeOptions", {}).get("Subpath")
+            if subpath is not None and ".." in subpath.split("/"):
                 raise _Denied("create.mount", "volume subpath is not allowed")
-        elif kind != "tmpfs":
+        elif kind == "tmpfs":
+            if source:
+                raise _Denied("create.mount", "a tmpfs mount takes no source")
+        else:
             raise _Denied("create.mount", f"mount type {kind!r} is not allowed")
+        for options, allowed in (("BindOptions", "bind"), ("VolumeOptions", "volume")):
+            if options in mount and kind != allowed:
+                raise _Denied("create.mount", f"{options} on a {kind} mount")
+        if "TmpfsOptions" in mount and kind != "tmpfs":
+            raise _Denied("create.mount", f"TmpfsOptions on a {kind} mount")
 
 
-def _check_paths(value: Any, what: str) -> None:
-    """Keys of ``Volumes``/``Tmpfs`` must be plain container paths.
+def _cap(value: Any, limit: int) -> int:
+    return value if isinstance(value, int) and 0 < value < limit else limit
 
-    Podman parses a ``Volumes`` key like a ``-v`` flag, so ``/host:/x`` would be a bind.
+
+def _labels(labels: Mapping[str, str], ctx: CellContext, rule: str) -> dict[str, str]:
+    for key, val in labels.items():
+        if key.casefold().startswith(_LAB_PREFIX) and not (key == RUN_LABEL and val == ctx.run_id):
+            raise _Denied(rule, f"label {key}={val!r} is reserved for the lab")
+    return {**labels, RUN_LABEL: ctx.run_id}
+
+
+def _scoped_name(name: str, ctx: CellContext, rule: str) -> str:
+    if not _NAME_RE.fullmatch(name):
+        raise _Denied(rule, f"name {name!r} is malformed")
+    return ctx.scoped(name)
+
+
+def match_image(image: str, images: Sequence[AllowedImage]) -> str | None:
+    """The pinned ``image@digest`` to forward for ``image``, or ``None`` if not allowed.
+
+    ``image`` may be an entry's logical name, its repository (any tag, Docker defaults
+    applied), or ``repository[:tag]@digest`` with the listed digest of that repository.
+    A repository listed with several digests matches only by digest or logical name.
     """
-    for path in _mapping(value, what, "create.mount"):
-        if not path.startswith("/") or ":" in path or "," in path or ".." in path.split("/"):
-            raise _Denied("create.mount", f"{what} entry {path!r} is not a container path")
-
-
-def _check_host_config(host: dict[str, Any], ctx: CellContext) -> None:
-    if host.get("Privileged"):
-        raise _Denied("create.privileged", "HostConfig.Privileged is set")
-    for key, allowed in _NAMESPACE_MODES.items():
-        mode = host.get(key)
-        if mode is not None and (not isinstance(mode, str) or mode not in allowed):
-            raise _Denied("create.namespace", f"HostConfig.{key}={mode!r} is not allowed")
-    for cap in _strings(host.get("CapAdd"), "HostConfig.CapAdd", "create.capabilities"):
-        if cap.strip().upper().removeprefix("CAP_") not in ALLOWED_CAPS:
-            raise _Denied("create.capabilities", f"capability {cap!r} is not allowed")
-    for opt in _strings(host.get("SecurityOpt"), "HostConfig.SecurityOpt", "create.security_opt"):
-        key, _, val = opt.strip().replace("=", ":", 1).partition(":")
-        if key != "no-new-privileges" or val not in ("", "true"):
-            raise _Denied("create.security_opt", f"security option {opt!r} is not allowed")
-    _check_binds(host.get("Binds"), ctx)
-    _check_paths(host.get("Tmpfs"), "HostConfig.Tmpfs")
-    oom = host.get("OomScoreAdj")
-    if oom is not None and (isinstance(oom, bool) or not isinstance(oom, int) or oom < 0):
-        raise _Denied("create.field", "a negative HostConfig.OomScoreAdj is not allowed")
-    _check_mounts(host.get("Mounts"), ctx)
-    for key in ("MaskedPaths", "ReadonlyPaths"):
-        if host.get(key) is not None:
-            raise _Denied("create.field", f"HostConfig.{key} is not allowed")
-    log = _mapping(host.get("LogConfig"), "HostConfig.LogConfig", "create.field")
-    if log.get("Type") not in (None, *_LOG_DRIVERS):
-        raise _Denied("create.field", f"log driver {log.get('Type')!r} is not allowed")
-    log_options = _mapping(log.get("Config"), "HostConfig.LogConfig.Config", "create.field")
-    if not set(log_options) <= _LOG_OPTIONS:
-        raise _Denied("create.field", "log options are not allowed")
-    _reject_unknown(log, frozenset({"Type", "Config"}), "HostConfig.LogConfig.", "create.field")
-    _reject_unknown(host, _HOST_KNOWN, "HostConfig.", "create.field")
-
-
-def _cap(value: Any, limit: int, what: str) -> int:
-    if value is None:
-        return limit
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise _Denied("create.field", f"{what} is not an integer")
-    return value if 0 < value < limit else limit
+    for entry in images:
+        if image == entry.name:
+            return entry.pinned
+    ref = parse_image_ref(image)
+    if ref is None:
+        return None
+    if ref.digest is not None:
+        for entry in images:
+            if entry.digest == ref.digest and entry.repo == ref.repo:
+                return entry.pinned
+        return None
+    pinned = {entry.pinned for entry in images if entry.repo == ref.repo}
+    return pinned.pop() if len(pinned) == 1 else None
 
 
 def _force_network(body: dict[str, Any], host: dict[str, Any], ctx: CellContext) -> None:
@@ -705,49 +1070,47 @@ def _force_network(body: dict[str, Any], host: dict[str, Any], ctx: CellContext)
     if mode not in (None, "", "default", "bridge", ctx.network):
         raise _Denied("create.network", f"HostConfig.NetworkMode={mode!r} is not allowed")
     host["NetworkMode"] = ctx.network
-    networking = _mapping(body.get("NetworkingConfig"), "NetworkingConfig", "create.network")
-    _reject_unknown(
-        networking, frozenset({"EndpointsConfig"}), "NetworkingConfig.", "create.network"
-    )
-    endpoints = _mapping(networking.get("EndpointsConfig"), "EndpointsConfig", "create.network")
+    endpoints = body.get("NetworkingConfig", {}).get("EndpointsConfig", {})
     endpoint: dict[str, Any] = {}
     for name, config in endpoints.items():
         if name != ctx.network:
             raise _Denied("create.network", f"network {name!r} is not the cell network")
-        aliases = _strings(
-            _mapping(config, "endpoint", "create.network").get("Aliases"),
-            "Aliases",
-            "create.network",
-        )
-        if aliases:
-            endpoint["Aliases"] = aliases
+        endpoint = config
     body["NetworkingConfig"] = {"EndpointsConfig": {ctx.network: endpoint}}
 
 
+def _create_query(r: Route, ctx: CellContext) -> str:
+    pairs: list[tuple[str, str]] = []
+    for key, value in parse_qsl(r.query, keep_blank_values=True):
+        if key == "name" and value:
+            pairs.append((key, _scoped_name(value, ctx, "create.name")))
+        elif key == "platform" or (key == "name" and not value):
+            pairs.append((key, value))
+        else:
+            raise _Denied("create.query", f"query parameter {key!r} is not allowed")
+    if len({k for k, _ in pairs}) != len(pairs):
+        raise _Denied("create.query", "repeated query parameter")
+    return urlencode(pairs)
+
+
 def _container_create(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
-    body = _json_object(req.body, "create.body")
-    _reject_unknown(body, _CONFIG_SAFE, "", "create.field")
-    _check_paths(body.get("Volumes"), "Volumes")
+    body = _rebuild(_json_object(req.body, "create.body"), _CREATE, "", "create.field")
     image = body.get("Image")
     pinned = match_image(image, ctx.images) if isinstance(image, str) else None
     if pinned is None:
         raise _Denied("image.not_allowed", f"image {image!r} is not in images.lock")
-    forced: list[str] = []
-    if pinned != image:
-        body["Image"] = pinned
-        forced.append("Image")
-    body["Labels"] = _labels(body.get("Labels"), ctx, "create.labels")
-    host = _mapping(body.get("HostConfig"), "HostConfig", "create.body")
-    _check_host_config(host, ctx)
+    body["Image"] = pinned
+    body["Labels"] = _labels(body.get("Labels", {}), ctx, "create.labels")
+    host = body.setdefault("HostConfig", {})
+    _check_binds(host.get("Binds", []), ctx)
+    _check_mounts(host.get("Mounts", []), ctx)
     _force_network(body, host, ctx)
-    memory = _cap(host.get("Memory"), ctx.memory_bytes, "HostConfig.Memory")
-    host["Memory"] = host["MemorySwap"] = memory
-    host["NanoCpus"] = _cap(host.get("NanoCpus"), ctx.nano_cpus, "HostConfig.NanoCpus")
-    host["PidsLimit"] = _cap(host.get("PidsLimit"), ctx.pids_limit, "HostConfig.PidsLimit")
-    host.pop("CpuPeriod", None)
-    host.pop("CpuQuota", None)
-    body["HostConfig"] = host
-    forced += [
+    host["Memory"] = host["MemorySwap"] = _cap(host.get("Memory"), ctx.memory_bytes)
+    host["NanoCpus"] = _cap(host.get("NanoCpus"), ctx.nano_cpus)
+    host["PidsLimit"] = _cap(host.get("PidsLimit"), ctx.pids_limit)
+    query = _create_query(r, ctx)
+    forced = (
+        "Image",
         "Labels",
         "HostConfig.NetworkMode",
         "NetworkingConfig",
@@ -755,29 +1118,40 @@ def _container_create(r: Route, req: DockerRequest, ctx: CellContext) -> Decisio
         "HostConfig.MemorySwap",
         "HostConfig.NanoCpus",
         "HostConfig.PidsLimit",
-    ]
-    return _allow(r, req, "container.create", body=_encode(body), forced=tuple(forced))
+        "name",
+    )
+    return _allow(
+        r, req, "container.create", path=r.rebuild(r.base, query), body=_encode(body), forced=forced
+    )
 
 
 # --------------------------------------------------------------------------- other handlers
 
-_EXEC_CREATE_KEYS: Final = frozenset(
-    {
-        "AttachStdin",
-        "AttachStdout",
-        "AttachStderr",
-        "ConsoleSize",
-        "DetachKeys",
-        "Tty",
-        "Env",
-        "Cmd",
-        "User",
-        "WorkingDir",
-        "Privileged",
-        "Container",
-    }
-)
-_EXEC_START_KEYS: Final = frozenset({"Detach", "Tty", "ConsoleSize"})
+_EXEC_CREATE: Final[_Schema] = {
+    "Privileged": _privileged("exec.privileged"),
+    "Container": _str,
+    "User": _str,
+    "Tty": _bool,
+    "ConsoleSize": _console_size,
+    "AttachStdin": _bool,
+    "AttachStdout": _bool,
+    "AttachStderr": _bool,
+    "Detach": _bool,
+    "DetachKeys": _str,
+    "Env": _strlist,
+    "WorkingDir": _str,
+    "Cmd": _strlist,
+}
+_EXEC_START: Final[_Schema] = {"Detach": _bool, "Tty": _bool, "ConsoleSize": _console_size}
+_VOLUME_CREATE: Final[_Schema] = {
+    "Name": _str,
+    "Driver": _choice(frozenset({"", "local"})),
+    "DriverOpts": _zero(),
+    "Labels": _strmap,
+    "ClusterVolumeSpec": _zero(),
+}
+#: Operations that take a request body; every other operation must send none.
+_BODY_OPS: Final = frozenset({"container.create", "exec.create", "exec.start", "volume.create"})
 _UPGRADE_OPS: Final = frozenset({"container.attach", "exec.start"})
 
 
@@ -804,21 +1178,22 @@ def _targeted(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
         raise _Denied("target.not_owned", f"{r.target_kind} {r.ref!r} is not this cell's")
     if not _NAME_RE.fullmatch(target.id):
         raise _Denied("target.malformed", f"{r.target_kind} id {target.id!r} is malformed")
-    body = req.body
+    body = b""
     if r.op == "container.remove":
         if any(k == "link" and _truthy(v) for k, v in parse_qsl(r.query)):
             raise _Denied("remove.link", "removing links is not allowed")
     elif r.op == "exec.create":
-        doc = _json_object(req.body, "exec.body")
-        if doc.get("Privileged"):
-            raise _Denied("exec.privileged", "a privileged exec is not allowed")
-        # docker-py repeats the container in the body; it must be the one in the path.
-        if doc.get("Container") not in (None, "", r.ref, target.id, target.name):
+        doc = _rebuild(_json_object(req.body, "exec.body"), _EXEC_CREATE, "", "exec.field")
+        named = doc.pop("Container", None)
+        names = {r.ref, target.id, target.name}
+        if r.ref is not None:
+            names.add(ctx.scoped(r.ref))
+        if named not in (None, "", *names):
             raise _Denied("exec.field", "exec body names another container")
-        _reject_unknown(doc, _EXEC_CREATE_KEYS, "exec field ", "exec.field")
+        body = _encode(doc)
     elif r.op == "exec.start":
         doc = _json_object(req.body, "exec.body", empty_ok=True)
-        _reject_unknown(doc, _EXEC_START_KEYS, "exec start field ", "exec.field")
+        body = _encode(_rebuild(doc, _EXEC_START, "", "exec.field"))
     return Decision(
         allowed=True,
         op=r.op,
@@ -839,8 +1214,8 @@ def _own_list(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
     filters: dict[str, list[str]] = {}
     if raw and raw[0]:
         try:
-            doc = json.loads(raw[0])
-        except ValueError:
+            doc = json.loads(raw[0], parse_constant=_no_constants)
+        except (ValueError, RecursionError):
             raise _Denied("list.filters", "filters is not JSON") from None
         if not isinstance(doc, dict):
             raise _Denied("list.filters", "filters is not an object")
@@ -863,15 +1238,13 @@ def _own_list(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
 
 
 def _volume_create(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
-    body = _json_object(req.body, "volume.body")
-    _reject_unknown(body, frozenset({"Name", "Driver", "Labels"}), "volume field ", "volume.field")
-    name = body.get("Name")
-    if name is not None and (not isinstance(name, str) or (name and not _NAME_RE.fullmatch(name))):
-        raise _Denied("volume.field", f"volume name {name!r} is malformed")
-    if body.get("Driver") not in (None, "", "local"):
-        raise _Denied("volume.field", f"volume driver {body.get('Driver')!r} is not allowed")
-    body["Labels"] = _labels(body.get("Labels"), ctx, "volume.labels")
-    return _allow(r, req, r.op, body=_encode(body), forced=("Labels",))
+    body = _rebuild(_json_object(req.body, "volume.body"), _VOLUME_CREATE, "", "volume.field")
+    forced = ["Labels"]
+    if body.get("Name"):
+        body["Name"] = _scoped_name(body["Name"], ctx, "volume.field")
+        forced.append("Name")
+    body["Labels"] = _labels(body.get("Labels", {}), ctx, "volume.labels")
+    return _allow(r, req, r.op, body=_encode(body), forced=tuple(forced))
 
 
 def _plain(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
@@ -884,7 +1257,7 @@ def _allow(
     rule: str,
     *,
     path: str | None = None,
-    body: bytes | None = None,
+    body: bytes = b"",
     forced: tuple[str, ...] = (),
 ) -> Decision:
     return Decision(
@@ -893,7 +1266,7 @@ def _allow(
         rule=rule,
         reason="allowed",
         path=req.path if path is None else path,
-        body=req.body if body is None else body,
+        body=body,
         forced=forced,
     )
 
@@ -940,11 +1313,17 @@ def evaluate(request: DockerRequest, ctx: CellContext) -> Decision:
 
     if r.op == MALFORMED:
         return deny("path.malformed", f"malformed path {request.path!r}")
+    if r.version is not None:
+        major, minor = (int(part) for part in r.version.split("."))
+        if (major, minor) < MIN_API_VERSION:
+            return deny("api.version", f"API version {r.version} is below 1.40")
     handler = _HANDLERS.get(r.op)
     if handler is None:
         if r.op == UNKNOWN:
             return deny("path.unmatched", f"{request.method} {r.base} is not allowed")
         return deny(r.op, f"{r.op} is not allowed")
+    if r.op not in _BODY_OPS and request.body:
+        return deny("body.unexpected", f"{r.op} takes no request body")
     try:
         return handler(r, request, ctx)
     except _Denied as denied:

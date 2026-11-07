@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import json
 import os
+import socket
 import tempfile
 import threading
 import uuid
@@ -59,8 +60,8 @@ def make_ctx(**overrides: Any) -> CellContext:
         "run_id": RUN,
         "network": NETWORK,
         "images": (
-            AllowedImage(name="ghcr.io/usestrix/strix-sandbox:0.1", digest=DIGEST_A),
-            AllowedImage(name="alpine", digest=DIGEST_B),
+            AllowedImage("strix-sandbox-0.1", "ghcr.io/usestrix/strix-sandbox", DIGEST_A),
+            AllowedImage("alpine-3", "docker.io/library/alpine", DIGEST_B),
         ),
         "scratch_volume": "lab-scratch",
         "scratch_dir": "/srv/lab/scratch/cell1",
@@ -95,6 +96,7 @@ def foreign(kind: str = "container", ident: str = OTHER_CID, name: str = "theirs
 
 
 IMG = f"ghcr.io/usestrix/strix-sandbox@{DIGEST_A}"
+ALP = f"docker.io/library/alpine@{DIGEST_B}"
 
 
 # --------------------------------------------------------------------------- brief minimum
@@ -265,10 +267,19 @@ def test_spoofed_run_label_is_denied() -> None:
     assert decision.rule == "create.labels"
 
 
-def test_unknown_top_level_field_set_is_denied() -> None:
-    assert not create({"Image": IMG, "Escape": "please"}).allowed
-    # Zero values of any field are tolerated: the Docker CLI sends full structs.
-    assert create({"Image": IMG, "Escape": None, "Other": [], "Third": ""}).allowed
+def test_unknown_fields_are_denied_whatever_their_value() -> None:
+    for value in ["please", None, [], "", 0, False, {}]:
+        decision = create({"Image": IMG, "Escape": value})
+        assert not decision.allowed, value
+        assert decision.rule == "create.field"
+        nested = create({"Image": IMG, "HostConfig": {"Escape": value}})
+        assert not nested.allowed, value
+    # Zero values of known fields are tolerated (the Docker CLI sends full structs)
+    # and are not forwarded.
+    body = allowed_create(
+        {"Image": IMG, "HostConfig": {"Devices": [], "PortBindings": {}, "Runtime": ""}}
+    )
+    assert not {"Devices", "PortBindings", "Runtime"} & set(body["HostConfig"])
 
 
 def test_malformed_create_body_is_denied() -> None:
@@ -339,14 +350,16 @@ def test_endpoint_config_for_cell_network_keeps_aliases_only() -> None:
     ("image", "forwarded"),
     [
         (IMG, IMG),
-        (
-            f"ghcr.io/usestrix/strix-sandbox:0.1@{DIGEST_A}",
-            f"ghcr.io/usestrix/strix-sandbox:0.1@{DIGEST_A}",
-        ),
+        (f"ghcr.io/usestrix/strix-sandbox:0.1@{DIGEST_A}", IMG),
         ("ghcr.io/usestrix/strix-sandbox:0.1", IMG),
-        ("alpine", f"docker.io/library/alpine@{DIGEST_B}"),
-        ("docker.io/library/alpine:3.20", f"docker.io/library/alpine@{DIGEST_B}"),
-        (f"alpine@{DIGEST_B}", f"alpine@{DIGEST_B}"),
+        ("ghcr.io/usestrix/strix-sandbox:latest", IMG),  # any tag of a listed repository
+        ("ghcr.io/usestrix/strix-sandbox", IMG),
+        ("strix-sandbox-0.1", IMG),  # the logical name
+        ("alpine", ALP),
+        ("alpine-3", ALP),
+        ("docker.io/library/alpine:3.20", ALP),
+        (f"alpine@{DIGEST_B}", ALP),
+        (f"index.docker.io/library/alpine:3@{DIGEST_B}", ALP),
     ],
 )
 def test_listed_images_are_pinned_to_their_digest(image: str, forwarded: str) -> None:
@@ -359,7 +372,7 @@ def test_listed_images_are_pinned_to_their_digest(image: str, forwarded: str) ->
     [
         f"ghcr.io/usestrix/strix-sandbox@{DIGEST_B}",  # listed digest, wrong repo
         f"ghcr.io/evil/strix-sandbox@{DIGEST_A}",
-        "ghcr.io/usestrix/strix-sandbox:latest",  # unlisted tag of a tag-pinned entry
+        "strix-sandbox-0.1:latest",  # a logical name is matched exactly
         DIGEST_A,  # a bare id is not a reference to a listed image
         "a" * 12,
         "",
@@ -370,12 +383,8 @@ def test_other_image_references_are_denied(image: str) -> None:
     assert not create({"Image": image}).allowed
 
 
-def test_create_query_and_version_prefix() -> None:
-    for path in [
-        "/containers/create?name=sbx",
-        "/v1.44/containers/create",
-        "/v1.24/containers/create",
-    ]:
+def test_create_version_prefix() -> None:
+    for path in ["/containers/create", "/v1.44/containers/create", "/v1.40/containers/create"]:
         decision = create({"Image": IMG}, path)
         assert decision.allowed, path
         assert decision.op == "container.create"
@@ -614,32 +623,352 @@ def test_volumes() -> None:
     assert not evaluate(DockerRequest("POST", "/volumes/prune"), CTX).allowed
 
 
+# --------------------------------------------------------------------------- review 1: bodies
+
+
+# Go's encoding/json matches keys case-insensitively (last wins), so a key whose fold
+# collides with a known field would undo what the policy forced.
+SHADOW_CREATES = [
+    {"Image": IMG, "labels": None},
+    {"Image": IMG, "Labels": {}, "LABELS": {}},
+    {"Image": IMG, "hostconfig": None},
+    {"Image": IMG, "image": "docker.io/library/ubuntu"},
+    {"Image": IMG, "networkingconfig": {"EndpointsConfig": {"other": {}}}},
+    {"Image": IMG, "HostConfig": {"Memory": 1, "memory": 0}},
+    {"Image": IMG, "HostConfig": {"MemorySwap": 1, "memoryswap": 0}},
+    {"Image": IMG, "HostConfig": {"PidsLimit": 1, "pidslimit": 0}},
+    {"Image": IMG, "HostConfig": {"NanoCpus": 1, "NANOCPUS": 0}},
+    {"Image": IMG, "HostConfig": {"networkmode": ""}},
+    {"Image": IMG, "HostConfig": {"privileged": True}},
+    {"Image": IMG, "HostConfig": {"Privileged": False, "PRIVILEGED": False}},
+    {"Image": IMG, "HostConfig": {"capadd": ["SYS_ADMIN"]}},
+    {"Image": IMG, "HostConfig": {"binds": ["/:/host"]}},
+    {"Image": IMG, "HostConfig": {"pidmode": "host"}},
+    # Unicode simple folds: long s (U+017F) folds to s, Kelvin sign (U+212A) to k.
+    {"Image": IMG, "Label\u017f": None},
+    {"Image": IMG, "HostConfig": {"\u017fecurityOpt": ["seccomp=unconfined"]}},
+    {"Image": IMG, "HostConfig": {"Ma\u017fkedPaths": []}},
+    {"Image": IMG, "HostConfig": {"\u212aernelMemory": 1}},
+    {"Image": IMG, "HostConfig": {"Pid\u017fLimit": 0}},
+]
+
+
+@pytest.mark.parametrize("body", SHADOW_CREATES)
+def test_case_folded_shadow_keys_are_denied(body: dict[str, Any]) -> None:
+    decision = create(body)
+    assert not decision.allowed
+    assert decision.rule == "body.shadow_key", decision.reason
+
+
+@pytest.mark.parametrize(
+    "key", ["driverconfig", "DRIVERCONFIG", "Driverconfig", "driverConfig", "DRIVERconfig"]
+)
+def test_volume_driver_config_is_denied_in_any_casing(key: str) -> None:
+    driver = {"Name": "local", "Options": {"type": "none", "o": "bind", "device": "/"}}
+    mount: dict[str, Any] = {"Type": "volume", "Target": "/h", "VolumeOptions": {key: driver}}
+    decision = create({"Image": IMG, "HostConfig": {"Mounts": [mount]}})
+    assert not decision.allowed
+    assert decision.rule == "body.shadow_key"
+    mount["VolumeOptions"] = {"DriverConfig": driver}
+    exact = create({"Image": IMG, "HostConfig": {"Mounts": [mount]}})
+    assert not exact.allowed
+    assert exact.rule == "create.mount"
+    # A near-miss that is no fold of a known field is still an unknown key: denied.
+    mount["VolumeOptions"] = {"Driver\u212aonfig": driver}
+    assert not create({"Image": IMG, "HostConfig": {"Mounts": [mount]}}).allowed
+
+
+SCRATCH = "/srv/lab/scratch/cell1"
+
+
+@pytest.mark.parametrize(
+    "mount",
+    [
+        {
+            "Type": "bind",
+            "Source": SCRATCH,
+            "Target": "/s",
+            "BindOptions": {"Propagation": "rshared"},
+        },
+        {
+            "Type": "bind",
+            "Source": SCRATCH,
+            "Target": "/s",
+            "BindOptions": {"propagation": "rshared"},
+        },
+        {"Type": "bind", "Source": SCRATCH, "Target": "/s", "BindOptions": {"Escape": True}},
+        {"Type": "volume", "Target": "/v", "VolumeOptions": {"Subpath": "../../x"}},
+        {"Type": "volume", "Target": "/v", "VolumeOptions": {"Escape": None}},
+        {"Type": "tmpfs", "Target": "/t", "TmpfsOptions": {"Options": [["exec"]]}},
+        {"Type": "tmpfs", "Target": "/t", "TmpfsOptions": {"options": [["exec"]]}},
+        {"Type": "tmpfs", "Target": "/t", "Source": "/etc"},
+        {"Type": "tmpfs", "Target": "/t", "BindOptions": {"Propagation": "private"}},
+        {"Type": "volume", "Target": "/v", "type": "bind", "Source": "/"},
+        {"Type": "image", "Source": "alpine", "Target": "/i"},
+        {"Type": "bind", "Source": SCRATCH, "Target": "relative"},
+    ],
+)
+def test_nested_mount_options_are_checked(mount: dict[str, Any]) -> None:
+    assert not create({"Image": IMG, "HostConfig": {"Mounts": [mount]}}).allowed
+
+
+def test_forwarded_create_body_is_rebuilt_not_passed_through() -> None:
+    decision = create(
+        {
+            "Image": "alpine",
+            "Cmd": "sleep 1",
+            "Env": ["A=1"],
+            "Healthcheck": {"Test": ["CMD", "true"], "Interval": 1000000000},
+            "ExposedPorts": {"80/tcp": {}},
+            "Volumes": {"/data": {}},
+            "HostConfig": {
+                "Devices": [],
+                "Runtime": "",
+                "CpuQuota": 5,
+                "Ulimits": [{"Name": "nofile", "Soft": 1024, "Hard": 4096}],
+                "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+            },
+        }
+    )
+    assert decision.allowed, decision.reason
+    body = json.loads(decision.body)
+    assert set(body) == {
+        "Image",
+        "Cmd",
+        "Env",
+        "Healthcheck",
+        "ExposedPorts",
+        "Volumes",
+        "HostConfig",
+        "Labels",
+        "NetworkingConfig",
+    }
+    assert set(body["HostConfig"]) == {
+        "Ulimits",
+        "RestartPolicy",
+        "NetworkMode",
+        "Memory",
+        "MemorySwap",
+        "NanoCpus",
+        "PidsLimit",
+    }
+    assert body["Image"] == ALP
+    assert not create({"Image": IMG, "Healthcheck": {"Test": ["x"], "Escape": 1}}).allowed
+
+
+def test_type_confusion_is_denied() -> None:
+    for host in [
+        {"Memory": "0"},
+        {"Memory": 1.5},
+        {"Memory": True},
+        {"Memory": 1 << 64},
+        {"CapAdd": "SYS_ADMIN"},
+        {"Privileged": "false"},
+        {"Binds": "/:/host"},
+        {"Mounts": {"Type": "bind"}},
+    ]:
+        decision = create({"Image": IMG, "HostConfig": host})
+        assert not decision.allowed, host
+    raw = b'{"Image": "alpine", "HostConfig": {"Memory": NaN}}'
+    assert not evaluate(DockerRequest("POST", "/containers/create", raw), CTX).allowed
+
+
+@pytest.mark.parametrize(
+    ("ulimits", "allowed"),
+    [
+        ([{"Name": "nofile", "Soft": 1024, "Hard": 65536}], True),
+        ([{"Name": "nproc", "Soft": 4096, "Hard": 4096}], True),
+        ([{"Name": "nofile", "Soft": 1024, "Hard": 65537}], False),
+        ([{"Name": "nproc", "Soft": 10, "Hard": 4097}], False),
+        ([{"Name": "nofile", "Soft": 2048, "Hard": 1024}], False),
+        ([{"Name": "nofile", "Soft": -1, "Hard": 1024}], False),
+        ([{"Name": "rtprio", "Soft": 99, "Hard": 99}], False),
+        ([{"Name": "memlock", "Soft": -1, "Hard": -1}], False),
+        ([{"Name": "core", "Soft": 0, "Hard": 0}], False),
+        ([{"Name": "nofile", "Soft": 1, "Hard": 1, "name": "rtprio"}], False),
+        ([{"Name": "nofile", "Soft": 1}], False),
+    ],
+)
+def test_ulimits(ulimits: list[dict[str, Any]], allowed: bool) -> None:
+    decision = create({"Image": IMG, "HostConfig": {"Ulimits": ulimits}})
+    assert decision.allowed is allowed, decision.reason
+
+
+@pytest.mark.parametrize(
+    ("policy", "allowed"),
+    [
+        ({"Name": "no"}, True),
+        ({"Name": ""}, True),
+        ({"Name": "no", "MaximumRetryCount": 0}, True),
+        ({"Name": "always"}, False),
+        ({"Name": "unless-stopped"}, False),
+        ({"Name": "on-failure", "MaximumRetryCount": 3}, False),
+        ({"Name": "no", "MaximumRetryCount": 3}, False),
+        ({"Name": "no", "name": "always"}, False),
+    ],
+)
+def test_restart_policy(policy: dict[str, Any], allowed: bool) -> None:
+    decision = create({"Image": IMG, "HostConfig": {"RestartPolicy": policy}})
+    assert decision.allowed is allowed, decision.reason
+
+
+def test_exec_bodies_are_rebuilt() -> None:
+    path = f"/v1.44/containers/{CID}/exec"
+    for body in [
+        {"Cmd": ["sh"], "privileged": True},
+        {"Cmd": ["sh"], "Privileged": False, "PRIVILEGED": True},
+        {"Cmd": ["sh"], "Escape": None},
+    ]:
+        decision = evaluate(DockerRequest("POST", path, json.dumps(body).encode(), own()), CTX)
+        assert not decision.allowed, body
+    ok = evaluate(DockerRequest("POST", path, b'{"Cmd": ["id"], "Container": "mine"}', own()), CTX)
+    assert ok.allowed
+    assert json.loads(ok.body) == {"Cmd": ["id"]}
+    exec_id = "e" * 64
+    mine = Target(kind="exec", id=exec_id, name=None, labels={RUN_LABEL: RUN})
+    start = f"/v1.44/exec/{exec_id}/start"
+    assert not evaluate(DockerRequest("POST", start, b'{"detach": true}', mine), CTX).allowed
+    assert not evaluate(DockerRequest("POST", start, b'{"Escape": 1}', mine), CTX).allowed
+    started = evaluate(DockerRequest("POST", start, b'{"Detach": false, "Tty": true}', mine), CTX)
+    assert started.allowed
+    assert json.loads(started.body) == {"Detach": False, "Tty": True}
+
+
+def test_volume_create_bodies_are_rebuilt() -> None:
+    for body in [
+        {"Name": "w", "labels": None},
+        {"Name": "w", "driveropts": {"device": "/"}},
+        {"Name": "w", "DRIVER": "nfs"},
+        {"Name": "w", "Escape": None},
+    ]:
+        decision = evaluate(
+            DockerRequest("POST", "/volumes/create", json.dumps(body).encode()), CTX
+        )
+        assert not decision.allowed, body
+
+
+def test_body_on_a_body_less_operation_is_denied() -> None:
+    body = b'{"Privileged": true, "Binds": ["/:/host"]}'
+    path = f"/v1.44/containers/{CID}/start"
+    decision = evaluate(DockerRequest("POST", path, body, own()), CTX)
+    assert not decision.allowed
+    assert decision.rule == "body.unexpected"
+    assert not evaluate(DockerRequest("GET", "/_ping", b"x"), CTX).allowed
+    started = evaluate(DockerRequest("POST", path, b"", own()), CTX)
+    assert started.allowed and started.body == b""
+
+
+@pytest.mark.parametrize("version", ["1.20", "1.24", "1.39", "0.99"])
+def test_old_api_versions_are_denied(version: str) -> None:
+    decision = evaluate(DockerRequest("POST", f"/v{version}/containers/{CID}/start"), CTX)
+    assert not decision.allowed
+    assert decision.rule == "api.version"
+    assert not evaluate(DockerRequest("GET", f"/v{version}/_ping"), CTX).allowed
+
+
+def test_agent_chosen_names_get_the_cell_prefix() -> None:
+    prefix = CTX.prefix
+    assert prefix == f"{RUN.lower()}-"
+    decision = create({"Image": IMG}, "/v1.44/containers/create?name=sbx")
+    assert decision.allowed
+    assert parse_qs(urlsplit(decision.path).query)["name"] == [f"{prefix}sbx"]
+    already = create({"Image": IMG}, f"/containers/create?name={prefix}sbx")
+    assert parse_qs(urlsplit(already.path).query)["name"] == [f"{prefix}sbx"]
+    unnamed = create({"Image": IMG}, "/containers/create")
+    assert unnamed.allowed and unnamed.path == "/containers/create"
+    assert not create({"Image": IMG}, "/containers/create?name=..x").allowed
+    assert not create({"Image": IMG}, "/containers/create?name=a&name=b").allowed
+    assert not create({"Image": IMG}, "/containers/create?unknown=1").allowed
+
+    squat_body = json.dumps({"Name": "lab-scratch"}).encode()
+    squat = evaluate(DockerRequest("POST", "/volumes/create", squat_body), CTX)
+    assert squat.allowed
+    assert json.loads(squat.body)["Name"] == f"{prefix}lab-scratch"
+    anonymous = evaluate(DockerRequest("POST", "/volumes/create", b"{}"), CTX)
+    assert anonymous.allowed and "Name" not in json.loads(anonymous.body)
+    custom = make_ctx(name_prefix="cell7-")
+    named = evaluate(DockerRequest("POST", "/volumes/create", b'{"Name": "w"}'), custom)
+    assert json.loads(named.body)["Name"] == "cell7-w"
+
+
+# --------------------------------------------------------------------------- review 1: lock
+
+
+LOCK_FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "cellguard" / "images.lock"
+PY_DIGEST = "sha256:f72a86806f92fe13a49f49aeca1db0b19ea5cf4a0470b842a01b0e14314945b8"
+
+
+def test_real_images_lock_schema() -> None:
+    images = load_images_lock(LOCK_FIXTURE)
+    assert images == (
+        AllowedImage(
+            "python-3.10-bookworm", "docker.io/library/python", PY_DIGEST, ("curl", "bash")
+        ),
+    )
+    ctx = make_ctx(images=images)
+    pinned = f"docker.io/library/python@{PY_DIGEST}"
+    for image in [
+        "python-3.10-bookworm",
+        f"docker.io/library/python@{PY_DIGEST}",
+        "python:3.10-bookworm",
+        "docker.io/library/python",
+        f"python:3.10@{PY_DIGEST}",
+    ]:
+        body = json.dumps({"Image": image}).encode()
+        decision = evaluate(DockerRequest("POST", "/containers/create", body), ctx)
+        assert decision.allowed, image
+        assert json.loads(decision.body)["Image"] == pinned
+    for image in [f"ghcr.io/x/python@{PY_DIGEST}", "python-3.10-bookworm:latest", "ubuntu"]:
+        body = json.dumps({"Image": image}).encode()
+        assert not evaluate(DockerRequest("POST", "/containers/create", body), ctx).allowed
+
+
+def test_repository_with_several_digests_matches_by_name_or_digest_only() -> None:
+    images = (
+        AllowedImage("py-a", "docker.io/library/python", DIGEST_A),
+        AllowedImage("py-b", "docker.io/library/python", DIGEST_B),
+    )
+    ctx = make_ctx(images=images)
+
+    def image_of(image: str) -> str | None:
+        body = json.dumps({"Image": image}).encode()
+        decision = evaluate(DockerRequest("POST", "/containers/create", body), ctx)
+        return json.loads(decision.body)["Image"] if decision.allowed else None
+
+    assert image_of("python:3.12") is None
+    assert image_of("py-b") == f"docker.io/library/python@{DIGEST_B}"
+    assert image_of(f"python@{DIGEST_A}") == f"docker.io/library/python@{DIGEST_A}"
+
+
 # --------------------------------------------------------------------------- images.lock
 
 
 def test_load_images_lock_yaml_json_and_list(tmp_path: Path) -> None:
     entries = [
         {
-            "name": "ghcr.io/usestrix/strix-sandbox:0.1",
+            "name": "strix-sandbox-0.1",
+            "image": "ghcr.io/usestrix/strix-sandbox",
             "digest": DIGEST_A,
             "expect_tools": ["nmap"],
         },
-        {"name": "alpine", "digest": DIGEST_B, "expect_tools": []},
+        {"name": "alpine-3", "image": "docker.io/library/alpine", "digest": DIGEST_B},
     ]
     yml = tmp_path / "images.lock"
     yml.write_text(
-        "- name: ghcr.io/usestrix/strix-sandbox:0.1\n"
-        f"  digest: {DIGEST_A}\n"
-        "  expect_tools: [nmap]\n"
-        "- name: alpine\n"
-        f"  digest: {DIGEST_B}\n"
-        "  expect_tools: []\n"
+        "images:\n"
+        "  - name: strix-sandbox-0.1\n"
+        "    image: ghcr.io/usestrix/strix-sandbox\n"
+        f"    digest: {DIGEST_A}\n"
+        "    expect_tools: [nmap]\n"
+        "  - name: alpine-3\n"
+        "    image: docker.io/library/alpine\n"
+        f"    digest: {DIGEST_B}\n"
     )
     js = tmp_path / "images.json"
     js.write_text(json.dumps({"images": entries}))
     expected = (
-        AllowedImage("ghcr.io/usestrix/strix-sandbox:0.1", DIGEST_A, ("nmap",)),
-        AllowedImage("alpine", DIGEST_B, ()),
+        AllowedImage("strix-sandbox-0.1", "ghcr.io/usestrix/strix-sandbox", DIGEST_A, ("nmap",)),
+        AllowedImage("alpine-3", "docker.io/library/alpine", DIGEST_B, ()),
     )
     assert load_images_lock(yml) == expected
     assert load_images_lock(str(js)) == expected
@@ -649,10 +978,17 @@ def test_load_images_lock_yaml_json_and_list(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "entries",
     [
-        [{"name": "x", "digest": "sha256:short"}],
-        [{"name": "", "digest": DIGEST_A}],
-        [{"digest": DIGEST_A}],
-        [{"name": "x", "digest": DIGEST_A, "expect_tools": "nmap"}],
+        [{"name": "x", "image": "alpine", "digest": "sha256:short"}],
+        [{"name": "", "image": "alpine", "digest": DIGEST_A}],
+        [{"image": "alpine", "digest": DIGEST_A}],
+        [{"name": "x", "digest": DIGEST_A}],  # no image repository
+        [{"name": "x", "image": "UPPER", "digest": DIGEST_A}],
+        [{"name": "x", "image": f"alpine@{DIGEST_B}", "digest": DIGEST_A}],
+        [{"name": "x", "image": "alpine", "digest": DIGEST_A, "expect_tools": "nmap"}],
+        [
+            {"name": "x", "image": "alpine", "digest": DIGEST_A},
+            {"name": "x", "image": "busybox", "digest": DIGEST_B},
+        ],
         ["x"],
         {"not": "a list"},
     ],
@@ -702,7 +1038,7 @@ def test_decision_log_rejects_bad_run_id(tmp_path: Path) -> None:
 
 def test_config_from_env(tmp_path: Path) -> None:
     lock = tmp_path / "images.lock"
-    lock.write_text(f"- name: alpine\n  digest: {DIGEST_B}\n  expect_tools: []\n")
+    lock.write_text(f"images:\n  - name: alpine-3\n    image: alpine\n    digest: {DIGEST_B}\n")
     env = {
         "LAB_RUN_ID": RUN,
         "LAB_EVIDENCE_DIR": str(tmp_path / "ev"),
@@ -714,11 +1050,13 @@ def test_config_from_env(tmp_path: Path) -> None:
         "LAB_CELLGUARD_MEMORY": "268435456",
         "LAB_CELLGUARD_NANO_CPUS": "500000000",
         "LAB_CELLGUARD_PIDS": "128",
+        "LAB_CELLGUARD_MAX_CONNECTIONS": "8",
     }
     config = CellGuardConfig.from_env(env)
     assert config.context.run_id == RUN
     assert config.context.network == NETWORK
-    assert config.context.images == (AllowedImage("alpine", DIGEST_B, ()),)
+    assert config.context.images == (AllowedImage("alpine-3", "alpine", DIGEST_B),)
+    assert config.max_connections == 8
     assert config.context.memory_bytes == 268435456
     assert config.context.pids_limit == 128
     assert config.context.scratch_dir is None
@@ -854,7 +1192,7 @@ async def test_proxy_forwards_rewritten_create_and_logs(tmp_path: Path) -> None:
         resp = await call(sock, req("POST", "/v1.44/containers/create?name=sbx", body))
         assert resp.startswith(b"HTTP/1.1 201")
         method, target, headers, sent = daemon.requests[-1]
-        assert (method, target) == ("POST", "/v1.44/containers/create?name=sbx")
+        assert (method, target) == ("POST", f"/v1.44/containers/create?name={CTX.prefix}sbx")
         assert headers["connection"] == "close"
         forwarded = json.loads(sent)
         assert forwarded["HostConfig"]["NetworkMode"] == NETWORK
@@ -970,6 +1308,79 @@ async def test_proxy_accepts_chunked_request_bodies(tmp_path: Path) -> None:
         assert json.loads(daemon.requests[-1][3])["Labels"][RUN_LABEL] == RUN
 
 
+def records_of(tmp_path: Path) -> list[dict[str, Any]]:
+    lines = (tmp_path / DECISIONS_FILE).read_text().splitlines()
+    return [json.loads(line) for line in lines]
+
+
+async def test_proxy_rejects_non_ascii_content_length_with_a_record(tmp_path: Path) -> None:
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        # "\xb2" is SUPERSCRIPT TWO in latin-1: str.isdigit() is True, int() fails.
+        raw = b"POST /v1.44/volumes/create HTTP/1.1\r\nContent-Length: \xb2\r\n\r\n{}"
+        resp = await call(sock, raw)
+        assert resp.startswith(b"HTTP/1.1 400")
+        assert daemon.requests == []
+    assert [(r["allowed"], r["rule"]) for r in records_of(tmp_path)] == [(False, "http.400")]
+
+
+async def test_proxy_fails_closed_and_records_unexpected_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(request: DockerRequest, ctx: CellContext) -> Decision:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("cell.cellguard.proxy.evaluate", broken)
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        resp = await call(sock, req("GET", "/v1.44/version"))
+        assert resp.startswith(b"HTTP/1.1 500")
+        assert daemon.requests == []
+    records = records_of(tmp_path)
+    assert [(r["allowed"], r["rule"], r["op"]) for r in records] == [
+        (False, "http.500", "system.version")
+    ]
+
+
+async def test_proxy_caps_concurrent_connections(tmp_path: Path) -> None:
+    with short_tmp() as d:
+        daemon = FakeDaemon(d / "up.sock")
+        await daemon.start()
+        guard = CellGuard(CTX, str(daemon.sock), DecisionLog(RUN, tmp_path / DECISIONS_FILE), 1)
+        server = await guard.serve(d / "guard.sock")
+        try:
+            _r, held = await asyncio.open_unix_connection(str(d / "guard.sock"))
+            held.write(b"GET /_ping HTTP/1.1\r\n")  # an unfinished head keeps the slot busy
+            await held.drain()
+            await asyncio.sleep(0.1)
+            resp = await call(d / "guard.sock", req("GET", "/_ping"))
+            assert resp.startswith(b"HTTP/1.1 503")
+            held.close()
+            await asyncio.sleep(0.1)
+            resp = await call(d / "guard.sock", req("GET", "/_ping"))
+            assert resp.startswith(b"HTTP/1.1 200")
+        finally:
+            server.close()
+            await server.wait_closed()
+            await daemon.close()
+    rules = [r["rule"] for r in records_of(tmp_path)]
+    assert rules == ["http.503", "http.400", "system.ping"]  # the held head is dropped: 400
+
+
+async def test_proxy_resolves_agent_names_with_the_cell_prefix(tmp_path: Path) -> None:
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        prefixed = {
+            "Id": "f" * 64,
+            "Name": f"/{CTX.prefix}sbx",
+            "Config": {"Labels": {RUN_LABEL: RUN}},
+        }
+        daemon.containers[f"{CTX.prefix}sbx"] = prefixed
+        # An unprefixed container of that name exists too (not this cell's): the
+        # prefixed one wins.
+        daemon.containers["sbx"] = daemon.containers["theirs"]
+        resp = await call(sock, req("POST", "/v1.44/containers/sbx/start"))
+        assert resp.startswith(b"HTTP/1.1 200")
+        assert daemon.requests[-1][1] == "/v1.44/containers/" + "f" * 64 + "/start"
+
+
 # --------------------------------------------------------------------------- podman integration
 
 
@@ -988,6 +1399,18 @@ def _podman_client() -> Any:
     except Exception as exc:
         pytest.skip(f"Podman API or {ALPINE} unavailable: {exc}")
     return client, image
+
+
+def raw_request(sock: Path, method: str, path: str, doc: dict[str, Any]) -> tuple[int, bytes]:
+    """One raw HTTP request on a Unix socket (bypasses the SDK's body building)."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(30)
+        conn.connect(str(sock))
+        conn.sendall(req(method, path, json.dumps(doc).encode()))
+        data = b""
+        while chunk := conn.recv(65536):
+            data += chunk
+    return int(data.split(b" ", 2)[1]), data
 
 
 class ThreadedGuard:
@@ -1021,13 +1444,14 @@ def test_podman_integration(tmp_path: Path) -> None:
     network = real.networks.create(f"cg-test-{suffix}", internal=True)
     ctx = make_ctx(
         network=network.name,
-        images=(AllowedImage(name=ALPINE, digest=digests[0]),),
+        images=(AllowedImage("alpine-3.20", "docker.io/library/alpine", digests[0]),),
         scratch_dir=None,
         memory_bytes=64 << 20,
         nano_cpus=500_000_000,
         pids_limit=64,
     )
     created: list[str] = []
+    volumes: list[str] = []
     with short_tmp() as d:
         listen = d / "guard.sock"
         guard = CellGuard(ctx, str(PODMAN_SOCK), DecisionLog(RUN, tmp_path / DECISIONS_FILE))
@@ -1047,6 +1471,37 @@ def test_podman_integration(tmp_path: Path) -> None:
             assert attrs["HostConfig"]["NanoCpus"] == 500_000_000
             assert attrs["HostConfig"]["PidsLimit"] == 64
             assert attrs["Image"] == image.id  # the tag was pinned to the listed digest
+            # The agent's name got the cell prefix; the unprefixed name still resolves.
+            assert attrs["Name"].lstrip("/") == f"{ctx.prefix}cg-sbx-{suffix}"
+            assert client.containers.get(f"cg-sbx-{suffix}").id == sbx.id
+
+            # C1: case-folded shadow keys that would drop the label and limits are denied
+            # before the daemon sees them; no container appears.
+            before = {c.id for c in real.containers.list(all=True)}
+            shadow = {
+                "Image": ALPINE,
+                "Cmd": ["true"],
+                "HostConfig": {
+                    "Memory": 1,
+                    "MemorySwap": 1,
+                    "PidsLimit": 1,
+                    "memory": 0,
+                    "memoryswap": 0,
+                    "pidslimit": 0,
+                },
+                "Labels": {},
+                "labels": None,
+            }
+            status, reply = raw_request(listen, "POST", "/v1.44/containers/create", shadow)
+            assert status == 403, reply
+            assert b"body.shadow_key" in reply
+            assert {c.id for c in real.containers.list(all=True)} == before
+
+            # Volume create: forced label and prefixed name.
+            volume = client.volumes.create(name=f"cg-vol-{suffix}")
+            volumes.append(volume.name)
+            assert volume.name == f"{ctx.prefix}cg-vol-{suffix}"
+            assert real.volumes.get(volume.name).attrs["Labels"][RUN_LABEL] == RUN
 
             # Streams through exec work (upgrade passthrough).
             code, out = sbx.exec_run(["echo", "through-the-guard"])
@@ -1080,6 +1535,9 @@ def test_podman_integration(tmp_path: Path) -> None:
             for cid in created:
                 with contextlib.suppress(Exception):
                     real.api.remove_container(cid, force=True)
+            for name in volumes:
+                with contextlib.suppress(Exception):
+                    real.volumes.get(name).remove(force=True)
             with contextlib.suppress(Exception):
                 network.remove()
             runner.stop()
