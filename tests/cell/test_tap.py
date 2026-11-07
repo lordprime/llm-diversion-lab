@@ -22,11 +22,14 @@ from cell.tap.recorder import (
     EVENTS_FILE,
     TAP_STREAM,
     Recorder,
+    RequestMeta,
+    ResponseMeta,
     TapConfig,
     extract_requested_model,
     extract_returned_model,
     find_tags,
     parse_tags,
+    redact_path,
 )
 from control.core.ids import new_id
 from control.core.models import LlmCall, LlmRole
@@ -98,6 +101,18 @@ def test_find_tags_partially_escaped_json() -> None:
 def test_find_tags_in_object_key() -> None:
     body = ('{"' + _escape_all(TAG) + '": 1}').encode()
     assert find_tags(body, [TAG]) is True
+
+
+def test_find_tags_in_earlier_duplicate_key() -> None:
+    # json.loads keeps only the last value of a duplicate key; the raw search still sees it.
+    body = ('{"content": "' + TAG + '", "content": "clean"}').encode()
+    assert find_tags(body, [TAG]) is True
+
+
+def test_find_tags_digits_only_tag_inside_json_number() -> None:
+    digits = "1234567890123456"
+    body = ('{"max_tokens": ' + digits + "}").encode()
+    assert find_tags(body, [digits]) is True
 
 
 def test_find_tags_non_json_falls_back_to_raw_bytes() -> None:
@@ -249,6 +264,78 @@ def test_call_without_response(tmp_path: Path) -> None:
     assert not (tmp_path / "llm" / "0000.resp.body").exists()
 
 
+def test_meta_sidecar(tmp_path: Path) -> None:
+    rec = _recorder(tmp_path)
+    req_meta = RequestMeta(
+        method="POST",
+        path="/v1/messages/count_tokens?beta=true",
+        content_type="application/json",
+        content_encoding=None,
+    )
+    resp_meta = ResponseMeta(
+        status=429, content_type="application/json", content_encoding="gzip", decoded=False
+    )
+    rec.record(_request("x"), b"raw gzip bytes", TS, req_meta, resp_meta)
+    raw = (tmp_path / "llm" / "0000.meta.json").read_bytes()
+    assert json.loads(raw) == {
+        "seq": 0,
+        "request": {
+            "method": "POST",
+            "path": "/v1/messages/count_tokens?beta=true",
+            "content_type": "application/json",
+            "content_encoding": None,
+            "decoded": True,
+        },
+        "response": {
+            "status": 429,
+            "content_type": "application/json",
+            "content_encoding": "gzip",
+            "decoded": False,
+            "stored": True,
+        },
+    }
+
+
+def test_meta_sidecar_without_response(tmp_path: Path) -> None:
+    rec = _recorder(tmp_path)
+    rec.record(_request("x"), None, TS, RequestMeta(method="GET", path="/v1/models"))
+    meta = json.loads((tmp_path / "llm" / "0000.meta.json").read_bytes())
+    assert meta["request"]["method"] == "GET"
+    assert meta["response"] is None
+
+
+def test_meta_sidecar_is_write_once_and_resumed(tmp_path: Path) -> None:
+    llm = tmp_path / "llm"
+    llm.mkdir()
+    (llm / "0004.meta.json").write_bytes(b"{}")
+    call = _recorder(tmp_path).record(_request("x"), _response(), TS)
+    assert call.seq == 5
+    assert (llm / "0004.meta.json").read_bytes() == b"{}"
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/v1/messages", "/v1/messages"),
+        ("/v1/messages?beta=true", "/v1/messages?beta=true"),
+        ("/v1/models?key=AIzaSECRET&x=1", "/v1/models?key=REDACTED&x=1"),
+        ("/a?API_KEY=s&Access_Token=t&b", "/a?API_KEY=REDACTED&Access_Token=REDACTED&b"),
+        ("/a?x-api-key=s", "/a?x-api-key=REDACTED"),
+        ("/a?%6Bey=s", "/a?%6Bey=REDACTED"),
+    ],
+)
+def test_redact_path(path: str, expected: str) -> None:
+    assert redact_path(path) == expected
+
+
+def test_meta_path_query_credentials_are_redacted(tmp_path: Path) -> None:
+    rec = _recorder(tmp_path)
+    rec.record(_request("x"), None, TS, RequestMeta(method="GET", path="/v1/m?key=SECRETVALUE"))
+    raw = (tmp_path / "llm" / "0000.meta.json").read_bytes()
+    assert b"SECRETVALUE" not in raw
+    assert json.loads(raw)["request"]["path"] == "/v1/m?key=REDACTED"
+
+
 def test_files_are_write_once(tmp_path: Path) -> None:
     llm = tmp_path / "llm"
     llm.mkdir()
@@ -272,13 +359,40 @@ def test_existing_file_fails_loudly_and_is_kept(tmp_path: Path) -> None:
     assert rec.record(_request("y"), _response(), TS).seq == 1
 
 
-def test_response_file_collision_fails_loudly(tmp_path: Path) -> None:
+def test_response_file_collision_still_writes_event(tmp_path: Path) -> None:
+    """A response that cannot be stored still leaves the call's event, then raises."""
     rec = _recorder(tmp_path)
-    pending = rec.begin(_request("x"), TS)
+    pending = rec.begin(_request(f"tagged {TAG}"), TS)
     (tmp_path / "llm" / "0000.resp.body").write_bytes(b"not ours")
     with pytest.raises(FileExistsError):
-        rec.finish(pending, _response())
+        rec.finish(pending, _response("m-resp"), ResponseMeta(status=200))
     assert (tmp_path / "llm" / "0000.resp.body").read_bytes() == b"not ours"
+    (line,) = (tmp_path / EVENTS_FILE).read_bytes().splitlines()
+    call = LlmCall.model_validate_json(line)
+    assert call.seq == 0
+    assert call.tag_present is True
+    assert call.first_tag_seq == 0
+    assert call.response_artifact is None
+    assert call.returned_model == "m-resp"
+    meta = json.loads((tmp_path / "llm" / "0000.meta.json").read_bytes())
+    assert meta["response"]["status"] == 200
+    assert meta["response"]["stored"] is False
+    # The next call is unaffected.
+    assert rec.record(_request("y"), _response(), TS).seq == 1
+
+
+def test_meta_file_collision_still_writes_event(tmp_path: Path) -> None:
+    rec = _recorder(tmp_path)
+    pending = rec.begin(_request(TAG), TS)
+    (tmp_path / "llm" / "0000.meta.json").write_bytes(b"not ours")
+    with pytest.raises(FileExistsError):
+        rec.finish(pending, _response())
+    assert (tmp_path / "llm" / "0000.meta.json").read_bytes() == b"not ours"
+    assert (tmp_path / "llm" / "0000.resp.body").read_bytes() == _response()
+    (line,) = (tmp_path / EVENTS_FILE).read_bytes().splitlines()
+    call = LlmCall.model_validate_json(line)
+    assert call.tag_present is True
+    assert call.response_artifact == "llm/0000.resp.body"
 
 
 def test_finish_twice_is_refused(tmp_path: Path) -> None:
@@ -416,13 +530,65 @@ def test_addon_refuses_to_forward_unrecorded_request(tmp_path: Path) -> None:
 
 def test_addon_withholds_unrecorded_response(tmp_path: Path) -> None:
     tap = LlmTap(_recorder(tmp_path))
-    flow = _flow(_request("x"), resp=None)
+    flow = _flow(_request(TAG), resp=None)
     tap.request(flow)
     (tmp_path / "llm" / "0000.resp.body").write_bytes(b"not ours")
     flow.response = http.Response.make(200, _response(), {"content-type": "application/json"})
     tap.response(flow)
     assert flow.response.status_code == 502
     assert (tmp_path / "llm" / "0000.resp.body").read_bytes() == b"not ours"
+    # The call reached the gateway, so its event is still recorded.
+    (line,) = (tmp_path / EVENTS_FILE).read_bytes().splitlines()
+    call = LlmCall.model_validate_json(line)
+    assert call.tag_present is True
+    assert call.response_artifact is None
+
+
+def test_addon_writes_meta_without_credentials(tmp_path: Path) -> None:
+    tap = LlmTap(_recorder(tmp_path))
+    flow = _flow(_request("x"), resp=None)
+    flow.request.path = "/v1/messages/count_tokens?beta=true"
+    flow.request.headers["content-type"] = "application/json"
+    for name in (
+        "authorization",
+        "x-api-key",
+        "anthropic-api-key",
+        "cookie",
+        "proxy-authorization",
+    ):
+        flow.request.headers[name] = f"SECRET-{name}"
+    tap.request(flow)
+    flow.response = http.Response.make(
+        404, b"not found", {"content-type": "text/plain", "set-cookie": "SECRET-set-cookie"}
+    )
+    tap.response(flow)
+    raw = (tmp_path / "llm" / "0000.meta.json").read_bytes()
+    assert b"SECRET" not in raw
+    meta = json.loads(raw)
+    assert meta["request"] == {
+        "method": "POST",
+        "path": "/v1/messages/count_tokens?beta=true",
+        "content_type": "application/json",
+        "content_encoding": None,
+        "decoded": True,
+    }
+    assert meta["response"]["status"] == 404
+    assert meta["response"]["content_type"] == "text/plain"
+    assert meta["response"]["stored"] is True
+
+
+def test_addon_marks_undecodable_body_as_raw(tmp_path: Path) -> None:
+    tap = LlmTap(_recorder(tmp_path))
+    flow = _flow(b"", resp=None)
+    flow.request.headers["content-encoding"] = "gzip"
+    flow.request.raw_content = b"definitely not gzip"
+    tap.request(flow)
+    assert (tmp_path / "llm" / "0000.req.json").read_bytes() == b"definitely not gzip"
+    tap.error(flow)
+    meta = json.loads((tmp_path / "llm" / "0000.meta.json").read_bytes())
+    assert meta["request"]["content_encoding"] == "gzip"
+    assert meta["request"]["decoded"] is False
+    assert meta["response"] is None
 
 
 def test_addon_ignores_flows_it_did_not_see(tmp_path: Path) -> None:
