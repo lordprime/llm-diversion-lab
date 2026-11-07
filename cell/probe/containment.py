@@ -2,38 +2,53 @@
 
 Run as a sibling container on the agent's network (the self-test does this)::
 
-    python -m cell.probe.containment \\
-        --dest internet:tcp:1.1.1.1:443 --dest internet:dns:example.com \\
-        --dest host:tcp:172.30.0.1:22 --dest lan:tcp:192.168.1.1:80 \\
-        [--sinkhole <catcher-ip>] [--timeout 2]
+    python -m cell.probe.containment --defaults \\
+        --reach tap:8080 --sinkhole <catcher-ip> --lan 192.168.1.1 \\
+        [--host-gateway 172.30.0.1] [--dest lan:tcp:10.0.0.1:22 ...] [--timeout 2]
 
-or with ``--defaults`` (plus ``--host-gateway`` / ``--lan``) for the standard set from
-:func:`default_destinations`. It prints one JSON :class:`ContainmentReport` on stdout and
-exits ``0`` if the cell is contained, ``1`` if not, ``2`` on a usage error.
+It prints one JSON :class:`ContainmentReport` on stdout and exits ``0`` if the cell is
+contained, ``1`` if not, ``2`` on a usage error.
 
 Destinations are ``<category>:<kind>:<target>[:<port>]``:
 
-* category ``internet``, ``host`` (the LXC/host bridge gateway) or ``lan`` (home LAN);
+* category ``internet``, ``host`` (the LXC/host bridge gateway) or ``lan`` (home LAN):
+  **must-fail**; or ``reach``: **must-reach**, a positive control (the tap, the target)
+  proving that the probe has a working network at all;
 * kind ``tcp`` (a TCP connect to ``target:port``; IPv6 literals in brackets) or ``dns``
   (resolve ``target`` through the cell's resolver; no port).
 
-Every destination is *must-fail*. Outcomes, per destination:
+A must-fail ``tcp`` target **must be an IP literal**: with a hostname, a resolution
+failure would look like containment although no address was tried. Hostnames are
+rejected at parse time, and a directly constructed one is reported as ``error``. A
+``reach`` target may be a cell service name; if it does not resolve that is an
+``error`` too (and a must-reach failure).
+
+Outcomes, per destination:
 
 * ``reachable``: the TCP handshake completed, or the name resolved to an address that
   is not one of the ``--sinkhole`` addresses (the cell's resolver is the callback
-  catcher, which answers every name with its own IP; that answer is not a leak).
+  catcher, which answers every name with its own IP; that answer is not a leak). For a
+  ``reach`` DNS destination any answer counts.
 * ``refused``: the connection was actively refused (``ECONNREFUSED``). The lab's
   firewalls **drop** cell egress and never reject it, so a refusal means something on
-  the path answered: it counts as a breach.
-* ``unreachable``: no route / host or network unreachable / not permitted, or the name
-  did not resolve.
+  the path answered: for a must-fail destination it is a breach.
+* ``unreachable``: no route / host or network unreachable / not permitted, or (DNS
+  only) the name did not resolve.
 * ``timeout``: nothing answered within the timeout (the expected result under DROP).
-* ``error``: the probe could not test the destination (an unexpected exception). This
-  is reported, never raised, and fails closed: an untested destination proves nothing.
+* ``error``: the probe could not test the destination: an unexpected exception, a tcp
+  hostname that did not resolve, or a destination that could not be determined (no
+  host gateway, no LAN address). Reported, never raised; it fails closed.
 
-:func:`is_contained` is true only if at least one destination was probed and every
-outcome is ``unreachable`` or ``timeout``. The probe itself never raises on a
-destination, whatever the connector does.
+:func:`is_contained` is true only if **every expected category** (by default all four,
+``reach`` included) has at least one result, every must-fail outcome is
+``unreachable`` or ``timeout``, and every must-reach outcome is ``reachable``.
+
+With ``--defaults`` (or no ``--dest`` at all) the probe adds: public IPv4 and IPv6
+addresses on 443 and a public name; the host gateway from ``--host-gateway``, else the
+default route in ``/proc/net/route``, else an ``error`` result; the home LAN from
+``--lan`` (required, or ``--allow-default-lan`` for 192.168.1.1). ``--reach HOST:PORT``
+adds must-reach destinations; without one the ``reach`` category is missing and the
+cell is reported as not contained.
 
 Stdlib only: the probe image needs nothing but Python.
 """
@@ -54,6 +69,7 @@ from enum import StrEnum
 from typing import Any
 
 __all__ = [
+    "ALL_CATEGORIES",
     "DEFAULT_INTERNET",
     "DEFAULT_LAN",
     "DEFAULT_TIMEOUT_S",
@@ -67,6 +83,7 @@ __all__ = [
     "ProbeResult",
     "Resolver",
     "default_destinations",
+    "default_gateway",
     "dns_resolve",
     "is_contained",
     "main",
@@ -77,22 +94,37 @@ __all__ = [
 
 #: Per-destination timeout in seconds.
 DEFAULT_TIMEOUT_S = 2.0
-#: Well-known public anycast resolvers on 443 and a name to resolve.
-DEFAULT_INTERNET: tuple[tuple[str, int], ...] = (("1.1.1.1", 443), ("9.9.9.9", 443))
+#: Well-known public anycast resolvers (IPv4 and IPv6) on 443, and a name to resolve.
+DEFAULT_INTERNET: tuple[tuple[str, int], ...] = (
+    ("1.1.1.1", 443),
+    ("9.9.9.9", 443),
+    ("2606:4700:4700::1111", 443),
+    ("2620:fe::fe", 443),
+)
 DEFAULT_DNS_NAME = "example.com"
-#: The usual home-router address; override with ``--lan``.
+#: The usual home-router address, used only with ``--allow-default-lan``.
 DEFAULT_LAN: tuple[str, ...] = ("192.168.1.1",)
 #: Ports tried on the host gateway: SSH, HTTP(S), the Docker API, Postgres, the APIs.
 HOST_PORTS: tuple[int, ...] = (22, 80, 443, 2375, 5432, 8000)
 LAN_PORTS: tuple[int, ...] = (80, 443)
+DEFAULT_ROUTE_FILE = "/proc/net/route"
 
 
 class Category(StrEnum):
-    """What a must-fail destination stands for."""
+    """What a destination stands for; all are must-fail except ``reach``."""
 
     INTERNET = "internet"
     HOST = "host"
     LAN = "lan"
+    REACH = "reach"
+
+    @property
+    def must_reach(self) -> bool:
+        return self is Category.REACH
+
+
+#: The categories :func:`probe` expects by default: each must have a result.
+ALL_CATEGORIES: frozenset[Category] = frozenset(Category)
 
 
 class Kind(StrEnum):
@@ -108,7 +140,7 @@ class Outcome(StrEnum):
     ERROR = "error"
 
 
-#: Outcomes that show the destination was *not* reached.
+#: Outcomes that show a must-fail destination was *not* reached.
 _CONTAINED_OUTCOMES = frozenset({Outcome.UNREACHABLE, Outcome.TIMEOUT})
 
 #: errnos meaning "no path": routing failure or a local firewall verdict.
@@ -138,10 +170,14 @@ class Destination:
     port: int | None = None
     #: DNS only: answers that are the cell's own sinkhole (the catcher), not a leak.
     sinkhole: tuple[str, ...] = ()
+    #: Set when the destination could not be determined (e.g. no host gateway):
+    #: probing it yields ``error`` with this text, so the category fails closed.
+    unavailable: str | None = None
 
     @property
     def label(self) -> str:
-        target = f"[{self.target}]" if ":" in self.target else self.target
+        target = self.target or "?"
+        target = f"[{target}]" if ":" in target else target
         where = target if self.port is None else f"{target}:{self.port}"
         return f"{self.category}:{self.kind}:{where}"
 
@@ -152,6 +188,7 @@ class Destination:
             "kind": str(self.kind),
             "target": self.target,
             "port": self.port,
+            "must_reach": self.category.must_reach,
         }
 
 
@@ -169,9 +206,17 @@ class ProbeResult:
         """True if the destination answered (``reachable`` or ``refused``)."""
         return self.outcome in (Outcome.REACHABLE, Outcome.REFUSED)
 
+    @property
+    def ok(self) -> bool:
+        """Must-reach: ``reachable``. Must-fail: ``unreachable`` or ``timeout``."""
+        if self.destination.category.must_reach:
+            return self.outcome is Outcome.REACHABLE
+        return self.outcome in _CONTAINED_OUTCOMES
+
     def to_dict(self) -> dict[str, Any]:
         return {
             **self.destination.to_dict(),
+            "ok": self.ok,
             "outcome": str(self.outcome),
             "detail": self.detail,
             "errno": self.errno_name,
@@ -184,6 +229,7 @@ class ProbeResult:
 class ContainmentReport:
     results: tuple[ProbeResult, ...]
     timeout_s: float = DEFAULT_TIMEOUT_S
+    expected: frozenset[Category] = ALL_CATEGORIES
     started_at: float = field(default_factory=time.time)
 
     @property
@@ -191,13 +237,25 @@ class ContainmentReport:
         return is_contained(self)
 
     @property
+    def missing_categories(self) -> frozenset[Category]:
+        """Expected categories without any result."""
+        return self.expected - {r.destination.category for r in self.results}
+
+    @property
     def breaches(self) -> tuple[ProbeResult, ...]:
-        """Results that break containment (reached, refused, or untestable)."""
-        return tuple(r for r in self.results if r.outcome not in _CONTAINED_OUTCOMES)
+        """Must-fail results that break containment (reached, refused or untestable)."""
+        return tuple(r for r in self.results if not r.destination.category.must_reach and not r.ok)
+
+    @property
+    def reach_failures(self) -> tuple[ProbeResult, ...]:
+        """Must-reach results that did not reach: the probe's network is not proven."""
+        return tuple(r for r in self.results if r.destination.category.must_reach and not r.ok)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "contained": self.contained,
+            "expected_categories": sorted(str(c) for c in self.expected),
+            "missing_categories": sorted(str(c) for c in self.missing_categories),
             "timeout_s": self.timeout_s,
             "started_at": self.started_at,
             "results": [r.to_dict() for r in self.results],
@@ -208,13 +266,16 @@ class ContainmentReport:
 
 
 def is_contained(report: ContainmentReport) -> bool:
-    """True only if something was probed and no must-fail destination was reached.
+    """True only if every expected category was probed and every result is ``ok``.
 
-    Any ``reachable`` or ``refused`` destination (internet, host or LAN) is a critical
-    failure; an ``error`` also fails closed, since an untested destination proves
-    nothing, and so does an empty report.
+    A ``reachable`` or ``refused`` must-fail destination (internet, host or LAN) is a
+    critical failure; an ``error`` fails closed (an untested destination proves
+    nothing); a must-reach destination that was not reached means the probe's network
+    is unproven; an empty report or an expected category with no result fails too.
     """
-    return bool(report.results) and all(r.outcome in _CONTAINED_OUTCOMES for r in report.results)
+    return (
+        bool(report.results) and not report.missing_categories and all(r.ok for r in report.results)
+    )
 
 
 # --------------------------------------------------------------------- real I/O
@@ -252,7 +313,43 @@ def dns_resolve(name: str, timeout: float) -> list[str]:
     return result
 
 
+_RTF_UP, _RTF_GATEWAY = 0x1, 0x2
+
+
+def default_gateway(route_file: str = DEFAULT_ROUTE_FILE) -> str | None:
+    """The IPv4 default-route gateway from ``/proc/net/route``, or ``None``.
+
+    A Docker ``internal`` network has no default route, so inside a cell this is
+    usually ``None``: pass ``--host-gateway`` (the cell network's bridge address).
+    """
+    try:
+        with open(route_file, encoding="ascii") as fh:
+            lines = fh.read().splitlines()[1:]
+    except (OSError, UnicodeDecodeError):
+        return None
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 8:
+            continue
+        try:
+            dest, gateway, flags, mask = (int(fields[i], 16) for i in (1, 2, 3, 7))
+        except ValueError:
+            continue
+        if dest == 0 and mask == 0 and flags & _RTF_UP and flags & _RTF_GATEWAY and gateway:
+            # The kernel prints the address in host (little-endian) byte order.
+            return str(ipaddress.IPv4Address(gateway.to_bytes(4, "little")))
+    return None
+
+
 # --------------------------------------------------------------------- probing
+
+
+def _is_ip(text: str) -> bool:
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    return True
 
 
 def _errno_name(exc: BaseException) -> str | None:
@@ -274,11 +371,12 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
-def _classify(exc: BaseException) -> tuple[Outcome, str | None]:
+def _classify(kind: Kind, exc: BaseException) -> tuple[Outcome, str | None]:
     """Map an exception from the connector or resolver to an outcome and errno name."""
     if isinstance(exc, socket.gaierror):
-        # Resolution failed (no such name, resolver unreachable, ...): nothing reached.
-        return Outcome.UNREACHABLE, _gai_name(exc)
+        # DNS: resolution failed (no such name, resolver unreachable...): nothing reached.
+        # TCP: a hostname did not resolve, so no address was tried: untested, an error.
+        return (Outcome.UNREACHABLE if kind is Kind.DNS else Outcome.ERROR), _gai_name(exc)
     if isinstance(exc, TimeoutError):  # socket.timeout is TimeoutError
         return Outcome.TIMEOUT, _errno_name(exc)
     if isinstance(exc, ConnectionRefusedError):
@@ -301,20 +399,24 @@ def _probe_one(
     def elapsed() -> float:
         return (time.monotonic() - start) * 1000.0
 
+    if dest.unavailable is not None:
+        return ProbeResult(dest, Outcome.ERROR, dest.unavailable, elapsed())
     try:
         if dest.kind is Kind.TCP:
             if dest.port is None:
                 raise ValueError(f"tcp destination {dest.label} has no port")
+            if not dest.category.must_reach and not _is_ip(dest.target):
+                raise ValueError(f"must-fail tcp target {dest.target!r} is not an IP literal")
             connect(dest.target, dest.port, timeout)
             return ProbeResult(dest, Outcome.REACHABLE, "tcp handshake completed", elapsed())
         answers = tuple(resolve(dest.target, timeout))
     except Exception as exc:  # reported, never raised: that is the probe's contract
-        outcome, code = _classify(exc)
+        outcome, code = _classify(dest.kind, exc)
         gai = code if isinstance(exc, socket.gaierror) else None
         detail = _describe(exc) if gai is None else f"{gai}: {exc}"
         return ProbeResult(dest, outcome, detail, elapsed(), errno_name=code)
 
-    sinkhole = set(dest.sinkhole)
+    sinkhole = set() if dest.category.must_reach else set(dest.sinkhole)
     leaked = [a for a in answers if a not in sinkhole]
     if not answers:
         return ProbeResult(dest, Outcome.UNREACHABLE, "resolved to no address", elapsed())
@@ -332,10 +434,15 @@ def probe(
     resolve: Resolver = dns_resolve,
     *,
     timeout: float = DEFAULT_TIMEOUT_S,
+    expect: Iterable[Category] = ALL_CATEGORIES,
 ) -> ContainmentReport:
-    """Probe every destination in order; never raises because of a destination."""
+    """Probe every destination in order; never raises because of a destination.
+
+    ``expect``: the categories that must each have at least one result for the report
+    to count as contained (default: all four, ``reach`` included).
+    """
     results = tuple(_probe_one(d, connect, resolve, timeout) for d in destinations)
-    return ContainmentReport(results=results, timeout_s=timeout)
+    return ContainmentReport(results=results, timeout_s=timeout, expected=frozenset(expect))
 
 
 # --------------------------------------------------------------------- destinations
@@ -344,26 +451,60 @@ def probe(
 def default_destinations(
     *,
     host_gateway: str | None = None,
-    lan: Sequence[str] = DEFAULT_LAN,
+    lan: Sequence[str] | None = None,
     sinkhole: Sequence[str] = (),
+    reach: Sequence[tuple[str, int]] = (),
+    route_file: str = DEFAULT_ROUTE_FILE,
 ) -> list[Destination]:
-    """The standard must-fail set: public IPs on 443, a public name, the LAN, the host.
+    """The standard set: public IPv4/IPv6 on 443, a public name, host, LAN and reach.
 
-    The host gateway is only probed if given (it differs per cell network).
+    * host: ``host_gateway``, else :func:`default_gateway`, else one ``error`` result;
+    * LAN: ``lan`` must be given; ``None`` yields one ``error`` result, never a guess;
+    * reach: one must-reach tcp destination per ``(host, port)``; with none, the
+      ``reach`` category is missing and the report is not contained.
     """
     dests = [Destination(Category.INTERNET, Kind.TCP, ip, port) for ip, port in DEFAULT_INTERNET]
     dests.append(
         Destination(Category.INTERNET, Kind.DNS, DEFAULT_DNS_NAME, sinkhole=tuple(sinkhole))
     )
-    if host_gateway:
-        dests += [Destination(Category.HOST, Kind.TCP, host_gateway, p) for p in HOST_PORTS]
-    for addr in lan:
-        dests += [Destination(Category.LAN, Kind.TCP, addr, p) for p in LAN_PORTS]
+    gateway = host_gateway or default_gateway(route_file)
+    if gateway:
+        dests += [Destination(Category.HOST, Kind.TCP, gateway, p) for p in HOST_PORTS]
+    else:
+        why = f"no host gateway: none given and no default route in {route_file}"
+        dests.append(Destination(Category.HOST, Kind.TCP, "", unavailable=why))
+    if lan is None:
+        why = "no home-LAN address given (--lan, or --allow-default-lan)"
+        dests.append(Destination(Category.LAN, Kind.TCP, "", unavailable=why))
+    else:
+        for addr in lan:
+            dests += [Destination(Category.LAN, Kind.TCP, addr, p) for p in LAN_PORTS]
+    dests += [Destination(Category.REACH, Kind.TCP, host, port) for host, port in reach]
     return dests
 
 
 def _bad(spec: str, why: str) -> ValueError:
     return ValueError(f"bad destination {spec!r}: {why}")
+
+
+def _split_host_port(spec: str, rest: str) -> tuple[str, int]:
+    if rest.startswith("["):
+        host, sep, port_s = rest[1:].partition("]:")
+        if not sep:
+            raise _bad(spec, "expected [ipv6]:port")
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            raise _bad(spec, f"{host!r} is not an IPv6 address") from None
+    else:
+        host, sep, port_s = rest.rpartition(":")
+        if not sep or not host:
+            raise _bad(spec, "tcp needs <target>:<port>")
+        if ":" in host:
+            raise _bad(spec, "put an IPv6 address in brackets: [addr]:port")
+    if not port_s.isdigit() or not 1 <= int(port_s) <= 65535:
+        raise _bad(spec, "port must be 1-65535")
+    return host, int(port_s)
 
 
 def parse_destination(spec: str, *, sinkhole: Sequence[str] = ()) -> Destination:
@@ -386,23 +527,10 @@ def parse_destination(spec: str, *, sinkhole: Sequence[str] = ()) -> Destination
             raise _bad(spec, "dns takes a name and no port")
         return Destination(category, kind, rest, sinkhole=tuple(sinkhole))
 
-    if rest.startswith("["):
-        host, sep, port_s = rest[1:].partition("]:")
-        if not sep:
-            raise _bad(spec, "expected [ipv6]:port")
-        try:
-            ipaddress.IPv6Address(host)
-        except ValueError:
-            raise _bad(spec, f"{host!r} is not an IPv6 address") from None
-    else:
-        host, sep, port_s = rest.rpartition(":")
-        if not sep or not host:
-            raise _bad(spec, "tcp needs <target>:<port>")
-        if ":" in host:
-            raise _bad(spec, "put an IPv6 address in brackets: [addr]:port")
-    if not port_s.isdigit() or not 1 <= int(port_s) <= 65535:
-        raise _bad(spec, "port must be 1-65535")
-    return Destination(category, kind, host, int(port_s))
+    host, port = _split_host_port(spec, rest)
+    if not category.must_reach and not _is_ip(host):
+        raise _bad(spec, "a must-fail tcp target must be an IP literal, not a hostname")
+    return Destination(category, kind, host, port)
 
 
 # --------------------------------------------------------------------- CLI
@@ -412,8 +540,8 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m cell.probe.containment",
         description=(
-            "Try destinations that must be unreachable from a run cell; print a JSON "
-            "report; exit 0 if contained, 1 if not."
+            "Try destinations that must be unreachable from a run cell (and ones that "
+            "must be reachable); print a JSON report; exit 0 if contained, 1 if not."
         ),
     )
     p.add_argument(
@@ -421,21 +549,37 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="CATEGORY:KIND:TARGET[:PORT]",
-        help="a must-fail destination, e.g. internet:tcp:1.1.1.1:443, "
-        "internet:dns:example.com, host:tcp:172.30.0.1:22, lan:tcp:192.168.1.1:80 "
-        "(repeatable)",
+        help="a destination, e.g. internet:tcp:1.1.1.1:443, internet:dns:example.com, "
+        "host:tcp:172.30.0.1:22, lan:tcp:192.168.1.1:80, reach:tcp:tap:8080 (repeatable)",
     )
     p.add_argument(
         "--defaults",
         action="store_true",
-        help="also probe the default set (public IPs, a public name, --lan, --host-gateway)",
+        help="also probe the default set (implied when no --dest is given)",
     )
-    p.add_argument("--host-gateway", help="the cell network's bridge gateway address")
+    p.add_argument(
+        "--host-gateway",
+        help="the cell network's bridge gateway (default: the default route, if any)",
+    )
     p.add_argument(
         "--lan",
         action="append",
         default=None,
-        help=f"home-LAN address for --defaults (repeatable; default {list(DEFAULT_LAN)})",
+        help="home-LAN address for the default set (repeatable; required with the "
+        "default set unless --allow-default-lan)",
+    )
+    p.add_argument(
+        "--allow-default-lan",
+        action="store_true",
+        help=f"use {list(DEFAULT_LAN)} as the home LAN when no --lan is given",
+    )
+    p.add_argument(
+        "--reach",
+        action="append",
+        default=[],
+        metavar="HOST:PORT",
+        help="a must-reach destination proving the probe's network works (the tap, the "
+        "target); without one the cell is never reported contained (repeatable)",
     )
     p.add_argument(
         "--sinkhole",
@@ -444,6 +588,7 @@ def _parser() -> argparse.ArgumentParser:
         help="an address the cell's resolver answers every name with (the catcher)",
     )
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="seconds per probe")
+    p.add_argument("--route-file", default=DEFAULT_ROUTE_FILE, help=argparse.SUPPRESS)
     return p
 
 
@@ -454,14 +599,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--timeout must be positive")
     try:
         dests = [parse_destination(s, sinkhole=args.sinkhole) for s in args.dest]
+        reach = [_split_host_port(f"reach:tcp:{r}", r) for r in args.reach]
     except ValueError as exc:
         parser.error(str(exc))
     if args.defaults or not dests:
+        if args.lan is None and not args.allow_default_lan:
+            parser.error("the default set needs --lan ADDR (or --allow-default-lan)")
         dests += default_destinations(
             host_gateway=args.host_gateway,
             lan=args.lan if args.lan is not None else DEFAULT_LAN,
             sinkhole=args.sinkhole,
+            route_file=args.route_file,
         )
+    dests += [Destination(Category.REACH, Kind.TCP, host, port) for host, port in reach]
     report = probe(dests, timeout=args.timeout)
     sys.stdout.write(report.to_json() + "\n")
     sys.stdout.flush()
