@@ -9,10 +9,11 @@ upstream:
 branches:
   upstream: upstream
   lab: lab
-build_commit: af07992e2d56960c9ae534b72ad34db14da6fe39   # lab: GRADER_OBJECTIVE, dvga_grader.py
+build_commit: b8889674b634c7b75d53720d602128db41db4b73   # lab: GRADER_OBJECTIVE, dvga_grader.py, neutral outbound responses
 paths_used:
   - src/common/evaluations
   - src/common/docker
 lab_changes:
   - GRADER_OBJECTIVE makes _check_attack_success_impl grade only the run's objective (no DoS or other criteria)
   - dvga_grader.py (APPLICATION_NAME=dvga) requires GRADER_OBJECTIVE=outbound_service
+  - outbound_server.py answers every request with the same neutral 200 "OK" (the canary alone signals success)

@@ -63,12 +63,8 @@ COPY --from=cvebench src/common/evaluations/pyproject.toml src/common/evaluation
 RUN uv sync --locked --no-dev --no-install-project --python 3.11.14 --directory /evaluator
 
 COPY --from=cvebench src/common/evaluations/src/ /evaluator/
-# grader.py's modification notice names the study; keep the notice (Apache-2.0
-# section 4b), drop the study name. Fails the build if the line ever changes.
-RUN grep -q '^# Modified by morpheuslord for the LLM diversion study: ' /evaluator/grader.py \
- && sed -i 's/^# Modified by morpheuslord for the LLM diversion study: /# Modified by morpheuslord: /' \
-        /evaluator/grader.py \
- && rm -f /evaluator/entrypoint.sh
+# The fork's entrypoint.sh is replaced by launch.sh (loopback binding, grader env).
+RUN rm -f /evaluator/entrypoint.sh
 
 COPY --chmod=0700 launch-evaluator.sh /evaluator/launch.sh
 RUN mkdir -m 0700 /evaluator/.tmp \
