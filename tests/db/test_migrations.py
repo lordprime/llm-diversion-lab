@@ -22,6 +22,7 @@ EXPECTED_TABLES = {
     "callbacks",
     "oracle_polls",
     "labels",
+    "event_keys",
 }
 
 EVENT_TABLES = {

@@ -12,7 +12,7 @@ from control.core.ids import new_id
 from control.core.models import Arm, Event, RunStatus
 from control.db import tables as t
 from control.db.engine import session_scope
-from control.db.repo import claim_next_run, insert_events
+from control.db.repo import EventKey, InsertResult, claim_next_run, insert_events
 
 TS = datetime(2026, 11, 7, 12, 0, tzinfo=UTC)
 SHA = "a" * 64
@@ -335,7 +335,8 @@ def _count(engine: Engine, model: type[Any]) -> int:
         return s.scalar(select(func.count()).select_from(model)) or 0
 
 
-def test_insert_events_is_idempotent_on_run_stream_seq(engine: Engine) -> None:
+def _seed_injected_run(engine: Engine) -> tuple[str, str]:
+    """An injected run with one planted placement; returns (run_id, placement_id)."""
     ids = seed_experiment(engine)
     run_id = add_run(engine, ids, schedule_index=0, arm=Arm.INJECTED)
     placement_id = new_id("pl")
@@ -356,20 +357,35 @@ def test_insert_events_is_idempotent_on_run_stream_seq(engine: Engine) -> None:
                 )
             )
         )
+    return run_id, placement_id
 
+
+def _ledger(engine: Engine) -> dict[tuple[str, str, int], m.EventKind]:
+    with session_scope(engine) as s:
+        return {(e.run_id, e.stream, e.seq): e.kind for e in s.scalars(select(t.EventKeyEntry))}
+
+
+def _kind_table_counts(engine: Engine) -> dict[str, int]:
+    return {table.__tablename__: _count(engine, table) for table in t.EVENT_TABLES.values()}
+
+
+def test_normal_batch_inserts_all_rows_and_records_every_key(engine: Engine) -> None:
+    """(d) a fresh batch: every event stored, every key in event_keys with its kind."""
+    run_id, placement_id = _seed_injected_run(engine)
     events = _events(run_id, placement_id)
-    with session_scope(engine) as s:
-        assert insert_events(s, events) == len(events)
-    with session_scope(engine) as s:
-        assert insert_events(s, events) == 0  # re-shipped batch: nothing new
 
-    assert _count(engine, t.Callback) == 2
-    assert _count(engine, t.TargetAccess) == 1
-    assert _count(engine, t.PlacementServe) == 1
-    assert _count(engine, t.LlmCall) == 1
-    assert _count(engine, t.AgentEvent) == 1
-    assert _count(engine, t.OraclePoll) == 1
+    with session_scope(engine) as s:
+        assert insert_events(s, events) == InsertResult(inserted=len(events))
 
+    assert _ledger(engine) == {(e.run_id, e.stream, e.seq): e.kind for e in events}
+    assert _kind_table_counts(engine) == {
+        "placement_serves": 1,
+        "target_access": 1,
+        "llm_calls": 1,
+        "agent_events": 1,
+        "callbacks": 2,  # catcher-http#0 and catcher-dns#0: same kind+seq, two streams
+        "oracle_polls": 1,
+    }
     with session_scope(engine) as s:
         http = s.scalars(select(t.Callback).where(t.Callback.stream == "catcher-http")).one()
         assert http.headers == [["Host", "cb.lab.test"], ["X-A", "1"]]
@@ -377,18 +393,130 @@ def test_insert_events_is_idempotent_on_run_stream_seq(engine: Engine) -> None:
         assert float(call.cost_usd or 0) == pytest.approx(0.0125)
         agent = s.scalars(select(t.AgentEvent)).one()
         assert agent.tool_args == {"url": "http://target/", "n": [1, 2]}
+        hashes = s.scalars(select(t.EventKeyEntry.content_sha256)).all()
+        assert all(len(h) == 64 for h in hashes)
+        assert len(set(hashes)) == len(events)
 
 
-def test_insert_events_new_seq_on_existing_stream_is_stored(engine: Engine) -> None:
-    ids = seed_experiment(engine)
-    run_id = add_run(engine, ids, schedule_index=0)
+def test_reshipping_identical_events_counts_duplicates(engine: Engine) -> None:
+    """(b) an identical re-ship: all duplicates, nothing inserted, no conflict."""
+    run_id, placement_id = _seed_injected_run(engine)
+    events = _events(run_id, placement_id)
+    with session_scope(engine) as s:
+        insert_events(s, events)
+    before = _kind_table_counts(engine)
+
+    with session_scope(engine) as s:
+        result = insert_events(s, events)
+    assert result == InsertResult(inserted=0, duplicates=len(events), conflicts=[])
+    assert _kind_table_counts(engine) == before
+    assert len(_ledger(engine)) == len(events)
+
+
+def test_same_key_under_another_kind_is_a_conflict(engine: Engine) -> None:
+    """(a) injector#0 stored as target_access, re-shipped as placement_serve: rejected."""
+    run_id, placement_id = _seed_injected_run(engine)
+    access = m.TargetAccessEvent(
+        run_id=run_id, stream="injector", seq=0, ts=TS, flow_id="f1", method="GET", url="/"
+    )
+    with session_scope(engine) as s:
+        assert insert_events(s, [access]).inserted == 1
+
+    serve = m.PlacementServe(
+        run_id=run_id,
+        stream="injector",
+        seq=0,
+        ts=TS,
+        placement_id=placement_id,
+        surface="P1",
+        flow_id="f1",
+        url="/robots.txt",
+        status=200,
+        decoded_sha256=SHA,
+        wire_sha256=SHA,
+        insert_ok=True,
+    )
+    with session_scope(engine) as s:
+        result = insert_events(s, [serve])
+    assert result == InsertResult(
+        inserted=0,
+        duplicates=0,
+        conflicts=[EventKey(run_id, "injector", 0, m.EventKind.PLACEMENT_SERVE)],
+    )
+    assert _count(engine, t.PlacementServe) == 0
+    assert _count(engine, t.TargetAccess) == 1
+    assert _ledger(engine) == {(run_id, "injector", 0): m.EventKind.TARGET_ACCESS}
+
+
+def test_same_key_and_kind_with_altered_content_is_a_conflict(engine: Engine) -> None:
+    """(c) write-once evidence: a changed event under a stored key is rejected."""
+    run_id, _ = _seed_injected_run(engine)
+    original = m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=False)
+    altered = m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=True)
+    with session_scope(engine) as s:
+        insert_events(s, [original])
+
+    with session_scope(engine) as s:
+        result = insert_events(s, [altered])
+    assert result == InsertResult(
+        conflicts=[EventKey(run_id, "oracle", 0, m.EventKind.ORACLE_POLL)]
+    )
+    with session_scope(engine) as s:
+        assert s.scalars(select(t.OraclePoll.status)).all() == [False]
+
+
+def test_mixed_batch_reports_each_outcome(engine: Engine) -> None:
+    """New, duplicate and conflicting events in one batch are each handled correctly."""
+    run_id, _ = _seed_injected_run(engine)
     first = m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=False)
+    with session_scope(engine) as s:
+        insert_events(s, [first])
+
     later = m.OraclePoll(run_id=run_id, stream="oracle", seq=1, ts=TS, status=True)
+    clash = m.TargetAccessEvent(
+        run_id=run_id, stream="oracle", seq=0, ts=TS, flow_id="f", method="GET", url="/"
+    )
     with session_scope(engine) as s:
-        assert insert_events(s, [first]) == 1
-    with session_scope(engine) as s:
-        assert insert_events(s, [first, later]) == 1
+        result = insert_events(s, [first, later, clash])
+    assert result == InsertResult(
+        inserted=1,
+        duplicates=1,
+        conflicts=[EventKey(run_id, "oracle", 0, m.EventKind.TARGET_ACCESS)],
+    )
     assert _count(engine, t.OraclePoll) == 2
+    assert _count(engine, t.TargetAccess) == 0
+
+
+def test_conflict_within_one_call_first_event_wins(engine: Engine) -> None:
+    run_id, _ = _seed_injected_run(engine)
+    a = m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=False)
+    b = m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=True)
+    with session_scope(engine) as s:
+        result = insert_events(s, [a, a, b])
+    assert result == InsertResult(
+        inserted=1,
+        duplicates=1,
+        conflicts=[EventKey(run_id, "oracle", 0, m.EventKind.ORACLE_POLL)],
+    )
+    with session_scope(engine) as s:
+        assert s.scalars(select(t.OraclePoll.status)).all() == [False]
+
+
+def test_per_table_unique_key_is_a_second_line_of_defence(engine: Engine) -> None:
+    """A kind-table row written around the ledger makes insert_events fail loudly."""
+    run_id, _ = _seed_injected_run(engine)
+    poll = m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=False)
+    with session_scope(engine) as s:
+        s.add(t.OraclePoll(**poll.model_dump(exclude={"kind"})))  # bypasses event_keys
+
+    with pytest.raises(IntegrityError), session_scope(engine) as s:
+        insert_events(s, [poll])
+    assert _ledger(engine) == {}  # the failed transaction left no ledger entry
+
+
+def test_insert_events_empty_input(engine: Engine) -> None:
+    with session_scope(engine) as s:
+        assert insert_events(s, []) == InsertResult()
 
 
 def test_claim_next_run_is_fifo_across_transactions(engine: Engine) -> None:

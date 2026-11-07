@@ -8,10 +8,17 @@ matching table (checked by ``tests/db/test_tables.py``). Migrations under
 Event tables
 ------------
 Every evidence-event table (:data:`EVENT_TABLES`) derives from :class:`EventRow` and
-carries ``run_id``, ``stream``, ``seq`` and ``ts``. Its idempotency key is the unique
-constraint on :data:`EVENT_KEY` = ``(run_id, stream, seq)``: ``seq`` is numbered per
-producer stream, so ``kind`` is deliberately not part of the key. Writers insert with
-``ON CONFLICT (run_id, stream, seq) DO NOTHING`` (see :func:`control.db.repo.insert_events`).
+carries ``run_id``, ``stream``, ``seq`` and ``ts``. The idempotency key is
+:data:`EVENT_KEY` = ``(run_id, stream, seq)``: ``seq`` is numbered per producer stream
+*across all kinds*, so ``kind`` is deliberately not part of the key.
+
+Because events of different kinds live in different tables, a per-table unique
+constraint alone would let one key be stored twice under two kinds. The key is
+therefore claimed first in the ledger table ``event_keys`` (:class:`EventKeyEntry`,
+primary key ``(run_id, stream, seq)``, plus the event's ``kind`` and
+``content_sha256``); only a newly claimed key is written to its kind table (see
+:func:`control.db.repo.insert_events`). The per-table unique constraint on
+``(run_id, stream, seq)`` stays as a second line of defence.
 
 Enums are stored as ``VARCHAR`` with a ``CHECK`` constraint (not native Postgres enum
 types), holding the enum *values* (``"queued"``, ``"P1"``...), so adding a value later
@@ -69,6 +76,7 @@ __all__ = [
     "AgentEvent",
     "Base",
     "Callback",
+    "EventKeyEntry",
     "EventRow",
     "Experiment",
     "ExperimentArm",
@@ -446,6 +454,29 @@ class OraclePoll(EventRow):
     status: Mapped[bool] = mapped_column(Boolean)
     message: Mapped[str] = mapped_column(Text, default="", server_default=text("''"))
     error: Mapped[str | None] = mapped_column(Text)
+
+
+class EventKeyEntry(Base):
+    """Ledger of every stored event key, across all kinds (table ``event_keys``).
+
+    ``content_sha256`` is the hash of the event's canonical JSON
+    (:func:`control.db.repo.event_content_sha256`), so a re-shipped key can be told
+    apart as an identical duplicate or a conflicting rewrite.
+    """
+
+    __tablename__ = "event_keys"
+    __table_args__ = (
+        CheckConstraint("seq >= 0", name="seq_nonnegative"),
+        CheckConstraint(f"stream ~ '{STREAM_PATTERN}'", name="stream_format"),
+        CheckConstraint("content_sha256 ~ '^[0-9a-f]{64}$'", name="content_sha256_format"),
+    )
+
+    run_id: Mapped[str] = mapped_column(_ID, ForeignKey("runs.run_id"), primary_key=True)
+    stream: Mapped[str] = mapped_column(String(32), primary_key=True)
+    seq: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    kind: Mapped[EventKind] = mapped_column(_enum(EventKind, "kind"))
+    content_sha256: Mapped[str] = mapped_column(_SHA256)
+    received_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now())
 
 
 #: The table that stores each event kind.

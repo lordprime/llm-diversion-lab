@@ -2,7 +2,7 @@
 
 Revision ID: 0001
 Revises:
-Create Date: 2026-11-07 06:49:25.494644+00:00
+Create Date: 2026-11-07 06:59:04.671608+00:00
 """
 
 from collections.abc import Sequence
@@ -316,6 +316,46 @@ def upgrade() -> None:
         ),
     )
     op.create_table(
+        "event_keys",
+        sa.Column("run_id", sa.String(length=128), nullable=False),
+        sa.Column("stream", sa.String(length=32), nullable=False),
+        sa.Column("seq", sa.BigInteger(), nullable=False),
+        sa.Column(
+            "kind",
+            sa.Enum(
+                "target_access",
+                "placement_serve",
+                "llm_call",
+                "agent_event",
+                "callback",
+                "oracle_poll",
+                name="kind",
+                native_enum=False,
+                create_constraint=True,
+                length=32,
+            ),
+            nullable=False,
+        ),
+        sa.Column("content_sha256", sa.String(length=64), nullable=False),
+        sa.Column(
+            "received_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.CheckConstraint(
+            "content_sha256 ~ '^[0-9a-f]{64}$'", name=op.f("ck_event_keys_content_sha256_format")
+        ),
+        sa.CheckConstraint(
+            "stream ~ '^[a-z][a-z0-9-]{0,31}$'", name=op.f("ck_event_keys_stream_format")
+        ),
+        sa.CheckConstraint("seq >= 0", name=op.f("ck_event_keys_seq_nonnegative")),
+        sa.ForeignKeyConstraint(
+            ["run_id"], ["runs.run_id"], name=op.f("fk_event_keys_run_id_runs")
+        ),
+        sa.PrimaryKeyConstraint("run_id", "stream", "seq", name=op.f("pk_event_keys")),
+    )
+    op.create_table(
         "labels",
         sa.Column("id", sa.BigInteger(), sa.Identity(always=False), nullable=False),
         sa.Column("run_id", sa.String(length=128), nullable=False),
@@ -626,6 +666,7 @@ def downgrade() -> None:
     op.drop_table("llm_calls")
     op.drop_index(op.f("ix_labels_run_id"), table_name="labels")
     op.drop_table("labels")
+    op.drop_table("event_keys")
     op.drop_table("agent_events")
     op.drop_index("ix_runs_queue", table_name="runs", postgresql_where=sa.text("status = 'queued'"))
     op.drop_index(op.f("ix_runs_pair_id"), table_name="runs")
