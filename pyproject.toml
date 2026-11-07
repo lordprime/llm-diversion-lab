@@ -1,0 +1,47 @@
+[project]
+name = "llm-diversion-lab"
+version = "0.0.0"
+description = "LLM Diversion Lab: harness for a security-research study"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "sqlalchemy>=2",
+    "alembic",
+    "pydantic>=2",
+    "pydantic-settings",
+    "httpx",
+    "python-ulid",
+    "dnslib",
+    "structlog",
+    "pyyaml",
+]
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "hypothesis",
+    "types-pyyaml",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["forks", "targets", "tools"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
