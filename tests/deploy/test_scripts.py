@@ -666,6 +666,68 @@ def _unit(path: Path) -> dict[str, list[str]]:
     return out
 
 
+FIREWALL_MODULES = [
+    "nft_fib_inet",
+    "nft_log",
+    "nf_log_syslog",
+    "nft_limit",
+    "nft_ct",
+    "nft_compat",
+    "xt_comment",
+]
+
+
+def _task_index(tasks: list[dict[str, Any]], predicate: Any) -> int:
+    return next(i for i, t in enumerate(tasks) if predicate(t))
+
+
+def test_firewall_checks_modules_and_cell_networks_before_loading_rules() -> None:
+    role = ANSIBLE / "roles" / "firewall"
+    assert _load_yaml(role / "defaults" / "main.yml")["firewall_kernel_modules"] == FIREWALL_MODULES
+    tasks = _load_yaml(role / "tasks" / "main.yml")
+    modules = _task_index(tasks, lambda t: "firewall_kernel_modules" in json.dumps(t))
+    networks = _task_index(tasks, lambda t: "strict=True" in json.dumps(t))
+    render = _task_index(
+        tasks, lambda t: t.get("ansible.builtin.template", {}).get("src") == "host.nft.j2"
+    )
+    assert modules < render
+    assert networks < render
+    # The module check names what is missing and where to load it.
+    text = (role / "tasks" / "main.yml").read_text(encoding="utf-8")
+    assert "modules-load.d" in text
+
+
+def test_module_check_finds_loaded_and_reports_missing_modules() -> None:
+    """Run the role's own module-check snippet against this machine's kernel."""
+    tasks = _load_yaml(ANSIBLE / "roles" / "firewall" / "tasks" / "main.yml")
+    task = tasks[_task_index(tasks, lambda t: "firewall_kernel_modules" in json.dumps(t))]
+    code = task["ansible.builtin.command"]["argv"][3]
+    loaded = next(p.name for p in Path("/sys/module").iterdir() if p.is_dir())
+    result = _run([sys.executable, "-I", "-c", code, json.dumps([loaded, "lab_no_such_module"])])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["lab_no_such_module"]
+
+
+@pytest.mark.parametrize(
+    ("networks", "ok"),
+    [
+        (["10.231.0.0/16"], True),
+        (["10.231.0.0/16", "10.232.0.0/24"], True),
+        (["10.231.0.1/16"], False),  # host bits set
+        (["fd00::/64"], False),  # IPv4 only
+        ([], False),
+        (["10.231.0.0/16 , drop"], False),
+    ],
+)
+def test_cell_network_validation_is_strict(networks: list[str], ok: bool) -> None:
+    """Run the role's own validation snippet on the given value."""
+    tasks = _load_yaml(ANSIBLE / "roles" / "firewall" / "tasks" / "main.yml")
+    task = tasks[_task_index(tasks, lambda t: "strict=True" in json.dumps(t))]
+    code = task["ansible.builtin.command"]["argv"][3]
+    result = _run([sys.executable, "-I", "-c", code, json.dumps(networks)])
+    assert (result.returncode == 0) is ok, result.stderr
+
+
 def test_docker_cannot_start_without_the_host_firewall() -> None:
     templates = ANSIBLE / "roles" / "firewall" / "templates"
     dropin = _unit(templates / "docker-requires-lab-firewall.conf.j2")
@@ -769,12 +831,17 @@ FAKE_DOCKER = """\
 #!/usr/bin/env bash
 printf '%s\\n' "$*" >>"$FAKE_DOCKER_LOG"
 case "$*" in
-*"config --services"*) printf 'db\\napi\\nworker\\nmigrate\\n' ;;
+*"config --services"*)
+    [[ ${FAKE_CONFIG_FAIL:-0} == 1 ]] && exit 1
+    printf 'db\\napi\\nworker\\nmigrate\\n' ;;
 *"config --images"*) printf '%s\\n' $FAKE_IMAGES ;;
 *"config --format json"*) printf '%s\\n' "$FAKE_CONFIG_JSON" ;;
 *"ps --status running --services"*) [[ ${FAKE_DB_DOWN:-0} == 1 ]] || echo db ;;
 *"pg_dump"*) echo DUMPDATA ;;
+*"pg_restore --list"*) [[ ${FAKE_LIST_FAIL:-0} == 1 ]] && exit 1 ;;
 *"pg_restore"*) [[ ${FAKE_RESTORE_FAIL:-0} == 1 ]] && exit 1 ;;
+*"RENAME TO"*) [[ ${FAKE_SWAP_FAIL:-0} == 1 ]] && exit 1 ;;
+*"run --rm --no-deps migrate"*) [[ ${FAKE_MIGRATE_FAIL:-0} == 1 ]] && exit 1 ;;
 *" up "*) [[ ${FAKE_UP_FAIL:-0} == 1 ]] && exit 1 ;;
 esac
 exit 0
@@ -850,6 +917,31 @@ def test_migrate_refuses_without_a_dump_when_a_release_is_deployed(
     assert not any("run --rm --no-deps migrate" in line for line in _docker_log(env))
 
 
+def test_migrate_fails_closed_when_the_services_cannot_be_read(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    _, env = lab_root
+    result = _run(
+        ["bash", str(DEPLOY / "remote" / "release.sh"), "migrate", "v0.1.0"],
+        env={**env, "FAKE_CONFIG_FAIL": "1"},
+    )
+    assert result.returncode != 0
+    assert not any("run --rm --no-deps migrate" in line for line in _docker_log(env))
+    assert not any("pg_dump" in line for line in _docker_log(env))
+
+
+def test_migrate_failure_reports_the_state(lab_root: tuple[Path, dict[str, str]]) -> None:
+    root, env = lab_root
+    result = _run(
+        ["bash", str(DEPLOY / "remote" / "release.sh"), "migrate", "v0.1.0"],
+        env={**env, "FAKE_MIGRATE_FAIL": "1"},
+    )
+    assert result.returncode != 0
+    assert "migrate failed" in result.stderr
+    assert f"current -> {root}/releases/v0.0.9" in result.stderr
+    assert f"{root}/backups/pre-v0.1.0-" in result.stderr  # the dump path
+
+
 @pytest.fixture
 def failed_release(lab_root: tuple[Path, dict[str, str]]) -> tuple[Path, dict[str, str], Path]:
     """v0.1.0 is current and failed; v0.0.9 is the rollback target; a dump exists."""
@@ -865,35 +957,63 @@ def failed_release(lab_root: tuple[Path, dict[str, str]]) -> tuple[Path, dict[st
     return root, env, dump
 
 
-def test_rollback_stops_writers_recreates_db_restores_atomically_then_swaps(
+def _rollback(env: Mapping[str, str], **fail: str) -> subprocess.CompletedProcess[str]:
+    return _run(["bash", str(DEPLOY / "remote" / "release.sh"), "rollback"], env={**env, **fail})
+
+
+def test_rollback_restores_into_a_scratch_db_before_touching_the_live_one(
     failed_release: tuple[Path, dict[str, str], Path],
 ) -> None:
     root, env, _ = failed_release
-    result = _run(["bash", str(DEPLOY / "remote" / "release.sh"), "rollback"], env=env)
+    result = _rollback(env)
     assert result.returncode == 0, result.stderr
     log = _docker_log(env)
     stop = _first(log, " stop api worker")
-    recreate = _first(log, "exec -T db", "dropdb", "createdb")
-    restore = _first(log, "exec -T db", "pg_restore", "--single-transaction", "--exit-on-error")
+    precheck = _first(log, "exec -T db", "pg_restore --list")
+    scratch = _first(log, "exec -T db", 'CREATE DATABASE :"rb"', "CONNECTION LIMIT 0")
+    restore = _first(log, "exec -T db", "pg_restore --single-transaction --exit-on-error", '_rb"')
+    swap = _first(log, "exec -T db", 'DROP DATABASE :"db"', 'RENAME TO :"db"')
     up = _first(log, " up -d")
-    assert stop < recreate < restore < up
+    assert stop < precheck < scratch < restore < swap < up
+    assert not any("--no-owner" in line for line in log)
     assert os.readlink(root / "current") == f"{root}/releases/v0.0.9"
     assert not (root / "releases" / ".state" / "pending-dump").exists()
 
 
-def test_rollback_restore_failure_names_the_dump_and_the_state(
-    failed_release: tuple[Path, dict[str, str], Path],
+@pytest.mark.parametrize("failure", ["FAKE_LIST_FAIL", "FAKE_RESTORE_FAIL"])
+def test_rollback_with_a_bad_dump_leaves_the_live_db_untouched(
+    failed_release: tuple[Path, dict[str, str], Path], failure: str
 ) -> None:
     root, env, dump = failed_release
-    result = _run(
-        ["bash", str(DEPLOY / "remote" / "release.sh"), "rollback"],
-        env={**env, "FAKE_RESTORE_FAIL": "1"},
-    )
+    result = _rollback(env, **{failure: "1"})
     assert result.returncode != 0
     assert str(dump) in result.stderr
     assert f"current -> {root}/releases/v0.1.0" in result.stderr
-    assert "database:" in result.stderr
-    assert not any(" up -d" in line for line in _docker_log(env)), "no start on a bad restore"
+    assert "database: untouched" in result.stderr
+    log = _docker_log(env)
+    assert not any('DROP DATABASE :"db"' in line for line in log), "live DB never dropped"
+    assert not any(" up -d" in line for line in log), "no start on a bad restore"
+    if failure == "FAKE_RESTORE_FAIL":
+        restore = _first(log, "pg_restore --single-transaction")
+        cleanup = [
+            i
+            for i, line in enumerate(log)
+            if 'DROP DATABASE IF EXISTS :"rb"' in line and "CREATE" not in line
+        ]
+        assert cleanup and cleanup[0] > restore, "the scratch database is dropped again"
+    else:
+        assert not any("CREATE DATABASE" in line for line in log)
+
+
+def test_rollback_swap_failure_points_at_the_restored_copy(
+    failed_release: tuple[Path, dict[str, str], Path],
+) -> None:
+    _, env, dump = failed_release
+    result = _rollback(env, FAKE_SWAP_FAIL="1")
+    assert result.returncode != 0
+    assert "_rb" in result.stderr
+    assert str(dump) in result.stderr
+    assert not any(" up -d" in line for line in _docker_log(env))
 
 
 def test_rollback_reports_when_the_old_release_cannot_start(

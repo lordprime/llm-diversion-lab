@@ -2,13 +2,78 @@
 # nftables inside the LXC (DEPLOYMENT §0.2). Runs BEFORE the docker role, and fails
 # closed: Docker is installed with a drop-in that Requires= lab-firewall.service,
 # so Docker never starts (not even its first start from the apt postinst) without
-# the host firewall. Two layers stop run-cell egress:
-# 1. table inet lab_host (lab-firewall.service): input drop for cells and a forward
-#    chain that drops cell traffic leaving the cell networks, and forwarded IPv6;
-# 2. Docker's DOCKER-USER chain (lab-cell-egress.service), written with iptables-nft
-#    in the syntax Docker itself uses there, re-applied whenever Docker starts.
+# the host firewall. Cells are matched by bridge name (labc*) and by source address.
+# Two layers stop run-cell egress:
+# 1. table inet lab_host (lab-firewall.service): a strict reverse-path check on cell
+#    bridges (prerouting, priority raw); an input chain that drops IPv6 and anything
+#    from a cell; a forward chain that drops forwarded IPv6 and all cell traffic
+#    except bridge-to-bridge within the cell networks and to the LLM gateway;
+# 2. Docker's DOCKER-USER chain (lab-cell-egress.service), the same policy written
+#    with iptables-nft in the syntax Docker itself uses there, re-applied whenever
+#    Docker starts.
+# To apply a changed ruleset by hand: `systemctl reload lab-firewall` (replaces the
+# table atomically). `restart` would also restart Docker, through its Requires=.
 # The Proxmox firewall on the container (internet only, never the LAN) is the manual
-# step in §0.1, verified by `labctl doctor`.
+# step in §0.1; `labctl doctor` (not built in M0; Task 14b/15b) is to verify it.
+- name: Check the cell networks are IPv4 networks without host bits
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import ipaddress, json, sys
+        nets = json.loads(sys.argv[1])
+        if not isinstance(nets, list) or not nets:
+            sys.exit("lab_cell_networks must be a non-empty list")
+        for net in nets:
+            try:
+                parsed = ipaddress.ip_network(net, strict=True)
+            except (TypeError, ValueError) as exc:
+                sys.exit(f"lab_cell_networks: {net!r} is not a network without host bits: {exc}")
+            if parsed.version != 4:
+                sys.exit(f"lab_cell_networks: {net!r} is not IPv4 (IPv6 is off in the lab)")
+      - "{{ lab_cell_networks | to_json }}"
+  changed_when: false
+  check_mode: false
+
+# Loaded modules show in /sys/module; built-in ones are listed in modules.builtin
+# (when the container can see /lib/modules). Prints the names it cannot find.
+- name: Look for the kernel modules the firewall rules need
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json, os, sys
+        builtin = set()
+        try:
+            with open(f"/lib/modules/{os.uname().release}/modules.builtin") as fh:
+                builtin = {os.path.basename(line.strip()).removesuffix(".ko") for line in fh}
+        except OSError:
+            pass
+        for name in json.loads(sys.argv[1]):
+            if not os.path.isdir(f"/sys/module/{name}") and name not in builtin:
+                print(name)
+      - "{{ firewall_kernel_modules | to_json }}"
+  changed_when: false
+  check_mode: false
+  register: firewall_missing_modules
+
+- name: Stop if a kernel module is missing (load it on the Proxmox host)
+  ansible.builtin.assert:
+    that:
+      - firewall_missing_modules.stdout_lines | length == 0
+    fail_msg: >-
+      Kernel module(s) missing: {{ firewall_missing_modules.stdout_lines | join(', ') }}.
+      An unprivileged container may not autoload them. On the Proxmox host run
+      `modprobe {{ firewall_missing_modules.stdout_lines | join(' ') }}` and list them in
+      /etc/modules-load.d/llm-lab.conf (DEPLOYMENT §0.1), then re-run bootstrap.sh.
+      If one is built into the host kernel but not listed in modules.builtin visible
+      here, drop it from firewall_kernel_modules for this host.
+    quiet: true
+
 - name: Check the LLM gateway exception is well formed
   ansible.builtin.assert:
     that:

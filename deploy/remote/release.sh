@@ -125,16 +125,19 @@ for service in json.load(sys.stdin)["services"].values():
 	fi
 }
 
-# app_services TREE: every service except the database and the one-shot migrate.
-app_services() {
-	compose "$1" config --services | grep -vxE 'db|migrate' || true
-}
-
-# stop_writers: stop the running release's app services; the database keeps running.
+# stop_writers: stop the running release's app services (everything except the
+# database and the one-shot migrate); the database keeps running. Fails closed: if
+# the service list cannot be read, nothing is assumed stopped.
 stop_writers() {
-	local services
+	local all service services=()
 	[[ -L $LAB/current ]] || return 0
-	mapfile -t services < <(app_services "$LAB/current")
+	all=$(compose "$LAB/current" config --services) || {
+		echo "ERROR: cannot read the services of $(readlink "$LAB/current")" >&2
+		return 1
+	}
+	while IFS= read -r service; do
+		[[ -z $service || $service == db || $service == migrate ]] || services+=("$service")
+	done <<<"$all"
 	((${#services[@]} > 0)) || return 0
 	echo "stopping app services: ${services[*]}"
 	compose "$LAB/current" stop "${services[@]}"
@@ -153,21 +156,38 @@ cmd_begin() {
 	echo "rollback target: $(<"$STATE/previous")"
 }
 
+MG_DUMP="(none)"
+
+# migrate_fail LINE: the ERR trap of cmd_migrate; release.sh then rolls back.
+migrate_fail() {
+	{
+		printf 'ERROR: migrate failed (line %s)\n' "$1"
+		printf '  current -> %s\n' "$(readlink "$LAB/current" 2>/dev/null || echo '(none)')"
+		printf '  pre-migration dump: %s\n' "$MG_DUMP"
+		printf '  database: may be partly migrated; release.sh rolls back from the dump\n'
+	} >&2
+	exit 1
+}
+
 cmd_migrate() {
-	local tree dump
+	local tree dump services
+	trap 'migrate_fail $LINENO' ERR
 	tree=$(release_tree "$1")
 	mkdir -p "$STATE"
-	if ! compose "$tree" config --services | grep -qx migrate; then
+	services=$(compose "$tree" config --services)
+	if ! grep -qx migrate <<<"$services"; then
 		echo "this release has no 'migrate' service: no migrations to run"
 		return 0
 	fi
 	stop_writers
 	if compose "$tree" ps --status running --services | grep -qx db; then
 		dump=$LAB/backups/pre-$1-$(date -u +%Y%m%dT%H%M%SZ).dump
+		MG_DUMP="$dump (being written)"
 		# shellcheck disable=SC2016 # expanded inside the db container, not here
 		compose "$tree" exec -T db sh -c 'pg_dump -U "$POSTGRES_USER" -Fc "$POSTGRES_DB"' >"$dump"
 		chmod 0600 "$dump"
 		printf '%s\n' "$dump" >"$STATE/pending-dump"
+		MG_DUMP=$dump
 		echo "pre-migration dump: $dump"
 	elif [[ -s $STATE/previous ]]; then
 		die "release $(<"$STATE/previous") is deployed but its database is not running:" \
@@ -210,28 +230,63 @@ rollback_fail() {
 	exit 1
 }
 
-# The database is dropped and recreated, then restored in ONE transaction that
-# stops at the first error: the result is the dump exactly, or an empty database
-# and a non-zero exit, never a half-restored mix of old and new schema.
-# shellcheck disable=SC2016 # expanded inside the db container, not here
-RECREATE_DB='set -e; M="--maintenance-db=template1 -U $POSTGRES_USER"; dropdb $M --if-exists --force "$POSTGRES_DB"; createdb $M -O "$POSTGRES_USER" "$POSTGRES_DB"'
-# shellcheck disable=SC2016 # expanded inside the db container, not here
-RESTORE_DB='pg_restore --single-transaction --exit-on-error --no-owner -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+# The live database is never touched until a restore has succeeded:
+# 1. PRECHECK  `pg_restore --list` reads the whole dump's table of contents;
+# 2. SCRATCH   create ${POSTGRES_DB}_rb with CONNECTION LIMIT 0 (no app can use it;
+#              the superuser restoring it is exempt);
+# 3. RESTORE   into the scratch database, in ONE transaction that stops at the
+#              first error (on failure the scratch database is dropped again);
+# 4. SWAP      drop the live database (WITH (FORCE) ends any connection), rename the
+#              scratch one into its place and lift the connection limit.
+# Each snippet runs inside the db container (official postgres image), where
+# POSTGRES_USER and POSTGRES_DB are set; psql variables quote the identifiers.
+read -r -d '' PRECHECK_DB <<'SH' || true
+pg_restore --list >/dev/null
+SH
+read -r -d '' SCRATCH_DB <<'SH' || true
+printf '%s\n' 'DROP DATABASE IF EXISTS :"rb";' 'CREATE DATABASE :"rb" OWNER :"owner" CONNECTION LIMIT 0;' | psql -X -q -v ON_ERROR_STOP=1 -v rb="${POSTGRES_DB}_rb" -v owner="$POSTGRES_USER" -U "$POSTGRES_USER" -d template1
+SH
+read -r -d '' RESTORE_DB <<'SH' || true
+pg_restore --single-transaction --exit-on-error -U "$POSTGRES_USER" -d "${POSTGRES_DB}_rb"
+SH
+read -r -d '' SWAP_DB <<'SH' || true
+printf '%s\n' 'DROP DATABASE :"db" WITH (FORCE);' 'ALTER DATABASE :"rb" RENAME TO :"db";' 'ALTER DATABASE :"db" CONNECTION LIMIT -1;' | psql -X -q -v ON_ERROR_STOP=1 -v db="$POSTGRES_DB" -v rb="${POSTGRES_DB}_rb" -U "$POSTGRES_USER" -d template1
+SH
+read -r -d '' DROP_SCRATCH_DB <<'SH' || true
+printf '%s\n' 'DROP DATABASE IF EXISTS :"rb" WITH (FORCE);' | psql -X -q -v ON_ERROR_STOP=1 -v rb="${POSTGRES_DB}_rb" -U "$POSTGRES_USER" -d template1
+SH
 
-# rollback: stop writers -> recreate + restore the database -> swap back -> start.
+db_exec() {
+	compose "$LAB/current" exec -T db sh -c "$1"
+}
+
+# restore_failed MESSAGE: drop the scratch copy, keep the live database, stop.
+restore_failed() {
+	db_exec "$DROP_SCRATCH_DB" </dev/null ||
+		RB_DB="$RB_DB; the scratch copy \${POSTGRES_DB}_rb could not be dropped (drop it by hand)"
+	rollback_fail "$1"
+}
+
+# rollback: stop writers -> restore into a scratch db -> swap it in -> swap
+# `current` back -> start the previous release.
 cmd_rollback() {
 	local prev=""
+	trap 'rollback_fail "unexpected error at line $LINENO"' ERR
 	[[ -f $STATE/previous ]] && prev=$(<"$STATE/previous")
 	stop_writers || rollback_fail "could not stop the app services"
 	if [[ -f $STATE/pending-dump && -L $LAB/current ]]; then
 		RB_DUMP=$(<"$STATE/pending-dump")
+		RB_DB="untouched (the live database has not been changed)"
 		[[ -s $RB_DUMP ]] || rollback_fail "the pre-migration dump is missing or empty"
-		RB_DB="unchanged so far (recreating it failed before the drop, or the drop failed)"
-		compose "$LAB/current" exec -T db sh -c "$RECREATE_DB" ||
-			rollback_fail "could not drop and recreate the database"
-		RB_DB="EMPTY (recreated); restore it by hand from the dump"
-		compose "$LAB/current" exec -T db sh -c "$RESTORE_DB" <"$RB_DUMP" ||
-			rollback_fail "pg_restore failed (single transaction: nothing was restored)"
+		db_exec "$PRECHECK_DB" <"$RB_DUMP" ||
+			rollback_fail "the dump is unreadable (pg_restore --list failed)"
+		db_exec "$SCRATCH_DB" </dev/null ||
+			restore_failed "could not create the scratch database"
+		db_exec "$RESTORE_DB" <"$RB_DUMP" ||
+			restore_failed "pg_restore into the scratch database failed (nothing was restored)"
+		RB_DB="UNKNOWN: the swap failed part-way; the restored copy is \${POSTGRES_DB}_rb in the db container (rename it by hand)"
+		db_exec "$SWAP_DB" </dev/null ||
+			rollback_fail "could not swap the restored copy into place"
 		RB_DB="restored from $RB_DUMP"
 		rm -f "$STATE/pending-dump"
 		echo "database restored from $RB_DUMP"

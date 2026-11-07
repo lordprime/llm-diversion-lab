@@ -4,3 +4,19 @@ firewall_ssh_port: "{{ ansible_port | default(22) }}"
 firewall_https_port: 443
 # Comment on every DOCKER-USER rule this role owns (status.sh and labctl find them).
 firewall_cell_egress_tag: lab-cell-egress
+
+# Kernel modules the rules need. An unprivileged LXC may not autoload them, so they
+# are loaded on the Proxmox host (/etc/modules-load.d/llm-lab.conf, DEPLOYMENT §0.1)
+# and only checked here, before any rule is loaded. nft_fib_ipv4/ipv6 come in as
+# dependencies of nft_fib_inet. xt_tcpudp (-p tcp --dport) is not checked: on
+# recent kernels it is part of x_tables, not a module of its own (absent from
+# /sys/module and modules.builtin on a 7.2 kernel), so a check would fail wrongly;
+# load it on the host where it does exist as a module.
+firewall_kernel_modules:
+  - nft_fib_inet # fib: strict reverse-path check on cell bridges
+  - nft_log # log: rate-limited drop logging
+  - nf_log_syslog # the log backend
+  - nft_limit # limit rate
+  - nft_ct # ct state
+  - nft_compat # iptables-nft matches in DOCKER-USER
+  - xt_comment # -m comment
