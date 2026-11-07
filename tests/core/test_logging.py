@@ -524,6 +524,9 @@ def _assert_scales_linearly(run: Callable[[str], object], text: str) -> None:
     Measured below :data:`MAX_INPUT_CHARS`, where nothing is windowed; a 1 ms floor
     on the small input absorbs timer noise. Quadratic work would take ~16x.
     """
+    # Inputs a few characters over the ceiling would switch the big run to the windowed
+    # path (more work per character), so the ratio would compare two code paths.
+    text = text[:MAX_INPUT_CHARS]
     small = text[: len(text) // 4]
     ratios = []
     # Load on a shared machine only ever slows a run down, so one clean attempt out of
