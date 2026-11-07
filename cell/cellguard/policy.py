@@ -33,9 +33,10 @@ What is allowed (everything else is denied):
   publishes on the cell network carries the cell prefix: network aliases and a
   non-empty ``Hostname`` must start with it (so none can be ``target``, ``tap`` or
   ``catcher``). Mounts: only the cell's scratch *named* volume (``<name>:/path[:ro]``
-  or a ``volume`` mount without subpath), anonymous volumes via ``Mounts`` (labelled)
-  and tmpfs; **no host path is ever mounted** (a symlink planted in a bind-mounted
-  directory would reach any host path). Denied: privileged; host or container
+  or a ``volume`` mount without subpath), anonymous volumes via ``Mounts``
+  (labelled on Docker; Podman ignores ``VolumeOptions.Labels``) and tmpfs; **no host
+  path is ever mounted** (a symlink planted in a bind-mounted directory would reach
+  any host path). Denied: privileged; host or container
   network/PID/IPC/user/UTS/cgroup namespaces; devices; bind mounts; other named
   volumes; volume subpaths and driver options; top-level ``Volumes`` (unlabelled
   anonymous volumes; an entry that only mirrors a ``Binds`` target is dropped);
@@ -44,8 +45,11 @@ What is allowed (everything else is denied):
   ``Dns``/``DnsSearch``/``DnsOptions``/``ExtraHosts``; sysctls; runtimes; cgroup
   parents; masked/read-only path overrides; any non-empty ``LogConfig`` (the daemon's
   log driver applies); restart policies other than ``no``; ulimits other than
-  ``nofile``/``nproc`` within caps; ``lab.*`` and ``com.docker.*`` labels; and every
-  other field set to a non-zero value;
+  ``nofile``/``nproc`` within caps; ``GroupAdd`` ``keep-groups`` (Podman: the caller's
+  supplementary groups); a ``Healthcheck`` ``Interval``/``Timeout``/``StartInterval``
+  that is neither 0 (the default) nor at least 1 s; ``lab.*``, ``com.docker.*``,
+  ``io.containers.*`` and ``io.podman.*`` labels and ``PODMAN_SYSTEMD_UNIT`` (Podman
+  acts on them); and every other field set to a non-zero value;
 * start, stop, kill, wait, remove, inspect, logs, attach (incl. websocket), resize,
   exec create/start/resize/inspect: only on containers carrying both ownership labels;
   the path is pinned to the container's full id. A privileged exec is denied;
@@ -106,8 +110,16 @@ RUN_LABEL: Final = "lab.run_id"
 ORIGIN_LABEL: Final = "lab.origin"
 ORIGIN: Final = "cellguard"
 #: Label namespaces an agent may not set (``lab.*`` is the lab's; ``com.docker.*`` would
-#: spoof compose ownership). Only the forced ``lab.*`` values themselves are accepted.
-_RESERVED_LABEL_PREFIXES: Final = ("lab.", "com.docker.")
+#: spoof compose ownership; Podman acts on ``io.containers.*`` / ``io.podman.*``, e.g.
+#: auto-update). Only the forced ``lab.*`` values themselves are accepted. Compared
+#: case-insensitively.
+_RESERVED_LABEL_PREFIXES: Final = ("lab.", "com.docker.", "io.containers.", "io.podman.")
+#: Single label keys an agent may not set (casefolded): Podman ties a container
+#: carrying ``PODMAN_SYSTEMD_UNIT`` to that systemd unit.
+_RESERVED_LABEL_KEYS: Final = frozenset({"podman_systemd_unit"})
+#: Healthcheck periods (ns) below this, other than 0 (the default), are denied: a 1 ms
+#: interval would have the daemon exec the check a thousand times a second.
+MIN_HEALTHCHECK_NS: Final = 1_000_000_000
 #: Capabilities a created container may add.
 #: NET_RAW is Docker's default and agents need raw scans; NET_ADMIN would let an agent
 #: container take another container's address, so it is not allowed.
@@ -687,6 +699,14 @@ def _container_path(path: str) -> bool:
     )
 
 
+def _group_add(value: Any, where: str, rule: str) -> Any:
+    """Supplementary groups; Podman's ``keep-groups`` (the caller's groups) is denied."""
+    groups = _strlist(value, where, rule)
+    if groups is not _OMIT and any(g.strip().casefold() == "keep-groups" for g in groups):
+        raise _bad(rule, where, "keep-groups is not allowed")
+    return groups
+
+
 def _console_size(value: Any, where: str, rule: str) -> Any:
     if value is None:
         return _OMIT
@@ -810,12 +830,20 @@ def _log_config(value: Any, where: str, rule: str) -> Any:
     return _OMIT
 
 
+def _period(value: Any, where: str, rule: str) -> Any:
+    """A healthcheck period in ns: 0 (the daemon's default) or at least 1 s."""
+    value = _uint(value, where, rule)
+    if value is not _OMIT and 0 < value < MIN_HEALTHCHECK_NS:
+        raise _bad(rule, where, f"={value} ns is below 1 s (use 0 for the default)")
+    return value
+
+
 _HEALTHCHECK: Final[_Schema] = {
     "Test": _strlist,
-    "Interval": _uint,
-    "Timeout": _uint,
+    "Interval": _period,
+    "Timeout": _period,
     "StartPeriod": _uint,
-    "StartInterval": _uint,
+    "StartInterval": _period,
     "Retries": _uint,
 }
 
@@ -936,7 +964,7 @@ _HOST_CONFIG: Final[_Schema] = {
     "DnsOptions": _zero("create.field"),
     "DnsSearch": _zero("create.field"),
     "ExtraHosts": _zero("create.field"),
-    "GroupAdd": _strlist,
+    "GroupAdd": _group_add,
     "ShmSize": _uint,
     "Isolation": _choice(frozenset({"", "default"})),
     "CpuShares": _uint,
@@ -1053,8 +1081,9 @@ def _check_binds(binds: list[str], ctx: CellContext) -> None:
 def _check_mounts(mounts: list[dict[str, Any]], ctx: CellContext) -> None:
     """Volume (anonymous or the scratch volume) and tmpfs mounts only.
 
-    Volume mounts get the cell's ownership labels in ``VolumeOptions.Labels`` (Docker
-    applies them to a volume it creates for the mount, e.g. an anonymous one).
+    Volume mounts get the cell's ownership labels in ``VolumeOptions.Labels``: labelled
+    on Docker, which applies them to a volume it creates for the mount (e.g. an
+    anonymous one); Podman ignores them, so cleanup also goes by the run's mounts.
     """
     for mount in mounts:
         kind, source, target = mount.get("Type"), mount.get("Source"), mount.get("Target")
@@ -1088,7 +1117,8 @@ def _labels(labels: Mapping[str, str], ctx: CellContext, rule: str) -> dict[str,
     """``labels`` plus the forced ownership labels; reserved namespaces are denied."""
     forced = _forced_labels(ctx)
     for key, val in labels.items():
-        reserved = key.casefold().startswith(_RESERVED_LABEL_PREFIXES)
+        folded = key.casefold()
+        reserved = folded.startswith(_RESERVED_LABEL_PREFIXES) or folded in _RESERVED_LABEL_KEYS
         if reserved and forced.get(key) != val:
             raise _Denied(rule, f"label {key}={val!r} is reserved")
     return {**labels, **forced}

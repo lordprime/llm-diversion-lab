@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 import pytest
 
+from cell.cellguard import policy
 from cell.cellguard.policy import (
     ORIGIN,
     ORIGIN_LABEL,
@@ -1320,6 +1321,81 @@ def test_cell_dns_must_be_an_ip_address() -> None:
         with pytest.raises(ValueError):
             make_ctx(dns=bad)
     assert make_ctx(dns="fd00::53").dns == "fd00::53"
+
+
+# --------------------------------------------------------------------------- hardening H
+
+SECOND = 1_000_000_000
+
+
+@pytest.mark.parametrize("field", ["Interval", "Timeout", "StartInterval"])
+@pytest.mark.parametrize(
+    ("value", "ok"),
+    [(0, True), (SECOND, True), (30 * SECOND, True), (1, False), (1_000_000, False)],
+)
+def test_healthcheck_intervals_are_zero_or_at_least_one_second(
+    field: str, value: int, ok: bool
+) -> None:
+    """A 1 ms interval would have the daemon exec the check a thousand times a second."""
+    decision = create({"Image": IMG, "Healthcheck": {"Test": ["CMD", "true"], field: value}})
+    assert decision.allowed is ok, decision.reason
+    if ok:
+        assert json.loads(decision.body)["Healthcheck"][field] == value
+    else:
+        assert decision.rule == "create.field"
+        assert field in decision.reason
+
+
+def test_healthcheck_start_period_and_retries_are_unchanged() -> None:
+    body = {"Test": ["CMD", "true"], "StartPeriod": 1, "Retries": 3}
+    assert allowed_create({"Image": IMG, "Healthcheck": body})["Healthcheck"] == body
+
+
+@pytest.mark.parametrize("group", ["keep-groups", "KEEP-GROUPS", " keep-groups"])
+def test_podman_keep_groups_is_denied(group: str) -> None:
+    """Podman's ``keep-groups`` hands the container the caller's supplementary groups."""
+    decision = create({"Image": IMG, "HostConfig": {"GroupAdd": ["audio", group]}})
+    assert not decision.allowed
+    assert decision.rule == "create.field"
+
+
+def test_ordinary_group_add_is_forwarded() -> None:
+    body = allowed_create({"Image": IMG, "HostConfig": {"GroupAdd": ["audio", "1000"]}})
+    assert body["HostConfig"]["GroupAdd"] == ["audio", "1000"]
+
+
+PODMAN_LABELS = [
+    {"io.containers.autoupdate": "registry"},
+    {"io.podman.annotations.privileged": "TRUE"},
+    {"IO.Containers.capabilities": "SYS_ADMIN"},
+    {"PODMAN_SYSTEMD_UNIT": "lab.service"},
+    {"podman_systemd_unit": "lab.service"},
+]
+
+
+@pytest.mark.parametrize("labels", PODMAN_LABELS)
+def test_podman_labels_are_reserved(labels: dict[str, str]) -> None:
+    decision = create({"Image": IMG, "Labels": labels})
+    assert not decision.allowed
+    assert decision.rule == "create.labels"
+    volume = evaluate(
+        DockerRequest("POST", "/volumes/create", json.dumps({"Labels": labels}).encode()), CTX
+    )
+    assert not volume.allowed
+    mount = {"Type": "volume", "Target": "/a", "VolumeOptions": {"Labels": labels}}
+    assert not create({"Image": IMG, "HostConfig": {"Mounts": [mount]}}).allowed
+
+
+def test_labels_that_only_resemble_podmans_are_allowed() -> None:
+    labels = {"io.containersx": "a", "org.io.podman.note": "b", "PODMAN_SYSTEMD_UNITS": "c"}
+    assert allowed_create({"Image": IMG, "Labels": labels})["Labels"] == {**labels, **MINE}
+
+
+def test_policy_documents_that_mount_labels_apply_on_docker() -> None:
+    assert policy.__doc__ is not None
+    assert "labelled on Docker" in policy.__doc__
+    assert "keep-groups" in policy.__doc__
+    assert "io.containers." in policy.__doc__
 
 
 # --------------------------------------------------------------------------- images.lock
