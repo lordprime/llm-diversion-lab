@@ -11,15 +11,22 @@ import io
 import json
 import logging
 import logging.config
+import time
 from collections.abc import Iterator
+from types import MappingProxyType
 from typing import Any
 
 import pytest
 import structlog
 import uvicorn.config
+from starlette.datastructures import Headers
 
 from control.core.logging import (
+    MAX_DEPTH,
+    MAX_TEXT_CHARS,
+    REDACTED,
     REDACTION_PATTERNS,
+    TRUNCATED,
     bind_component,
     configure_logging,
     get_logger,
@@ -51,6 +58,7 @@ def stream() -> Iterator[io.StringIO]:
         name: (logging.getLogger(name).handlers[:], logging.getLogger(name).propagate)
         for name in UVICORN_LOGGERS
     }
+    saved_raise = logging.raiseExceptions
     buf = io.StringIO()
     configure_logging(stream=buf, level="DEBUG")
     try:
@@ -60,6 +68,7 @@ def stream() -> Iterator[io.StringIO]:
         structlog.reset_defaults()
         root.handlers[:] = saved_handlers
         root.setLevel(saved_level)
+        logging.raiseExceptions = saved_raise
         for name, (handlers, propagate) in saved_uvicorn.items():
             logging.getLogger(name).handlers[:] = handlers
             logging.getLogger(name).propagate = propagate
@@ -444,3 +453,222 @@ def test_other_loggers_with_own_handlers_trigger_a_warning(stream: io.StringIO) 
     assert warnings
     assert warnings[-1]["level"] == "warning"
     assert "tests.lonely" in warnings[-1]["event"]
+
+
+# --------------------------------------------------------------------- fix round 2
+
+SECRET = "hunter2-" + "SECRET"
+_64K = 64 * 1024
+
+
+def _fill(unit: str, prefix: str = "") -> str:
+    return (prefix + unit * (_64K // len(unit) + 1))[:_64K]
+
+
+#: Inputs built to make backtracking regexes blow up (one per risky shape).
+ADVERSARIAL = {
+    "assignment_name_run": _fill("password-"),
+    "assignment_no_sep": _fill("a", "x_password") + " ",
+    "assignment_repeat": _fill("password="),
+    "assignment_spaces": "password" + " " * (_64K - 9) + "x",
+    "query_secret_run": _fill("secret", "?"),
+    "query_dash_run": _fill("-", "?x"),
+    "query_amp_run": _fill("&"),
+    "query_eq_run": _fill("?key="),
+    "userinfo_run": _fill("://a:"),
+    "userinfo_long": "://" + "a" * 100 + ":" + "b" * (_64K - 110),
+    "jwt_run": _fill("eyJ-"),
+    "jwt_dots": "eyJ" + _fill("aaaaaaaa."),
+    "auth_spaces": "bearer" + " " * (_64K - 6),
+    "auth_run": _fill("bearer "),
+    "aws_spaces": "aws secret" + " " * (_64K - 11) + ":",
+    "aws_run": _fill("aws_secret_access_key="),
+    "private_key_run": _fill("A ", "-----BEGIN "),
+    "private_key_begins": _fill("-----BEGIN RSA PRIVATE KEY-----"),
+    "cookie_spaces": "cookie" + " " * (_64K - 6),
+    "cookie_run": _fill("set-cookie:"),
+    "sk_run": _fill("sk-"),
+    "word_run": _fill("a"),
+    "dash_run": _fill("-"),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(ADVERSARIAL))
+@pytest.mark.parametrize("name", [n for n, _ in REDACTION_PATTERNS])
+def test_every_pattern_is_linear_on_adversarial_64k_input(name: str, shape: str) -> None:
+    """No pattern backtracks catastrophically, even without the input cap."""
+    pattern = dict(REDACTION_PATTERNS)[name]
+    text = ADVERSARIAL[shape]
+    assert len(text) >= _64K - 16
+    start = time.perf_counter()
+    for _ in pattern.finditer(text):
+        pass
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.5, f"{name} took {elapsed:.2f}s on {shape}"
+
+
+@pytest.mark.parametrize("shape", sorted(ADVERSARIAL))
+def test_redact_text_is_fast_on_adversarial_input(shape: str) -> None:
+    start = time.perf_counter()
+    redact_text(ADVERSARIAL[shape])
+    assert time.perf_counter() - start < 0.5
+
+
+def test_long_strings_are_truncated_before_redaction() -> None:
+    assert MAX_TEXT_CHARS == 16 * 1024
+    out = redact_text("a" * (MAX_TEXT_CHARS * 3))
+    assert out == "a" * MAX_TEXT_CHARS + TRUNCATED
+    short = "a" * MAX_TEXT_CHARS
+    assert redact_text(short) == short
+
+
+def test_bounded_patterns_still_mask_what_they_should() -> None:
+    assert redact_text("DB_PASSWORD=" + SECRET) == "DB_PASSWORD=[REDACTED:assignment]"
+    assert redact_text(f'{{"client_secret": "{SECRET}"}}') == (
+        '{"client_secret": "[REDACTED:assignment]"}'
+    )
+    assert SECRET not in redact_text(f"GET /x?page=1&my_api_key={SECRET}&q=2")
+    assert redact_text("GET /x?keyboard=qwerty&monkey=1") == "GET /x?keyboard=qwerty&monkey=1"
+    assert redact_text("keyword=value passkey=1") == "keyword=value passkey=1"
+
+
+def _boom() -> object:
+    class Boom:
+        def __str__(self) -> str:
+            raise RuntimeError(f"cannot render {SECRET}")
+
+        __repr__ = __str__
+
+    return Boom()
+
+
+def test_mixed_key_types_do_not_leak_the_secret(
+    stream: io.StringIO, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reviewer's reproducer: ``sort_keys`` used to fail on int + str keys."""
+    get_logger("test").info("x", data={1: "a", "password": SECRET})
+    get_logger("test").info("y", data={("a", "b"): "v", "password": SECRET, None: 2})
+
+    captured = capsys.readouterr()
+    assert SECRET not in stream.getvalue()
+    assert SECRET not in captured.err + captured.out
+    first, second = _lines(stream)
+    assert first["data"] == {"1": "a", "password": "[REDACTED]"}
+    assert second["data"]["password"] == REDACTED
+    assert second["data"]["None"] == 2
+
+
+@pytest.mark.parametrize("via", ["structlog", "stdlib"])
+def test_render_failure_emits_a_fixed_redacted_fallback_line(
+    stream: io.StringIO, capsys: pytest.CaptureFixture[str], via: str
+) -> None:
+    if via == "structlog":
+        get_logger("test").warning(f"about {SECRET}", obj=_boom())
+    else:
+        logging.getLogger("test").warning("about %s %s", SECRET, _boom())
+
+    captured = capsys.readouterr()
+    assert SECRET not in stream.getvalue()
+    assert SECRET not in captured.err + captured.out
+    (line,) = _lines(stream)
+    assert line["event"] == "log_render_error"
+    assert line["level"] == "warning"
+    assert line["logger"] == "test"
+    assert set(line) <= {"event", "level", "logger", "timestamp"}
+
+
+def test_configure_logging_turns_off_raise_exceptions(stream: io.StringIO) -> None:
+    assert logging.raiseExceptions is False
+
+
+def test_a_failing_stream_never_prints_the_record(capsys: pytest.CaptureFixture[str]) -> None:
+    class Broken(io.StringIO):
+        def write(self, s: str) -> int:
+            raise OSError("disk full")
+
+    root = logging.getLogger()
+    saved, saved_level, saved_raise = root.handlers[:], root.level, logging.raiseExceptions
+    try:
+        configure_logging(stream=Broken())
+        logging.getLogger("lib").error("key is %s", SECRET)
+        get_logger("lib").error("key", value=SECRET)
+    finally:
+        structlog.reset_defaults()
+        root.handlers[:] = saved
+        root.setLevel(saved_level)
+        logging.raiseExceptions = saved_raise
+    captured = capsys.readouterr()
+    assert SECRET not in captured.err + captured.out
+
+
+def test_cycles_are_cut_not_recursed(stream: io.StringIO) -> None:
+    loop: dict[str, Any] = {"name": "a"}
+    loop["self"] = loop
+    items: list[Any] = [1]
+    items.append(items)
+    shared = {"k": 1}
+    get_logger("test").info("x", loop=loop, items=items, twice=[shared, shared])
+
+    (line,) = _lines(stream)
+    assert line["loop"] == {"name": "a", "self": "[cycle]"}
+    assert line["items"] == [1, "[cycle]"]
+    assert line["twice"] == [{"k": 1}, {"k": 1}], "a repeat is not a cycle"
+
+
+def test_deep_structures_are_cut_at_max_depth(stream: io.StringIO) -> None:
+    deep: Any = SECRET
+    for _ in range(5000):
+        deep = [deep]
+    get_logger("test").info("x", deep=deep)
+
+    raw = stream.getvalue()
+    assert SECRET not in raw
+    (line,) = _lines(stream)
+    node = line["deep"]
+    depth = 0
+    while isinstance(node, list):
+        (node,) = node
+        depth += 1
+    assert node == "[depth]"
+    assert depth <= MAX_DEPTH
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["accessToken", "apiToken", "refreshToken", "xApiKey", "clientSecret", "dbPassword",
+     "AWSSecretAccessKey", "sessionToken"],
+)  # fmt: skip
+def test_camel_case_names_are_sensitive(name: str) -> None:
+    assert is_sensitive_key(name)
+
+
+@pytest.mark.parametrize("name", ["callbackToken", "inputTokens", "maxTokens", "runId"])
+def test_camel_case_ordinary_names_are_not(name: str) -> None:
+    assert not is_sensitive_key(name)
+
+
+def test_any_mapping_keeps_key_masking(stream: io.StringIO) -> None:
+    headers = Headers(headers={"x-api-key": "plainvalue", "accept": "*/*"})
+    proxy = MappingProxyType({"authorization": "plainvalue", "n": 1})
+    get_logger("test").info("req", headers=headers, proxy=proxy)
+
+    assert "plainvalue" not in stream.getvalue()
+    (line,) = _lines(stream)
+    assert line["headers"] == {"x-api-key": "[REDACTED]", "accept": "*/*"}
+    assert line["proxy"] == {"authorization": "[REDACTED]", "n": 1}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Set-Cookie: session=plainvalue; Path=/; HttpOnly",
+        "cookie: a=plainvalue; b=plainvalue",
+        "HTTP/1.1 200 OK\r\nSet-Cookie: sid=plainvalue\r\nServer: x",
+    ],
+)
+def test_cookie_header_text_is_masked(text: str) -> None:
+    out = redact_text(text)
+    assert "plainvalue" not in out
+    assert "[REDACTED:cookie_header]" in out
+    if "Server: x" in text:
+        assert out.endswith("\r\nServer: x")
