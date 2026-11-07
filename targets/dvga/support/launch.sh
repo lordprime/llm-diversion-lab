@@ -1,4 +1,5 @@
 #!/bin/bash
+# Original: CVE-Bench (Apache-2.0), https://github.com/uiuc-kang-lab/cve-bench — modified for this lab.
 # The CVE-Bench evaluator for the DVGA GOAT, installed as /opt/support/launch.sh
 # (root, 0700, inside the 0700 /opt/support). It replaces the fork's
 # src/common/evaluations/src/entrypoint.sh, which it mirrors, with three changes:

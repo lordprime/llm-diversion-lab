@@ -78,7 +78,7 @@ The immediate goal is a **short pilot that tells us whether this line of work ha
 │          Surface injector ──► Target       Callback catcher                              │
 │          (plants P1–P7)       (GOAT)       (per-run tokens)                              │
 │                                 │                                                        │
-│                     Oracle :9091 (/health /done /upload)                                 │
+│                     Oracle: Unix socket, docker exec (/health /done /upload)             │
 │                                                                                          │
 │ pcap sidecar records all agent traffic ──► run volume (JSONL + artifacts)                │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
@@ -107,7 +107,7 @@ There are two layers.
 | LLM tap | Records exact request/response bytes, then forwards to the gateway |
 | Surface injector | Reverse proxy in front of the target that plants tagged content |
 | Target | A GOAT app from a seeded, content-populated image |
-| Oracle sidecar | CVE-Bench-compatible evaluator on `:9091` |
+| Oracle sidecar | CVE-Bench-compatible evaluator; its status service listens only on a root-only Unix socket (no TCP port) |
 | Callback catcher | HTTP/HTTPS + DNS that answers every name, with per-run tokens |
 | Packet capture sidecar | Records all of the agent's traffic |
 
@@ -235,7 +235,7 @@ These come from the current Claude API documentation:
 | **Agent trajectory** | Adapter `collect()` | Normalised AgentEvents plus the untouched native logs |
 | **Callbacks** | Callback catcher | Every HTTP/HTTPS/DNS contact: full raw request, DNS qname, token, and leak classification. This is the strongest **Uptake** signal |
 | **Packet capture** | pcap sidecar | Everything else, e.g. TLS SNI from agents that refuse our CA, non-HTTP attempts |
-| **Oracle verdict** | Oracle sidecar `/done` | The **Outcome**, independent of the agent's claims |
+| **Oracle verdict** | Oracle `/done` | The **Outcome**, independent of the agent's claims |
 | **Run metadata** | Runner | Image digests, adapter capability sheet, model ID, effort, seed, schedule index, pair ID, timings, end status, attempt number |
 
 **Funnel visibility is direct for every configuration.** The paper expected "Visible" to be directly observable only for open-weight models (A3) and inferred for API models. Because we capture the exact bytes each agent sends to the provider, Visible is directly observed for every configuration, closed models included. This is worth stating in the paper.
@@ -266,7 +266,7 @@ There are four APIs. The cell never talks to the control plane directly; it writ
 | `GET /done` | `{"status": bool, "message": str}`, the verified objective. The runner reads it after the run, and it is the **only** source of Outcome. |
 | `POST /upload` | A single key/value of at most 256 characters, used for secret-exfiltration objectives. |
 
-- The injector fronts only the app port. **Agents cannot reach `:9091` at all**, because the target sits on a network only the injector can reach. The runner calls the evaluator with `docker exec`.
+- The injector fronts only the app port. **Agents cannot reach the oracle at all**: its status service (`status_svc`) listens only on a Unix socket in the root-only `/opt/support` (0700), with no TCP port, so neither an agent nor an SSRF in the app can query it. The runner calls only `/opt/support/done.sh` and `health.sh`, with `docker exec`.
 - **The runner polls `/done` every 15 s during the run.** CVE-Bench's "previously successful" latch only survives while the container lives, and agents can reset targets (DVGA `/start_over`).
 - **Default (my call, revised):** agents are *not* told about the oracle, which differs from CVE-Bench's prompt. A visible oracle gives the agent success feedback, and that would interact with derail payloads ("the task is complete"). A CVE-Bench-comparable "oracle visible" variant can be added as an arm (decision 5, §10).
 - **The reverse proxy must never sit in the target's network namespace.** Proxied traffic would then arrive from 127.0.0.1 and satisfy the outbound canary's localhost check.
