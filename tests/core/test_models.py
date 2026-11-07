@@ -76,6 +76,7 @@ EVENT_FIXTURES: dict[type[BaseModel], dict[str, Any]] = {
     PlacementServe: {
         "kind": "placement_serve",
         "run_id": RUN,
+        "stream": "injector",
         "seq": 0,
         "ts": TS,
         "placement_id": "pl_1",
@@ -92,6 +93,7 @@ EVENT_FIXTURES: dict[type[BaseModel], dict[str, Any]] = {
     TargetAccessEvent: {
         "kind": "target_access",
         "run_id": RUN,
+        "stream": "injector",
         "seq": 1,
         "ts": TS,
         "flow_id": "f-1",
@@ -104,6 +106,7 @@ EVENT_FIXTURES: dict[type[BaseModel], dict[str, Any]] = {
     LlmCall: {
         "kind": "llm_call",
         "run_id": RUN,
+        "stream": "tap",
         "seq": 0,
         "ts": TS,
         "role": "main",
@@ -122,6 +125,7 @@ EVENT_FIXTURES: dict[type[BaseModel], dict[str, Any]] = {
     AgentEvent: {
         "kind": "agent_event",
         "run_id": RUN,
+        "stream": "agent",
         "seq": 0,
         "ts": TS,
         "event_type": "tool_call",
@@ -131,6 +135,7 @@ EVENT_FIXTURES: dict[type[BaseModel], dict[str, Any]] = {
     Callback: {
         "kind": "callback",
         "run_id": RUN,
+        "stream": "catcher-http",
         "seq": 0,
         "ts": TS,
         "channel": "http",
@@ -146,6 +151,7 @@ EVENT_FIXTURES: dict[type[BaseModel], dict[str, Any]] = {
     OraclePoll: {
         "kind": "oracle_poll",
         "run_id": RUN,
+        "stream": "oracle",
         "seq": 0,
         "ts": TS,
         "status": True,
@@ -269,7 +275,14 @@ def test_callback_http_requires_method_and_url() -> None:
 
 
 def test_callback_dns_requires_qname() -> None:
-    base = {"kind": "callback", "run_id": RUN, "seq": 1, "ts": TS, "channel": "dns"}
+    base = {
+        "kind": "callback",
+        "run_id": RUN,
+        "stream": "catcher-dns",
+        "seq": 1,
+        "ts": TS,
+        "channel": "dns",
+    }
     ok = Callback.model_validate({**base, "qname": f"{TOKEN}.cb.lab.test", "qtype": "A"})
     assert ok.qname == f"{TOKEN}.cb.lab.test"
     with pytest.raises(ValidationError):
@@ -317,10 +330,50 @@ def test_event_batch_rejects_foreign_run_id() -> None:
         EventBatch.model_validate(batch_dict(events=[ev]))
 
 
-def test_event_batch_rejects_duplicate_kind_seq() -> None:
+def test_event_batch_rejects_duplicate_stream_seq() -> None:
     ev = EVENT_FIXTURES[OraclePoll]
     with pytest.raises(ValidationError):
         EventBatch.model_validate(batch_dict(events=[ev, ev]))
+
+
+def test_event_batch_rejects_same_stream_seq_across_kinds() -> None:
+    # Key is (stream, seq), not (kind, seq): one stream numbers all its events.
+    serve = EVENT_FIXTURES[PlacementServe]
+    access = dict(EVENT_FIXTURES[TargetAccessEvent], seq=serve["seq"])
+    assert serve["stream"] == access["stream"]
+    with pytest.raises(ValidationError):
+        EventBatch.model_validate(batch_dict(events=[serve, access]))
+
+
+def test_event_batch_accepts_same_seq_on_different_streams() -> None:
+    # HTTP and DNS catchers both emit kind="callback" and each numbers from 0.
+    http_cb = dict(EVENT_FIXTURES[Callback], stream="catcher-http", seq=0)
+    dns_cb = {
+        "kind": "callback",
+        "run_id": RUN,
+        "stream": "catcher-dns",
+        "seq": 0,
+        "ts": TS,
+        "channel": "dns",
+        "qname": f"{TOKEN}.cb.lab.test",
+        "qtype": "A",
+    }
+    batch = EventBatch.model_validate(batch_dict(events=[http_cb, dns_cb]))
+    assert [(e.stream, e.seq) for e in batch.events] == [("catcher-http", 0), ("catcher-dns", 0)]
+
+
+@pytest.mark.parametrize("model", list(EVENT_FIXTURES), ids=lambda c: c.__name__)
+def test_event_requires_stream(model: type[BaseModel]) -> None:
+    d = dict(EVENT_FIXTURES[model])
+    del d["stream"]
+    with pytest.raises(ValidationError):
+        model.model_validate(d)
+
+
+@pytest.mark.parametrize("stream", ["", "Tap", "1tap", "tap_1", "tap.x", "a" * 33])
+def test_event_rejects_bad_stream(stream: str) -> None:
+    with pytest.raises(ValidationError):
+        OraclePoll.model_validate(dict(EVENT_FIXTURES[OraclePoll], stream=stream))
 
 
 def test_event_batch_rejects_unknown_kind() -> None:

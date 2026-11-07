@@ -8,9 +8,20 @@ Field names use the study's domain words verbatim: ``surface``, ``placement``,
 ``arm``, ``pair_id``, ``access``, ``visible``, ``uptake``, ``outcome``, ``run_id``,
 ``experiment_id``.
 
-Every evidence event carries ``run_id`` and ``seq``. ``seq`` is monotonic per
-``(run_id, kind)`` (each sidecar numbers its own stream), so the idempotency key for
-storage is ``(run_id, kind, seq)``.
+Event sequencing and idempotency contract
+-----------------------------------------
+Every evidence event carries ``run_id``, ``stream`` and ``seq``.
+
+* ``stream`` names the *producer* of the event (``STREAM_PATTERN``:
+  ``^[a-z][a-z0-9-]{0,31}$``). Conventional names: ``injector``, ``tap``,
+  ``catcher-http``, ``catcher-dns``, ``agent``, ``oracle``. Two components that
+  emit the same ``kind`` (e.g. the HTTP and DNS catchers both emit ``callback``)
+  MUST use different streams.
+* ``seq`` is numbered per ``(run_id, stream)``: each producer counts its own events
+  from 0, monotonically, across all kinds it emits.
+* The idempotency key for storing an event is ``(run_id, stream, seq)``. Re-shipping
+  an event with the same key is a no-op; ``kind`` is NOT part of the key.
+* An :class:`EventBatch` rejects a duplicate ``(stream, seq)`` within one batch.
 """
 
 from __future__ import annotations
@@ -37,6 +48,7 @@ from control.core.tokens import TAG_PATTERN, TOKEN_PATTERN
 __all__ = [
     "ALL_MODELS",
     "SCHEMA_VERSION",
+    "STREAM_PATTERN",
     "AgentEvent",
     "AgentEventType",
     "Arm",
@@ -72,6 +84,10 @@ Tag = Annotated[str, StringConstraints(pattern=TAG_PATTERN)]
 Token = Annotated[str, StringConstraints(pattern=TOKEN_PATTERN)]
 NonEmptyStr = Annotated[str, StringConstraints(min_length=1)]
 HttpStatus = Annotated[int, Field(ge=100, le=599)]
+
+#: Accepted shape of an event producer stream name.
+STREAM_PATTERN = r"^[a-z][a-z0-9-]{0,31}$"
+Stream = Annotated[str, StringConstraints(pattern=STREAM_PATTERN)]
 
 # --------------------------------------------------------------------------- enums
 
@@ -171,6 +187,7 @@ class _Model(BaseModel):
 
 class _Event(_Model):
     run_id: Id
+    stream: Stream
     seq: NonNegativeInt
     ts: AwareDatetime
 
@@ -387,10 +404,10 @@ class EventBatch(_Model):
         seen: set[tuple[str, int]] = set()
         for ev in self.events:
             if ev.run_id != self.run_id:
-                raise ValueError(f"event {ev.kind}#{ev.seq} has run_id {ev.run_id}")
-            key = (ev.kind.value, ev.seq)
+                raise ValueError(f"event {ev.stream}#{ev.seq} has run_id {ev.run_id}")
+            key = (ev.stream, ev.seq)
             if key in seen:
-                raise ValueError(f"duplicate event {ev.kind}#{ev.seq} in batch")
+                raise ValueError(f"duplicate event {ev.stream}#{ev.seq} in batch")
             seen.add(key)
         return self
 

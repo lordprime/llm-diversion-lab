@@ -39,6 +39,11 @@
       "title": "Status",
       "type": "boolean"
     },
+    "stream": {
+      "pattern": "^[a-z][a-z0-9-]{0,31}$",
+      "title": "Stream",
+      "type": "string"
+    },
     "ts": {
       "format": "date-time",
       "title": "Ts",
@@ -47,6 +52,7 @@
   },
   "required": [
     "run_id",
+    "stream",
     "seq",
     "ts",
     "status"

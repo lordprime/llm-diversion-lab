@@ -77,6 +77,11 @@
       "title": "Status",
       "type": "integer"
     },
+    "stream": {
+      "pattern": "^[a-z][a-z0-9-]{0,31}$",
+      "title": "Stream",
+      "type": "string"
+    },
     "surface": {
       "$ref": "#/$defs/Surface"
     },
@@ -98,6 +103,7 @@
   },
   "required": [
     "run_id",
+    "stream",
     "seq",
     "ts",
     "placement_id",

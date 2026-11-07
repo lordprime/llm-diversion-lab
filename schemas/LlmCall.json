@@ -173,6 +173,11 @@
       "default": null,
       "title": "Stop Reason"
     },
+    "stream": {
+      "pattern": "^[a-z][a-z0-9-]{0,31}$",
+      "title": "Stream",
+      "type": "string"
+    },
     "tag_present": {
       "title": "Tag Present",
       "type": "boolean"
@@ -185,6 +190,7 @@
   },
   "required": [
     "run_id",
+    "stream",
     "seq",
     "ts",
     "tag_present",

@@ -35,6 +35,11 @@
           "title": "Seq",
           "type": "integer"
         },
+        "stream": {
+          "pattern": "^[a-z][a-z0-9-]{0,31}$",
+          "title": "Stream",
+          "type": "string"
+        },
         "text": {
           "anyOf": [
             {
@@ -94,6 +99,7 @@
       },
       "required": [
         "run_id",
+        "stream",
         "seq",
         "ts",
         "event_type"
@@ -249,6 +255,11 @@
           "default": null,
           "title": "Source Ip"
         },
+        "stream": {
+          "pattern": "^[a-z][a-z0-9-]{0,31}$",
+          "title": "Stream",
+          "type": "string"
+        },
         "token": {
           "anyOf": [
             {
@@ -282,6 +293,7 @@
       },
       "required": [
         "run_id",
+        "stream",
         "seq",
         "ts",
         "channel"
@@ -462,6 +474,11 @@
           "default": null,
           "title": "Stop Reason"
         },
+        "stream": {
+          "pattern": "^[a-z][a-z0-9-]{0,31}$",
+          "title": "Stream",
+          "type": "string"
+        },
         "tag_present": {
           "title": "Tag Present",
           "type": "boolean"
@@ -474,6 +491,7 @@
       },
       "required": [
         "run_id",
+        "stream",
         "seq",
         "ts",
         "tag_present",
@@ -533,6 +551,11 @@
           "title": "Status",
           "type": "boolean"
         },
+        "stream": {
+          "pattern": "^[a-z][a-z0-9-]{0,31}$",
+          "title": "Stream",
+          "type": "string"
+        },
         "ts": {
           "format": "date-time",
           "title": "Ts",
@@ -541,6 +564,7 @@
       },
       "required": [
         "run_id",
+        "stream",
         "seq",
         "ts",
         "status"
@@ -611,6 +635,11 @@
           "title": "Status",
           "type": "integer"
         },
+        "stream": {
+          "pattern": "^[a-z][a-z0-9-]{0,31}$",
+          "title": "Stream",
+          "type": "string"
+        },
         "surface": {
           "$ref": "#/$defs/Surface"
         },
@@ -632,6 +661,7 @@
       },
       "required": [
         "run_id",
+        "stream",
         "seq",
         "ts",
         "placement_id",
@@ -721,6 +751,11 @@
           "default": null,
           "title": "Status"
         },
+        "stream": {
+          "pattern": "^[a-z][a-z0-9-]{0,31}$",
+          "title": "Stream",
+          "type": "string"
+        },
         "ts": {
           "format": "date-time",
           "title": "Ts",
@@ -734,6 +769,7 @@
       },
       "required": [
         "run_id",
+        "stream",
         "seq",
         "ts",
         "flow_id",

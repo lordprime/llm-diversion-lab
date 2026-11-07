@@ -145,6 +145,11 @@
       "default": null,
       "title": "Source Ip"
     },
+    "stream": {
+      "pattern": "^[a-z][a-z0-9-]{0,31}$",
+      "title": "Stream",
+      "type": "string"
+    },
     "token": {
       "anyOf": [
         {
@@ -178,6 +183,7 @@
   },
   "required": [
     "run_id",
+    "stream",
     "seq",
     "ts",
     "channel"
