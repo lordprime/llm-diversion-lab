@@ -1,0 +1,43 @@
+{
+  "additionalProperties": false,
+  "description": "One raw artifact file of a run, identified by its key and content hash.\n\n``path`` is relative to the run's artifact directory ``runs/<run_id>/`` (e.g.\n``llm/0000.req.json``, ``net.pcap``); ``sha256`` and ``size_bytes`` describe the\nexact bytes stored there.",
+  "properties": {
+    "media_type": {
+      "anyOf": [
+        {
+          "maxLength": 200,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Media Type"
+    },
+    "path": {
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9._+=@,-]*(/[A-Za-z0-9_][A-Za-z0-9._+=@,-]*)*$",
+      "title": "Path",
+      "type": "string"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Sha256",
+      "type": "string"
+    },
+    "size_bytes": {
+      "minimum": 0,
+      "title": "Size Bytes",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "path",
+    "sha256",
+    "size_bytes"
+  ],
+  "title": "ArtifactFile",
+  "type": "object"
+}

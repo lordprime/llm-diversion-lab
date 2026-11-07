@@ -20,6 +20,15 @@ primary key ``(run_id, stream, seq)``, plus the event's ``kind`` and
 :func:`control.db.repo.insert_events`). The per-table unique constraint on
 ``(run_id, stream, seq)`` stays as a second line of defence.
 
+Collector tables
+----------------
+``artifacts`` registers raw artifact files (key ``(run_id, path)``, plus sha256 and
+size); ``run_heartbeats`` keeps runner lifecycle heartbeats (key ``(run_id, seq)``);
+``rejected_batches`` keeps every request body the Collector API refused, byte for byte,
+with the endpoint, the reason and a JSON detail (validation errors or conflicting
+keys). Its ``run_id`` is the URL value as received and deliberately not a foreign key,
+so a body for an unknown or malformed run is kept too. All three are write-once.
+
 Enums are stored as ``VARCHAR`` with a ``CHECK`` constraint (not native Postgres enum
 types), holding the enum *values* (``"queued"``, ``"P1"``...), so adding a value later
 is a plain constraint change in a migration.
@@ -43,6 +52,7 @@ from sqlalchemy import (
     Identity,
     Index,
     Integer,
+    LargeBinary,
     MetaData,
     Numeric,
     String,
@@ -61,10 +71,13 @@ from control.core.models import (
     AgentEventType,
     Arm,
     CallbackChannel,
+    CollectorEndpoint,
     EndStatus,
     EventKind,
     FunnelStage,
     LlmRole,
+    RejectReason,
+    RunPhase,
     RunStatus,
     Surface,
 )
@@ -74,6 +87,7 @@ __all__ = [
     "EVENT_TABLES",
     "Agent",
     "AgentEvent",
+    "Artifact",
     "Base",
     "Callback",
     "EventKeyEntry",
@@ -86,7 +100,9 @@ __all__ = [
     "OraclePoll",
     "Placement",
     "PlacementServe",
+    "RejectedBatch",
     "Run",
+    "RunHeartbeatRow",
     "Target",
     "TargetAccess",
 ]
@@ -520,3 +536,59 @@ class Label(Base):
         JSONB, default=dict, server_default=text("'{}'::jsonb")
     )
     created_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now())
+
+
+# --------------------------------------------------------------------------- collector
+
+
+class Artifact(Base):
+    """A registered raw artifact file (mirrors :class:`control.core.models.ArtifactFile`).
+
+    ``path`` is relative to ``runs/<run_id>/``. Write-once: re-registering a path with
+    different content is a conflict (see :func:`control.db.repo.register_artifacts`).
+    """
+
+    __tablename__ = "artifacts"
+    __table_args__ = (
+        CheckConstraint("size_bytes >= 0", name="size_bytes_nonnegative"),
+        CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="sha256_format"),
+    )
+
+    run_id: Mapped[str] = mapped_column(_ID, ForeignKey("runs.run_id"), primary_key=True)
+    path: Mapped[str] = mapped_column(String(512), primary_key=True)
+    sha256: Mapped[str] = mapped_column(_SHA256)
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    media_type: Mapped[str | None] = mapped_column(_NAME)
+    received_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now())
+
+
+class RunHeartbeatRow(Base):
+    """A runner lifecycle heartbeat (mirrors :class:`control.core.models.RunHeartbeat`)."""
+
+    __tablename__ = "run_heartbeats"
+    __table_args__ = (CheckConstraint("seq >= 0", name="seq_nonnegative"),)
+
+    run_id: Mapped[str] = mapped_column(_ID, ForeignKey("runs.run_id"), primary_key=True)
+    seq: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    phase: Mapped[RunPhase] = mapped_column(_enum(RunPhase, "phase"))
+    ts: Mapped[datetime] = mapped_column(_TS)
+    message: Mapped[str] = mapped_column(Text, default="", server_default=text("''"))
+    received_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now())
+
+
+class RejectedBatch(Base):
+    """A request body the Collector API refused, kept verbatim (never dropped)."""
+
+    __tablename__ = "rejected_batches"
+    __table_args__ = (CheckConstraint("body_sha256 ~ '^[0-9a-f]{64}$'", name="body_sha256_format"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    #: the run_id from the request URL, as received (not a foreign key)
+    run_id: Mapped[str] = mapped_column(Text, index=True)
+    endpoint: Mapped[CollectorEndpoint] = mapped_column(_enum(CollectorEndpoint, "endpoint"))
+    reason: Mapped[RejectReason] = mapped_column(_enum(RejectReason, "reason"))
+    body: Mapped[bytes] = mapped_column(LargeBinary)
+    body_sha256: Mapped[str] = mapped_column(_SHA256)
+    #: validation errors, conflicting keys or the database error, as JSON
+    detail: Mapped[Any] = mapped_column(JSONB)
+    received_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now())

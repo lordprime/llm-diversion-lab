@@ -11,21 +11,50 @@ import json
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
+from pydantic import BaseModel, JsonValue
 from sqlalchemy import func, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from control.core.models import Event, EventKind, RunStatus
-from control.db.tables import EVENT_TABLES, EventKeyEntry, EventRow, Run
+from control.core import models as m
+from control.core.models import (
+    CollectorEndpoint,
+    Event,
+    EventKind,
+    RejectReason,
+    RunStatus,
+)
+from control.db.tables import (
+    EVENT_TABLES,
+    Artifact,
+    EventKeyEntry,
+    EventRow,
+    Placement,
+    RejectedBatch,
+    Run,
+    RunHeartbeatRow,
+)
 
 __all__ = [
+    "ArtifactResult",
     "EventKey",
     "InsertResult",
+    "WriteOutcome",
+    "WriteResult",
     "claim_next_run",
     "event_content_sha256",
+    "foreign_placements",
     "insert_events",
+    "model_sha256",
+    "record_heartbeat",
+    "record_manifest",
+    "record_rejected",
+    "record_verdict",
+    "register_artifacts",
+    "run_exists",
 ]
 
 
@@ -86,15 +115,20 @@ class InsertResult:
     conflicts: list[EventKey] = field(default_factory=list)
 
 
-def event_content_sha256(event: Event) -> str:
-    """SHA-256 of the event's canonical JSON (every field, kind included, sorted keys)."""
+def model_sha256(model: BaseModel) -> str:
+    """SHA-256 of a model's canonical JSON (every field, sorted keys, compact, UTF-8)."""
     canonical = json.dumps(
-        event.model_dump(mode="json"),
+        model.model_dump(mode="json"),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def event_content_sha256(event: Event) -> str:
+    """SHA-256 of the event's canonical JSON (every field, kind included, sorted keys)."""
+    return model_sha256(event)
 
 
 def insert_events(session: Session, events: Iterable[Event]) -> InsertResult:
@@ -182,3 +216,233 @@ def _classify(
         result.duplicates += 1
     else:
         result.conflicts.append(EventKey(event.run_id, event.stream, event.seq, event.kind))
+
+
+# --------------------------------------------------------------------------- collector
+
+
+class WriteOutcome(StrEnum):
+    """Outcome of a write-once record (manifest, verdict, heartbeat)."""
+
+    #: written now
+    STORED = "stored"
+    #: identical to what is already stored; nothing written
+    DUPLICATE = "duplicate"
+    #: contradicts what is already stored (or the run row); nothing written
+    CONFLICT = "conflict"
+    #: no such run; nothing written
+    UNKNOWN_RUN = "unknown_run"
+
+
+@dataclass(frozen=True, slots=True)
+class WriteResult:
+    """A :class:`WriteOutcome` plus, for a conflict, the fields that disagree."""
+
+    outcome: WriteOutcome
+    fields: tuple[str, ...] = ()
+
+
+def run_exists(session: Session, run_id: str) -> bool:
+    return session.scalar(select(Run.run_id).where(Run.run_id == run_id)) is not None
+
+
+def foreign_placements(session: Session, run_id: str, placement_ids: Iterable[str]) -> list[str]:
+    """The ``placement_ids`` that are not planned placements of ``run_id``, sorted."""
+    wanted = set(placement_ids)
+    if not wanted:
+        return []
+    found = set(
+        session.scalars(
+            select(Placement.placement_id).where(
+                Placement.run_id == run_id, Placement.placement_id.in_(wanted)
+            )
+        )
+    )
+    return sorted(wanted - found)
+
+
+#: Manifest fields that must agree with the queued run row.
+MANIFEST_RUN_FIELDS = ("experiment_id", "pair_id", "arm", "schedule_index", "attempt", "tag")
+
+
+def record_manifest(session: Session, manifest: m.RunManifest) -> WriteResult:
+    """Store a run's manifest once: its placements plus ``runs.manifest_sha256``.
+
+    The manifest must agree with the run row on :data:`MANIFEST_RUN_FIELDS`. The hash
+    (:func:`model_sha256`) is set with ``UPDATE ... WHERE manifest_sha256 IS NULL``, so
+    of two concurrent posts exactly one writes the placements; a later identical
+    manifest is a duplicate and a different one a conflict.
+    """
+    row = session.execute(
+        select(*(getattr(Run, f) for f in MANIFEST_RUN_FIELDS)).where(Run.run_id == manifest.run_id)
+    ).one_or_none()
+    if row is None:
+        return WriteResult(WriteOutcome.UNKNOWN_RUN)
+    mismatched = tuple(f for f in MANIFEST_RUN_FIELDS if getattr(row, f) != getattr(manifest, f))
+    if mismatched:
+        return WriteResult(WriteOutcome.CONFLICT, mismatched)
+
+    digest = model_sha256(manifest)
+    claimed = session.execute(
+        update(Run)
+        .where(Run.run_id == manifest.run_id, Run.manifest_sha256.is_(None))
+        .values(manifest_sha256=digest)
+        .returning(Run.run_id)
+        .execution_options(synchronize_session=False)
+    ).first()
+    if claimed is None:
+        stored = session.scalar(select(Run.manifest_sha256).where(Run.run_id == manifest.run_id))
+        if stored == digest:
+            return WriteResult(WriteOutcome.DUPLICATE)
+        return WriteResult(WriteOutcome.CONFLICT, ("manifest_sha256",))
+    if manifest.placements:
+        session.execute(pg_insert(Placement).values([p.model_dump() for p in manifest.placements]))
+    return WriteResult(WriteOutcome.STORED)
+
+
+def record_verdict(session: Session, verdict: m.Verdict) -> WriteResult:
+    """Set the run's oracle verdict and end status, write-once.
+
+    ``UPDATE runs ... WHERE outcome IS NULL AND end_status IS NULL``: the first verdict
+    wins; re-posting the same verdict is a duplicate and a different one a conflict
+    (the stored verdict is never overwritten).
+    """
+    values: dict[str, Any] = {
+        "end_status": verdict.end_status,
+        "outcome": verdict.outcome,
+        "oracle_message": verdict.oracle_message,
+        "decided_at": verdict.decided_at,
+    }
+    claimed = session.execute(
+        update(Run)
+        .where(Run.run_id == verdict.run_id, Run.outcome.is_(None), Run.end_status.is_(None))
+        .values(**values)
+        .returning(Run.run_id)
+        .execution_options(synchronize_session=False)
+    ).first()
+    if claimed is not None:
+        return WriteResult(WriteOutcome.STORED)
+    stored = session.execute(
+        select(Run.end_status, Run.outcome, Run.oracle_message, Run.decided_at).where(
+            Run.run_id == verdict.run_id
+        )
+    ).one_or_none()
+    if stored is None:
+        return WriteResult(WriteOutcome.UNKNOWN_RUN)
+    differing = tuple(k for k, v in values.items() if getattr(stored, k) != v)
+    if differing:
+        return WriteResult(WriteOutcome.CONFLICT, differing)
+    return WriteResult(WriteOutcome.DUPLICATE)
+
+
+@dataclass(slots=True)
+class ArtifactResult:
+    """Outcome of :func:`register_artifacts`; ``conflicts`` lists rejected paths."""
+
+    inserted: int = 0
+    duplicates: int = 0
+    conflicts: list[str] = field(default_factory=list)
+
+
+def register_artifacts(session: Session, batch: m.ArtifactBatch) -> ArtifactResult:
+    """Register artifact files idempotently on ``(run_id, path)``.
+
+    A path already registered with the same sha256, size and media type is a
+    duplicate; with any difference it is a conflict and the stored row is kept.
+    """
+    result = ArtifactResult()
+    if not batch.artifacts:
+        return result
+    files = {a.path: a for a in batch.artifacts}
+    claimed = set(
+        session.scalars(
+            pg_insert(Artifact)
+            .values([{"run_id": batch.run_id, **a.model_dump()} for a in batch.artifacts])
+            .on_conflict_do_nothing()
+            .returning(Artifact.path)
+        )
+    )
+    existing = [p for p in files if p not in claimed]
+    if existing:
+        stored = {
+            row.path: (row.sha256, row.size_bytes, row.media_type)
+            for row in session.execute(
+                select(
+                    Artifact.path, Artifact.sha256, Artifact.size_bytes, Artifact.media_type
+                ).where(Artifact.run_id == batch.run_id, Artifact.path.in_(existing))
+            )
+        }
+        for path in existing:
+            a = files[path]
+            if stored.get(path) == (a.sha256, a.size_bytes, a.media_type):
+                result.duplicates += 1
+            else:
+                result.conflicts.append(path)
+    result.inserted = len(claimed)
+    return result
+
+
+def record_heartbeat(session: Session, heartbeat: m.RunHeartbeat) -> WriteResult:
+    """Store a lifecycle heartbeat idempotently on ``(run_id, seq)``.
+
+    The run must exist (checked by the caller; the foreign key enforces it).
+    """
+    values: dict[str, Any] = {
+        "phase": heartbeat.phase,
+        "ts": heartbeat.ts,
+        "message": heartbeat.message,
+    }
+    claimed = session.scalar(
+        pg_insert(RunHeartbeatRow)
+        .values(run_id=heartbeat.run_id, seq=heartbeat.seq, **values)
+        .on_conflict_do_nothing()
+        .returning(RunHeartbeatRow.seq)
+    )
+    if claimed is not None:
+        return WriteResult(WriteOutcome.STORED)
+    stored = session.execute(
+        select(RunHeartbeatRow.phase, RunHeartbeatRow.ts, RunHeartbeatRow.message).where(
+            RunHeartbeatRow.run_id == heartbeat.run_id, RunHeartbeatRow.seq == heartbeat.seq
+        )
+    ).one()
+    differing = tuple(k for k, v in values.items() if getattr(stored, k) != v)
+    if differing:
+        return WriteResult(WriteOutcome.CONFLICT, differing)
+    return WriteResult(WriteOutcome.DUPLICATE)
+
+
+def record_rejected(
+    session: Session,
+    *,
+    run_id: str,
+    endpoint: CollectorEndpoint,
+    reason: RejectReason,
+    body: bytes,
+    detail: JsonValue,
+) -> int:
+    """Keep a refused request body verbatim in ``rejected_batches``; return its id.
+
+    ``body`` is stored byte for byte. NUL characters (which Postgres text and JSONB
+    cannot hold) are replaced by U+FFFD in ``run_id`` and ``detail`` only.
+    """
+    row = RejectedBatch(
+        run_id=run_id.replace("\x00", "\ufffd"),
+        endpoint=endpoint,
+        reason=reason,
+        body=body,
+        body_sha256=hashlib.sha256(body).hexdigest(),
+        detail=_without_nul(detail),
+    )
+    session.add(row)
+    session.flush()
+    return row.id
+
+
+def _without_nul(value: JsonValue) -> JsonValue:
+    if isinstance(value, str):
+        return value.replace("\x00", "\ufffd")
+    if isinstance(value, list):
+        return [_without_nul(v) for v in value]
+    if isinstance(value, dict):
+        return {k.replace("\x00", "\ufffd"): _without_nul(v) for k, v in value.items()}
+    return value

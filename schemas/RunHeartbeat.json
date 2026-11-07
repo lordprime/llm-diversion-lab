@@ -1,0 +1,60 @@
+{
+  "$defs": {
+    "RunPhase": {
+      "description": "Runner lifecycle phase reported by ``POST /v1/runs/{run_id}/status`` heartbeats.\n\nInformational only (live dashboard); it never changes ``runs.status``.",
+      "enum": [
+        "claimed",
+        "cell_starting",
+        "probing",
+        "agent_running",
+        "collecting",
+        "shipping",
+        "teardown",
+        "finished"
+      ],
+      "title": "RunPhase",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "``POST /v1/runs/{run_id}/status`` body: one runner lifecycle heartbeat.\n\n``seq`` is numbered per run by the runner from 0; the idempotency key is\n``(run_id, seq)``.",
+  "properties": {
+    "message": {
+      "default": "",
+      "title": "Message",
+      "type": "string"
+    },
+    "phase": {
+      "$ref": "#/$defs/RunPhase"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "seq": {
+      "minimum": 0,
+      "title": "Seq",
+      "type": "integer"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "seq",
+    "phase",
+    "ts"
+  ],
+  "title": "RunHeartbeat",
+  "type": "object"
+}

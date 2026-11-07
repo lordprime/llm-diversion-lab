@@ -14,7 +14,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "``POST /v1/runs/{run_id}/verdict`` body: oracle outcome plus end status.",
+  "description": "``POST /v1/runs/{run_id}/verdict`` body: oracle outcome plus end status.\n\nWrite-once per run: the first verdict stored wins; re-posting the same verdict is a\nno-op and a different one is rejected.",
   "properties": {
     "decided_at": {
       "format": "date-time",

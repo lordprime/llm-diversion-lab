@@ -47,13 +47,17 @@ from control.core.tokens import TAG_PATTERN, TOKEN_PATTERN
 
 __all__ = [
     "ALL_MODELS",
+    "ARTIFACT_PATH_PATTERN",
     "SCHEMA_VERSION",
     "STREAM_PATTERN",
     "AgentEvent",
     "AgentEventType",
     "Arm",
+    "ArtifactBatch",
+    "ArtifactFile",
     "Callback",
     "CallbackChannel",
+    "CollectorEndpoint",
     "EndStatus",
     "Event",
     "EventBatch",
@@ -66,7 +70,10 @@ __all__ = [
     "OraclePoll",
     "Placement",
     "PlacementServe",
+    "RejectReason",
+    "RunHeartbeat",
     "RunManifest",
+    "RunPhase",
     "RunStatus",
     "Surface",
     "TargetAccessEvent",
@@ -135,6 +142,22 @@ class RunStatus(StrEnum):
     RUNNING = "running"
     VALID = "valid"
     INVALID = "invalid"
+
+
+class RunPhase(StrEnum):
+    """Runner lifecycle phase reported by ``POST /v1/runs/{run_id}/status`` heartbeats.
+
+    Informational only (live dashboard); it never changes ``runs.status``.
+    """
+
+    CLAIMED = "claimed"
+    CELL_STARTING = "cell_starting"
+    PROBING = "probing"
+    AGENT_RUNNING = "agent_running"
+    COLLECTING = "collecting"
+    SHIPPING = "shipping"
+    TEARDOWN = "teardown"
+    FINISHED = "finished"
 
 
 class EventKind(StrEnum):
@@ -413,13 +436,99 @@ class EventBatch(_Model):
 
 
 class Verdict(_Model):
-    """``POST /v1/runs/{run_id}/verdict`` body: oracle outcome plus end status."""
+    """``POST /v1/runs/{run_id}/verdict`` body: oracle outcome plus end status.
+
+    Write-once per run: the first verdict stored wins; re-posting the same verdict is a
+    no-op and a different one is rejected.
+    """
 
     run_id: Id
     end_status: EndStatus
     outcome: bool
     oracle_message: str = ""
     decided_at: AwareDatetime
+
+
+#: A path segment of an artifact key: no empty, ``.`` or ``..`` segments, no hidden
+#: files, no backslashes. Keys are relative to ``runs/<run_id>/``.
+_ARTIFACT_SEGMENT = r"[A-Za-z0-9_][A-Za-z0-9._+=@,-]*"
+ARTIFACT_PATH_PATTERN: Final = rf"^{_ARTIFACT_SEGMENT}(/{_ARTIFACT_SEGMENT})*$"
+ArtifactPath = Annotated[str, StringConstraints(pattern=ARTIFACT_PATH_PATTERN, max_length=512)]
+
+
+class ArtifactFile(_Model):
+    """One raw artifact file of a run, identified by its key and content hash.
+
+    ``path`` is relative to the run's artifact directory ``runs/<run_id>/`` (e.g.
+    ``llm/0000.req.json``, ``net.pcap``); ``sha256`` and ``size_bytes`` describe the
+    exact bytes stored there.
+    """
+
+    path: ArtifactPath
+    sha256: Sha256
+    size_bytes: NonNegativeInt
+    media_type: Annotated[str, StringConstraints(min_length=1, max_length=200)] | None = None
+
+
+class ArtifactBatch(_Model):
+    """``POST /v1/runs/{run_id}/artifacts`` body: register artifact files with sha256.
+
+    Idempotent on ``(run_id, path)``: re-registering a path with the same hash, size and
+    media type is a no-op; any difference is a conflict. Paths are unique per batch.
+    """
+
+    schema_version: Literal[1] = SCHEMA_VERSION
+    run_id: Id
+    artifacts: list[ArtifactFile]
+
+    @model_validator(mode="after")
+    def _paths_unique(self) -> Self:
+        paths = [a.path for a in self.artifacts]
+        if len(set(paths)) != len(paths):
+            raise ValueError("artifact paths must be unique within a batch")
+        return self
+
+
+class RunHeartbeat(_Model):
+    """``POST /v1/runs/{run_id}/status`` body: one runner lifecycle heartbeat.
+
+    ``seq`` is numbered per run by the runner from 0; the idempotency key is
+    ``(run_id, seq)``.
+    """
+
+    schema_version: Literal[1] = SCHEMA_VERSION
+    run_id: Id
+    seq: NonNegativeInt
+    phase: RunPhase
+    ts: AwareDatetime
+    message: str = ""
+
+
+class CollectorEndpoint(StrEnum):
+    """Collector API write endpoint, as recorded on a rejected request."""
+
+    MANIFEST = "manifest"
+    EVENTS = "events"
+    ARTIFACTS = "artifacts"
+    VERDICT = "verdict"
+    STATUS = "status"
+
+
+class RejectReason(StrEnum):
+    """Why the Collector API rejected (and kept) a request body."""
+
+    #: not valid JSON, or fails the envelope's schema
+    INVALID = "invalid"
+    #: ``run_id`` in the URL differs from the one in the payload
+    RUN_ID_MISMATCH = "run_id_mismatch"
+    #: no such run
+    UNKNOWN_RUN = "unknown_run"
+    #: an event references a placement that is not planned for this run
+    UNKNOWN_PLACEMENT = "unknown_placement"
+    #: contradicts evidence already stored (write-once)
+    CONFLICT = "conflict"
+    #: schema-valid but refused by a database constraint (length, NUL byte, uniqueness)
+    CONSTRAINT = "constraint"
 
 
 #: Every model with a generated JSON Schema in ``schemas/``.
@@ -435,4 +544,7 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     RunManifest,
     EventBatch,
     Verdict,
+    ArtifactFile,
+    ArtifactBatch,
+    RunHeartbeat,
 )

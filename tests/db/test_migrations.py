@@ -5,7 +5,7 @@ from sqlalchemy import inspect
 
 from control.db.engine import create_db_engine
 from control.db.tables import Base
-from tests.db.conftest import alembic_config
+from tests.conftest import alembic_config
 
 EXPECTED_TABLES = {
     "experiments",
@@ -23,6 +23,9 @@ EXPECTED_TABLES = {
     "oracle_polls",
     "labels",
     "event_keys",
+    "artifacts",
+    "run_heartbeats",
+    "rejected_batches",
 }
 
 EVENT_TABLES = {

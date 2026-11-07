@@ -1,4 +1,4 @@
-"""Postgres fixtures for the database tests.
+"""Postgres fixtures shared by the database and Collector API tests.
 
 Server selection, in order:
 
@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover - the dev group always installs it
 
 POSTGRES_IMAGE = "docker.io/library/postgres:17-alpine"
 READY_TIMEOUT_S = 60.0
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _docker_hosts() -> list[str]:

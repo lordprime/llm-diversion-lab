@@ -15,6 +15,7 @@ MIRRORS: list[tuple[type[BaseModel], type[t.Base]]] = [
     (m.Callback, t.Callback),
     (m.OraclePoll, t.OraclePoll),
     (m.FunnelLabel, t.Label),
+    (m.ArtifactFile, t.Artifact),
 ]
 
 
