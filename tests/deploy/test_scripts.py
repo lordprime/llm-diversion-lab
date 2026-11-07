@@ -1186,7 +1186,9 @@ def test_host_nft_ruleset_fails_closed_for_cells(firewall_default: Path) -> None
     # cell with NET_RAW cannot forge a source that does not route back via its bridge.
     prerouting = _chain(listing, "prerouting")
     assert "type filter hook prerouting priority raw" in prerouting[0]
-    _index(prerouting, 'iifname "labc*"', "fib saddr . iif oif missing", "drop")
+    # nft prints the existence test as `oif missing` (older) or `check missing` (newer).
+    rpf = [r.replace("iif check missing", "iif oif missing") for r in prerouting]
+    _index(rpf, 'iifname "labc*"', "fib saddr . iif oif missing", "drop")
 
     # Cells are matched by ingress interface AND by source address.
     forward = _chain(listing, "forward")

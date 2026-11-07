@@ -64,7 +64,7 @@ check() {
 		return 1
 	fi
 	if ! nft list chain inet lab_host forward 2>/dev/null | grep -q '"lab: cell egress"' ||
-		! nft list chain inet lab_host prerouting 2>/dev/null | grep -q 'fib saddr . iif oif missing'; then
+		! nft list chain inet lab_host prerouting 2>/dev/null | grep -Eq 'fib saddr \. iif (oif|check) missing'; then
 		echo "nftables table inet lab_host (forward drop, reverse-path check) is not loaded" >&2
 		return 1
 	fi
