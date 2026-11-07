@@ -2,7 +2,7 @@
 
 The connector and resolver are injected, so no test touches the network except the
 real-connector tests, which aim the socket at a listener (or a closed port) on
-127.0.0.1 behind a TEST-NET destination (loopback is never a valid target).
+127.0.0.1 behind a public-looking destination (loopback is never a valid target).
 """
 
 from __future__ import annotations
@@ -183,7 +183,7 @@ def test_dns_answers_only_from_the_sinkhole_are_not_a_breach() -> None:
 def _to_loopback(port: int) -> Callable[[str, int, float], None]:
     """The real connector, aimed at a loopback port whatever the destination says.
 
-    Loopback is not a valid must-fail target, so the destination is a TEST-NET address
+    Loopback is not a valid must-fail target, so the destination is a public address
     and only the socket underneath is local.
     """
 
@@ -198,7 +198,7 @@ def test_a_dead_destination_in_the_real_connector_is_reported() -> None:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]  # bound but not listening: connections are refused
-        dest = Destination(Category.HOST, Kind.TCP, "192.0.2.7", port)
+        dest = Destination(Category.HOST, Kind.TCP, "93.184.215.7", port)
         report = probe([dest], connect=_to_loopback(port), timeout=1.0)
 
     (result,) = report.results
@@ -215,7 +215,7 @@ def test_ipv6_unreachable_on_a_v4_only_cell_is_ok() -> None:
 
 
 def test_reachable_destination_is_reported_as_success(listener: int) -> None:
-    dest = Destination(Category.LAN, Kind.TCP, "192.0.2.8", listener)
+    dest = Destination(Category.LAN, Kind.TCP, "192.168.1.8", listener)
     report = probe([dest], connect=_to_loopback(listener), timeout=1.0)
 
     (result,) = report.results
@@ -465,7 +465,7 @@ def test_timeout_below_the_floor_is_refused(timeout: float) -> None:
 @pytest.mark.parametrize("value", ["0.001", "0.5", "0", "-1", "60.5", "3600", "nan", "inf"])
 def test_cli_timeout_outside_the_bounds_is_a_usage_error(value: str) -> None:
     with pytest.raises(SystemExit) as exc:
-        main(["--dest", "internet:tcp:192.0.2.1:443", "--timeout", value])
+        main(["--dest", "internet:tcp:1.1.1.1:443", "--timeout", value])
     assert exc.value.code == 2
 
 
@@ -498,6 +498,19 @@ BAD_MUST_FAIL = [
     "::ffff:255.255.255.255",  # IPv4-mapped forms
     "::ffff:127.0.0.1",
     "::ffff:224.0.0.1",
+    # NEW-4: link-local (scoped or not) and documentation/test/reserved ranges
+    "fe80::1",
+    "fe80::1%lo",
+    "fe80::abcd%eth0",
+    "febf::1",
+    "0.1.2.3",  # 0.0.0.0/8
+    "192.0.2.1",  # RFC 5737 TEST-NETs
+    "198.51.100.7",
+    "203.0.113.9",
+    "2001:db8::1",  # RFC 3849
+    "100::1",  # RFC 6666 discard-only
+    "::ffff:192.0.2.1",
+    "::ffff:0.1.2.3",
 ]
 
 
@@ -511,6 +524,39 @@ def _spec(category: str, ip: str, port: int = 443) -> str:
 def test_bad_must_fail_target_is_rejected_at_parse(category: str, ip: str) -> None:
     with pytest.raises(ValueError, match="destination"):
         parse_destination(_spec(category, ip))
+
+
+@pytest.mark.parametrize(
+    "spec",
+    ["lan:tcp:[fe80::1%lo]:80", "lan:tcp:[fe80::1%eth0]:22", "host:tcp:[2001:db8::5]:22"],
+)
+def test_scoped_link_local_and_documentation_specs_are_rejected(spec: str) -> None:
+    """Reviewer's NEW-4 shape: a scoped link-local target reads 'unreachable' instantly."""
+    with pytest.raises(ValueError, match="destination"):
+        parse_destination(spec)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--lan", "fe80::1%lo"],
+        ["--lan", "192.0.2.3"],
+        ["--host-gateway", "198.51.100.1"],
+        ["--host-gateway", "fe80::1"],
+        ["--dest", "lan:tcp:[fe80::1%lo]:80"],
+        ["--dest", "internet:tcp:203.0.113.5:443"],
+    ],
+)
+def test_cli_rejects_link_local_and_documentation_must_fail_targets(argv: list[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main([*FULL_CLI, *argv])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("ip", ["169.254.169.254", "93.184.215.14", "2606:4700:4700::1111"])
+def test_metadata_and_public_must_fail_targets_stay_allowed(ip: str) -> None:
+    """The cloud metadata address is a real path a breakout would use."""
+    assert parse_destination(_spec("lan", ip)).target == ip
 
 
 @pytest.mark.parametrize("ip", BAD_MUST_FAIL)
@@ -787,11 +833,11 @@ def test_report_serialises_to_json() -> None:
     assert first["ok"] is False
 
 
-#: Every category given explicitly, on TEST-NET addresses (RFC 5737).
+#: Every category given explicitly (the injected connectors never touch the network).
 FULL_CLI = [
-    "--dest", "internet:tcp:192.0.2.1:443",
-    "--dest", "host:tcp:192.0.2.2:22",
-    "--dest", "lan:tcp:192.0.2.3:80",
+    "--dest", "internet:tcp:1.1.1.1:443",
+    "--dest", "host:tcp:172.17.0.1:22",
+    "--dest", "lan:tcp:192.168.1.1:80",
     "--reach", "tap:8080",
 ]  # fmt: skip
 
@@ -813,20 +859,20 @@ def test_main_prints_report_and_exits_nonzero_when_not_contained(
     """A real listener (reached through loopback) behind a reachable must-fail address."""
 
     def connect(host: str, port: int, timeout: float) -> None:
-        if host == "192.0.2.9":
+        if host == "192.168.1.9":
             tcp_connect("127.0.0.1", listener, timeout)
         else:
             _only_reach(host, port, timeout)
 
     code = main(
-        [*FULL_CLI, "--dest", f"lan:tcp:192.0.2.9:{listener}"],
+        [*FULL_CLI, "--dest", f"lan:tcp:192.168.1.9:{listener}"],
         connect=connect,
         resolve=_resolve_tap,
     )
     doc = json.loads(capsys.readouterr().out)
     assert code == 1
     assert doc["contained"] is False
-    assert [r["outcome"] for r in doc["results"] if r["target"] == "192.0.2.9"] == ["reachable"]
+    assert [r["outcome"] for r in doc["results"] if r["target"] == "192.168.1.9"] == ["reachable"]
 
 
 def test_main_without_reach_is_never_contained(capsys: pytest.CaptureFixture[str]) -> None:

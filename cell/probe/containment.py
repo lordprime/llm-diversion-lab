@@ -23,7 +23,11 @@ Rules that keep a broken or mis-specified probe from reading as "contained":
   not a hostname (a resolution failure would look like containment although no
   address was tried), and not loopback, unspecified, multicast, broadcast or reserved
   (``255.255.255.255``, ``224.0.0.0/4``, ``240.0.0.0/4``, ``ff00::/8``, IPv4-mapped and
-  IPv4-compatible forms included), which fail instantly without testing any path.
+  IPv4-compatible forms included), which fail instantly without testing any path; nor
+  IPv6 link-local (``fe80::/10``) or scoped (``fe80::1%lo``), nor a documentation, test
+  or discard range that no real path leads to (``0.0.0.0/8``, ``192.0.2.0/24``,
+  ``198.51.100.0/24``, ``203.0.113.0/24``, ``2001:db8::/32``, ``100::/64``). The
+  metadata address ``169.254.169.254`` stays allowed: it is a real path.
   Rejected at parse time (``--host-gateway`` and ``--lan`` too); a directly
   constructed one, or a bad gateway read from the route table, is ``error``.
 * Each must-fail category counts as probed only with at least one **tcp** result. DNS
@@ -428,18 +432,43 @@ def _never_a_path(addr: _Address) -> str | None:
     return None
 
 
+#: Ranges no real path leads to (documentation, test, discard-only): a must-fail target
+#: there proves nothing whatever it reads.
+_NO_PATH_NETWORKS = tuple(
+    ipaddress.ip_network(net)
+    for net in (
+        "0.0.0.0/8",
+        "192.0.2.0/24",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "2001:db8::/32",
+        "100::/64",
+    )
+)
+
+
 def _must_fail_problem(target: str) -> str | None:
     """Why ``target`` cannot be a must-fail tcp target, or ``None`` if it can.
 
     It must be an IP literal that is not loopback, unspecified, multicast, broadcast or
     reserved: those fail (or succeed) instantly without testing any path, so they
-    would "cover" a category with a meaningless ``unreachable``.
+    would "cover" a category with a meaningless ``unreachable``. Nor may it be scoped
+    or IPv6 link-local (``fe80::1%lo`` fails instantly with ``ENETUNREACH``), or in a
+    documentation/test/discard range (:data:`_NO_PATH_NETWORKS`). IPv4 link-local stays
+    allowed: ``169.254.169.254`` is the metadata service, a real breakout path.
     """
     addr = _ip(target)
     if addr is None:
         return "is not an IP literal"
     reason = _never_a_path(addr)
-    return f"is {reason}" if reason else None
+    if reason:
+        return f"is {reason}"
+    if isinstance(addr, ipaddress.IPv6Address) and (addr.scope_id or addr.is_link_local):
+        return "is IPv6 link-local or scoped"
+    for form in _forms(addr):
+        if any(form in net for net in _NO_PATH_NETWORKS):
+            return "is in a documentation, test or discard range"
+    return None
 
 
 def _reach_problem(target: str) -> str | None:
