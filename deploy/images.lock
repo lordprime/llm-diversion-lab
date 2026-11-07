@@ -13,3 +13,14 @@ images:
     image: docker.io/library/python
     digest: sha256:f72a86806f92fe13a49f49aeca1db0b19ea5cf4a0470b842a01b0e14314945b8
     expect_tools: [curl, bash]
+
+  # The control-plane database (deploy/compose/control-plane.yml, service `db`):
+  # official postgres 17.11-bookworm, multi-arch index digest, resolved 7 Nov 2026.
+  # PostgreSQL >= 13 is required (release.sh's rollback uses DROP DATABASE ... WITH
+  # (FORCE)). The compose file pins this same image@digest (a test checks that they
+  # agree). The digest must be refreshed only by a reviewed commit that changes
+  # both files; never replace it with a tag.
+  - name: postgres-17-bookworm
+    image: docker.io/library/postgres
+    digest: sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+    expect_tools: [pg_dump, pg_restore, psql, pg_isready]

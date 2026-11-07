@@ -1,0 +1,7 @@
+# Build context of control.Dockerfile is the repository root: send only what the
+# image copies (BuildKit reads <Dockerfile>.dockerignore next to the Dockerfile).
+*
+!pyproject.toml
+!uv.lock
+!control/
+**/__pycache__

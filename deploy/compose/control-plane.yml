@@ -1,0 +1,125 @@
+# LLM Diversion Lab control plane: Postgres, the one-shot migration, the Collector API.
+#
+# Used ONLY as (deploy/remote/release.sh, deploy/remote/status.sh):
+#   docker compose --project-name lab --env-file /srv/lab/secrets/lab.env \
+#     -f /srv/lab/current/deploy/compose/control-plane.yml ...
+#
+# Contract (tests/deploy/test_control_plane_compose.py):
+# * `db` is the official postgres image pinned by the digest in deploy/images.lock
+#   (PostgreSQL >= 13). POSTGRES_DB and POSTGRES_USER are set explicitly: release.sh
+#   runs pg_dump / pg_restore inside this container with them. The password is
+#   LAB_DB_PASSWORD from lab.env; the stack refuses to start without it. Postgres
+#   reads it only when the data directory is first initialised: changing it in
+#   lab.env later does NOT change the database's password.
+# * `migrate` is a one-shot `alembic upgrade head` (python -m control.cli.migrate,
+#   which configures the redacted JSON logging first). release.sh runs it with
+#   `run --rm --no-deps migrate` after a pg_dump; `up` runs it again before the
+#   Collector starts, where it is a no-op at head.
+# * `collector` is the Collector API (python -m control.api: configure_logging, then
+#   uvicorn with log_config=None). Its /metrics derive from the runs table and the
+#   self-test status file (/srv/lab/state, read-only), so they survive restarts.
+# * Every published port binds 127.0.0.1 only: Postgres on 5432 (labctl on the host),
+#   the Collector on 8100 (the runner, labctl doctor, Prometheus). 8000 stays free
+#   for the Control/Results API that Caddy fronts; the Collector is never behind Caddy.
+# * The one network has an explicit subnet outside the run-cell range 10.231.0.0/16,
+#   Docker's default address pools (172.20.0.0/14), the home LAN (192.168.0.0/16)
+#   and Twingate/CGNAT (100.64.0.0/10).
+# * Images: `db` is pulled by digest. `migrate` and `collector` are built from this
+#   release tree (deploy/compose/control.Dockerfile, base images pinned by digest),
+#   which needs `release.sh --allow-build` until CI publishes a pinned
+#   control-plane image; without it release.sh refuses the unpinned local tag.
+
+name: lab
+
+x-control-image: &control-image
+  image: lab/control:release
+  build:
+    context: ../..
+    dockerfile: deploy/compose/control.Dockerfile
+
+x-control-env: &control-env
+  # No password in the URL: libpq reads PGPASSWORD.
+  DATABASE_URL: postgresql+psycopg://lab@db:5432/lab
+  PGPASSWORD: ${LAB_DB_PASSWORD:?LAB_DB_PASSWORD is not set}
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+services:
+  db:
+    image: docker.io/library/postgres@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: lab
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: ${LAB_DB_PASSWORD:?LAB_DB_PASSWORD is not set (deploy/secrets.sh)}
+      # The image's default auth: scram-sha-256 over TCP (the app services, labctl);
+      # trust only on the container's own Unix socket (release.sh's pg_dump/psql).
+      # A subdirectory, so the entrypoint's chown never touches /srv/lab/db itself
+      # (owned by lab:lab, mode 0700, by the base role).
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - /srv/lab/db:/var/lib/postgresql/data
+    ports:
+      - 127.0.0.1:5432:5432
+    networks: [control]
+    shm_size: 256m
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  migrate:
+    <<: *control-image
+    restart: "no"
+    command: ["python", "-m", "control.cli.migrate"]
+    environment:
+      <<: *control-env
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [control]
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+  collector:
+    <<: *control-image
+    restart: unless-stopped
+    command: ["python", "-m", "control.api", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *control-env
+      LAB_SELFTEST_STATUS_FILE: /srv/lab/state/selftest.json
+    volumes:
+      - /srv/lab/state:/srv/lab/state:ro
+    ports:
+      - 127.0.0.1:8100:8000
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [control]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=4)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+networks:
+  control:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.231.0/24
