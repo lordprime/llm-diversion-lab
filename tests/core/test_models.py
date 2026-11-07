@@ -13,6 +13,7 @@ from control.core.models import (
     AgentEvent,
     Arm,
     Callback,
+    CellGuardDecision,
     EndStatus,
     EventBatch,
     FunnelLabel,
@@ -159,7 +160,37 @@ EVENT_FIXTURES: dict[type[BaseModel], dict[str, Any]] = {
         "status": True,
         "message": "objective met",
     },
+    CellGuardDecision: {
+        "kind": "cellguard_decision",
+        "run_id": RUN,
+        "stream": "cellguard",
+        "seq": 0,
+        "ts": TS,
+        "allowed": False,
+        "op": "container.create",
+        "rule": "create.privileged",
+        "reason": "privileged containers are denied",
+        "method": "POST",
+        "path": "/v1.44/containers/create",
+        "forwarded_path": None,
+        "forced": [],
+        "target_kind": None,
+        "target": None,
+        "target_run": None,
+        "body_bytes": 42,
+        "body_sha256": SHA,
+    },
 }
+
+
+def test_a_cellguard_decision_needs_a_forwarded_path_only_when_allowed() -> None:
+    allowed = dict(EVENT_FIXTURES[CellGuardDecision], allowed=True)
+    with pytest.raises(ValidationError, match="forwarded_path"):
+        CellGuardDecision.model_validate(allowed)
+    CellGuardDecision.model_validate(dict(allowed, forwarded_path="/v1.44/containers/create"))
+    denied = dict(EVENT_FIXTURES[CellGuardDecision], forwarded_path="/x")
+    with pytest.raises(ValidationError, match="forwarded_path"):
+        CellGuardDecision.model_validate(denied)
 
 
 @pytest.mark.parametrize("model", list(EVENT_FIXTURES), ids=lambda c: c.__name__)

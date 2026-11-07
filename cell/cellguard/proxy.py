@@ -28,11 +28,12 @@ client's half-close is passed on as a half-close). Otherwise the response is rel
 by its ``Content-Length`` and the connection closed, so the client can never speak
 HTTP to the daemon on a kept-alive connection.
 
-Evidence: ``<evidence>/cellguard/decisions.jsonl``, stream ``cellguard``. The shared
-event models have no cell-guard event kind, so these are cell-guard's own JSONL
-decision records (one per request, allowed or denied), with the same write-once
-discipline as the other cell components: append + fsync, ``seq`` per stream from 0,
-resumed after a restart, a torn last line closed and its ``seq`` never reused.
+Evidence: ``<evidence>/cellguard/decisions.jsonl``, stream ``cellguard``: one
+:class:`~control.core.models.CellGuardDecision` event per request, allowed or denied,
+each line exactly its ``model_dump_json()`` so the runner ships it to the Collector
+byte-for-byte. The same write-once discipline as the other cell components: append +
+fsync, ``seq`` per stream from 0, resumed after a restart, a torn last line closed and
+its ``seq`` never reused.
 Request bodies are not stored (they may carry the agent's environment); their
 SHA-256 and size are.
 
@@ -89,6 +90,7 @@ from cell.cellguard.policy import (
     load_images_lock,
     route,
 )
+from control.core.models import CellGuardDecision
 
 __all__ = [
     "CELLGUARD_DIR",
@@ -202,27 +204,27 @@ class DecisionLog:
         with self._lock:
             seq = self._next_seq
             self._next_seq += 1
-            record: dict[str, Any] = {
-                "run_id": self._run_id,
-                "stream": CELLGUARD_STREAM,
-                "seq": seq,
-                "ts": (ts or datetime.now(UTC)).isoformat(),
-                "allowed": decision.allowed,
-                "op": decision.op,
-                "rule": decision.rule,
-                "reason": decision.reason,
-                "method": request.method,
-                "path": request.path,
-                "forwarded_path": decision.path if decision.allowed else None,
-                "forced": list(decision.forced),
-                "target_kind": target.kind if target else None,
-                "target": target.id if target else None,
-                "target_run": target.labels.get(RUN_LABEL) if target else None,
-                "body_bytes": len(request.body),
-                "body_sha256": hashlib.sha256(request.body).hexdigest(),
-            }
-            line = json.dumps(record, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-            _append(self._path, line)
+            event = CellGuardDecision(
+                run_id=self._run_id,
+                stream=CELLGUARD_STREAM,
+                seq=seq,
+                ts=ts or datetime.now(UTC),
+                allowed=decision.allowed,
+                op=decision.op,
+                rule=decision.rule,
+                reason=decision.reason,
+                method=request.method,
+                path=request.path,
+                forwarded_path=decision.path if decision.allowed else None,
+                forced=list(decision.forced),
+                target_kind=target.kind if target else None,
+                target=target.id if target else None,
+                target_run=target.labels.get(RUN_LABEL) if target else None,
+                body_bytes=len(request.body),
+                body_sha256=hashlib.sha256(request.body).hexdigest(),
+            )
+            _append(self._path, event.model_dump_json().encode() + b"\n")
+        record: dict[str, Any] = event.model_dump(mode="json")
         return record
 
 

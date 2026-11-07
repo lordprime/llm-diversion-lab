@@ -100,6 +100,7 @@ from control.core.models import (
     AgentEvent,
     Arm,
     Callback,
+    CellGuardDecision,
     Event,
     EventKind,
     FunnelLabel,
@@ -813,7 +814,11 @@ def _read_events(data: bytes, rel: str, source: EventSource, skipped: list[str])
             raise LabelingError(
                 f"{rel}:{lineno}: not a valid event ({exc.error_count()} errors)"
             ) from exc
-        if event.kind not in source.kinds or event.stream != source.stream:
+        if (
+            isinstance(event, CellGuardDecision)  # never labelled; shipped as evidence only
+            or event.kind not in source.kinds
+            or event.stream != source.stream
+        ):
             raise LabelingError(
                 f"{rel}:{lineno}: a {event.kind.value} event on stream {event.stream!r} "
                 f"is not allowed in this file (only {sorted(k.value for k in source.kinds)} "

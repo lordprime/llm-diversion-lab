@@ -340,6 +340,148 @@
       "title": "CallbackChannel",
       "type": "string"
     },
+    "CellGuardDecision": {
+      "additionalProperties": false,
+      "description": "One request an agent sent to its cell-guard Docker socket, and the decision.\n\nWritten by cell-guard (stream ``cellguard``) before anything is forwarded, allowed\nor denied. A denial is a containment signal. The request body is never stored, only\nits size and sha256 (it may carry the agent's environment). ``forwarded_path`` is\nwhat was forwarded to the daemon, set exactly when the request was allowed.\n``target*`` describe the object the request named, as the daemon reported it.",
+      "properties": {
+        "allowed": {
+          "title": "Allowed",
+          "type": "boolean"
+        },
+        "body_bytes": {
+          "minimum": 0,
+          "title": "Body Bytes",
+          "type": "integer"
+        },
+        "body_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Body Sha256",
+          "type": "string"
+        },
+        "forced": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Forced",
+          "type": "array"
+        },
+        "forwarded_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded Path"
+        },
+        "kind": {
+          "const": "cellguard_decision",
+          "default": "cellguard_decision",
+          "title": "Kind",
+          "type": "string"
+        },
+        "method": {
+          "maxLength": 16,
+          "title": "Method",
+          "type": "string"
+        },
+        "op": {
+          "maxLength": 64,
+          "title": "Op",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        },
+        "rule": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Rule",
+          "type": "string"
+        },
+        "run_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "seq": {
+          "minimum": 0,
+          "title": "Seq",
+          "type": "integer"
+        },
+        "stream": {
+          "pattern": "^[a-z][a-z0-9-]{0,31}$",
+          "title": "Stream",
+          "type": "string"
+        },
+        "target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target"
+        },
+        "target_kind": {
+          "anyOf": [
+            {
+              "maxLength": 32,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Kind"
+        },
+        "target_run": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Run"
+        },
+        "ts": {
+          "format": "date-time",
+          "title": "Ts",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "stream",
+        "seq",
+        "ts",
+        "allowed",
+        "op",
+        "rule",
+        "reason",
+        "method",
+        "path",
+        "body_bytes",
+        "body_sha256"
+      ],
+      "title": "CellGuardDecision",
+      "type": "object"
+    },
     "JsonValue": {},
     "LlmCall": {
       "additionalProperties": false,
@@ -820,6 +962,7 @@
           "mapping": {
             "agent_event": "#/$defs/AgentEvent",
             "callback": "#/$defs/Callback",
+            "cellguard_decision": "#/$defs/CellGuardDecision",
             "llm_call": "#/$defs/LlmCall",
             "oracle_poll": "#/$defs/OraclePoll",
             "placement_serve": "#/$defs/PlacementServe",
@@ -845,6 +988,9 @@
           },
           {
             "$ref": "#/$defs/OraclePoll"
+          },
+          {
+            "$ref": "#/$defs/CellGuardDecision"
           }
         ]
       },

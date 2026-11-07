@@ -90,6 +90,7 @@ __all__ = [
     "Artifact",
     "Base",
     "Callback",
+    "CellGuardDecisionRow",
     "EventKeyEntry",
     "EventRow",
     "Experiment",
@@ -478,6 +479,28 @@ class OraclePoll(EventRow):
     error: Mapped[str | None] = mapped_column(Text)
 
 
+class CellGuardDecisionRow(EventRow):
+    """Agent Docker-socket requests and cell-guard's decisions (``cellguard_decision``)."""
+
+    __tablename__ = "cellguard_decisions"
+
+    allowed: Mapped[bool] = mapped_column(Boolean)
+    op: Mapped[str] = mapped_column(String(64))
+    rule: Mapped[str] = mapped_column(String(64))
+    reason: Mapped[str] = mapped_column(Text)
+    method: Mapped[str] = mapped_column(String(16))
+    path: Mapped[str] = mapped_column(Text)
+    forwarded_path: Mapped[str | None] = mapped_column(Text)
+    forced: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
+    target_kind: Mapped[str | None] = mapped_column(String(32))
+    target: Mapped[str | None] = mapped_column(Text)
+    target_run: Mapped[str | None] = mapped_column(Text)
+    body_bytes: Mapped[int] = mapped_column(BigInteger)
+    body_sha256: Mapped[str] = mapped_column(_SHA256)
+
+
 class EventKeyEntry(Base):
     """Ledger of every stored event key, across all kinds (table ``event_keys``).
 
@@ -509,6 +532,7 @@ EVENT_TABLES: Final[Mapping[EventKind, type[EventRow]]] = {
     EventKind.AGENT_EVENT: AgentEvent,
     EventKind.CALLBACK: Callback,
     EventKind.ORACLE_POLL: OraclePoll,
+    EventKind.CELLGUARD_DECISION: CellGuardDecisionRow,
 }
 
 

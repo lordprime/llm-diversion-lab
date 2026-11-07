@@ -3,6 +3,7 @@ from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from sqlalchemy import inspect
 
+from control.core.models import EventKind
 from control.db.engine import create_db_engine
 from control.db.tables import Base
 from tests.conftest import alembic_config
@@ -21,6 +22,7 @@ EXPECTED_TABLES = {
     "agent_events",
     "callbacks",
     "oracle_polls",
+    "cellguard_decisions",
     "labels",
     "event_keys",
     "artifacts",
@@ -35,7 +37,21 @@ EVENT_TABLES = {
     "agent_events",
     "callbacks",
     "oracle_polls",
+    "cellguard_decisions",
 }
+
+
+def test_event_keys_kind_check_accepts_every_event_kind(db_url: str) -> None:
+    """The migrated CHECK on event_keys.kind lists exactly the model's kinds."""
+    command.upgrade(alembic_config(db_url), "head")
+    eng = create_db_engine(db_url)
+    try:
+        checks = inspect(eng).get_check_constraints("event_keys")
+    finally:
+        eng.dispose()
+    (kind_check,) = [c for c in checks if c["name"] == "ck_event_keys_kind"]
+    for kind in EventKind:
+        assert f"'{kind.value}'" in kind_check["sqltext"]
 
 
 def _tables(url: str) -> set[str]:

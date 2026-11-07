@@ -337,6 +337,43 @@ def _events(run_id: str, placement_id: str) -> list[Event]:
     ]
 
 
+def _decision(run_id: str, seq: int = 0, **update: Any) -> m.CellGuardDecision:
+    return m.CellGuardDecision(
+        run_id=run_id,
+        stream="cellguard",
+        seq=seq,
+        ts=TS,
+        allowed=True,
+        op="container.create",
+        rule="create.ok",
+        reason="allowed",
+        method="POST",
+        path="/v1.44/containers/create?name=x",
+        forwarded_path="/v1.44/containers/create?name=run-x",
+        forced=["Labels", "HostConfig.Dns"],
+        body_bytes=12,
+        body_sha256=SHA,
+    ).model_copy(update=update)
+
+
+def test_cellguard_decisions_are_stored_idempotently(engine: Engine) -> None:
+    run_id, _ = _seed_injected_run(engine)
+    events: list[Event] = [_decision(run_id), _decision(run_id, 1, rule="create.privileged")]
+    with session_scope(engine) as s:
+        assert insert_events(s, events) == InsertResult(inserted=2)
+    with session_scope(engine) as s:
+        assert insert_events(s, events) == InsertResult(duplicates=2)
+    with session_scope(engine) as s:
+        rows = s.scalars(select(t.CellGuardDecisionRow).order_by(t.CellGuardDecisionRow.seq))
+        first, second = rows.all()
+        assert first.forced == ["Labels", "HostConfig.Dns"] and first.allowed is True
+        assert second.rule == "create.privileged"
+    assert _ledger(engine) == {
+        (run_id, "cellguard", 0): m.EventKind.CELLGUARD_DECISION,
+        (run_id, "cellguard", 1): m.EventKind.CELLGUARD_DECISION,
+    }
+
+
 def _count(engine: Engine, model: type[Any]) -> int:
     with session_scope(engine) as s:
         return s.scalar(select(func.count()).select_from(model)) or 0
@@ -392,6 +429,7 @@ def test_normal_batch_inserts_all_rows_and_records_every_key(engine: Engine) -> 
         "agent_events": 1,
         "callbacks": 2,  # catcher-http#0 and catcher-dns#0: same kind+seq, two streams
         "oracle_polls": 1,
+        "cellguard_decisions": 0,
     }
     with session_scope(engine) as s:
         http = s.scalars(select(t.Callback).where(t.Callback.stream == "catcher-http")).one()

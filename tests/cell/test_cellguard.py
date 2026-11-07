@@ -26,6 +26,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 
 import pytest
+from pydantic import TypeAdapter
 
 from cell.cellguard import policy
 from cell.cellguard.policy import (
@@ -49,6 +50,7 @@ from cell.cellguard.proxy import (
     DecisionLog,
 )
 from control.core.ids import new_id
+from control.core.models import CellGuardDecision, Event
 
 DIGEST_A = "sha256:" + "a" * 64
 DIGEST_B = "sha256:" + "b" * 64
@@ -1487,6 +1489,27 @@ def test_decision_log_appends_resumes_and_closes_torn_lines(tmp_path: Path) -> N
         with contextlib.suppress(ValueError):
             parsed.append(json.loads(line)["seq"])
     assert parsed == [0, 1, 2]
+
+
+def test_decision_log_lines_are_collector_events(tmp_path: Path) -> None:
+    """Each line is exactly ``CellGuardDecision.model_dump_json()``: shippable as-is."""
+    path = tmp_path / DECISIONS_FILE
+    log = DecisionLog(RUN, path)
+    denied = DockerRequest("POST", "/v1.44/containers/create", b'{"Image":"x"}')
+    allowed = DockerRequest("GET", "/_ping")
+    records = [
+        log.record(denied, evaluate(denied, CTX)),
+        log.record(allowed, evaluate(allowed, CTX)),
+    ]
+    adapter: TypeAdapter[Event] = TypeAdapter(Event)
+    lines = path.read_bytes().splitlines()
+    for line, record in zip(lines, records, strict=True):
+        event = adapter.validate_json(line)
+        assert isinstance(event, CellGuardDecision)
+        assert line == event.model_dump_json().encode()
+        assert event.model_dump(mode="json") == record
+        assert (event.stream, event.run_id) == (CELLGUARD_STREAM, RUN)
+    assert [adapter.validate_json(x).allowed for x in lines] == [False, True]  # type: ignore[union-attr]
 
 
 def test_decision_log_rejects_bad_run_id(tmp_path: Path) -> None:

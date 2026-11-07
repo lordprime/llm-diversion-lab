@@ -14,7 +14,7 @@ Every evidence event carries ``run_id``, ``stream`` and ``seq``.
 
 * ``stream`` names the *producer* of the event (``STREAM_PATTERN``:
   ``^[a-z][a-z0-9-]{0,31}$``). Conventional names: ``injector``, ``tap``,
-  ``catcher-http``, ``catcher-dns``, ``agent``, ``oracle``. Two components that
+  ``catcher-http``, ``catcher-dns``, ``agent``, ``oracle``, ``cellguard``. Two components that
   emit the same ``kind`` (e.g. the HTTP and DNS catchers both emit ``callback``)
   MUST use different streams.
 * ``seq`` is numbered per ``(run_id, stream)``: each producer counts its own events
@@ -61,6 +61,7 @@ __all__ = [
     "ArtifactFile",
     "Callback",
     "CallbackChannel",
+    "CellGuardDecision",
     "CollectorEndpoint",
     "EndStatus",
     "Event",
@@ -178,6 +179,7 @@ class EventKind(StrEnum):
     AGENT_EVENT = "agent_event"
     CALLBACK = "callback"
     ORACLE_POLL = "oracle_poll"
+    CELLGUARD_DECISION = "cellguard_decision"
 
 
 class LlmRole(StrEnum):
@@ -380,8 +382,47 @@ class OraclePoll(_Event):
     error: str | None = None
 
 
+class CellGuardDecision(_Event):
+    """One request an agent sent to its cell-guard Docker socket, and the decision.
+
+    Written by cell-guard (stream ``cellguard``) before anything is forwarded, allowed
+    or denied. A denial is a containment signal. The request body is never stored, only
+    its size and sha256 (it may carry the agent's environment). ``forwarded_path`` is
+    what was forwarded to the daemon, set exactly when the request was allowed.
+    ``target*`` describe the object the request named, as the daemon reported it.
+    """
+
+    kind: Literal[EventKind.CELLGUARD_DECISION] = EventKind.CELLGUARD_DECISION
+    allowed: bool
+    #: Empty ``method``/``op`` only for a request too malformed to parse.
+    op: Annotated[str, StringConstraints(max_length=64)]
+    rule: Annotated[str, StringConstraints(min_length=1, max_length=64)]
+    reason: str
+    method: Annotated[str, StringConstraints(max_length=16)]
+    path: str
+    forwarded_path: str | None = None
+    forced: list[str] = Field(default_factory=list)
+    target_kind: Annotated[str, StringConstraints(max_length=32)] | None = None
+    target: str | None = None
+    target_run: str | None = None
+    body_bytes: NonNegativeInt
+    body_sha256: Sha256
+
+    @model_validator(mode="after")
+    def _forwarded_iff_allowed(self) -> Self:
+        if self.allowed != (self.forwarded_path is not None):
+            raise ValueError("forwarded_path is set exactly when the request was allowed")
+        return self
+
+
 Event = Annotated[
-    TargetAccessEvent | PlacementServe | LlmCall | AgentEvent | Callback | OraclePoll,
+    TargetAccessEvent
+    | PlacementServe
+    | LlmCall
+    | AgentEvent
+    | Callback
+    | OraclePoll
+    | CellGuardDecision,
     Field(discriminator="kind"),
 ]
 
@@ -572,6 +613,7 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     AgentEvent,
     Callback,
     OraclePoll,
+    CellGuardDecision,
     FunnelLabel,
     RunManifest,
     EventBatch,
