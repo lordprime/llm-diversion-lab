@@ -76,11 +76,14 @@ traceback):
 A name is sensitive if, with camelCase split (``accessToken`` → ``access_token``),
 lowercased and ``-`` read as ``_``, it *contains* one of :data:`SENSITIVE_KEY_PARTS`
 (``password``, ``secret``, ``api_key``, ``authorization``, ``cookie``, ``credential``...)
-or *ends with* ``_token``, or is (or ends with ``_`` +) ``pass`` / ``pwd`` (never a bare
-``pass`` substring: ``passed``, ``bypass`` stay readable), unless it is in
+or *ends with* ``_token``, or is (or ends with ``_`` +) ``pass`` / ``pwd`` / ``passcode``
+(never a bare ``pass`` substring: ``passed``, ``bypass`` stay readable), unless it is in
 :data:`NON_SECRET_KEYS`: ``token`` and
 ``callback_token`` are the run's callback token, which is evidence the analysis relies
-on (it is an HMAC of the run id, not a credential), so it stays readable. ``*_url`` /
+on (it is an HMAC of the run id, not a credential), so it stays readable. ``PWD``
+(exactly that name: the shell's working directory) holding an absolute path is not
+masked as a whole either (``PWD=/home/u`` stays readable; the path is still scanned
+like any text); ``pwd=secret``, ``pwd=/x`` and ``DB_PWD=/x`` are. ``*_url`` /
 ``*_dsn`` values are not masked as a whole (they are useful), but their
 ``user:password@`` part is, by the ``url_userinfo`` pattern, wherever it appears.
 
@@ -231,7 +234,7 @@ _QUERY_PARTS = (
     "signature",
     "credential",
 )
-_QUERY_NAMES = frozenset({"key", "sig", "token", "auth", "code", "pass", "pwd"})
+_QUERY_NAMES = frozenset({"key", "sig", "token", "auth", "code", "pass", "pwd", "passcode"})
 
 
 def _compact(name: str) -> str:
@@ -239,8 +242,11 @@ def _compact(name: str) -> str:
 
 
 def _assigned_is_secret(match: re.Match[str]) -> bool:
-    """An assigned name is secret by the same rule as a field name."""
-    return is_sensitive_key(match.group("aname"))
+    """An assigned name is secret by the same rule as a field name (and its value)."""
+    name = match.group("aname")
+    if name == _SHELL_PWD and match.string.startswith("/", match.end()):
+        return False
+    return is_sensitive_key(name)
 
 
 def _query_name_is_secret(match: re.Match[str]) -> bool:
@@ -427,7 +433,11 @@ SENSITIVE_KEY_PARTS: tuple[str, ...] = (
 )
 #: Exact names, and ``_``-suffixes, that are sensitive although too short to match as a
 #: substring: a bare ``pass`` would mask ``passed``, ``bypass``, ``passthrough``.
-_SENSITIVE_SHORT_NAMES: tuple[str, ...] = ("pass", "pwd")
+_SENSITIVE_SHORT_NAMES: tuple[str, ...] = ("pass", "pwd", "passcode")
+_SENSITIVE_SHORT_SUFFIXES: tuple[str, ...] = tuple(f"_{n}" for n in _SENSITIVE_SHORT_NAMES)
+#: The shell's working-directory variable: holding an absolute path, it is not a password
+#: (exactly this name; ``pwd``, ``DB_PWD`` are masked whatever they hold).
+_SHELL_PWD = "PWD"  # noqa: S105 -- a variable name, not a password
 #: Field names that look sensitive but are evidence (the callback token), never masked.
 NON_SECRET_KEYS: frozenset[str] = frozenset({"token", "callback_token"})
 
@@ -634,11 +644,20 @@ def is_sensitive_key(key: object) -> bool:
     name = name.replace(" ", "_")
     if name in NON_SECRET_KEYS:
         return False
-    if name in _SENSITIVE_SHORT_NAMES or name.endswith(
-        tuple(f"_{n}" for n in _SENSITIVE_SHORT_NAMES)
-    ):
+    if name in _SENSITIVE_SHORT_NAMES or name.endswith(_SENSITIVE_SHORT_SUFFIXES):
         return True
     return name.endswith("_token") or any(part in name for part in SENSITIVE_KEY_PARTS)
+
+
+def _masked(key: object, value: object) -> bool:
+    """Whether the field ``key`` = ``value`` becomes :data:`REDACTED` as a whole."""
+    if not is_sensitive_key(key):
+        return False
+    if isinstance(key, bytes | bytearray | memoryview):
+        key = _as_text(key)
+    if isinstance(value, bytes | bytearray | memoryview):
+        value = _as_text(value)
+    return not (key == _SHELL_PWD and isinstance(value, str) and value.startswith("/"))
 
 
 def _key(key: Any) -> str:
@@ -663,10 +682,10 @@ def _scrub(value: Any, depth: int, path: frozenset[int]) -> Any:
         inner = path | {id(value)}
         if isinstance(value, Mapping):
             return {
-                _key(k): REDACTED if is_sensitive_key(k) else _scrub(v, depth + 1, inner)
+                _key(k): REDACTED if _masked(k, v) else _scrub(v, depth + 1, inner)
                 for k, v in value.items()
             }
-        if isinstance(value, list | tuple) and len(value) == 2 and is_sensitive_key(value[0]):
+        if isinstance(value, list | tuple) and len(value) == 2 and _masked(*value):
             # A ``(name, value)`` pair, e.g. one raw header.
             return [_scrub(value[0], depth + 1, inner), REDACTED]
         return [_scrub(v, depth + 1, inner) for v in value]
@@ -678,7 +697,7 @@ def _scrub(value: Any, depth: int, path: frozenset[int]) -> Any:
 def redact(_logger: WrappedLogger, _method: str, event_dict: EventDict) -> EventDict:
     """structlog processor: mask secrets anywhere in the event (see the module doc)."""
     return {
-        _key(k): REDACTED if is_sensitive_key(k) else _scrub(v, 1, frozenset())
+        _key(k): REDACTED if _masked(k, v) else _scrub(v, 1, frozenset())
         for k, v in event_dict.items()
     }
 

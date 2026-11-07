@@ -1229,3 +1229,94 @@ NESTED_ADVERSARIAL = {
 def test_redact_text_is_linear_on_nested_secret_names(shape: str) -> None:
     _assert_fast(lambda: redact_text(NESTED_ADVERSARIAL[shape]))
     _assert_scales_linearly(redact_text, NESTED_ADVERSARIAL[shape])
+
+
+# --------------------------------------------------------------------------- hardening H
+
+
+@pytest.mark.parametrize(
+    "name", ["passcode", "PASSCODE", "mfa_passcode", "userPasscode", "ssh-passcode"]
+)
+def test_passcode_names_are_sensitive(name: str) -> None:
+    assert is_sensitive_key(name)
+    assert "hunter2" not in redact_text(f"{name}=hunter2")
+    assert redact(None, "info", {"event": "x", name: "hunter2"})[name] == REDACTED
+
+
+def test_passcode_query_parameter_is_masked() -> None:
+    assert "hunter2" not in redact_text("/login?passcode=hunter2&x=1")
+
+
+def test_passcode_is_matched_exactly_or_as_a_suffix_only() -> None:
+    assert not is_sensitive_key("passcodex")
+    assert redact_text("passcodex=1") == "passcodex=1"
+
+
+def test_short_name_suffixes_are_computed_once() -> None:
+    from control.core import logging as lab_logging
+
+    expected = tuple(f"_{name}" for name in lab_logging._SENSITIVE_SHORT_NAMES)
+    assert expected == lab_logging._SENSITIVE_SHORT_SUFFIXES
+    assert "passcode" in lab_logging._SENSITIVE_SHORT_NAMES
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "PWD=/home/u",
+        "cwd PWD=/srv/lab/releases/v0.1.0 ok",
+        '{"PWD": "/home/u", "HOME": "/home/u"}',
+        "PWD='/tmp/x y'",
+    ],
+)
+def test_the_shell_working_directory_stays_readable(text: str) -> None:
+    assert redact_text(text) == text
+
+
+def _as_str(value: str | bytes) -> str:
+    return value.decode() if isinstance(value, bytes) else value
+
+
+def test_the_shell_working_directory_field_stays_readable() -> None:
+    for key, value in (("PWD", "/home/u"), (b"PWD", b"/srv")):
+        out = redact(None, "info", {"event": "x", key: value})
+        assert out == {"event": "x", "PWD": _as_str(value)}
+    env = redact(None, "info", {"event": "x", "env": {"PWD": "/home/u", "PASSWORD": "x"}})
+    assert env["env"] == {"PWD": "/home/u", "PASSWORD": REDACTED}
+    pairs = redact(None, "info", {"event": "x", "env": [("PWD", "/home/u")]})
+    assert pairs["env"] == [["PWD", "/home/u"]]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "pwd=hunter2",
+        "PWD=hunter2",
+        "pwd=/hunter2",  # only the shell variable's exact name is exempt
+        "Pwd=/hunter2",
+        "DB_PWD=/hunter2",
+        'PWD="hunter2"',
+        "PWD=hunter2/x",
+    ],
+)
+def test_pwd_not_holding_a_working_directory_is_masked(text: str) -> None:
+    assert "hunter2" not in redact_text(text), redact_text(text)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("pwd", "/hunter2"), ("pwd", "hunter2"), ("PWD", "hunter2"), ("db_pwd", "/x"), ("PWD", 1)],
+)
+def test_pwd_fields_not_holding_a_working_directory_are_masked(key: str, value: object) -> None:
+    assert redact(None, "info", {"event": "x", key: value})[key] == REDACTED
+    pairs = redact(None, "info", {"event": "x", "env": [(key, value)]})
+    assert pairs["env"] == [[key, REDACTED]]
+
+
+def test_a_readable_working_directory_is_still_scanned() -> None:
+    out = redact_text(f"PWD=/srv/{ANTHROPIC_KEY} password=hunter2")
+    assert ANTHROPIC_KEY not in out
+    assert "hunter2" not in out
+    assert out.startswith("PWD=/srv/")
+    field = redact(None, "info", {"event": "x", "PWD": f"/srv/{ANTHROPIC_KEY}"})
+    assert ANTHROPIC_KEY not in field["PWD"]
