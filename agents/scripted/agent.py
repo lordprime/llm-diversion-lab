@@ -10,8 +10,10 @@ funnel stage end to end without spending tokens:
   put tool output into its context: the run's tag becomes *Visible*;
 * ``follow_decoy``: if fetched text names a decoy path ``/x-<tag>``, ``GET`` it;
 * ``callback_http``: if fetched text names a callback host ``<token>.<callback_domain>``,
-  ``GET http://<host>/r/<token>``;
-* ``callback_dns``: resolve that host through the cell's resolver;
+  resolve it and ``GET /r/<token>`` from the answer with that ``Host``;
+* ``callback_dns``: resolve that host once more (a DNS-only callback). Lookups use the
+  container's resolver, or the script's ``dns_server`` asked directly where the
+  engine's embedded resolver cannot reach the cell's catcher (local Podman);
 * ``graphql``: ``POST`` a GraphQL query (the self-test's objective: DVGA's importPaste
   fetching the target's own ``http://localhost:8000/``).
 
@@ -47,9 +49,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Final, Protocol, Self
 
+from dnslib import QTYPE, DNSError, DNSRecord  # type: ignore[import-untyped]
 from pydantic import (
     BaseModel,
     ConfigDict,
+    IPvAnyAddress,
     JsonValue,
     StringConstraints,
     ValidationError,
@@ -70,8 +74,10 @@ __all__ = [
     "Step",
     "StepAction",
     "UrllibHttp",
+    "direct_resolver",
     "main",
     "run_script",
+    "system_resolve",
 ]
 
 #: Producer stream of the agent's events (``control.labeler.funnel.EVENT_FILES``).
@@ -133,6 +139,9 @@ class AgentScript(_Frozen):
     model: Annotated[str, StringConstraints(min_length=1, max_length=200)]
     callback_domain: Annotated[str, StringConstraints(pattern=_DOMAIN, max_length=200)]
     steps: tuple[Step, ...]
+    #: Ask this resolver directly instead of the container's own (only where the
+    #: engine's embedded resolver cannot forward to the cell's catcher: local Podman).
+    dns_server: IPvAnyAddress | None = None
 
 
 # --------------------------------------------------------------------------- I/O seams
@@ -193,6 +202,24 @@ def system_resolve(name: str) -> list[str]:
     """IPv4 addresses of ``name`` through the container's resolver."""
     infos = socket.getaddrinfo(name, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
     return sorted({str(info[4][0]) for info in infos})
+
+
+def direct_resolver(
+    server: str, *, port: int = 53, timeout: float = 5.0
+) -> Callable[[str], list[str]]:
+    """A resolver that asks ``server`` (UDP) directly for ``A`` records."""
+
+    def resolve(name: str) -> list[str]:
+        try:
+            reply = DNSRecord.parse(DNSRecord.question(name).send(server, port, timeout=timeout))
+        except (OSError, DNSError) as exc:
+            raise OSError(f"{name}: {exc}") from exc
+        answers = sorted({str(rr.rdata) for rr in reply.rr if rr.rtype == QTYPE.A})
+        if not answers:
+            raise OSError(f"{name}: no A record from {server}")
+        return answers
+
+    return resolve
 
 
 # --------------------------------------------------------------------------- evidence
@@ -261,10 +288,18 @@ class _Agent:
     # helpers
 
     def _send(
-        self, method: str, url: str, *, body: bytes | None = None, json_body: bool = False
+        self,
+        method: str,
+        url: str,
+        *,
+        body: bytes | None = None,
+        json_body: bool = False,
+        host: str | None = None,
     ) -> HttpResult | None:
         headers = {"content-type": "application/json"} if json_body else {}
         args: dict[str, JsonValue] = {"method": method, "url": url}
+        if host is not None:
+            headers["host"] = args["host"] = host
         if body is not None:
             args["body"] = _text(body)
         self.log.record(
@@ -343,24 +378,30 @@ class _Agent:
             return None
         return match.group(0), match.group(1)
 
-    def callback_http(self, _step: Step) -> None:
-        found = self._callback_host()
-        if found is not None:
-            host, token = found
-            self._send("GET", f"http://{host}/r/{token}")
-
-    def callback_dns(self, _step: Step) -> None:
-        found = self._callback_host()
-        if found is None:
-            return
-        host, _ = found
+    def _lookup(self, host: str) -> list[str]:
         self.log.record(AgentEventType.TOOL_CALL, tool_name="dns_lookup", tool_args={"qname": host})
         try:
             answers = self.resolve(host)
         except OSError as exc:
             self.log.record(AgentEventType.MESSAGE, text=f"lookup {host} failed: {exc}")
-            return
+            return []
         self.log.record(AgentEventType.MESSAGE, text=f"lookup {host} -> {', '.join(answers)}")
+        return answers
+
+    def callback_http(self, _step: Step) -> None:
+        """Resolve the callback host, then ``GET /r/<token>`` from its address with Host."""
+        found = self._callback_host()
+        if found is None:
+            return
+        host, token = found
+        answers = self._lookup(host)
+        if answers:
+            self._send("GET", f"http://{answers[0]}/r/{token}", host=host)
+
+    def callback_dns(self, _step: Step) -> None:
+        found = self._callback_host()
+        if found is not None:
+            self._lookup(found[0])
 
     def graphql(self, step: Step) -> None:
         body = json.dumps({"query": step.query}).encode()
@@ -410,7 +451,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError, ValidationError) as exc:
         print(f"scripted agent: {exc}", file=sys.stderr)
         return 2
-    return run_script(script, http=UrllibHttp(), resolve=system_resolve, log=log)
+    resolve = (
+        direct_resolver(str(script.dns_server)) if script.dns_server is not None else system_resolve
+    )
+    return run_script(script, http=UrllibHttp(), resolve=resolve, log=log)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -61,6 +61,8 @@ __all__ = [
     "DEFAULT_CELL_NETWORK",
     "EVIDENCE_PREFIXES",
     "REPO_ROOT",
+    "ROLE_LABEL",
+    "RUN_LABEL",
     "AgentSpec",
     "CellError",
     "CellFile",
@@ -415,7 +417,9 @@ def _labels(run: ScheduledRun, role: str | None = None) -> dict[str, str]:
     return labels
 
 
-def _agent_script(run: ScheduledRun, experiment: Experiment, meta: Mapping[str, Any]) -> bytes:
+def _agent_script(
+    run: ScheduledRun, experiment: Experiment, meta: Mapping[str, Any], dns_server: str | None
+) -> bytes:
     host, port = str(meta["agent_host"]), int(meta["agent_port"])
     target_url = f"http://{host}" if port == 80 else f"http://{host}:{port}"
     target = experiment.target(run.target)
@@ -441,6 +445,8 @@ def _agent_script(run: ScheduledRun, experiment: Experiment, meta: Mapping[str, 
         "callback_domain": experiment.callback_domain,
         "steps": steps,
     }
+    if dns_server is not None:
+        doc["dns_server"] = dns_server
     return json.dumps(doc, sort_keys=True).encode()
 
 
@@ -521,8 +527,17 @@ def render_cell(
         if settings.engine is Engine.DOCKER:
             entry["driver_opts"] = {"com.docker.network.bridge.name": bridge_name(run.run_id, role)}
         networks[role] = entry
+    # Static addresses below the dynamic range: the catcher is the agent's DNS server;
+    # the injector and the tap are also pinned in the agent's /etc/hosts, so it finds
+    # them without depending on the engine's embedded DNS (on Podman the configured
+    # server replaces it; on Docker it only forwards).
     catcher_ip = str(subnets.agent.network_address + 2)
+    injector_ip = str(subnets.agent.network_address + 3)
+    tap_ip = str(subnets.agent.network_address + 4)
     services["catcher"]["networks"]["agent"]["ipv4_address"] = catcher_ip
+    services["injector"]["networks"]["agent"]["ipv4_address"] = injector_ip
+    services["tap"]["networks"]["agent"] = {"ipv4_address": tap_ip}
+    agent_hosts = [f"{meta['agent_host']}:{injector_ip}", f"tap:{tap_ip}"]
 
     # per-run environment of the infrastructure
     p1 = Surface.P1 in experiment.arms.injected.surfaces
@@ -599,6 +614,7 @@ def render_cell(
         "volumes": agent_volumes,
         "networks": {"agent": {}},
         "dns": [catcher_ip],
+        "extra_hosts": agent_hosts,
     }
     if not spec.cap_add:
         del services["agent"]["cap_add"]
@@ -626,7 +642,13 @@ def render_cell(
     )
     files.append(CellFile("cfg_catcher", "tokens.json", render_catcher_file(manifest, experiment)))
     if spec.scripted:
-        files.append(CellFile("cfg_agent", "script.json", _agent_script(run, experiment, meta)))
+        # Podman's resolver on an internal network answers NXDOMAIN for every outside name
+        # instead of forwarding to the catcher, so there the script asks the catcher
+        # itself. On Docker the agent uses its own resolver, exactly as a real agent
+        # does (whether that reaches the catcher is a Task 17 check on the host).
+        dns_server = catcher_ip if settings.engine is Engine.PODMAN else None
+        script = _agent_script(run, experiment, meta, dns_server)
+        files.append(CellFile("cfg_agent", "script.json", script))
 
     probe_paths: list[tuple[str, int]] = []
     for surface in sorted(experiment.arms.injected.surfaces):

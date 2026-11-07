@@ -49,6 +49,7 @@ __all__ = [
     "event_content_sha256",
     "foreign_placements",
     "insert_events",
+    "invalid_runs_by_reason",
     "model_sha256",
     "record_heartbeat",
     "record_manifest",
@@ -70,8 +71,18 @@ def _chunks[T](items: Sequence[T], size: int = BULK_CHUNK_ROWS) -> Iterator[Sequ
         yield items[start : start + size]
 
 
-def claim_next_run(session: Session) -> Run | None:
-    """Claim the next queued run, or return ``None`` if none is claimable.
+def invalid_runs_by_reason(session: Session) -> dict[str, int]:
+    """Invalid runs counted by ``runs.invalid_reason`` (for ``lab_invalid_runs_total``)."""
+    rows = session.execute(
+        select(Run.invalid_reason, func.count())
+        .where(Run.status == RunStatus.INVALID)
+        .group_by(Run.invalid_reason)
+    )
+    return {(reason.value if reason is not None else "unrecorded"): n for reason, n in rows}
+
+
+def claim_next_run(session: Session, *, experiment_id: str | None = None) -> Run | None:
+    """Claim the next queued run (of ``experiment_id`` if given), or ``None``.
 
     The oldest queued run (by ``created_at``, then ``schedule_index``) is selected with
     ``SELECT ... FOR UPDATE SKIP LOCKED`` and, in the same statement, moved to
@@ -79,9 +90,12 @@ def claim_next_run(session: Session) -> Run | None:
     holds is skipped rather than waited for, so concurrent workers never claim the
     same run. If the caller's transaction rolls back, the run is queued again.
     """
+    queued = Run.status == RunStatus.QUEUED
+    if experiment_id is not None:
+        queued = queued & (Run.experiment_id == experiment_id)
     next_queued = (
         select(Run.run_id)
-        .where(Run.status == RunStatus.QUEUED)
+        .where(queued)
         .order_by(Run.created_at, Run.schedule_index, Run.run_id)
         .limit(1)
         .with_for_update(skip_locked=True)

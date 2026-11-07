@@ -75,6 +75,7 @@ from control.core.models import (
     EndStatus,
     EventKind,
     FunnelStage,
+    InvalidReason,
     LlmRole,
     RejectReason,
     RunPhase,
@@ -285,6 +286,9 @@ class Run(Base):
         CheckConstraint("schedule_index >= 0", name="schedule_index_nonnegative"),
         CheckConstraint("attempt >= 1", name="attempt_positive"),
         CheckConstraint("(arm = 'control') = (tag IS NULL)", name="control_has_no_tag"),
+        CheckConstraint(
+            "(status = 'invalid') = (invalid_reason IS NOT NULL)", name="invalid_has_reason"
+        ),
         # the work queue: claim_next_run scans only queued rows, in this order
         Index(
             "ix_runs_queue",
@@ -323,6 +327,11 @@ class Run(Base):
     created_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(_TS)
     finished_at: Mapped[datetime | None] = mapped_column(_TS)
+    #: set exactly when status is 'invalid' (a bounded set, for metrics) plus free detail
+    invalid_reason: Mapped[InvalidReason | None] = mapped_column(
+        _enum(InvalidReason, "invalid_reason")
+    )
+    invalid_detail: Mapped[str | None] = mapped_column(Text)
 
 
 class Placement(Base):

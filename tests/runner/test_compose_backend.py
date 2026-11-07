@@ -1,0 +1,319 @@
+"""The Compose cell backend, driven with a recording fake of the Docker CLI."""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import ipaddress
+import json
+import stat
+import tarfile
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from control.core.models import Arm
+from control.runner.cell_spec import (
+    CellError,
+    CellSettings,
+    ComposeProject,
+    allocate_subnets,
+    render_cell,
+)
+from control.runner.compose_backend import (
+    CellHandle,
+    CollectReport,
+    CommandResult,
+    ComposeBackend,
+    ContainerState,
+    extract_evidence,
+    files_tar,
+)
+from control.runner.experiment import load_experiment
+from control.runner.render import render_manifest
+from control.runner.schedule import build_schedule
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+KEY = hashlib.sha256(b"compose-backend-test-key").digest()
+IMAGES = {
+    "lab-cell": "ghcr.io/lordprime/lab-cell@sha256:" + "a" * 64,
+    "goat-dvga": "ghcr.io/lordprime/goat-dvga@sha256:" + "b" * 64,
+}
+
+Responder = Callable[[tuple[str, ...], bytes | None], CommandResult | None]
+
+
+@dataclass
+class FakeDocker:
+    """Records argv; the first responder that answers wins, else exit 0 with no output."""
+
+    responders: list[Responder] = field(default_factory=list)
+    calls: list[tuple[tuple[str, ...], bytes | None]] = field(default_factory=list)
+
+    def __call__(
+        self, argv: Sequence[str], *, stdin: bytes | None = None, timeout: float | None = None
+    ) -> CommandResult:
+        key = tuple(argv)
+        self.calls.append((key, stdin))
+        for responder in self.responders:
+            result = responder(key, stdin)
+            if result is not None:
+                return result
+        return CommandResult(key, 0)
+
+    def argvs(self) -> list[tuple[str, ...]]:
+        return [a for a, _ in self.calls]
+
+
+def _after_compose(argv: tuple[str, ...]) -> tuple[str, ...]:
+    """The Compose subcommand and its arguments (after ``--profile setup``)."""
+    return argv[argv.index("setup") + 1 :] if "compose" in argv else argv[1:]
+
+
+@pytest.fixture(scope="module")
+def project() -> ComposeProject:
+    experiment = load_experiment(REPO_ROOT / "experiments" / "selftest.yaml")
+    run = next(r for r in build_schedule(experiment) if r.arm is Arm.INJECTED)
+    manifest = render_manifest(run, experiment, KEY, created_at=datetime(2026, 11, 7, tzinfo=UTC))
+    return render_cell(
+        run,
+        manifest,
+        experiment=experiment,
+        settings=CellSettings(images=IMAGES),
+        subnets=allocate_subnets((ipaddress.IPv4Network("10.231.0.0/16"),), []),
+    )
+
+
+def _ps_writer(argv: tuple[str, ...], _stdin: bytes | None) -> CommandResult | None:
+    if _after_compose(argv)[:3] == ("ps", "-a", "-q"):
+        return CommandResult(argv, 0, b"cid-" + _after_compose(argv)[3].encode() + b"\n")
+    return None
+
+
+def test_up_writes_files_through_the_writer_then_starts_infrastructure_only(
+    tmp_path: Path, project: ComposeProject
+) -> None:
+    docker = FakeDocker([_ps_writer])
+    cell = ComposeBackend(docker).up(project, tmp_path)
+    assert stat.S_IMODE(cell.compose_file.stat().st_mode) == 0o600
+    assert cell.compose_file.read_text() == project.to_yaml()
+    steps = [_after_compose(a) for a in docker.argvs()]
+    assert steps[0] == ("create", "secrets-writer")
+    assert steps[1] == ("ps", "-a", "-q", "secrets-writer")
+    volumes = sorted({f.volume for f in project.files})
+    copies = docker.calls[2 : 2 + len(volumes)]
+    assert sorted(a for a, _ in copies) == sorted(
+        ("docker", "cp", "-", f"cid-secrets-writer:/w/{v}") for v in volumes
+    )
+    rest = steps[2 + len(volumes) :]
+    assert rest[0] == ("rm", "-f", "-s", "secrets-writer")
+    assert rest[1][:3] == ("up", "-d", "--no-build")
+    started = set(rest[1][3:])
+    assert "agent" not in started and "secrets-writer" not in started
+    assert started == {"goat", "injector", "tap", "stub-llm", "catcher"}
+    for argv in docker.argvs():
+        if "compose" in argv:
+            assert argv[2:6] == ("-p", project.name, "-f", str(cell.compose_file))
+
+    # each copied tar: one root-owned regular file per CellFile of that volume, its mode
+    seen = 0
+    for argv, stdin in copies:
+        volume = argv[3].rpartition("/")[2]
+        assert stdin is not None
+        with tarfile.open(fileobj=io.BytesIO(stdin)) as tar:
+            members = {m.name: m for m in tar.getmembers()}
+            expected = [f for f in project.files if f.volume == volume]
+            assert set(members) == {f.name for f in expected}
+            for f in expected:
+                member = members[f.name]
+                assert member.isreg() and (member.uid, member.gid, member.mode) == (0, 0, f.mode)
+                extracted = tar.extractfile(member)
+                assert extracted is not None and extracted.read() == f.content
+                seen += 1
+                if volume.startswith("secret_"):
+                    assert member.mode == 0o400
+    assert seen == len(project.files)
+
+
+def test_up_fails_loudly_when_a_step_fails(tmp_path: Path, project: ComposeProject) -> None:
+    def refuse_cp(argv: tuple[str, ...], _stdin: bytes | None) -> CommandResult | None:
+        if argv[:2] == ("docker", "cp"):
+            return CommandResult(argv, 1, b"", b"no such container")
+        return None
+
+    with pytest.raises(CellError, match="no such container"):
+        ComposeBackend(FakeDocker([refuse_cp, _ps_writer])).up(project, tmp_path)
+
+
+def test_health_polls_the_targets_own_script_until_it_passes(
+    tmp_path: Path, project: ComposeProject
+) -> None:
+    answers = iter([1, 1, 0])
+
+    def health(argv: tuple[str, ...], _stdin: bytes | None) -> CommandResult | None:
+        if _after_compose(argv)[:3] == ("exec", "-T", "goat"):
+            assert _after_compose(argv)[3:] == ("/opt/support/health.sh",)
+            return CommandResult(argv, next(answers))
+        return None
+
+    backend = ComposeBackend(FakeDocker([health]), health_interval_s=0)
+    cell = CellHandle(project, tmp_path / "compose.yml")
+    assert backend.health(cell, timeout_s=60) is True
+    never = ComposeBackend(FakeDocker([lambda a, _: CommandResult(a, 1)]), health_interval_s=0)
+    assert never.health(cell, timeout_s=0) is False
+
+
+def test_agent_state_parses_compose_ps_json(tmp_path: Path, project: ComposeProject) -> None:
+    cell = CellHandle(project, tmp_path / "compose.yml")
+    for out, expected in [
+        (b'{"State":"running","ExitCode":0}\n', ContainerState("running", 0)),
+        (b'[{"State":"exited","ExitCode":3}]', ContainerState("exited", 3)),
+        (b"", ContainerState("missing")),
+    ]:
+        docker = FakeDocker([lambda a, _, o=out: CommandResult(a, 0, o)])
+        assert ComposeBackend(docker).agent_state(cell) == expected
+    assert ContainerState("running").running and not ContainerState("exited", 0).running
+
+
+def test_subnets_in_use_reads_every_networks_ipam(tmp_path: Path) -> None:
+    inspect = [
+        {"IPAM": {"Config": [{"Subnet": "10.231.0.0/27"}, {"Subnet": "fd00::/64"}]}},
+        {"IPAM": {"Config": None}},
+        {"IPAM": {"Config": [{"Subnet": "172.17.0.0/16"}]}},
+    ]
+
+    def respond(argv: tuple[str, ...], _stdin: bytes | None) -> CommandResult | None:
+        if argv[1:4] == ("network", "ls", "-q"):
+            return CommandResult(argv, 0, b"n1\nn2\nn3\n")
+        if argv[1:3] == ("network", "inspect"):
+            assert argv[3:] == ("n1", "n2", "n3")
+            return CommandResult(argv, 0, json.dumps(inspect).encode())
+        return None
+
+    nets = ComposeBackend(FakeDocker([respond])).subnets_in_use()
+    assert nets == [ipaddress.IPv4Network("10.231.0.0/27"), ipaddress.IPv4Network("172.17.0.0/16")]
+
+
+def _evidence_tar(entries: list[tuple[str, Any]]) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, content in entries:
+            info = tarfile.TarInfo(name)
+            if content == "dir":
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+            elif isinstance(content, tuple):  # (type, linkname)
+                info.type, info.linkname = content
+                tar.addfile(info)
+            else:
+                info.size = len(content)
+                tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def test_extract_evidence_keeps_only_the_producers_own_regular_files(tmp_path: Path) -> None:
+    data = _evidence_tar(
+        [
+            ("evidence", "dir"),
+            ("evidence/agent", "dir"),
+            ("evidence/agent/events.jsonl", b'{"x":1}\n'),
+            ("evidence/agent/sub/ok.txt", b"ok"),
+            ("evidence/injector/events.jsonl", b"forged"),  # another producer's file
+            ("evidence/agent/.hidden", b"h"),
+            ("evidence/agent/../../etc/passwd", b"x"),
+            ("evidence/agent/link", (tarfile.SYMTYPE, "/etc/shadow")),
+            ("evidence/agent/hard", (tarfile.LNKTYPE, "evidence/agent/events.jsonl")),
+            ("evidence/agent/fifo", (tarfile.FIFOTYPE, "")),
+        ]
+    )
+    report = CollectReport()
+    extract_evidence(data, tmp_path, "agent", report)
+    assert sorted(report.files) == ["agent/events.jsonl", "agent/sub/ok.txt"]
+    assert (tmp_path / "agent" / "events.jsonl").read_bytes() == b'{"x":1}\n'
+    assert not (tmp_path / "injector").exists()
+    assert not (tmp_path / "agent" / "link").exists()
+    assert not (tmp_path / "agent" / "hard").exists()
+    assert not (tmp_path / "agent" / "fifo").exists()
+    assert len(report.refused) == 6
+    assert not any(p.name == "passwd" for p in tmp_path.rglob("*"))
+
+
+def test_extract_evidence_never_overwrites(tmp_path: Path) -> None:
+    data = _evidence_tar([("evidence/agent/events.jsonl", b"a")])
+    extract_evidence(data, tmp_path, "agent", CollectReport())
+    with pytest.raises(FileExistsError):
+        extract_evidence(data, tmp_path, "agent", CollectReport())
+
+
+def test_collect_copies_each_producers_evidence_from_its_container(
+    tmp_path: Path, project: ComposeProject
+) -> None:
+    def respond(argv: tuple[str, ...], _stdin: bytes | None) -> CommandResult | None:
+        if argv[:2] == ("docker", "cp"):
+            container = argv[2].split(":")[0]
+            prefix = project.evidence[container.removeprefix("cid-")]
+            return CommandResult(argv, 0, _evidence_tar([(f"evidence/{prefix}/f.txt", b"1")]))
+        return _ps_writer(argv, _stdin)
+
+    docker = FakeDocker([respond])
+    report = ComposeBackend(docker).collect(
+        CellHandle(project, tmp_path / "c.yml"), tmp_path / "ev"
+    )
+    assert sorted(report.files) == sorted(f"{p}/f.txt" for p in project.evidence.values())
+    copies = [a for a in docker.argvs() if a[:2] == ("docker", "cp")]
+    assert all(a[2].endswith(":/evidence") and a[3] == "-" for a in copies)
+    assert set(project.evidence) == {"injector", "tap", "catcher", "agent"}
+
+
+def test_teardown_removes_the_project_and_everything_labelled_with_the_run(
+    tmp_path: Path, project: ComposeProject
+) -> None:
+    label = f"label=lab.run_id={project.run_id}"
+    listed = {"ps": iter([b"c1\nc2\n", b""]), "volume": iter([b"v1\n"]), "network": iter([b"n1\n"])}
+
+    def respond(argv: tuple[str, ...], _stdin: bytes | None) -> CommandResult | None:
+        if argv[1:3] == ("ps", "-a"):
+            assert argv[-1] == label
+            return CommandResult(argv, 0, next(listed["ps"]))
+        if argv[1] in ("volume", "network") and argv[2] == "ls":
+            assert argv[-1] == label
+            return CommandResult(argv, 0, next(listed[argv[1]]))
+        return None
+
+    docker = FakeDocker([respond])
+    ComposeBackend(docker).teardown(CellHandle(project, tmp_path / "c.yml"))
+    argvs = docker.argvs()
+    assert _after_compose(argvs[0]) == ("down", "-v", "--remove-orphans", "-t", "10")
+    assert ("docker", "rm", "-f", "-v", "c1", "c2") in argvs  # anonymous volumes too
+    assert ("docker", "volume", "rm", "-f", "v1") in argvs
+    assert ("docker", "network", "rm", "n1") in argvs
+
+
+def test_teardown_reports_what_it_could_not_remove(tmp_path: Path, project: ComposeProject) -> None:
+    def respond(argv: tuple[str, ...], _stdin: bytes | None) -> CommandResult | None:
+        if argv[1:3] == ("ps", "-a"):
+            return CommandResult(argv, 0, b"stuck\n")
+        return None
+
+    with pytest.raises(CellError, match="containers left"):
+        ComposeBackend(FakeDocker([respond])).teardown(CellHandle(project, tmp_path / "c.yml"))
+
+
+def test_files_tar_round_trips() -> None:
+    from control.runner.cell_spec import CellFile
+
+    data = files_tar([CellFile("cfg_agent", "script.json", b"{}", mode=0o444)])
+    with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        (member,) = tar.getmembers()
+        assert member.name == "script.json" and member.mode == 0o444
+
+
+def test_extract_evidence_accepts_podmans_absolute_member_names(tmp_path: Path) -> None:
+    data = _evidence_tar([("/", "dir"), ("/llm", "dir"), ("/llm/events.jsonl", b"{}\n")])
+    report = CollectReport()
+    extract_evidence(data, tmp_path, "llm", report)
+    assert report.files == ["llm/events.jsonl"] and report.refused == []

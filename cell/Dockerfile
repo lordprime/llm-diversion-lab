@@ -13,7 +13,10 @@
 #
 # Runs as the unprivileged uid 10001 by default; a service that must bind a port
 # below 1024 (the catcher's DNS and HTTP, the injector's :80) runs as root with
-# every capability dropped except NET_BIND_SERVICE (set in the cell file).
+# every capability dropped except NET_BIND_SERVICE (set in the cell file). Without
+# DAC_OVERRIDE such a root cannot write into a directory it does not own, so
+# /evidence (copied into each service's own fresh evidence volume) is 1777: every
+# producer creates its own subdirectory there, whatever its uid.
 
 ARG PYTHON_IMAGE=docker.io/library/python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.24@sha256:3af4716e991d6956a41e573eab705d0ee08500cd829ed30293eb8472f372c65a
@@ -31,8 +34,8 @@ FROM ${PYTHON_IMAGE}
 RUN groupadd --system --gid 10001 lab \
  && useradd --system --uid 10001 --gid lab --home-dir /nonexistent --shell /usr/sbin/nologin lab \
  && mkdir -p /evidence /etc/lab \
- && chown lab:lab /evidence \
- && chmod 0755 /evidence /etc/lab
+ && chmod 1777 /evidence \
+ && chmod 0755 /etc/lab
 COPY --from=build /opt/lab/.venv /opt/lab/.venv
 COPY control/__init__.py /opt/lab/control/__init__.py
 COPY control/core /opt/lab/control/core

@@ -113,6 +113,7 @@ def run_row(
         pair_id=pair_id or new_id("pair"),
         schedule_index=schedule_index,
         status=status,
+        invalid_reason=m.InvalidReason.INTERNAL if status is RunStatus.INVALID else None,
         tag=None if arm is Arm.CONTROL else TAG,
     )
 
@@ -182,6 +183,40 @@ def test_claim_next_run_follows_schedule_order_and_skips_non_queued(engine: Engi
             break
         order.append(run.run_id)
     assert order == [first, second]
+
+
+def test_claim_next_run_can_be_limited_to_one_experiment(engine: Engine) -> None:
+    first = seed_experiment(engine)
+    second = {**first, "experiment_id": new_id("exp"), "control_arm_id": new_id("arm")}
+    with session_scope(engine) as s:
+        s.add(
+            t.Experiment(
+                experiment_id=second["experiment_id"],
+                name="other",
+                definition_yaml="name: other\n",
+                definition_sha256=SHA,
+                schedule_seed=8,
+            )
+        )
+        s.flush()
+        s.add(
+            t.ExperimentArm(
+                arm_id=second["control_arm_id"],
+                experiment_id=second["experiment_id"],
+                name="control",
+                arm=Arm.CONTROL,
+                surfaces=[],
+            )
+        )
+    older = add_run(engine, first, schedule_index=0)
+    mine = add_run(engine, second, schedule_index=0)
+    with session_scope(engine) as s:
+        claimed = claim_next_run(s, experiment_id=second["experiment_id"])
+        assert claimed is not None and claimed.run_id == mine
+    with session_scope(engine) as s:
+        assert claim_next_run(s, experiment_id=second["experiment_id"]) is None
+        claimed = claim_next_run(s)
+        assert claimed is not None and claimed.run_id == older
 
 
 def test_claim_rolled_back_returns_run_to_queue(engine: Engine) -> None:

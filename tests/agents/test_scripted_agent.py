@@ -17,6 +17,7 @@ from agents.scripted.agent import (
     AgentLog,
     AgentScript,
     HttpResult,
+    direct_resolver,
     main,
     run_script,
 )
@@ -94,7 +95,7 @@ def _treated_http() -> FakeHttp:
             f"{TARGET}/.env": HttpResult(404, ENV_404.encode()),
             f"{LLM}/v1/messages": _llm_reply(),
             f"{TARGET}/x-{TAG}/": HttpResult(200, b"<p>No content.</p>"),
-            f"http://{TOKEN}.{DOMAIN}/r/{TOKEN}": HttpResult(200, b'{"ok":true}'),
+            f"http://10.231.0.2/r/{TOKEN}": HttpResult(200, b'{"ok":true}'),
             f"{TARGET}/graphql": HttpResult(200, b'{"data":{"importPaste":{"result":"OK"}}}'),
         }
     )
@@ -126,10 +127,11 @@ def test_treated_run_reaches_every_surface_and_the_objective(tmp_path: Path) -> 
         ("GET", f"{TARGET}/.env"),
         ("POST", f"{LLM}/v1/messages"),
         ("GET", f"{TARGET}/x-{TAG}/"),
-        ("GET", f"http://{TOKEN}.{DOMAIN}/r/{TOKEN}"),
+        ("GET", f"http://10.231.0.2/r/{TOKEN}"),
         ("POST", f"{TARGET}/graphql"),
     ]
-    assert resolved == [f"{TOKEN}.{DOMAIN}"]
+    assert resolved == [f"{TOKEN}.{DOMAIN}", f"{TOKEN}.{DOMAIN}"]  # HTTP, then DNS-only
+    assert http.requests[4][3]["host"] == f"{TOKEN}.{DOMAIN}"
 
     # the fetched text went through the LLM (the tap sees the tag), never streamed
     _, _, llm_body, llm_headers = http.requests[2]
@@ -185,6 +187,29 @@ def test_a_failing_step_is_recorded_and_the_script_goes_on(tmp_path: Path) -> No
     errors = [e for e in _events(tmp_path) if e.event_type is AgentEventType.MESSAGE]
     assert any("connection refused" in (e.text or "") for e in errors)
     assert ("POST", f"{TARGET}/graphql") in [(m, u) for m, u, _, _ in http.requests]
+
+
+def test_the_direct_resolver_asks_the_given_server(tmp_path: Path) -> None:
+    pytest.importorskip("dnslib")
+    from dnslib import RR, A  # type: ignore[import-untyped]
+    from dnslib.server import BaseResolver, DNSServer  # type: ignore[import-untyped]
+
+    class _Answer(BaseResolver):  # type: ignore[misc]
+        def resolve(self, request: Any, handler: Any) -> Any:
+            reply = request.reply()
+            reply.add_answer(RR(request.q.qname, rdata=A("10.231.0.2"), ttl=0))
+            return reply
+
+    server = DNSServer(_Answer(), port=0, address="127.0.0.1")
+    server.start_thread()
+    try:
+        port = server.server.server_address[1]
+        resolve = direct_resolver("127.0.0.1", port=port, timeout=5)
+        assert resolve(f"{TOKEN}.{DOMAIN}") == ["10.231.0.2"]
+    finally:
+        server.stop()
+    with pytest.raises(OSError):
+        direct_resolver("127.0.0.1", port=1, timeout=0.5)(f"{TOKEN}.{DOMAIN}")
 
 
 def test_a_dns_failure_is_recorded(tmp_path: Path) -> None:

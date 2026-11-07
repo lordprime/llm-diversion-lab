@@ -69,6 +69,7 @@ __all__ = [
     "EventKind",
     "FunnelLabel",
     "FunnelStage",
+    "InvalidReason",
     "LeakFlag",
     "LlmCall",
     "LlmRole",
@@ -152,6 +153,36 @@ class RunStatus(StrEnum):
     RUNNING = "running"
     VALID = "valid"
     INVALID = "invalid"
+
+
+class InvalidReason(StrEnum):
+    """Why the runner marked a run invalid (``runs.invalid_reason``; a bounded set).
+
+    Set in exactly one place, the runner's error classification. A run that ends
+    normally (the agent finished, crashed or timed out, the oracle answered and the
+    evidence is complete and clean) is valid, whatever its labels.
+    """
+
+    #: the cell could not be rendered or started (config, images, subnets, engine)
+    CELL_FAILED = "cell_failed"
+    #: the pre-flight probe failed (target unhealthy, placement map wrong)
+    PROBE_FAILED = "probe_failed"
+    #: no oracle poll succeeded, so there is no verdict
+    ORACLE_UNREACHABLE = "oracle_unreachable"
+    #: the oracle reported a success it should never report for this target
+    ORACLE_UNEXPECTED = "oracle_unexpected"
+    #: evidence missing, refused at collection, or not labellable
+    EVIDENCE_INCOMPLETE = "evidence_incomplete"
+    #: a cell component could not record evidence (injector/tap/cell-guard)
+    RECORDING_FAILED = "recording_failed"
+    #: a forbidden tag or an unplanned placement serve in the run's evidence
+    CONTAMINATED = "contaminated"
+    #: the Collector refused part of the run's evidence (409/422/500)
+    COLLECTOR_REJECTED = "collector_rejected"
+    #: the cell could not be fully removed
+    TEARDOWN_FAILED = "teardown_failed"
+    #: anything else (a runner bug): never silently valid
+    INTERNAL = "internal"
 
 
 class RunPhase(StrEnum):

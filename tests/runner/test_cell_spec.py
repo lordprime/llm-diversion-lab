@@ -241,6 +241,11 @@ def test_agent_is_only_on_an_internal_network_and_reaches_the_llm_only_via_the_t
         catcher_ip = services["catcher"]["networks"]["agent"]["ipv4_address"]
         assert agent["dns"] == [catcher_ip]
         assert _env(project, "catcher")["LAB_CATCHER_IP"] == catcher_ip
+        # the agent finds the injector and the tap by pinned address, not by DNS
+        injector_ip = services["injector"]["networks"]["agent"]["ipv4_address"]
+        tap_ip = services["tap"]["networks"]["agent"]["ipv4_address"]
+        assert agent["extra_hosts"] == [f"target:{injector_ip}", f"tap:{tap_ip}"]
+        assert len({catcher_ip, injector_ip, tap_ip}) == 3
 
 
 def test_networks_have_cell_subnets_bridge_names_and_labels(
@@ -512,6 +517,18 @@ def test_podman_rendering_omits_docker_only_network_options(
     for net in project.document["networks"].values():
         assert "com.docker.network.bridge.name" not in net.get("driver_opts", {})
         assert net["internal"] is True
+    # Podman's internal-network resolver does not forward: the script asks the catcher
+    catcher_ip = _services(project)["catcher"]["networks"]["agent"]["ipv4_address"]
+    script = AgentScript.model_validate_json(_file(project, "cfg_agent", "script.json"))
+    assert str(script.dns_server) == catcher_ip
+
+
+def test_docker_scripts_use_the_agents_own_resolver(
+    control: tuple[ScheduledRun, RunManifest, ComposeProject],
+) -> None:
+    _, _, project = control
+    script = AgentScript.model_validate_json(_file(project, "cfg_agent", "script.json"))
+    assert script.dns_server is None
 
 
 def test_gateway_mode_routes_the_tap_to_the_gateway_without_a_stub(
