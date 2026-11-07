@@ -22,13 +22,25 @@ Planning the order and assigning identities are separate steps:
   monotonic, so sorting runs by ``run_id`` gives the schedule order. Scheduling the
   same experiment twice gives the same order with new ids and tags: the runs of two
   schedules are never confused, and a resumed queue keeps the runs it already has.
+
+Attempts
+--------
+An invalid run is re-queued with the identical configuration (DEVELOPMENT_PLAN 5.4).
+:func:`retry` gives the next attempt of a run the same pair, arm, cell and
+``schedule_index``, ``attempt + 1``, a new ``run_id`` and, for an injected run, a new
+tag, so every attempt's evidence is told apart in leak checks. Every attempt is kept:
+a schedule is the list of all of them.
+
+:func:`check_schedule` re-checks a schedule (for example one reloaded from the
+database) before it is run or labelled.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterator
+from collections import defaultdict
+from collections.abc import Callable, Hashable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Annotated, NamedTuple, Self
 
@@ -36,6 +48,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     NonNegativeInt,
+    PositiveInt,
     StringConstraints,
     model_validator,
 )
@@ -43,14 +56,17 @@ from pydantic import (
 from control.core.ids import ID_PATTERN, new_id
 from control.core.models import Arm
 from control.core.tokens import TAG_PATTERN, new_tag
-from control.runner.experiment import Experiment
+from control.runner.experiment import AgentName, Experiment, ModelName, TargetName
 
 __all__ = [
     "PairKey",
     "PlannedRun",
+    "ScheduleError",
     "ScheduledRun",
     "build_schedule",
+    "check_schedule",
     "plan_order",
+    "retry",
 ]
 
 Id = Annotated[str, StringConstraints(pattern=ID_PATTERN)]
@@ -75,9 +91,11 @@ class PlannedRun:
 
 
 class ScheduledRun(BaseModel):
-    """One run of a schedule: its identity, arm, cell, position and (injected) tag.
+    """One run of a schedule: its identity, arm, cell, position, attempt and tag.
 
-    ``rep`` counts from 0. A control run has no tag; an injected run has one.
+    ``rep`` counts from 0, ``attempt`` from 1. A control run has no tag; an injected
+    run has one. All attempts of a run share its ``pair_id``, arm, cell and
+    ``schedule_index`` (see :func:`retry`).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -86,11 +104,12 @@ class ScheduledRun(BaseModel):
     experiment_id: Id
     pair_id: Id
     arm: Arm
-    target: str
-    agent: str
-    model: str
+    target: TargetName
+    agent: AgentName
+    model: ModelName
     rep: NonNegativeInt
     schedule_index: NonNegativeInt
+    attempt: PositiveInt = 1
     tag: Tag | None
 
     @model_validator(mode="after")
@@ -164,3 +183,93 @@ def build_schedule(experiment: Experiment) -> list[ScheduledRun]:
             )
         )
     return runs
+
+
+def retry(run: ScheduledRun) -> ScheduledRun:
+    """The next attempt of ``run``: same pair, arm, cell and position, ``attempt + 1``.
+
+    It gets a new ``run_id`` and, for an injected run, a new tag. Add it to the
+    schedule beside the earlier attempts; never replace them.
+    """
+    return run.model_copy(
+        update={
+            "run_id": new_id("run"),
+            "attempt": run.attempt + 1,
+            "tag": new_tag() if run.arm is Arm.INJECTED else None,
+        }
+    )
+
+
+class ScheduleError(ValueError):
+    """A schedule breaks the matched-pair design."""
+
+
+def _unique_by(
+    runs: Sequence[ScheduledRun], key: Callable[[ScheduledRun], Hashable], what: str
+) -> None:
+    seen: set[Hashable] = set()
+    for run in runs:
+        value = key(run)
+        if value in seen:
+            raise ScheduleError(f"duplicate {what} {value!r}")
+        seen.add(value)
+
+
+def check_schedule(runs: Sequence[ScheduledRun]) -> None:
+    """Raise :class:`ScheduleError` unless ``runs`` is a well-formed matched-pair schedule.
+
+    Checked over all attempts:
+
+    * ``run_id`` values and tags are unique; a control run has no tag and an injected
+      run has one; all runs belong to one experiment;
+    * ``(schedule_index, attempt)`` and ``(pair_id, arm, attempt)`` are unique (the
+      database's own uniqueness rules);
+    * each pair has both arms and all its runs share one cell; each arm's attempts are
+      numbered ``1..n`` and share one ``schedule_index``, so the latest attempt of
+      each arm is exactly one run;
+    * pairs are adjacent: in ``schedule_index`` order pair *k* holds exactly the
+      positions ``2k`` and ``2k + 1``, so positions run ``0..2*pairs - 1`` without gaps.
+    """
+    if not runs:
+        return
+    experiments = {r.experiment_id for r in runs}
+    if len(experiments) != 1:
+        raise ScheduleError(f"runs of several experiments: {', '.join(sorted(experiments))}")
+    _unique_by(runs, lambda r: r.run_id, "run_id")
+    _unique_by(runs, lambda r: (r.schedule_index, r.attempt), "(schedule_index, attempt)")
+    _unique_by(runs, lambda r: (r.pair_id, r.arm.value, r.attempt), "(pair_id, arm, attempt)")
+    tags: set[str] = set()
+    for run in runs:
+        if run.arm is Arm.CONTROL and run.tag is not None:
+            raise ScheduleError(f"control run {run.run_id} carries a tag")
+        if run.arm is Arm.INJECTED and run.tag is None:
+            raise ScheduleError(f"injected run {run.run_id} has no tag")
+        if run.tag is not None:
+            if run.tag in tags:
+                raise ScheduleError(f"run {run.run_id} reuses another run's tag")
+            tags.add(run.tag)
+
+    pairs: dict[str, list[ScheduledRun]] = defaultdict(list)
+    for run in runs:
+        pairs[run.pair_id].append(run)
+    lows: list[int] = []
+    for pair_id, members in pairs.items():
+        if len({m.key for m in members}) != 1:
+            raise ScheduleError(f"pair {pair_id} mixes cells")
+        positions: list[int] = []
+        for arm in (Arm.CONTROL, Arm.INJECTED):
+            attempts = sorted(m.attempt for m in members if m.arm is arm)
+            if not attempts:
+                raise ScheduleError(f"pair {pair_id} has no {arm.value} run")
+            if attempts != list(range(1, len(attempts) + 1)):
+                raise ScheduleError(f"pair {pair_id} {arm.value} attempts are not 1..n: {attempts}")
+            indexes = {m.schedule_index for m in members if m.arm is arm}
+            if len(indexes) != 1:
+                raise ScheduleError(f"pair {pair_id} {arm.value} attempts change position")
+            positions.append(indexes.pop())
+        low, high = sorted(positions)
+        if high != low + 1:
+            raise ScheduleError(f"pair {pair_id} is not adjacent (positions {low}, {high})")
+        lows.append(low)
+    if sorted(lows) != list(range(0, 2 * len(lows), 2)):
+        raise ScheduleError("pairs are not adjacent: positions are not 0..2*pairs-1 two by two")

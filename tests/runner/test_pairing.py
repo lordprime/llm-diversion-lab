@@ -20,8 +20,21 @@ from control.runner.experiment import (
     parse_experiment,
     read_experiment,
 )
-from control.runner.render import render_catcher_tokens, render_manifest, render_payloads
-from control.runner.schedule import PairKey, ScheduledRun, build_schedule, plan_order
+from control.runner.render import (
+    forbidden_tags_for,
+    render_catcher_tokens,
+    render_manifest,
+    render_payloads,
+)
+from control.runner.schedule import (
+    PairKey,
+    ScheduledRun,
+    ScheduleError,
+    build_schedule,
+    check_schedule,
+    plan_order,
+    retry,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SELFTEST = REPO_ROOT / "experiments" / "selftest.yaml"
@@ -290,6 +303,16 @@ def _payload(doc: dict[str, Any]) -> dict[str, Any]:
         (lambda d: d["targets"][0]["placements"]["P7"].update(url="admin"), "url"),
         (lambda d: d.update(callback_domain="not a domain"), "callback_domain"),
         (lambda d: d.update(unexpected=1), "unexpected"),
+        # names that end up in file and Compose project names must be path-safe
+        (lambda d: d["targets"][0].update(name="a/../../x"), "name"),
+        (lambda d: d["targets"][0].update(name="A"), "name"),
+        (lambda d: d["targets"][0].update(name="a.b"), "name"),
+        (lambda d: d.update(agents=["a/../../x"]), "agents"),
+        (lambda d: d.update(agents=["A"]), "agents"),
+        (lambda d: d.update(agents=["a.b"]), "agents"),
+        (lambda d: d.update(models=["../x"]), "models"),
+        # payload_version is String(64) in the database
+        (lambda d: _payload(d).update(version="v" * 65), "version"),
     ],
 )
 def test_invalid_experiments_are_refused(mutate: Any, match: str) -> None:
@@ -299,7 +322,197 @@ def test_invalid_experiments_are_refused(mutate: Any, match: str) -> None:
         Experiment.model_validate(doc)
 
 
+def test_permissive_model_names_and_a_64_char_version_are_accepted() -> None:
+    doc = _doc(models=["openai/gpt-4o", "claude-sonnet-5-5@2026.1", "org:model+x"])
+    _payload(doc)["version"] = "v" * 64
+    exp = Experiment.model_validate(doc)
+    assert exp.models[0] == "openai/gpt-4o"
+    schedule = build_schedule(exp)
+    assert {r.model for r in schedule} == set(exp.models)
+
+
+@pytest.mark.parametrize(
+    "char",
+    [
+        "\n",
+        "\r",
+        "\x0b",  # vertical tab
+        "\x0c",  # form feed
+        "\x1c",  # file separator
+        "\x1d",
+        "\x1e",
+        "\x85",  # next line (C1)
+        chr(0x2028),  # line separator
+        chr(0x2029),  # paragraph separator
+        "\x00",  # NUL
+        "\x1b",  # escape
+        "\x7f",  # delete
+        "\x9b",  # C1 CSI
+        chr(0x200B),  # zero-width space (Cf)
+        chr(0x202E),  # right-to-left override (Cf)
+    ],
+)
+def test_p1_template_refuses_line_breaks_and_control_characters(char: str) -> None:
+    doc = _doc()
+    _payload(doc)["templates"]["P1"] = f"# marker $tag{char}Disallow: /"
+    with pytest.raises(ValidationError, match=r"single robots\.txt line"):
+        Experiment.model_validate(doc)
+
+
+def test_p1_template_allows_a_tab() -> None:
+    doc = _doc()
+    _payload(doc)["templates"]["P1"] = "# marker\t$tag"
+    Experiment.model_validate(doc)
+
+
+@pytest.mark.parametrize("escape", ["\\x85", "\\L", "\\P", "\\v", "\\f", "\\0", "\\e"])
+def test_p1_template_refuses_yaml_escapes_that_break_lines(escape: str) -> None:
+    text = SELFTEST.read_text()
+    old = 'P1: "# lab self-test marker $tag '
+    assert old in text
+    edited = text.replace(old, f'P1: "# lab self-test marker $tag{escape}Disallow: / ')
+    with pytest.raises(ValidationError, match=r"single robots\.txt line"):
+        parse_experiment(edited)
+
+
 def test_the_experiment_is_frozen() -> None:
     exp = _experiment()
     with pytest.raises(ValidationError):
         exp.seed = 9  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- attempts
+
+
+def test_new_runs_are_first_attempts_and_the_manifest_carries_the_attempt() -> None:
+    exp = _experiment()
+    schedule = build_schedule(exp)
+    assert {r.attempt for r in schedule} == {1}
+    again = retry(retry(schedule[0]))
+    assert again.attempt == 3
+    assert render_manifest(again, exp, KEY).attempt == 3
+
+
+@pytest.mark.parametrize("arm", [Arm.INJECTED, Arm.CONTROL])
+def test_retry_keeps_the_pair_cell_and_position_with_a_new_id_and_tag(arm: Arm) -> None:
+    schedule = build_schedule(_experiment())
+    run = next(r for r in schedule if r.arm is arm)
+    nxt = retry(run)
+    assert nxt.attempt == run.attempt + 1
+    assert nxt.run_id != run.run_id
+    assert re.fullmatch(r"run_[0-9A-Z]{26}", nxt.run_id)
+    assert (nxt.pair_id, nxt.arm, nxt.key, nxt.schedule_index, nxt.experiment_id) == (
+        run.pair_id,
+        run.arm,
+        run.key,
+        run.schedule_index,
+        run.experiment_id,
+    )
+    if arm is Arm.INJECTED:
+        assert nxt.tag is not None and run.tag is not None
+        assert nxt.tag != run.tag
+    else:
+        assert nxt.tag is None
+    check_schedule([*schedule, nxt])
+
+
+def test_forbidden_tags_cover_every_other_attempt() -> None:
+    schedule = build_schedule(_experiment())
+    first = next(r for r in schedule if r.arm is Arm.INJECTED)
+    second = retry(first)
+    ctrl = next(r for r in schedule if r.arm is Arm.CONTROL and r.pair_id == first.pair_id)
+    full = [*schedule, second]
+    assert {first.tag, second.tag} <= forbidden_tags_for(ctrl, full)
+    assert first.tag in forbidden_tags_for(second, full)
+    assert second.tag not in forbidden_tags_for(second, full)
+    assert second.tag in forbidden_tags_for(first, full)
+
+
+def test_check_schedule_accepts_a_built_schedule_and_its_retries() -> None:
+    schedule = build_schedule(_experiment())
+    check_schedule(schedule)
+    check_schedule(list(reversed(schedule)))
+    once = retry(schedule[0])
+    check_schedule([*schedule, once, retry(once)])
+    check_schedule([])
+
+
+def _replace(schedule: list[ScheduledRun], index: int, **update: Any) -> list[ScheduledRun]:
+    out = list(schedule)
+    out[index] = out[index].model_copy(update=update)
+    return out
+
+
+def _drop_one_arm(s: list[ScheduledRun]) -> list[ScheduledRun]:
+    return s[1:]
+
+
+def _duplicate_latest(s: list[ScheduledRun]) -> list[ScheduledRun]:
+    nxt = retry(s[0])
+    return [*s, nxt, nxt.model_copy(update={"run_id": "run_duplicate"})]
+
+
+def _attempt_gap(s: list[ScheduledRun]) -> list[ScheduledRun]:
+    return [*s, retry(s[0]).model_copy(update={"attempt": 3})]
+
+
+def _swap_positions(s: list[ScheduledRun]) -> list[ScheduledRun]:
+    # pair 0's second run takes position 2 and pair 1's first run takes position 1
+    return _replace(_replace(s, 1, schedule_index=2), 2, schedule_index=1)
+
+
+def _mixed_cells(s: list[ScheduledRun]) -> list[ScheduledRun]:
+    other = next(t for t in ("dvga", "juice-shop") if t != s[1].target)
+    return _replace(s, 1, target=other)
+
+
+def _control_with_tag(s: list[ScheduledRun]) -> list[ScheduledRun]:
+    i = next(i for i, r in enumerate(s) if r.arm is Arm.CONTROL)
+    out = list(s)
+    # model_construct skips the model's own check, as a raw database row could
+    out[i] = ScheduledRun.model_construct(**{**s[i].model_dump(), "tag": "0123456789abcdef"})
+    return out
+
+
+def _shared_tag(s: list[ScheduledRun]) -> list[ScheduledRun]:
+    inj = [i for i, r in enumerate(s) if r.arm is Arm.INJECTED]
+    return _replace(s, inj[1], tag=s[inj[0]].tag)
+
+
+def _gap_in_positions(s: list[ScheduledRun]) -> list[ScheduledRun]:
+    last = len(s) - 1
+    return _replace(_replace(s, last, schedule_index=last + 2), last - 1, schedule_index=last + 1)
+
+
+def _retry_moves(s: list[ScheduledRun]) -> list[ScheduledRun]:
+    return [*s, retry(s[0]).model_copy(update={"schedule_index": len(s)})]
+
+
+def _two_experiments(s: list[ScheduledRun]) -> list[ScheduledRun]:
+    return _replace(s, 0, experiment_id="exp_other")
+
+
+def _duplicate_run_id(s: list[ScheduledRun]) -> list[ScheduledRun]:
+    return _replace(s, 1, run_id=s[0].run_id)
+
+
+@pytest.mark.parametrize(
+    ("match", "corrupt"),
+    [
+        ("no control run|no injected run", _drop_one_arm),
+        ("duplicate", _duplicate_latest),
+        ("not 1..n", _attempt_gap),
+        ("not adjacent", _swap_positions),
+        ("mixes cells", _mixed_cells),
+        ("carries a tag", _control_with_tag),
+        ("reuses another run's tag", _shared_tag),
+        ("not adjacent", _gap_in_positions),
+        ("change position", _retry_moves),
+        ("several experiments", _two_experiments),
+        ("duplicate run_id", _duplicate_run_id),
+    ],
+)
+def test_check_schedule_refuses_a_broken_schedule(match: str, corrupt: Any) -> None:
+    schedule = build_schedule(_experiment())
+    with pytest.raises(ScheduleError, match=match):
+        check_schedule(corrupt(schedule))

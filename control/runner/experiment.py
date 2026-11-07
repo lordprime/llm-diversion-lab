@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -50,22 +51,29 @@ from control.core.models import Surface
 from control.core.tags import request_path
 
 __all__ = [
+    "LABEL_PATTERN",
     "MAX_SEED",
     "P7_LOCATOR_PATTERN",
     "ROBOTS_LOCATOR",
     "ROBOTS_PATH",
+    "SAFE_NAME_PATTERN",
     "SUPPORTED_SURFACES",
     "TEMPLATE_FIELDS",
+    "AgentName",
     "ControlArmSpec",
     "Experiment",
     "ExperimentArms",
     "ExperimentFile",
     "InjectedArmSpec",
+    "ModelName",
     "PayloadFamily",
+    "PayloadId",
     "PayloadSpec",
     "PayloadStyle",
+    "PayloadVersion",
     "PlacementSpec",
     "RunLimits",
+    "TargetName",
     "TargetSpec",
     "load_experiment",
     "parse_experiment",
@@ -93,8 +101,20 @@ _P7_LOCATOR = re.compile(P7_LOCATOR_PATTERN)
 
 Id = Annotated[str, StringConstraints(pattern=ID_PATTERN)]
 NonEmptyStr = Annotated[str, StringConstraints(min_length=1, max_length=200)]
-#: A target, agent or model name: no whitespace, safe in ids, labels and file names.
-Name = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")]
+#: Accepted shape of a target or agent name. These names end up in file names
+#: (``deploy/compose/cell.<target>.yml``) and Compose project names, so only lowercase
+#: letters, digits, ``_`` and ``-``: no ``/``, no ``.``, no uppercase.
+SAFE_NAME_PATTERN: Final = r"^[a-z0-9][a-z0-9_-]{0,62}$"
+#: Accepted shape of a model name or payload id. Permissive on purpose (provider model
+#: ids such as ``openai/gpt-4o`` or ``claude-sonnet-5-5@2026``): NOT safe in paths or
+#: Compose names; never build a file name or project name from it.
+LABEL_PATTERN: Final = r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$"
+TargetName = Annotated[str, StringConstraints(pattern=SAFE_NAME_PATTERN)]
+AgentName = Annotated[str, StringConstraints(pattern=SAFE_NAME_PATTERN)]
+ModelName = Annotated[str, StringConstraints(pattern=LABEL_PATTERN)]
+PayloadId = Annotated[str, StringConstraints(pattern=LABEL_PATTERN)]
+#: ``arms.payload_version`` and ``placements.payload_version`` are ``String(64)``.
+PayloadVersion = Annotated[str, StringConstraints(min_length=1, max_length=64)]
 DnsName = Annotated[
     str,
     StringConstraints(
@@ -154,7 +174,7 @@ class PlacementSpec(_Frozen):
 class TargetSpec(_Frozen):
     """One target and its placement map (one entry per surface it can carry)."""
 
-    name: Name
+    name: TargetName
     placements: dict[Surface, PlacementSpec]
 
     @model_validator(mode="after")
@@ -174,13 +194,31 @@ class TargetSpec(_Frozen):
         return self
 
 
+#: Unicode categories a P1 text may not contain (tab excepted): controls, format
+#: characters and line/paragraph separators. ``str.splitlines`` (used by
+#: :mod:`urllib.robotparser`) also breaks lines at several of them.
+_FORBIDDEN_P1_CATEGORIES: Final = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def _check_robots_line(text: str, where: str) -> None:
+    """A P1 text becomes one robots.txt line: refuse anything that could start another."""
+    if len(text.splitlines()) != 1:
+        raise ValueError(f"{where}: a P1 text must be a single robots.txt line")
+    for char in text:
+        if char != "\t" and unicodedata.category(char) in _FORBIDDEN_P1_CATEGORIES:
+            raise ValueError(
+                f"{where}: a P1 text must be a single robots.txt line "
+                f"without control characters (found U+{ord(char):04X})"
+            )
+
+
 class PayloadSpec(_Frozen):
     """A versioned payload: family, style and one text template per surface."""
 
-    payload_id: Name
+    payload_id: PayloadId
     family: PayloadFamily
     style: PayloadStyle
-    version: NonEmptyStr
+    version: PayloadVersion
     templates: dict[Surface, Annotated[str, StringConstraints(min_length=1, max_length=8192)]]
 
     @model_validator(mode="after")
@@ -199,8 +237,8 @@ class PayloadSpec(_Frozen):
                 )
             if "tag" not in used:
                 raise ValueError(f"{where}: must use $tag")
-            if surface is Surface.P1 and ("\n" in text or "\r" in text):
-                raise ValueError(f"{where}: a P1 text must be a single robots.txt line")
+            if surface is Surface.P1:
+                _check_robots_line(text, where)
         return self
 
 
@@ -257,8 +295,8 @@ class Experiment(_Frozen):
     seed: Annotated[int, Strict(), Field(ge=0, le=MAX_SEED)]
     repetitions: StrictPositiveInt
     targets: Annotated[tuple[TargetSpec, ...], Field(min_length=1)]
-    agents: Annotated[tuple[Name, ...], Field(min_length=1)]
-    models: Annotated[tuple[Name, ...], Field(min_length=1)]
+    agents: Annotated[tuple[AgentName, ...], Field(min_length=1)]
+    models: Annotated[tuple[ModelName, ...], Field(min_length=1)]
     arms: ExperimentArms
     limits: RunLimits
     #: DNS zone of the callback catcher; ``$callback_host`` is ``<token>.<this>``.

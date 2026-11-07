@@ -15,7 +15,8 @@ Placement ids are a function of the run: ``pl_<run ULID>_<surface>`` (e.g.
 tokens; only ``created_at`` differs unless given.
 
 :func:`forbidden_tags_for` gives the labeller the tags that must not appear in a run's
-evidence: the tags of every *other* injected run in the same schedule. For a control
+evidence: the tags of every *other* injected run in the same schedule, every attempt
+included (a retry has a new run id and tag, so its evidence is told apart). For a control
 run that always includes its paired injected run's tag (so the set is never empty);
 for an injected run it is the rest of the experiment's tags, which turns any
 cross-run leak (shared gateway, agent memory, a reused cell) into a refusal rather
@@ -143,6 +144,7 @@ def render_manifest(
         agent=run.agent,
         model=run.model,
         schedule_index=run.schedule_index,
+        attempt=run.attempt,
         tag=run.tag,
         placements=placements,
         created_at=created_at if created_at is not None else datetime.now(UTC),
@@ -211,10 +213,12 @@ def render_catcher_tokens(manifest: RunManifest) -> list[tuple[str, str]]:
 def forbidden_tags_for(run: ScheduledRun, schedule: Sequence[ScheduledRun]) -> frozenset[str]:
     """Tags that must not occur in ``run``'s evidence: every other injected run's tag.
 
-    For a control run the set always contains its paired injected run's tag and is
-    therefore never empty (the labeller requires that); ``ValueError`` if the schedule
-    lacks that run. Never contains ``run``'s own tag. ``ValueError`` if ``run`` is not
-    in ``schedule``.
+    ``schedule`` is every attempt of every run (see
+    :func:`~control.runner.schedule.retry`), so the set covers the tags of the other
+    attempts too, including earlier attempts of ``run`` itself. For a control run it
+    always contains its paired injected run's tag(s) and is therefore never empty (the
+    labeller requires that); ``ValueError`` if the schedule lacks that run. Never
+    contains ``run``'s own tag. ``ValueError`` if ``run`` is not in ``schedule``.
     """
     if not any(r.run_id == run.run_id for r in schedule):
         raise ValueError(f"run {run.run_id} is not in the schedule")
