@@ -22,10 +22,13 @@ import uvicorn.config
 from starlette.datastructures import Headers
 
 from control.core.logging import (
+    HEAD_CHARS,
     MAX_DEPTH,
+    MAX_INPUT_CHARS,
     MAX_TEXT_CHARS,
     REDACTED,
     REDACTION_PATTERNS,
+    TAIL_CHARS,
     TRUNCATED,
     bind_component,
     configure_logging,
@@ -514,12 +517,171 @@ def test_redact_text_is_fast_on_adversarial_input(shape: str) -> None:
     assert time.perf_counter() - start < 0.5
 
 
-def test_long_strings_are_truncated_before_redaction() -> None:
-    assert MAX_TEXT_CHARS == 16 * 1024
-    out = redact_text("a" * (MAX_TEXT_CHARS * 3))
-    assert out == "a" * MAX_TEXT_CHARS + TRUNCATED
+def test_long_strings_keep_head_and_tail_after_redaction() -> None:
+    assert MAX_TEXT_CHARS == HEAD_CHARS + TAIL_CHARS == 16 * 1024
+    words = " ".join(f"w{i:05d}" for i in range(8000))  # ~56 KiB of short words
+    out = redact_text(words)
+    head, marker, tail = out.partition(TRUNCATED)
+    assert marker == TRUNCATED
+    assert words.startswith(head)
+    assert words.endswith(tail)
+    assert len(head) <= HEAD_CHARS
+    assert len(tail) <= TAIL_CHARS
+    assert head.endswith(" ") or head.endswith(head.split()[-1])
+    assert head.split()[-1] in words.split()  # no word cut in half at the cut
+    assert tail.split()[0] in words.split()
     short = "a" * MAX_TEXT_CHARS
     assert redact_text(short) == short
+
+
+# --------------------------------------------------------------------- fix round 3
+
+#: The reviewer's R1 shapes: a rejected name must never swallow a following secret.
+SWALLOW = [
+    "ValueError: password=hunter2",
+    "db error: password=hunter2",
+    "msg=DB_PASSWORD=hunter2",
+    '{"detail": "client_secret=hunter2"}',
+    "GET /login?next=/cb?api_key=hunter2 HTTP/1.1",
+    "GET /a?redirect_uri=https://x/cb?access_token=hunter2",
+    "env: AWS_SECRET=hunter2",
+    "a=b=c=d=password=hunter2",
+    "x: y: z: secret: hunter2",
+    "?a=1&b=2&c=/x?d=4&password=hunter2",
+    "note=see client_secret=hunter2",
+]
+
+
+@pytest.mark.parametrize("text", SWALLOW)
+def test_rejected_names_never_swallow_a_following_secret(text: str) -> None:
+    out = redact_text(text)
+    assert "hunter2" not in out, out
+    assert "[REDACTED:" in out
+
+
+def test_secret_in_a_rendered_traceback_is_masked(stream: io.StringIO) -> None:
+    secret = "hun" + "ter2"  # not literal: the traceback quotes this source line
+    try:
+        raise ValueError(f"password={secret}")
+    except ValueError:
+        get_logger("test").exception("failed")
+    out = stream.getvalue()
+    assert "hunter2" not in out
+    assert "ValueError: password=[REDACTED:assignment]" in out
+
+
+def _cut_at_limit(prefix_secret: str) -> str:
+    """Pad so that ``prefix_secret`` ends exactly at :data:`MAX_TEXT_CHARS`."""
+    pad = "x " * ((MAX_TEXT_CHARS - len(prefix_secret)) // 2)
+    pad += "x" * (MAX_TEXT_CHARS - len(prefix_secret) - len(pad))
+    return pad + prefix_secret
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "secret"),
+    [
+        ("AWS secret access key: " + "A" * 39, "A" + " tail", "A" * 39),
+        ("db=postgres://admin:hunter2-SECRET", "@db:5432/x", "hunter2-SECRET"),
+        ("key sk-proj-ABCDEFGHIJKLMNO", "PQRSTUVWXYZ123456", "ABCDEFGHIJKLMNO"),
+    ],
+    ids=["aws", "dsn", "openai"],
+)
+def test_a_secret_straddling_the_cut_is_masked(before: str, after: str, secret: str) -> None:
+    """Reviewer's R2 shapes: patterns run on the full text before any cut."""
+    out = redact_text(_cut_at_limit(before) + after + " end" * 2000)
+    assert secret not in out
+
+
+@pytest.mark.parametrize("where", ["head_edge", "tail_edge", "middle"])
+def test_inputs_above_the_ceiling_never_leak_at_a_window_edge(where: str) -> None:
+    dsn_line = "db=postgres://admin:" + "hunter2-SECRET" + "@db:5432/x"
+    half = MAX_INPUT_CHARS // 2
+    if where == "head_edge":
+        text = "x " * ((half - 20) // 2) + dsn_line + " y" * 60000
+    elif where == "tail_edge":
+        text = "x " * 60000 + dsn_line + " y" * ((half - 20) // 2)
+    else:
+        text = "x " * 60000 + dsn_line + " y" * 60000
+    assert len(text) > MAX_INPUT_CHARS
+    out = redact_text(text)
+    assert "hunter2" not in out
+    assert TRUNCATED in out
+    assert len(out) <= MAX_TEXT_CHARS + len(TRUNCATED)
+
+
+def test_traceback_final_lines_survive_truncation(stream: io.StringIO) -> None:
+    """Reviewer's r2_tb shape: a 60-deep chained exception keeps its last line."""
+
+    def chain(n: int) -> None:
+        try:
+            if n == 0:
+                raise KeyError("ROOT")
+            chain(n - 1)
+        except Exception as exc:
+            raise RuntimeError(f"layer {n} " + "context " * 20) from exc
+
+    try:
+        chain(60)
+    except RuntimeError:
+        get_logger("s").exception("chained")
+    (line,) = _lines(stream)
+    assert TRUNCATED in line["exception"]
+    assert "RuntimeError: layer 60 " in line["exception"]
+    assert "KeyError: 'ROOT'" in line["exception"]  # the head keeps the root cause
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "DB_PASSWORD            = hunter2",
+        "password:\n  hunter2",
+        "password\t\t\t\t\t\t\t\t\t= hunter2",
+        "password" + " " * 60 + "=" + " " * 60 + "hunter2",
+        "x" * 129 + "_password=hunter2",
+        "x" * 240 + "_password=hunter2",
+        "postgres://u:" + "p" * 300 + "hunter2@h/db",
+        "postgres://u:" + "p" * 1000 + "hunter2@h/db",
+        "postgres://u:p@ss@hunter2@h/db?x=1",
+        "?" + "a" * 70 + "_api_key=hunter2",
+        "?" + "a" * 240 + "_api_key=hunter2",
+        "Bearer" + " " * 20 + "hunter2",
+        "Bearer" + " " * 60 + "hunter2",
+        "Authorization: hunter2rawtoken",
+        "access_token=hunter2",
+        "api_token=hunter2",
+        "accessToken: hunter2",
+    ],
+)
+def test_round_one_cases_are_masked_with_raised_bounds(text: str) -> None:
+    """Reviewer's R3 shapes (whitespace, long names, long passwords, long query names)."""
+    assert "hunter2" not in redact_text(text)
+
+
+def test_quoted_values_are_masked_whole() -> None:
+    assert redact_text('{"password": "hunter 2"}') == '{"password": "[REDACTED:assignment]"}'
+    assert redact_text("secret='a b c'") == "secret='[REDACTED:assignment]'"
+
+
+def test_auth_scheme_mask_is_not_masked_again() -> None:
+    assert redact_text("Authorization: Basic abc") == "Authorization: Basic [REDACTED:auth_scheme]"
+
+
+#: Extra adversarial shapes for the scanning loop (rejected names back to back).
+CHAINS = {
+    "eq_chain": _fill("a="),
+    "colon_chain": _fill("x: "),
+    "query_chain": _fill("&a=1"),
+    "quote_chain": _fill('"k": "'),
+    "secret_chain": _fill("password=x "),
+    "nested_query": _fill("?n=/"),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(CHAINS))
+def test_redact_text_is_fast_on_rejected_name_chains(shape: str) -> None:
+    start = time.perf_counter()
+    redact_text(CHAINS[shape])
+    assert time.perf_counter() - start < 0.5
 
 
 def test_bounded_patterns_still_mask_what_they_should() -> None:

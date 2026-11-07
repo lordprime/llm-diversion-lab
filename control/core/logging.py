@@ -42,12 +42,20 @@ Redaction
 (the message, bound fields, nested mappings/lists/tuples, bytes, the rendered
 traceback):
 
-* every string is first cut to :data:`MAX_TEXT_CHARS` (16 KiB) with a
-  :data:`TRUNCATED` marker; then any match of :data:`REDACTION_PATTERNS` becomes
-  ``[REDACTED:<pattern name>]``; text in a group named ``keep`` (an auth scheme,
-  ``://``, ``?api_key=``, ``password=``, ``Set-Cookie:``) is kept in front of the mask.
-  Every pattern is linear: bounded or possessive quantifiers only, and name-dependent
-  patterns match any name and then check it in Python (no nested unbounded runs);
+* any match of :data:`REDACTION_PATTERNS` becomes ``[REDACTED:<pattern name>]``; text
+  in a group named ``keep`` (an auth scheme, ``://``, ``?api_key=``, ``password=``,
+  ``Set-Cookie:``) is kept in front of the mask. Every pattern is linear: bounded or
+  possessive quantifiers only. The name-dependent ones (``assignment``,
+  ``query_param``) match only *name + separator*, check the name in Python (the
+  :func:`is_sensitive_key` rule for assignments) and consume the value only when the
+  name is secret; a rejected match resumes right after its separator, so a value like
+  ``DB_PASSWORD=x`` in ``msg=DB_PASSWORD=x`` is still scanned;
+* redaction runs on the **whole** string before any cut (up to
+  :data:`MAX_INPUT_CHARS`; beyond that, on a head and a tail window whose cut edges
+  first drop their partial token), so a cut never splits a secret into a leaking
+  prefix. The redacted string is then cut to :data:`HEAD_CHARS` +
+  :data:`TRUNCATED` + :data:`TAIL_CHARS` (a traceback keeps its root cause and its
+  final lines), dropping any token split at a cut;
 * the value of any field whose *name* is sensitive (:func:`is_sensitive_key`) becomes
   ``[REDACTED]`` whatever it looks like. This applies to the keys of any mapping
   (``dict``, ``MappingProxyType``, Starlette ``Headers``...) at any depth (str or bytes
@@ -85,7 +93,9 @@ import structlog
 from structlog.typing import EventDict, Processor, WrappedLogger
 
 __all__ = [
+    "HEAD_CHARS",
     "MAX_DEPTH",
+    "MAX_INPUT_CHARS",
     "MAX_TEXT_CHARS",
     "NON_SECRET_KEYS",
     "REDACTED",
@@ -93,6 +103,7 @@ __all__ = [
     "RENDER_ERROR_EVENT",
     "RUN_FIELDS",
     "SENSITIVE_KEY_PARTS",
+    "TAIL_CHARS",
     "TRUNCATED",
     "bind_component",
     "configure_logging",
@@ -104,8 +115,16 @@ __all__ = [
 ]
 
 REDACTED = "[REDACTED]"
-#: Every string is cut to this many characters before the patterns run.
-MAX_TEXT_CHARS = 16 * 1024
+#: The patterns run on at most this much of a string: longer ones are redacted as a
+#: head window and a tail window of half this size each (the timing tests prove every
+#: pattern linear and fast at this size).
+MAX_INPUT_CHARS = 64 * 1024
+#: After redaction a string longer than this keeps its first :data:`HEAD_CHARS` and
+#: last :data:`TAIL_CHARS` (so a traceback keeps its root cause and its final lines),
+#: joined by :data:`TRUNCATED`. A token cut in half at either edge is dropped.
+HEAD_CHARS = 12 * 1024
+TAIL_CHARS = 4 * 1024
+MAX_TEXT_CHARS = HEAD_CHARS + TAIL_CHARS
 TRUNCATED = "[truncated]"
 #: Containers nested deeper than this are replaced by ``"[depth]"``.
 MAX_DEPTH = 32
@@ -140,7 +159,7 @@ REDACTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "aws_secret_access_key",
         re.compile(
             r"(?i)(?P<keep>(?:aws[_\- ]?secret(?:[_\- ]?access)?(?:[_\- ]?key)?"
-            r"|secret[_\- ]?access[_\- ]?key)[\"']?[ \t]{0,8}+[:=][ \t]{0,8}+[\"']?)"
+            r"|secret[_\- ]?access[_\- ]?key)[\"']?\s{0,64}+[:=]\s{0,64}+[\"']?)"
             r"[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])"
         ),
     ),
@@ -159,30 +178,28 @@ REDACTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     # ``scheme://user:password@host``: mask the userinfo (up to the last ``@`` within
-    # 256 characters), keep the scheme and host.
-    ("url_userinfo", re.compile(r"(?P<keep>://)[^\s/:@]{1,256}+:[^\s/]{1,256}(?=@)")),
-    # ``?name=value`` / ``&name=value``: any name, checked by ``_query_name_is_secret``.
-    (
-        "query_param",
-        re.compile(r"(?P<keep>[?&;](?P<qname>[\w.\-]{1,64}+)=)(?P<value>[^&;#\s\"']++)"),
-    ),
+    # 1024 characters), keep the scheme and host.
+    ("url_userinfo", re.compile(r"(?P<keep>://)[^\s/:@]{1,1024}+:[^\s/]{1,1024}(?=@)")),
+    # Guarded patterns (see ``_GUARDED``): they match only ``name`` + separator, any
+    # name; the name is checked in Python and only then is the value consumed. A
+    # rejected name never consumes the value, so a secret inside it is still scanned.
+    # ``?name=`` / ``&name=``:
+    ("query_param", re.compile(r"(?P<keep>[?&;](?P<qname>[\w.\-]{1,256}+)=)")),
     # ``Authorization: Bearer|Basic|Token|Digest <credential>``: keep the scheme.
     (
         "auth_scheme",
-        re.compile(r"(?i)\b(?P<keep>(?:bearer|basic|token|digest)[ \t]{1,16}+)\S++"),
+        re.compile(r"(?i)\b(?P<keep>(?:bearer|basic|token|digest)[ \t]{1,64}+)\S++"),
     ),
-    # ``NAME=value`` / ``"name": "value"``: any name, checked by ``_assigned_is_secret``.
+    # ``NAME=`` / ``"name": "`` (whitespace, newlines included, around the separator):
     (
         "assignment",
         re.compile(
-            r"(?P<keep>(?<![\w-])(?P<aname>[\w-]{1,128}+)[\"']?[ \t]{0,8}+[:=][ \t]{0,8}+[\"']?)"
-            r"(?P<value>[^\s\"',;&]++)"
+            r"(?P<keep>(?<![\w-])(?P<aname>[\w-]{1,256}+)[\"']?\s{0,64}+[:=]\s{0,64}+"
+            r"(?P<quote>[\"']?))"
         ),
     ),
 )
 
-#: Compact (no ``_``/``-``, lowercased) name parts that make an assigned value secret.
-_ASSIGNMENT_PARTS = ("password", "passwd", "secret", "apikey", "privatekey", "credential")
 #: Compact query-parameter name parts, and exact names, that make a value secret.
 _QUERY_PARTS = (
     "apikey",
@@ -203,8 +220,8 @@ def _compact(name: str) -> str:
 
 
 def _assigned_is_secret(match: re.Match[str]) -> bool:
-    name = _compact(match.group("aname"))
-    return any(p in name for p in _ASSIGNMENT_PARTS)
+    """An assigned name is secret by the same rule as a field name."""
+    return is_sensitive_key(match.group("aname"))
 
 
 def _query_name_is_secret(match: re.Match[str]) -> bool:
@@ -213,10 +230,26 @@ def _query_name_is_secret(match: re.Match[str]) -> bool:
     return name in _QUERY_NAMES or any(p in compact for p in _QUERY_PARTS)
 
 
-#: Patterns that match any name and then decide in Python whether it is secret.
-_GUARDS: dict[str, Callable[[re.Match[str]], bool]] = {
-    "assignment": _assigned_is_secret,
-    "query_param": _query_name_is_secret,
+_UNQUOTED_VALUE = re.compile(r"[^\s\"',;&]++")
+_QUOTED_VALUE = {q: re.compile(rf"[^{q}\r\n]{{1,4096}}+") for q in ("'", '"')}
+_QUERY_VALUE = re.compile(r"[^&;#\s\"']++")
+#: A value already masked by an earlier pattern, possibly behind its auth scheme.
+_ALREADY_MASKED = re.compile(r"(?i)(?:(?:bearer|basic|token|digest)[ \t]{1,64}+)?\[REDACTED")
+
+
+def _assignment_value(match: re.Match[str]) -> re.Pattern[str]:
+    quote = match.group("quote")
+    return _QUOTED_VALUE[quote] if quote else _UNQUOTED_VALUE
+
+
+#: Patterns that match only ``name`` + separator: the check on the name, and the
+#: pattern for the value that follows when the name is secret.
+_GUARDED: dict[
+    str,
+    tuple[Callable[[re.Match[str]], bool], Callable[[re.Match[str]], re.Pattern[str]]],
+] = {
+    "assignment": (_assigned_is_secret, _assignment_value),
+    "query_param": (_query_name_is_secret, lambda _match: _QUERY_VALUE),
 }
 
 #: A field name containing any of these (snake-cased, lowercased) is sensitive.
@@ -243,28 +276,97 @@ _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 
 def redact_text(text: str) -> str:
-    """``text`` cut to :data:`MAX_TEXT_CHARS`, with every secret-shaped substring masked."""
-    if len(text) > MAX_TEXT_CHARS:
-        text = text[:MAX_TEXT_CHARS] + TRUNCATED
+    """``text`` with every secret-shaped substring masked, then cut to size.
+
+    Redaction always runs before any cut that could split a secret: on the whole
+    string up to :data:`MAX_INPUT_CHARS`, else on a head and a tail window of half that
+    size whose cut edges first lose their partial token. The redacted result is then
+    cut to :data:`HEAD_CHARS` + :data:`TRUNCATED` + :data:`TAIL_CHARS`, again dropping
+    any token split at a cut.
+    """
+    if len(text) > MAX_INPUT_CHARS:
+        half = MAX_INPUT_CHARS // 2
+        text = _redact_all(_head(text, half)) + TRUNCATED + _redact_all(_tail(text, half))
+    else:
+        text = _redact_all(text)
+    if len(text) <= MAX_TEXT_CHARS:
+        return text
+    return _head(text, HEAD_CHARS) + TRUNCATED + _tail(text, TAIL_CHARS)
+
+
+def _head(text: str, size: int) -> str:
+    """The first ``size`` characters, minus a token the cut splits."""
+    if len(text) <= size:
+        return text
+    head = text[:size]
+    if text[size].isspace() or head[-1].isspace():
+        return head
+    end = len(head)
+    while end and not head[end - 1].isspace():
+        end -= 1
+    return head[:end]
+
+
+def _tail(text: str, size: int) -> str:
+    """The last ``size`` characters, minus a token the cut splits."""
+    if len(text) <= size:
+        return text
+    tail = text[-size:]
+    if text[-size - 1].isspace() or tail[0].isspace():
+        return tail
+    start = 0
+    while start < len(tail) and not tail[start].isspace():
+        start += 1
+    return tail[start:]
+
+
+def _redact_all(text: str) -> str:
     for name, pattern in REDACTION_PATTERNS:
-        text = pattern.sub(_replacer(name, pattern), text)
+        guarded = _GUARDED.get(name)
+        if guarded is None:
+            text = pattern.sub(_replacer(name, pattern), text)
+        else:
+            text = _scan_guarded(name, pattern, *guarded, text)
     return text
 
 
 def _replacer(name: str, pattern: re.Pattern[str]) -> Callable[[re.Match[str]], str]:
     mask = f"[REDACTED:{name}]"
-    guard = _GUARDS.get(name)
     has_keep = "keep" in pattern.groupindex
-    has_value = "value" in pattern.groupindex
 
     def replace(match: re.Match[str]) -> str:
-        if guard is not None and not guard(match):
-            return match.group(0)
-        if has_value and match.group("value").startswith("[REDACTED"):
-            return match.group(0)  # already masked by a more specific pattern
         return (match.group("keep") if has_keep else "") + mask
 
     return replace
+
+
+def _scan_guarded(
+    name: str,
+    pattern: re.Pattern[str],
+    is_secret: Callable[[re.Match[str]], bool],
+    value_pattern: Callable[[re.Match[str]], re.Pattern[str]],
+    text: str,
+) -> str:
+    """Mask the value after every secret ``name`` + separator match, in linear time.
+
+    A match whose name is not secret is kept and the scan resumes right after its
+    separator, so the value (which may itself hold ``secret=...``) is scanned too.
+    """
+    mask = f"[REDACTED:{name}]"
+    out: list[str] = []
+    pos = 0
+    while (match := pattern.search(text, pos)) is not None:
+        end = match.end()
+        if is_secret(match) and not _ALREADY_MASKED.match(text, end):
+            value = value_pattern(match).match(text, end)
+            if value is not None and value.end() > end:
+                out += (text[pos : match.start()], match.group("keep"), mask)
+                pos = value.end()
+                continue
+        out.append(text[pos:end])
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _as_text(value: bytes | bytearray | memoryview) -> str:
