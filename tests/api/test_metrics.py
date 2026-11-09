@@ -218,43 +218,57 @@ def test_default_app_metrics_use_the_app_engine(engine: Engine) -> None:
 def test_concurrent_scrapes_run_one_query_at_a_time(
     monkeypatch: pytest.MonkeyPatch, status_file: Path
 ) -> None:
-    """A slow database must not pile scrapes onto the pool: one query in flight."""
+    """A slow database must not pile scrapes onto the pool: one query in flight.
+
+    Deterministic: the first scrape's query blocks until released; every scrape that
+    arrives meanwhile must return the cached result without querying.
+    """
     import threading
-    import time
 
     from control.api import metrics as metrics_mod
 
-    active = 0
-    peak = 0
+    entered = threading.Event()
+    release = threading.Event()
     calls = 0
-    lock = threading.Lock()
+    in_flight = 2  # agt_x's sample in the result the next query returns
 
-    def slow_query(engine: object) -> object:
-        nonlocal active, peak, calls
-        with lock:
-            active += 1
-            calls += 1
-            peak = max(peak, active)
-        time.sleep(0.3)
-        with lock:
-            active -= 1
-        return metrics_mod._RunCounts([], 0, [("agt_x", 2)])
+    def blocking_query(engine: object) -> object:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert release.wait(5), "the test never released the query"
+        return metrics_mod._RunCounts([], 0, [("agt_x", in_flight)])
 
-    monkeypatch.setattr(metrics_mod, "_query", slow_query)
+    monkeypatch.setattr(metrics_mod, "_query", blocking_query)
     lab = LabMetrics(object(), selftest_status_file=status_file)  # type: ignore[arg-type]
-    lab.exposition()  # warm: one result cached
+    release.set()
+    lab.exposition()  # warm: agt_x=2 cached
+    release.clear()
+    entered.clear()
     calls = 0
+    in_flight = 3  # the blocked query's own result
 
-    texts: list[str] = []
-    threads = [
-        threading.Thread(target=lambda: texts.append(lab.exposition().decode())) for _ in range(6)
+    def sample(text: str) -> float:
+        return _samples(text)[("lab_runs_in_flight", frozenset({("agent", "agt_x")}))]
+
+    first: list[str] = []
+    others: list[str] = []
+    slow = threading.Thread(target=lambda: first.append(lab.exposition().decode()))
+    slow.start()
+    assert entered.wait(5), "the first scrape never reached the database"
+    waiting = [
+        threading.Thread(target=lambda: others.append(lab.exposition().decode())) for _ in range(5)
     ]
-    for th in threads:
+    for th in waiting:
         th.start()
-    for th in threads:
-        th.join()
+    for th in waiting:
+        th.join(5)
+    assert not any(th.is_alive() for th in waiting), "a scrape waited for the query"
+    assert calls == 1, "scrapes that found a query in flight did not query"
+    assert [sample(t) for t in others] == [2.0] * 5, "they served the cached result"
 
-    assert peak == 1
-    assert calls < 6, "scrapes that found a query in flight reused the last result"
-    for text in texts:
-        assert _samples(text)[("lab_runs_in_flight", frozenset({("agent", "agt_x")}))] == 2.0
+    release.set()
+    slow.join(5)
+    assert not slow.is_alive()
+    assert calls == 1
+    assert [sample(t) for t in first] == [3.0]
