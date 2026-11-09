@@ -22,6 +22,8 @@ _REASONS = (
     "oracle_unexpected",
     "evidence_incomplete",
     "recording_failed",
+    "injector_failed",
+    "no_llm_calls",
     "contaminated",
     "collector_rejected",
     "teardown_failed",

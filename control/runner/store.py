@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -118,6 +118,7 @@ class RunStore:
                         f"experiment {exp.experiment_id} is registered with another definition "
                         f"(sha256 {stored.definition_sha256}, not {ef.definition_sha256})"
                     )
+                self._check_catalog(s, exp.experiment_id, catalog)
             else:
                 s.add(
                     t.Experiment(
@@ -132,6 +133,52 @@ class RunStore:
                 s.flush()
                 self._insert_schedule(s, ef, schedule, catalog)
         return self.load_schedule(exp.experiment_id)
+
+    @staticmethod
+    def _check_catalog(s: Session, experiment_id: str, catalog: RunCatalog) -> None:
+        """Refuse to resume a queue whose runs were registered against other builds."""
+        targets = s.execute(
+            select(t.Target)
+            .join(t.Run, t.Run.target_id == t.Target.target_id)
+            .where(t.Run.experiment_id == experiment_id)
+            .distinct()
+        ).scalars()
+        differ: list[str] = []
+        for row in targets:
+            rec = catalog.targets.get(row.name)
+            stored = TargetRecord(
+                row.image_digest,
+                row.content_pack_sha256,
+                row.placement_map_sha256,
+                row.oracle_grader,
+            )
+            if rec != stored:
+                differ.append(f"target {row.name}: registered {stored}, now {rec}")
+        agents = s.execute(
+            select(t.Agent)
+            .join(t.Run, t.Run.agent_id == t.Agent.agent_id)
+            .where(t.Run.experiment_id == experiment_id)
+            .distinct()
+        ).scalars()
+        for agent in agents:
+            arec = catalog.agents.get(agent.adapter)
+            stored_agent = AgentRecord(
+                agent.adapter_version, agent.framework_version, dict(agent.image_digests)
+            )
+            if arec is None or (
+                arec.adapter_version,
+                arec.framework_version,
+                dict(arec.image_digests),
+            ) != (
+                stored_agent.adapter_version,
+                stored_agent.framework_version,
+                stored_agent.image_digests,
+            ):
+                differ.append(f"agent {agent.adapter}: registered {stored_agent}, now {arec}")
+        if differ:
+            raise StoreError(
+                f"experiment {experiment_id} was registered with other builds: {'; '.join(differ)}"
+            )
 
     def _insert_schedule(
         self,
@@ -306,14 +353,22 @@ class RunStore:
         *,
         reason: InvalidReason | None = None,
         detail: str | None = None,
+        labels: Sequence[FunnelLabel] = (),
         container_ips: Mapping[str, str] | None = None,
     ) -> None:
-        """Set a running run's final status (``reason`` exactly when invalid)."""
+        """Set a running run's final status (``reason`` exactly when invalid).
+
+        ``labels`` are stored in the same transaction, so a run is never valid without
+        its labels nor labelled without its status.
+        """
         if (status is RunStatus.INVALID) != (reason is not None):
             raise StoreError("an invalid run needs a reason, a valid one none")
         if status not in (RunStatus.VALID, RunStatus.INVALID):
             raise StoreError(f"{status} is not a final status")
         with session_scope(self._engine) as s:
+            rows = [label.model_dump() for label in labels]
+            if rows:
+                s.execute(pg_insert(t.Label).values(rows).on_conflict_do_nothing())
             done = s.execute(
                 update(t.Run)
                 .where(t.Run.run_id == run_id, t.Run.status == RunStatus.RUNNING)
@@ -326,16 +381,8 @@ class RunStore:
                 )
                 .returning(t.Run.run_id)
             ).first()
-        if done is None:
-            raise StoreError(f"run {run_id} is not running")
-
-    def record_labels(self, labels: Iterable[FunnelLabel]) -> None:
-        """Store labels; idempotent on ``(run, stage, labeller, version)``, never rewritten."""
-        rows = [label.model_dump() for label in labels]
-        if not rows:
-            return
-        with session_scope(self._engine) as s:
-            s.execute(pg_insert(t.Label).values(rows).on_conflict_do_nothing())
+            if done is None:
+                raise StoreError(f"run {run_id} is not running")  # rolls the labels back
 
     def status(self, run_id: str) -> tuple[RunStatus, InvalidReason | None]:
         with session_scope(self._engine) as s:

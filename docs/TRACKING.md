@@ -50,6 +50,8 @@ Every log line, metric exemplar, database row, artifact path and UI page carries
 
 Every transition is a timestamped row (`run_transitions`), so per-stage durations and stuck runs can be found directly.
 
+**Evidence shipping rule (M0 runner, `control/runner/runner.py`).** Every run that reached collection (its cell came up and its producers' evidence was copied out) ships all its event lines and artifacts to the Collector, valid or not. The oracle **verdict** is posted only for a run that passed every validity check (no failure in the cell, injector alive with its pre-flight probe in its evidence, the oracle answered and reported nothing unexpected, at least one LLM call); otherwise the run has no verdict, never `outcome: false`. A run that failed before collection (manifest refused, cell never came up) ships only its manifest. Invalid reasons are the bounded `runs.invalid_reason` set; all problems of a run are kept in `runs.invalid_detail`, and a failed teardown is always the reason when it happened. Retrying an invalid run (a new attempt) is a queue policy outside the runner.
+
 **Schedule.** `enabled` ⇄ `paused`, then `removed`. Each firing is recorded with the runs it enqueued.
 
 ---

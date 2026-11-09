@@ -18,6 +18,7 @@ import pytest
 
 from control.core.models import Arm
 from control.runner.cell_spec import (
+    AgentSpec,
     CellError,
     CellSettings,
     ComposeProject,
@@ -88,6 +89,28 @@ def project() -> ComposeProject:
     )
 
 
+@pytest.fixture(scope="module")
+def guarded() -> ComposeProject:
+    """A cell whose agent starts containers (so it has a cell-guard and a scratch volume)."""
+    experiment = load_experiment(REPO_ROOT / "experiments" / "selftest.yaml")
+    run = next(r for r in build_schedule(experiment) if r.arm is Arm.CONTROL)
+    manifest = render_manifest(run, experiment, KEY, created_at=datetime(2026, 11, 7, tzinfo=UTC))
+    spec = AgentSpec(
+        name="scripted",
+        image="lab-cell",
+        command=("python", "-m", "agents.scripted.agent"),
+        needs_docker=True,
+    )
+    return render_cell(
+        run,
+        manifest,
+        experiment=experiment,
+        settings=CellSettings(images=IMAGES),
+        subnets=allocate_subnets((ipaddress.IPv4Network("10.231.0.0/16"),), []),
+        agent_spec=spec,
+    )
+
+
 def _ps_writer(argv: tuple[str, ...], _stdin: bytes | None) -> CommandResult | None:
     if _after_compose(argv)[:3] == ("ps", "-a", "-q"):
         return CommandResult(argv, 0, b"cid-" + _after_compose(argv)[3].encode() + b"\n")
@@ -98,7 +121,10 @@ def test_up_writes_files_through_the_writer_then_starts_infrastructure_only(
     tmp_path: Path, project: ComposeProject
 ) -> None:
     docker = FakeDocker([_ps_writer])
-    cell = ComposeBackend(docker).up(project, tmp_path)
+    backend = ComposeBackend(docker)
+    cell = backend.prepare(project, tmp_path)
+    assert docker.calls == []  # prepare only writes the project file
+    backend.up(cell)
     assert stat.S_IMODE(cell.compose_file.stat().st_mode) == 0o600
     assert cell.compose_file.read_text() == project.to_yaml()
     steps = [_after_compose(a) for a in docker.argvs()]
@@ -139,14 +165,171 @@ def test_up_writes_files_through_the_writer_then_starts_infrastructure_only(
     assert seen == len(project.files)
 
 
-def test_up_fails_loudly_when_a_step_fails(tmp_path: Path, project: ComposeProject) -> None:
-    def refuse_cp(argv: tuple[str, ...], _stdin: bytes | None) -> CommandResult | None:
-        if argv[:2] == ("docker", "cp"):
-            return CommandResult(argv, 1, b"", b"no such container")
-        return None
+@dataclass
+class Engine:
+    """A tiny container engine: what exists, and how the CLI calls change it.
 
-    with pytest.raises(CellError, match="no such container"):
-        ComposeBackend(FakeDocker([refuse_cp, _ps_writer])).up(project, tmp_path)
+    Every object here carries the run label. ``down`` fails (network still in use) while
+    any container Compose does not manage is attached, as Docker's does.
+    """
+
+    project: str
+    containers: dict[str, str | None] = field(default_factory=dict)  # id -> compose project
+    volumes: set[str] = field(default_factory=set)
+    networks: set[str] = field(default_factory=set)
+    fail: set[str] = field(default_factory=set)  # steps that fail: "cp", "up", "ls"
+
+    def __call__(self, argv: tuple[str, ...], stdin: bytes | None) -> CommandResult | None:
+        ok = CommandResult(argv, 0)
+        sub = _after_compose(argv) if "compose" in argv else argv[1:]
+        if "compose" in argv:
+            if sub[0] == "create":
+                self.containers["writer"] = self.project
+                self.volumes |= {f"{self.project}_cfg", f"{self.project}_secret"}
+                self.networks.add(f"{self.project}_agent")
+                return ok
+            if sub[:3] == ("ps", "-a", "-q"):
+                return CommandResult(argv, 0, b"writer\n" if "writer" in self.containers else b"")
+            if sub[0] == "rm":
+                self.containers.pop("writer", None)
+                return ok
+            if sub[0] == "up":
+                if "up" in self.fail:
+                    self.containers["goat"] = self.project  # half started
+                    return CommandResult(argv, 1, b"", b"up failed")
+                self.containers.update({s: self.project for s in sub[3:]})
+                return ok
+            if sub[0] == "down":
+                self.containers = {k: v for k, v in self.containers.items() if v != self.project}
+                self.volumes = {v for v in self.volumes if not v.startswith(self.project + "_")}
+                if any(v is None for v in self.containers.values()):
+                    return CommandResult(argv, 1, b"", b"network has active endpoints")
+                self.networks.clear()
+                return ok
+            return ok
+        if sub[0] == "cp":
+            return CommandResult(argv, 1, b"", b"cp failed") if "cp" in self.fail else ok
+        if sub[:2] == ("volume", "create"):
+            self.volumes.add(sub[-1])
+            return ok
+        if sub[:2] == ("volume", "inspect"):
+            return ok if sub[2] in self.volumes else CommandResult(argv, 1, b"", b"no such volume")
+        if sub[1:2] in (("ls",), ("-a",)) and "ls" in self.fail:
+            return CommandResult(argv, 1, b"", b"cannot connect to the daemon")
+        if sub[:2] == ("ps", "-a"):
+            if "--format" in sub:
+                rows = "".join(f"{c} {p or ''}\n" for c, p in self.containers.items())
+                return CommandResult(argv, 0, rows.encode())
+            return CommandResult(argv, 0, "".join(f"{c}\n" for c in self.containers).encode())
+        if sub[:2] == ("rm", "-f"):
+            for c in sub[3:]:
+                self.containers.pop(c, None)
+            return ok
+        if sub[0] in ("volume", "network") and sub[1] == "ls":
+            items = self.volumes if sub[0] == "volume" else self.networks
+            return CommandResult(argv, 0, "".join(f"{i}\n" for i in sorted(items)).encode())
+        if sub[:2] == ("volume", "rm"):
+            self.volumes -= set(sub[3:])
+            return ok
+        if sub[:2] == ("network", "rm"):
+            if self.containers:
+                return CommandResult(argv, 1, b"", b"in use")
+            self.networks -= set(sub[2:])
+            return ok
+        return ok
+
+    @property
+    def empty(self) -> bool:
+        return not (self.containers or self.volumes or self.networks)
+
+
+@pytest.mark.parametrize("step", ["cp", "up"])
+def test_a_failed_up_tears_the_cell_down_and_reraises(
+    tmp_path: Path, project: ComposeProject, step: str
+) -> None:
+    engine = Engine(project.name, fail={step})
+    backend = ComposeBackend(FakeDocker([engine]))
+    cell = backend.prepare(project, tmp_path)
+    with pytest.raises(CellError, match=f"{step} failed"):
+        backend.up(cell)
+    assert engine.empty, engine
+    assert not cell.compose_file.exists()
+
+
+def test_the_scratch_volume_is_created_labelled_and_removed_by_name(
+    tmp_path: Path, guarded: ComposeProject
+) -> None:
+    engine = Engine(guarded.name)
+    docker = FakeDocker([engine])
+    backend = ComposeBackend(docker)
+    cell = backend.prepare(guarded, tmp_path)
+    backend.up(cell)
+    assert guarded.scratch_volume is not None
+    create = ("docker", "volume", "create", "--label", f"lab.run_id={guarded.run_id}")
+    assert docker.argvs()[0] == (*create, guarded.scratch_volume)  # before anything starts
+    assert guarded.scratch_volume in engine.volumes
+    assert not any("lab.origin" in " ".join(a) for a in docker.argvs())
+    backend.teardown(cell)
+    assert engine.empty
+
+
+def test_teardown_removes_cell_guard_containers_before_compose_down(
+    tmp_path: Path, guarded: ComposeProject
+) -> None:
+    engine = Engine(guarded.name)
+    docker = FakeDocker([engine])
+    backend = ComposeBackend(docker)
+    cell = backend.prepare(guarded, tmp_path)
+    backend.up(cell)
+    engine.containers["spawned"] = None  # an agent-started container on the agent network
+    engine.volumes.add("anon-of-spawned")
+    backend.teardown(cell)
+    assert engine.empty
+    argvs = docker.argvs()
+    first_rm = argvs.index(("docker", "rm", "-f", "-v", "spawned"))
+    down = next(i for i, a in enumerate(argvs) if "down" in a)
+    assert first_rm < down  # otherwise down fails with the network still in use
+    assert not cell.compose_file.exists()  # it held the probe secret
+
+
+def test_teardown_is_judged_by_listing_again_not_by_downs_exit_code(
+    tmp_path: Path, project: ComposeProject
+) -> None:
+    class Stuck(Engine):
+        def __call__(self, argv: tuple[str, ...], stdin: bytes | None) -> CommandResult | None:
+            if argv[1:3] == ("network", "rm") or "down" in argv:
+                # down "succeeds" without removing the network; the rm fails
+                return CommandResult(argv, 0 if "down" in argv else 1, b"", b"busy")
+            return super().__call__(argv, stdin)
+
+    engine = Stuck(project.name, networks={"leftover"})
+    with pytest.raises(CellError, match="leftover"):
+        ComposeBackend(FakeDocker([engine])).teardown(CellHandle(project, tmp_path / "compose.yml"))
+
+
+def test_cell_guard_evidence_is_collected_from_its_own_path(
+    tmp_path: Path, guarded: ComposeProject
+) -> None:
+    def respond(argv: tuple[str, ...], _stdin: bytes | None) -> CommandResult | None:
+        if argv[:2] == ("docker", "cp"):
+            service = argv[2].split(":")[0].removeprefix("cid-")
+            root = Path(argv[2].split(":")[1]).name
+            prefix = guarded.evidence[service]
+            return CommandResult(argv, 0, _evidence_tar([(f"{root}/{prefix}/f.txt", b"1")]))
+        return _ps_writer(argv, _stdin)
+
+    docker = FakeDocker([respond])
+    report = ComposeBackend(docker).collect(
+        CellHandle(guarded, tmp_path / "c.yml"), tmp_path / "ev"
+    )
+    assert "cellguard/f.txt" in report.files and report.refused == []
+    assert ("docker", "cp", "cid-cellguard:/var/lib/cellguard-evidence", "-") in docker.argvs()
+
+
+def test_a_failed_listing_is_a_failed_teardown(tmp_path: Path, project: ComposeProject) -> None:
+    engine = Engine(project.name, fail={"ls"})
+    with pytest.raises(CellError, match="cannot connect"):
+        ComposeBackend(FakeDocker([engine])).teardown(CellHandle(project, tmp_path / "compose.yml"))
 
 
 def test_health_polls_the_targets_own_script_until_it_passes(
@@ -167,7 +350,7 @@ def test_health_polls_the_targets_own_script_until_it_passes(
     assert never.health(cell, timeout_s=0) is False
 
 
-def test_agent_state_parses_compose_ps_json(tmp_path: Path, project: ComposeProject) -> None:
+def test_state_parses_compose_ps_json(tmp_path: Path, project: ComposeProject) -> None:
     cell = CellHandle(project, tmp_path / "compose.yml")
     for out, expected in [
         (b'{"State":"running","ExitCode":0}\n', ContainerState("running", 0)),
@@ -175,8 +358,11 @@ def test_agent_state_parses_compose_ps_json(tmp_path: Path, project: ComposeProj
         (b"", ContainerState("missing")),
     ]:
         docker = FakeDocker([lambda a, _, o=out: CommandResult(a, 0, o)])
-        assert ComposeBackend(docker).agent_state(cell) == expected
+        assert ComposeBackend(docker).state(cell, "agent") == expected
     assert ContainerState("running").running and not ContainerState("exited", 0).running
+    created = ContainerState("created")
+    assert created.pending and not created.running and not created.ended
+    assert ContainerState("exited", 0).ended and ContainerState("dead").ended
 
 
 def test_subnets_in_use_reads_every_networks_ipam(tmp_path: Path) -> None:
@@ -267,40 +453,6 @@ def test_collect_copies_each_producers_evidence_from_its_container(
     copies = [a for a in docker.argvs() if a[:2] == ("docker", "cp")]
     assert all(a[2].endswith(":/evidence") and a[3] == "-" for a in copies)
     assert set(project.evidence) == {"injector", "tap", "catcher", "agent"}
-
-
-def test_teardown_removes_the_project_and_everything_labelled_with_the_run(
-    tmp_path: Path, project: ComposeProject
-) -> None:
-    label = f"label=lab.run_id={project.run_id}"
-    listed = {"ps": iter([b"c1\nc2\n", b""]), "volume": iter([b"v1\n"]), "network": iter([b"n1\n"])}
-
-    def respond(argv: tuple[str, ...], _stdin: bytes | None) -> CommandResult | None:
-        if argv[1:3] == ("ps", "-a"):
-            assert argv[-1] == label
-            return CommandResult(argv, 0, next(listed["ps"]))
-        if argv[1] in ("volume", "network") and argv[2] == "ls":
-            assert argv[-1] == label
-            return CommandResult(argv, 0, next(listed[argv[1]]))
-        return None
-
-    docker = FakeDocker([respond])
-    ComposeBackend(docker).teardown(CellHandle(project, tmp_path / "c.yml"))
-    argvs = docker.argvs()
-    assert _after_compose(argvs[0]) == ("down", "-v", "--remove-orphans", "-t", "10")
-    assert ("docker", "rm", "-f", "-v", "c1", "c2") in argvs  # anonymous volumes too
-    assert ("docker", "volume", "rm", "-f", "v1") in argvs
-    assert ("docker", "network", "rm", "n1") in argvs
-
-
-def test_teardown_reports_what_it_could_not_remove(tmp_path: Path, project: ComposeProject) -> None:
-    def respond(argv: tuple[str, ...], _stdin: bytes | None) -> CommandResult | None:
-        if argv[1:3] == ("ps", "-a"):
-            return CommandResult(argv, 0, b"stuck\n")
-        return None
-
-    with pytest.raises(CellError, match="containers left"):
-        ComposeBackend(FakeDocker([respond])).teardown(CellHandle(project, tmp_path / "c.yml"))
 
 
 def test_files_tar_round_trips() -> None:

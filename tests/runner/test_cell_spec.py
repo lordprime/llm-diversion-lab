@@ -486,16 +486,20 @@ def test_an_agent_that_starts_containers_gets_a_cell_guard(
         command=("python", "-m", "agents.scripted.agent", "--script", "/etc/lab/agent/script.json"),
         needs_docker=True,
     )
-    run, _, project = _render(experiment, schedule, Arm.CONTROL, agent_spec=spec)
+    _run, _, project = _render(experiment, schedule, Arm.CONTROL, agent_spec=spec)
     services = _services(project)
     guard = services["cellguard"]
     env = guard["environment"]
     catcher_ip = services["catcher"]["networks"]["agent"]["ipv4_address"]
     assert env["LAB_CELLGUARD_DNS"] == catcher_ip
     assert env["LAB_CELLGUARD_NETWORK"] == project.document["networks"]["agent"]["name"]
-    scratch = project.document["volumes"]["scratch"]
-    assert env["LAB_CELLGUARD_SCRATCH_VOLUME"] == scratch["name"]
-    assert scratch["labels"] == {"lab.run_id": run.run_id}
+    # The scratch volume is created by the backend (labelled lab.run_id only) before
+    # anything starts; Compose would never create it, cell-guard would unlabelled.
+    assert "scratch" not in project.document["volumes"]
+    assert project.scratch_volume == f"{project.name}_scratch"
+    assert env["LAB_CELLGUARD_SCRATCH_VOLUME"] == project.scratch_volume
+    assert project.evidence["cellguard"] == "cellguard"
+    assert env["LAB_EVIDENCE_DIR"] == project.evidence_paths["cellguard"] != "/evidence"
     assert "LAB_CELLGUARD_NAME_PREFIX" not in env  # the default <run id>- prefix
     assert "networks" not in guard and guard.get("network_mode") == "none"  # sockets only
     assert services["agent"]["environment"]["DOCKER_HOST"].startswith("unix:///run/cellguard/")

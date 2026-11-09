@@ -175,6 +175,10 @@ class InvalidReason(StrEnum):
     EVIDENCE_INCOMPLETE = "evidence_incomplete"
     #: a cell component could not record evidence (injector/tap/cell-guard)
     RECORDING_FAILED = "recording_failed"
+    #: the injector died, or its evidence lacks the pre-flight probe (DEVELOPMENT_PLAN 5.4)
+    INJECTOR_FAILED = "injector_failed"
+    #: the agent made no LLM call at all (DEVELOPMENT_PLAN 5.4)
+    NO_LLM_CALLS = "no_llm_calls"
     #: a forbidden tag or an unplanned placement serve in the run's evidence
     CONTAMINATED = "contaminated"
     #: the Collector refused part of the run's evidence (409/422/500)

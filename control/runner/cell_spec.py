@@ -59,6 +59,7 @@ __all__ = [
     "CANARY_FILES",
     "CELL_NAME_PREFIX",
     "DEFAULT_CELL_NETWORK",
+    "DEFAULT_EVIDENCE_PATH",
     "EVIDENCE_PREFIXES",
     "REPO_ROOT",
     "ROLE_LABEL",
@@ -107,6 +108,11 @@ _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 _TAP_URL: Final = "http://tap:8080"
 _GUARD_DIR: Final = "/run/cellguard"
 _DOCKER_SOCKET: Final = "/var/run/docker.sock"
+#: Where every cell service but cell-guard keeps its evidence (owned by uid 10001).
+DEFAULT_EVIDENCE_PATH: Final = "/evidence"
+#: cell-guard runs as root without capabilities: its evidence path is not in the image,
+#: so the fresh volume mounted there is root's.
+_GUARD_EVIDENCE: Final = "/var/lib/cellguard-evidence"
 
 
 class CellError(ValueError):
@@ -351,8 +357,13 @@ class ComposeProject:
     target_service: str = "goat"
     injector_service: str = "injector"
     writer_service: str = "secrets-writer"
-    #: Services whose ``/evidence`` the runner collects, and the prefix each may write.
+    #: Services whose evidence the runner collects, and the prefix each may write.
     evidence: Mapping[str, str] = field(default_factory=dict)
+    #: Where a service keeps its evidence when not :data:`DEFAULT_EVIDENCE_PATH`.
+    evidence_paths: Mapping[str, str] = field(default_factory=dict)
+    #: The cell-guard scratch volume (agents that start containers), created by the
+    #: backend with the run label before anything starts; ``None`` without cell-guard.
+    scratch_volume: str | None = None
 
     @property
     def infra_services(self) -> tuple[str, ...]:
@@ -562,11 +573,13 @@ def render_cell(
     if spec.needs_docker:
         agent_env["DOCKER_HOST"] = f"unix://{_GUARD_DIR}/docker.sock"
         agent_volumes.append(f"cellguard_sock:{_GUARD_DIR}")
-        for extra in ("cellguard_sock", "cfg_cellguard", "ev_cellguard", "scratch"):
+        for extra in ("cellguard_sock", "cfg_cellguard", "ev_cellguard"):
             volumes[extra] = {}
         services["cellguard"] = {
             "image": cell_image,
             "command": ["python", "-m", "cell.cellguard.proxy"],
+            # root, every capability dropped: it only needs the Docker socket's owner
+            # bits; its evidence path is not in the image, so root owns that volume
             "user": "0:0",
             "read_only": True,
             "tmpfs": ["/tmp:size=16m,mode=1777"],  # noqa: S108 - a container tmpfs
@@ -586,13 +599,13 @@ def render_cell(
                 "LAB_CELLGUARD_UPSTREAM": _DOCKER_SOCKET,
                 "LAB_CELLGUARD_SCRATCH_VOLUME": f"{name}_scratch",
                 "LAB_CELLGUARD_SOCKET_MODE": "666",
-                "LAB_EVIDENCE_DIR": "/evidence",
+                "LAB_EVIDENCE_DIR": _GUARD_EVIDENCE,
             },
             "volumes": [
                 f"{settings.docker_socket}:{_DOCKER_SOCKET}",
                 f"cellguard_sock:{_GUARD_DIR}",
                 "cfg_cellguard:/etc/lab/cellguard:ro",
-                "ev_cellguard:/evidence",
+                f"ev_cellguard:{_GUARD_EVIDENCE}",
             ],
         }
         services["secrets-writer"]["volumes"].append("cfg_cellguard:/w/cfg_cellguard")
@@ -672,4 +685,6 @@ def render_cell(
         probe_secret=secrets.probe_secret,
         probe_paths=tuple(probe_paths),
         evidence=evidence,
+        evidence_paths={"cellguard": _GUARD_EVIDENCE} if spec.needs_docker else {},
+        scratch_volume=f"{name}_scratch" if spec.needs_docker else None,
     )
