@@ -126,7 +126,7 @@
     docker_forbidden_re: "^5:({{ docker_ce_forbidden_versions | map('regex_escape') | join('|') }})-"
     docker_candidates: >-
       {{ docker_madison.stdout_lines
-         | map('regex_replace', '^\\s*docker-ce\\s*[|]\\s*(\\S+)\\s*[|].*$', '\\1')
+         | map('regex_replace', '^\s*docker-ce\s*[|]\s*(\S+)\s*[|].*$', '\1')
          | select('match', docker_minor_re)
          | reject('match', docker_forbidden_re)
          | list }}
