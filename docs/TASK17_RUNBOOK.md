@@ -6,6 +6,8 @@ Task 17 is M0's acceptance run on the real host: the Proxmox container CT 111 (`
 
 Task 17 is **complete** only when every step passes and the self-test runs for real (it was not skipped with `--skip-selftest`).
 
+**Status: complete on 9 Nov 2026** (release `v0.1.0`). The results are recorded in [DEPLOYMENT.md](DEPLOYMENT.md) §0.5.
+
 ---
 
 ## P0 Proxmox host and access (the user does these)
