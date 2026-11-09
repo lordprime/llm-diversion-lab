@@ -42,7 +42,7 @@ Task 17 is **complete** only when every step passes and the self-test runs for r
 
 ## P2 Bootstrap
 
-7. `./deploy/bootstrap.sh lab1`. **Pass:**
+7. `./deploy/bootstrap.sh lab1`. On a freshly started container, the first task waits up to 20 minutes (`lab_apt_lock_timeout`) for apt-daily and unattended-upgrades to finish, and every apt task waits as long for the dpkg lock. **Pass:**
    - the play recap shows `failed=0`;
    - the output has `OK: a test container started and exited cleanly` (the CVE-2025-52881 check);
    - the egress check reports OK.

@@ -463,6 +463,7 @@ The scripts validate every host entry: an unknown key, a bad type or a bad value
 | `lab` | **Not built in M0**: systemd units: `lab-control.service` (compose stack: Postgres, APIs, runner workers, scheduler, gateway, website), `lab-reaper.timer`, `lab-backup.timer`, `lab-selftest.timer` (nightly, in the maintenance window) |
 
 **`base`**
+- Waits first (up to `lab_apt_lock_timeout`, 20 min) for apt-daily and unattended-upgrades, which hold the dpkg lock for minutes on a freshly started container. Every apt task waits as long for the lock.
 - Updates and packages: git, jq, curl, tcpdump, nftables, iptables, restic, openssl, rsync. chrony only on a VM. fail2ban only when not behind Twingate (all clients share the connector's IP).
 - Locale `C.UTF-8`.
 - Creates the `lab` user and the `/srv/lab` tree with ownership.

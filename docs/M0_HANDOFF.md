@@ -33,7 +33,7 @@ Four reviewers checked the whole branch, one per area: control plane, runner and
 |---|---|---|
 | F1 | control plane, runner, self-test | Migration 0006 widens the method and qtype columns, and the Collector neutralises NUL characters. An unknown placement makes a run `contaminated`. The `exp_selftest_` prefix is reserved. Errors are redacted. There is one answered oracle poll before the agent starts. Torn or skipped evidence and a non-clean component exit make a run `recording_failed`. SIGTERM and SIGHUP are recorded, and stale self-test rows are swept. Self-test runs are left out of `lab_runs_in_flight`. The self-test's LAN check also covers port 53. |
 | F2 | cell components | The catcher logs `catcher: cannot record …` on a recording failure, which invalidates the run. cell-guard allows only listed query keys per operation (no `checkpoint`/`checkpoint-dir`). Body limits: injector 64 MiB, tap 32 MiB. The probe adds TCP 53 and a UDP/53 query to its LAN checks. |
-| F3 | deploy, CI, docs | The rollback swap never drops the former live database, and the manual swap is one transaction. `bootstrap --check` skips the uv download. Docker keeps overlay2 (containerd snapshotter off) and is pinned to **29.8**, because the repository no longer carries 29.1.x. CI holds a read-only token. The quickstarts match the release flags, and the docs cover public GHCR packages, a Known limits section (TRACKING §5) and the Task 17 runbook. |
+| F3 | deploy, CI, docs | The rollback swap never drops the former live database, and the manual swap is one transaction. `bootstrap --check` skips the uv download. Docker keeps overlay2 (containerd snapshotter off) and is pinned to **29.8**, because the repository no longer carries 29.1.x. An `ansible-playbook` test covers the docker-ce version choice (the controller's hotfix `d207db6`). Bootstrap now waits up to 20 minutes for unattended-upgrades and the dpkg lock instead of failing. CI holds a read-only token. The quickstarts match the release flags, and the docs cover public GHCR packages, a Known limits section (TRACKING §5) and the Task 17 runbook. |
 
 ## 3. What's left, in order
 
@@ -49,7 +49,7 @@ Four reviewers checked the whole branch, one per area: control plane, runner and
      - The kernel modules are persisted on the Proxmox host (`/etc/modules-load.d/llm-lab.conf`).
      - Snapshot `pre-m0` is taken.
      - `deploy/hosts.yml` exists. Its `lab1` vars carry `docker_ce_minor: "29.8"`, which is now also the role default.
-   - **First bootstrap:** it failed closed at "Check a usable docker-ce version exists". Docker's noble repository now lists 29.5.2–29.9.3, with containerd.io 2.4.x. This is fixed by the 29.8 pin. Re-run it from runbook step 7.
+   - **First bootstrap:** it failed closed at "Check a usable docker-ce version exists". Docker's noble repository now lists 29.5.2–29.9.3, with containerd.io 2.4.x. This is fixed by the 29.8 pin and by hotfix `d207db6`, which corrects the madison regex. The run also hit the dpkg lock held by unattended-upgrades; bootstrap now waits for it. Re-run it from runbook step 7.
    - **The Proxmox firewall for CT 111 is not configured.** Task 17 goes ahead without it, because cell containment rests on the in-LXC layers that P5 checks. Enabling it is recommended before any study run (decision below).
 
 ## 4. Decisions still open for you
