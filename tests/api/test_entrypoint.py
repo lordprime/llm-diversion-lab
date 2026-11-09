@@ -14,6 +14,11 @@ import pytest
 from control.api import __main__ as entry
 
 
+@pytest.fixture(autouse=True)
+def _database_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql://lab@db:5432/lab")
+
+
 def test_configures_logging_then_runs_uvicorn_without_its_log_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -49,3 +54,24 @@ def test_bad_arguments_exit_with_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(SystemExit) as exc:
         entry.main(["--port", "not-a-port"])
     assert exc.value.code == 2
+
+
+def test_database_connections_time_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hung database must not hang requests and scrapes on connect."""
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(entry, "configure_logging", lambda **kw: None)
+    monkeypatch.setattr(entry.uvicorn, "run", lambda app, **kw: seen.update(app=app))
+    real = entry.create_db_engine
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen["kwargs"] = kwargs
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(entry, "create_db_engine", spy)
+
+    entry.main([])
+
+    assert seen["kwargs"]["connect_args"]["connect_timeout"] == entry.CONNECT_TIMEOUT_S == 5
+    engine = seen["app"].state.engine
+    assert engine is not None
+    assert engine.url.host == "db"  # from $DATABASE_URL

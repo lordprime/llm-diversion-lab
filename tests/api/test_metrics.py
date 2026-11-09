@@ -213,3 +213,48 @@ def test_default_app_metrics_use_the_app_engine(engine: Engine) -> None:
     with TestClient(create_app(engine)) as c:
         samples = _samples(c.get("/metrics").text)
     assert samples[("lab_runs_in_flight", frozenset({("agent", ids["agent_id"])}))] == 1.0
+
+
+def test_concurrent_scrapes_run_one_query_at_a_time(
+    monkeypatch: pytest.MonkeyPatch, status_file: Path
+) -> None:
+    """A slow database must not pile scrapes onto the pool: one query in flight."""
+    import threading
+    import time
+
+    from control.api import metrics as metrics_mod
+
+    active = 0
+    peak = 0
+    calls = 0
+    lock = threading.Lock()
+
+    def slow_query(engine: object) -> object:
+        nonlocal active, peak, calls
+        with lock:
+            active += 1
+            calls += 1
+            peak = max(peak, active)
+        time.sleep(0.3)
+        with lock:
+            active -= 1
+        return metrics_mod._RunCounts([], 0, [("agt_x", 2)])
+
+    monkeypatch.setattr(metrics_mod, "_query", slow_query)
+    lab = LabMetrics(object(), selftest_status_file=status_file)  # type: ignore[arg-type]
+    lab.exposition()  # warm: one result cached
+    calls = 0
+
+    texts: list[str] = []
+    threads = [
+        threading.Thread(target=lambda: texts.append(lab.exposition().decode())) for _ in range(6)
+    ]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    assert peak == 1
+    assert calls < 6, "scrapes that found a query in flight reused the last result"
+    for text in texts:
+        assert _samples(text)[("lab_runs_in_flight", frozenset({("agent", "agt_x")}))] == 2.0

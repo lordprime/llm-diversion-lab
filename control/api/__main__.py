@@ -19,8 +19,13 @@ import uvicorn
 
 from control.api.app import create_app
 from control.core.logging import configure_logging
+from control.db.engine import create_db_engine
 
-__all__ = ["main"]
+__all__ = ["CONNECT_TIMEOUT_S", "main"]
+
+#: libpq connect timeout of the Collector's engine: a hung database fails requests and
+#: scrapes after this long instead of holding them (and the pool) indefinitely.
+CONNECT_TIMEOUT_S = 5
 
 
 def _port(value: str) -> int:
@@ -38,8 +43,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     configure_logging(level=args.log_level)
+    engine = create_db_engine(connect_args={"connect_timeout": CONNECT_TIMEOUT_S})
     uvicorn.run(
-        create_app(),
+        create_app(engine),
         host=args.host,
         port=args.port,
         log_config=None,

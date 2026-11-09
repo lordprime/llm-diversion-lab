@@ -32,7 +32,11 @@ rejected: in-memory counters reset on every Collector restart, and persisting th
 would duplicate what the runs table already records.
 
 Each scrape runs a few ``GROUP BY`` queries in one ``READ ONLY`` transaction with a
-:data:`QUERY_TIMEOUT_MS` statement timeout.
+:data:`QUERY_TIMEOUT_MS` statement timeout. **One query at a time:** a scrape that
+finds another one's query in flight reuses the last result instead of opening another
+connection (none yet: the database reads as down), so a slow or hung database cannot
+pile scrapes onto the connection pool. The Collector's engine also has a connect
+timeout (:mod:`control.api.__main__`).
 
 :class:`LabMetrics` owns its own :class:`~prometheus_client.CollectorRegistry` (never
 the process-global one), plus the standard ``process_*``, ``python_gc_*`` and
@@ -43,6 +47,7 @@ the process-global one), plus the standard ``process_*``, ``python_gc_*`` and
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable, Iterable, Iterator
 from enum import Enum
 from pathlib import Path
@@ -111,6 +116,8 @@ class _RunTableCollector(Collector):
     def __init__(self, engine: EngineSource | None, selftest_status_file: Path | None) -> None:
         self._engine = engine
         self._selftest_status_file = selftest_status_file
+        self._query_lock = threading.Lock()
+        self._last: _RunCounts | None = None
 
     def describe(self) -> Iterable[Metric]:
         # Families without samples: registering never touches the database.
@@ -122,12 +129,17 @@ class _RunTableCollector(Collector):
     def _read_database(self) -> _RunCounts | None:
         if self._engine is None:
             return None
+        if not self._query_lock.acquire(blocking=False):
+            return self._last  # another scrape's query is in flight
         try:
             engine = self._engine() if callable(self._engine) else self._engine
-            return _query(engine)
+            self._last = _query(engine)
         except (SQLAlchemyError, RuntimeError, ValueError) as exc:
             log.warning("metrics: database unavailable: %s", type(exc).__name__)
-            return None
+            self._last = None
+        finally:
+            self._query_lock.release()
+        return self._last
 
     def _families(self, db: _RunCounts | None) -> Iterator[Metric]:
         runs = CounterMetricFamily(
@@ -160,7 +172,7 @@ class _RunTableCollector(Collector):
 
         up = GaugeMetricFamily(
             "lab_metrics_database_up",
-            "1 if the run metrics were read from the database in this scrape, else 0.",
+            "1 if the latest database read for the run metrics succeeded, else 0.",
         )
         up.add_metric([], 0.0 if db is None else 1.0)
         yield up
