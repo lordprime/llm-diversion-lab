@@ -194,6 +194,24 @@ The runner sets `LAB_MAX_PARALLEL` and a per-agent concurrency cap from these nu
    - `labctl build` on the server stays as a fallback.
 
    This replaces call (p) in the plan.
+
+   **Built today** (`.github/workflows/build-images.yml`, no SBOMs yet): one job per image, each pushing `ghcr.io/lordprime/<name>`.
+
+   | Job / name | Dockerfile, build context | `images.lock` role | Checked before the push |
+   |---|---|---|---|
+   | `goat-dvga` | `targets/dvga/Dockerfile`, the two fork checkouts pinned in `targets/dvga/source.yaml` and `cell/oracle/source.yaml` | `target` | tools, file modes, nothing grader-related readable by the app user, `tests/targets/test_dvga_image.py` |
+   | `lab-cell` | `cell/Dockerfile`, the repository root (root `.dockerignore` allow-list) | `infra` | runs as 10001:10001; every in-cell module imports; `mitmdump`, `uvicorn`; `/evidence` 10001 0750; no control-plane code beyond `control/core` |
+   | `control` | `deploy/compose/control.Dockerfile`, the repository root (`control.Dockerfile.dockerignore`) | `control` | runs as 10001:10001; `python -m control.api --help` and `python -m control.cli.migrate --help`; the Alembic head is found; no in-cell code, mitmproxy or pytest |
+
+   Every job pins its actions by commit SHA, checks out with `persist-credentials: false` and holds only `contents: read` and `packages: write` (`tests/deploy/test_build_images_workflow.py` checks these). The workflow never edits `images.lock`.
+
+   **Building and pinning a digest:**
+   1. Trigger the workflow: push a `lab-vN` tag (e.g. `git tag lab-v1 && git push origin lab-v1`; the image tag is then `lab-v1`), or run it by hand (`gh workflow run build-images.yml --ref main`, or *Actions → build-images → Run workflow*; the image tag is then `sha-<12 hex>`).
+   2. Each job reads the pushed digest from `docker image inspect` (`RepoDigests`), checks it is `sha256:` + 64 hex, and writes a ready `images.lock` entry to its job summary and to the `<name>-digest` artifact (`gh run download <run-id> -n lab-cell-digest`).
+   3. Paste the entry into `deploy/images.lock` (replacing an older entry of the same name) with its `name`, `image` (the repository, no tag), `digest`, `expect_tools` and `role`: `goat-dvga` → `target`, `lab-cell` → `infra`, `control` → `control`. cell-guard lets an agent start only `role: agent` images, so none of these three can be started from inside a cell.
+   4. Commit it for review, then tag the release: `release.sh` pulls every `images.lock` entry by digest.
+
+   The control-plane compose file still builds `lab/control:<tag>` from the release tree; switching its `migrate` and `collector` to the pinned `control` image (and dropping `--allow-build`) is a separate reviewed change.
 3. **One run cell at a time by default** (`max_parallel_cells: 1`). The second slot is opened only for HackingBuddyGPT cells once M2 has measured real CPU and memory use.
 
 ### 0.6 Final runs on CISPA hardware (decided 5 Nov 2026)

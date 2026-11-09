@@ -1,8 +1,15 @@
 # Logical image name -> pinned digest. Cells pull `image@digest`, never a tag.
 #
 # Entries change only in reviewed commits. The build-images workflow
-# (.github/workflows/build-images.yml) publishes the digest it pushed in its job
-# summary and the `goat-dvga-digest` artifact; copy that entry here by hand.
+# (.github/workflows/build-images.yml; runs on a `lab-v*` tag or by hand) builds
+# goat-dvga, lab-cell and control and pushes ghcr.io/lordprime/<name>. Pinning a
+# CI-built digest (docs/DEPLOYMENT.md §0.5):
+#   1. take the entry from the run's job summary or its `<name>-digest` artifact
+#      (images.lock.entry.yml): name, image, digest, expect_tools and role;
+#   2. paste it under `images:` (replace the old entry of that name; never use a
+#      tag), keeping its role: goat-dvga -> target, lab-cell -> infra,
+#      control -> control;
+#   3. commit it for review; release.sh pulls exactly these image@digest refs.
 #
 # expect_tools: commands a smoke check expects on PATH inside the image.
 # role: agent | target | infra | control. cell-guard lets an agent start only
