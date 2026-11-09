@@ -6,10 +6,15 @@ Commands (each takes ``--json`` for scripting):
 * ``labctl status``: release, runs by status, experiments, last self-test, disk.
 * ``labctl runs ls [-n N] [--status S] [--experiment ID]``: runs, newest first.
 * ``labctl run show RUN_ID``: one run with its evidence counts.
-* ``labctl selftest [--quick]``: **not built yet** (Task 15b-2); exits 2.
+* ``labctl selftest [--quick] [--json]``: the instrumentation self-test
+  (:mod:`control.runner.selftest`): one injected and one control DVGA cell with the
+  scripted agent and the stub LLM, a containment probe, and the checks; the result is
+  recorded in the self-test status file (``labctl status``, ``/metrics``).
 
-Exit status: 0 success; 1 a check failed, the database is unreachable or the run does
-not exist; 2 usage error (an unparsable ``DATABASE_URL`` included) and the selftest stub.
+Exit status: 0 success (the self-test passed); 1 a check failed, the self-test failed,
+the database is unreachable or the run does not exist; 2 usage error (an unparsable
+``DATABASE_URL`` included). Never 3: ``deploy/remote/release.sh`` reads 3 as "labctl
+is not installed".
 
 Every command first calls :func:`~control.core.logging.configure_logging` (redacted
 JSON on **stderr**, level WARNING), so any log line, ours or a library's, is redacted
@@ -36,16 +41,20 @@ from control.cli import doctor, queries
 from control.cli.settings import ConfigError, LabSettings, read_env_file
 from control.core.logging import configure_logging, redact_text
 from control.core.models import RunStatus
-from control.core.selftest_status import SelftestStatusError, read_selftest_status
+from control.core.selftest_status import (
+    SelftestResult,
+    SelftestStatusError,
+    read_selftest_status,
+    record_selftest_result,
+)
 from control.db.engine import create_db_engine
+from control.runner import selftest
 
 __all__ = ["EXIT_FAIL", "EXIT_OK", "EXIT_USAGE", "build_parser", "main"]
 
 EXIT_OK: Final = 0
 EXIT_FAIL: Final = 1
 EXIT_USAGE: Final = 2
-
-SELFTEST_STUB_MESSAGE: Final = "labctl selftest: not built yet (Task 15b-2)"
 
 
 class _Failure(Exception):
@@ -261,12 +270,41 @@ def _cmd_run_show(args: argparse.Namespace, settings: LabSettings) -> int:
     return EXIT_OK
 
 
-# --------------------------------------------------------------------- selftest stub
+# --------------------------------------------------------------------- selftest
 
 
 def _cmd_selftest(args: argparse.Namespace, settings: LabSettings) -> int:
-    sys.stderr.write(SELFTEST_STUB_MESSAGE + "\n")
-    return EXIT_USAGE
+    """Run the self-test, record its result once, print it; 0 passed, 1 failed."""
+    # progress (runs, phases, problems) goes to stderr; the result to stdout
+    configure_logging(level="INFO", stream=sys.stderr)
+    try:
+        engine = _engine(settings)
+    except _Failure as exc:
+        if exc.code == EXIT_USAGE:
+            raise
+        report = selftest.failed_report(args.quick, "configuration", str(exc))
+    else:
+        try:
+            context = selftest.LabContext(
+                lab_root=settings.lab_root,
+                environ=settings.environ,
+                collector_url=settings.collector_url,
+                engine=engine,
+            )
+            report = selftest.run_lab_selftest(context, quick=args.quick)
+        finally:
+            engine.dispose()
+    _out(json.dumps(report.to_json(), indent=2, default=str) if args.json else report.render_text())
+    try:
+        record_selftest_result(
+            SelftestResult(report.passed, report.finished_at, args.quick, report.summary),
+            settings.selftest_status_file,
+        )
+    except OSError as exc:
+        raise _Failure(
+            f"the result could not be recorded in {settings.selftest_status_file}: {exc}"
+        ) from None
+    return EXIT_OK if report.passed else EXIT_FAIL
 
 
 # --------------------------------------------------------------------- parser
@@ -327,8 +365,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("run_id", metavar="RUN_ID")
     p.add_argument("--json", action="store_true", help="JSON output")
 
-    p = add("selftest", "instrumentation self-test (not built yet: Task 15b-2)", _cmd_selftest)
-    p.add_argument("--quick", action="store_true", help="one target only")
+    p = add(
+        "selftest",
+        "instrumentation self-test: an injected and a control cell, containment probe",
+        _cmd_selftest,
+    )
+    p.add_argument(
+        "--quick",
+        action="store_true",
+        help="first target only, containment probed in one cell (after a deploy)",
+    )
+    p.add_argument("--json", action="store_true", help="JSON output")
     return parser
 
 

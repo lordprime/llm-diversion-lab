@@ -1,4 +1,4 @@
-"""``labctl``: status, runs ls, run show, the selftest stub, exit codes, logging.
+"""``labctl``: status, runs ls, run show, exit codes, logging (selftest: tests/runner).
 
 The database commands run against a fresh migrated Postgres (``engine`` / ``db_url``
 fixtures) through ``DATABASE_URL``; they only read.
@@ -78,15 +78,6 @@ def test_help_exits_0(capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     for word in ("doctor", "status", "runs", "run", "selftest"):
         assert word in out
-
-
-@pytest.mark.parametrize("argv", [["selftest"], ["selftest", "--quick"]])
-def test_selftest_is_a_stub_that_exits_2(
-    argv: list[str], capsys: pytest.CaptureFixture[str]
-) -> None:
-    rc, _, err = _run(capsys, *argv)
-    assert rc == 2
-    assert "not built yet (Task 15b-2)" in err
 
 
 # --------------------------------------------------------------------- database errors

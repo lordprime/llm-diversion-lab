@@ -11,24 +11,41 @@ Needs the ``docker`` CLI with the compose plugin, a reachable socket, and the im
 ``LAB_E2E_ENGINE`` (``podman``/``docker``) and ``DOCKER_HOST`` choose the engine.
 Docker-only options (bridge names, DOCKER-USER) are not exercised here; their
 rendering is asserted in ``test_cell_spec.py``.
+
+``test_labctl_selftest_end_to_end`` runs ``labctl selftest`` itself (full mode): the
+lab wiring from a temporary ``LAB_ROOT``, a Collector served over HTTP, the
+containment probe in both cells. ``LAB_E2E_LAN`` names the LAN address to probe
+(default: this machine's default gateway). Under rootless Podman the agent network's
+gateway is the rootless network namespace, which answers with a reset, so the probe's
+host address is this machine's own LAN-side address (``LAB_PROBE_HOST_GATEWAY``,
+development only).
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 import os
 import shutil
+import socket
 import subprocess
+import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import NoReturn
 
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, select
 
+from cell.probe.containment import default_gateway
 from control.api.app import create_app
+from control.cli import main as cli
 from control.core.models import Arm, CallbackChannel, EndStatus, FunnelStage, RunStatus
+from control.core.selftest_status import read_selftest_status
 from control.db import tables as t
 from control.db.engine import session_scope
 from control.runner.cell_spec import CellSettings
@@ -127,3 +144,84 @@ def test_the_selftest_pair_in_real_cells(
                 check=True,
             )
             assert out.stdout.strip() == b"", (kind, result.run_id)
+
+
+# --------------------------------------------------------------------------- labctl selftest
+
+
+@contextlib.contextmanager
+def _collector_server(engine: Engine) -> Iterator[str]:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(create_app(engine), host="127.0.0.1", port=port, log_config=None)
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 30
+    while not server.started:
+        if time.monotonic() > deadline or not thread.is_alive():
+            pytest.fail("the Collector did not start")
+        time.sleep(0.05)
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=30)
+
+
+def _own_address(towards: str) -> str:
+    """This machine's source address towards ``towards`` (UDP connect: nothing is sent)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.connect((towards, 9))
+        return str(sock.getsockname()[0])
+
+
+def test_labctl_selftest_end_to_end(
+    engine: Engine,
+    db_url: str,
+    docker_env: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    engine_kind = os.environ.get("LAB_E2E_ENGINE") or (
+        "podman" if "podman" in docker_env.get("DOCKER_HOST", "") else "docker"
+    )
+    lan = os.environ.get("LAB_E2E_LAN") or default_gateway() or "192.168.1.1"
+    root = tmp_path / "lab"
+    (root / "secrets").mkdir(parents=True)
+    (root / "secrets" / "hmac.key").write_bytes(os.urandom(32))
+    (root / "host.env").write_text(
+        f"LAB_CELL_NETWORKS=10.231.0.0/16\nLAB_LLM_GATEWAY=\nLAB_PROBE_LAN={lan}\n"
+    )
+    env = {
+        "LAB_ROOT": str(root),
+        "DATABASE_URL": db_url,
+        "LAB_DEV": "1",
+        "LAB_ENGINE": engine_kind,
+        "LAB_REQUIRE_DIGESTS": "0",
+        "LAB_IMAGE_OVERRIDES": ",".join(f"{k}={v}" for k, v in IMAGES.items()),
+        "LAB_RELEASE_TREE": str(REPO_ROOT),
+        **docker_env,
+    }
+    if engine_kind == "podman":
+        env["LAB_PROBE_HOST_GATEWAY"] = _own_address(lan)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    for key in ("LAB_HOST_ENV", "LAB_RUNNER_LOCK", "LAB_SELFTEST_STATUS_FILE", "LAB_PROBE_LAN"):
+        monkeypatch.delenv(key, raising=False)
+
+    with _collector_server(engine) as url:
+        monkeypatch.setenv("LAB_COLLECTOR_URL", url)
+        rc = cli.main(["selftest", "--json"])
+    out = capsys.readouterr().out
+    report = json.loads(out)
+    failed = {c["name"]: c["detail"] for c in report["checks"] if not c["ok"]}
+    assert rc == 0, failed
+    assert report["passed"] and not report["quick"] and not failed
+    assert len(report["runs"]) == 2 and len(report["probes"]) == 2
+    assert all(p["contained"] for p in report["probes"])
+    last = read_selftest_status(root / "state" / "selftest.json").last_success
+    assert last is not None and last.passed and not last.quick
