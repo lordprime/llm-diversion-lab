@@ -18,7 +18,7 @@ from sqlalchemy import Engine, func, select, update
 from control.cli import main as cli
 from control.cli.main import main
 from control.core.ids import new_id
-from control.core.models import Arm, EndStatus, RunStatus
+from control.core.models import Arm, EndStatus, InvalidReason, RunStatus
 from control.core.selftest_status import SelftestResult, record_selftest_result
 from control.db import tables as t
 from control.db.engine import session_scope
@@ -225,6 +225,41 @@ def test_run_show_details_and_evidence_counts(
     assert data["outcome"] is True
     assert data["placements"] == 1
     assert data["events"] == {str(k): v for k, v in kinds.items()}
+
+
+def test_runs_ls_and_run_show_say_why_a_run_is_invalid(
+    lab_db: Engine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """invalid_reason and dev in both; invalid_detail (redacted, also for rows stored
+    before the runner redacted it) in run show."""
+    ids = seed_experiment(lab_db)
+    run_id = add_run(lab_db, ids, schedule_index=0, status=RunStatus.INVALID)
+    with session_scope(lab_db) as s:
+        s.execute(
+            update(t.Run)
+            .where(t.Run.run_id == run_id)
+            .values(
+                invalid_reason=InvalidReason.RECORDING_FAILED,
+                invalid_detail="tap exited 137; db at postgresql://lab:hunter2secret@db/lab",
+                dev=True,
+            )
+        )
+
+    rc, out, _ = _run(capsys, "runs", "ls")
+    assert rc == 0 and "recording_failed" in out and "invalid_reason" in out
+    rc, out, _ = _run(capsys, "runs", "ls", "--json")
+    (row,) = json.loads(out)
+    assert (row["invalid_reason"], row["dev"]) == ("recording_failed", True)
+    assert "invalid_detail" not in row  # the list stays short
+
+    rc, out, _ = _run(capsys, "run", "show", run_id)
+    assert rc == 0 and "recording_failed" in out and "tap exited 137" in out
+    assert "hunter2secret" not in out
+    rc, out, _ = _run(capsys, "run", "show", run_id, "--json")
+    data = json.loads(out)
+    assert data["invalid_reason"] == "recording_failed" and data["dev"] is True
+    assert "tap exited 137" in data["invalid_detail"]
+    assert "hunter2secret" not in data["invalid_detail"]
 
 
 def test_run_show_unknown_run(lab_db: Engine, capsys: pytest.CaptureFixture[str]) -> None:

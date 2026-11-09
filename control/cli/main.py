@@ -200,8 +200,10 @@ _RUN_COLUMNS: Final = (
     "target_id",
     "agent_id",
     "status",
+    "invalid_reason",
     "end_status",
     "outcome",
+    "dev",
     "created_at",
 )
 
@@ -227,8 +229,10 @@ def _cmd_runs_ls(args: argparse.Namespace, settings: LabSettings) -> int:
             r.target_id,
             r.agent_id,
             r.status,
+            r.invalid_reason or "-",
             r.end_status or "-",
             "-" if r.outcome is None else str(r.outcome).lower(),
+            "yes" if r.dev else "no",
             _dt(r.created_at),
         ]
         for r in runs
@@ -252,9 +256,10 @@ def _cmd_run_show(args: argparse.Namespace, settings: LabSettings) -> int:
         return EXIT_OK
     scalar = [
         "run_id", "experiment_id", "pair_id", "arm", "schedule_index", "attempt", "target_id",
-        "agent_id", "model_id", "status", "end_status", "outcome", "oracle_message", "tag",
-        "manifest_sha256", "created_at", "started_at", "finished_at", "decided_at",
-        "placements", "artifacts", "rejected_batches",
+        "agent_id", "model_id", "status", "invalid_reason", "invalid_detail", "end_status",
+        "outcome", "oracle_message", "tag", "dev", "manifest_sha256", "created_at",
+        "started_at", "finished_at", "decided_at", "placements", "artifacts",
+        "rejected_batches",
     ]  # fmt: skip
     width = max(map(len, scalar))
     for key in scalar:

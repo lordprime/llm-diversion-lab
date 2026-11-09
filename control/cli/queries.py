@@ -16,6 +16,7 @@ from typing import Any, Final
 from sqlalchemy import Engine, func, select, text
 from sqlalchemy.orm import Session
 
+from control.core.logging import redact_text
 from control.core.models import RunStatus
 from control.db.tables import (
     Artifact,
@@ -66,6 +67,10 @@ class RunSummary:
     end_status: str | None
     outcome: bool | None
     created_at: datetime
+    #: why the run is invalid (a bounded set), else None
+    invalid_reason: str | None
+    #: the run ran on a development host (LAB_DEV=1)
+    dev: bool
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -79,6 +84,8 @@ class RunSummary:
             "end_status": self.end_status,
             "outcome": self.outcome,
             "created_at": self.created_at.isoformat(),
+            "invalid_reason": self.invalid_reason,
+            "dev": self.dev,
         }
 
 
@@ -98,6 +105,8 @@ def _summary(run: Run) -> RunSummary:
         end_status=_value(run.end_status),
         outcome=run.outcome,
         created_at=run.created_at,
+        invalid_reason=_value(run.invalid_reason),
+        dev=run.dev,
     )
 
 
@@ -137,6 +146,9 @@ class RunDetail:
     attempt: int
     tag: str | None
     oracle_message: str | None
+    #: everything that went wrong, redacted (again: rows stored before the runner
+    #: redacted it may hold secrets)
+    invalid_detail: str | None
     started_at: datetime | None
     finished_at: datetime | None
     decided_at: datetime | None
@@ -159,6 +171,7 @@ class RunDetail:
             "attempt": self.attempt,
             "tag": self.tag,
             "oracle_message": self.oracle_message,
+            "invalid_detail": self.invalid_detail,
             "started_at": ts(self.started_at),
             "finished_at": ts(self.finished_at),
             "decided_at": ts(self.decided_at),
@@ -214,6 +227,7 @@ def get_run(session: Session, run_id: str) -> RunDetail | None:
         attempt=run.attempt,
         tag=run.tag,
         oracle_message=run.oracle_message,
+        invalid_detail=None if run.invalid_detail is None else redact_text(run.invalid_detail),
         started_at=run.started_at,
         finished_at=run.finished_at,
         decided_at=run.decided_at,
