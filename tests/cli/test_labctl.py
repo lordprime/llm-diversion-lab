@@ -7,6 +7,7 @@ fixtures) through ``DATABASE_URL``; they only read.
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -316,3 +317,8 @@ def test_status_finds_the_selftest_under_lab_root(
     assert rc == 0
     assert json.loads(out)["selftest"]["last_success"]["finished_at"] == 1_800_000_000.0
 
+
+def test_build_backend_is_pinned() -> None:
+    project = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    (requirement,) = project["build-system"]["requires"]
+    assert re.fullmatch(r"hatchling==\d+\.\d+\.\d+", requirement)
