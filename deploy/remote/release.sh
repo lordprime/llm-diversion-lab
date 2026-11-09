@@ -7,7 +7,8 @@
 #   labctl TAG                      install labctl for TAG into releases/TAG/.venv (host
 #                                   uv, the release's uv.lock); /usr/local/bin/labctl
 #                                   -> current/.venv/bin/labctl, so it follows `current`
-#   pull REF...                     docker pull each image@sha256:digest
+#   pull REF...                     docker pull each image@sha256:digest and tag it
+#                                   lab-pinned/<repository>:sha256-<hex> (prune-safe)
 #   compose-pull TAG [allow-build]  check every image is pinned by digest, then pull
 #                                   (or, as a fallback, build) the control-plane images
 #   migrate TAG                     stop the app services (db keeps running), pg_dump,
@@ -144,11 +145,24 @@ cmd_labctl() {
 	echo "labctl: $BIN/labctl -> $LAB/current/.venv/bin/labctl"
 }
 
+# A pinned image pulled by digest has no tag, so `docker image prune` counts it as
+# dangling and deletes it. Each one gets a local tag naming its repository and digest,
+# lab-pinned/<repository>:sha256-<hex>, which keeps it and is never pushed.
+pinned_tag() {
+	local repo=${1%@*} hex=${1##*@sha256:}
+	# drop a tag sitting before the digest (a colon in the last path part), then turn a
+	# registry port's colon into a dash: a repository path may not hold a colon
+	[[ ${repo##*/} != *:* ]] || repo=${repo%:*}
+	repo=${repo//:/-}
+	printf 'lab-pinned/%s:sha256-%s\n' "$repo" "$hex"
+}
+
 cmd_pull() {
 	local ref
 	for ref in "$@"; do
 		[[ $ref =~ ^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$ ]] || die "not a pinned image ref: $ref"
 		docker pull --quiet "$ref"
+		docker tag "$ref" "$(pinned_tag "$ref")"
 	done
 }
 

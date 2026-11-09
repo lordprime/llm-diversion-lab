@@ -998,6 +998,49 @@ def _first(log: list[str], *needles: str) -> int:
     return _index(log, *needles)
 
 
+# Docker's reference grammar (distribution/reference): path components and tag.
+_REF_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+_PINNED_TAG_RE = re.compile(rf"lab-pinned(?:/{_REF_COMPONENT})+:sha256-[0-9a-f]{{64}}")
+
+
+def test_pull_tags_each_pinned_image_so_prune_keeps_it(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    # Images pulled by digest are untagged, and `docker image prune` deletes untagged
+    # images: on CT 111 it removed lab-cell, goat-dvga and the Python base.
+    _, env = lab_root
+    refs = {
+        PINNED: "lab-pinned/ghcr.io/example/api:sha256-" + "a" * 64,
+        "docker.io/library/python@sha256:" + "b" * 64: (
+            "lab-pinned/docker.io/library/python:sha256-" + "b" * 64
+        ),
+        "registry.local:5000/team/x:1.2@sha256:" + "c" * 64: (
+            "lab-pinned/registry.local-5000/team/x:sha256-" + "c" * 64
+        ),
+    }
+    result = _run(["bash", str(DEPLOY / "remote" / "release.sh"), "pull", *refs], env=env)
+    assert result.returncode == 0, result.stderr
+    log = [line.rsplit(" [tag=", 1)[0] for line in _docker_log(env)]
+    expected = []
+    for ref, tag in refs.items():
+        expected += [f"pull --quiet {ref}", f"tag {ref} {tag}"]
+        assert _PINNED_TAG_RE.fullmatch(tag), f"not a valid docker reference: {tag}"
+    assert log == expected
+
+
+def test_pull_refuses_an_unpinned_ref_before_pulling(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    _, env = lab_root
+    result = _run(
+        ["bash", str(DEPLOY / "remote" / "release.sh"), "pull", "ghcr.io/example/api:latest"],
+        env=env,
+    )
+    assert result.returncode != 0
+    assert "not a pinned image ref" in result.stderr
+    assert not Path(env["FAKE_DOCKER_LOG"]).exists()
+
+
 def test_migrate_stops_writers_then_dumps_then_migrates_without_deps(
     lab_root: tuple[Path, dict[str, str]],
 ) -> None:

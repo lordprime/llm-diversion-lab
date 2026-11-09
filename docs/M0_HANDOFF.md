@@ -38,7 +38,7 @@ The release self-test then checks the new images in real cells.
 
 ## 3. Follow-ups left by Task 17
 
-- **Protect pinned images from `docker image prune`.** Images pulled by digest are untagged, so a prune deletes them (DEPLOYMENT §0.5). Option: `release.sh` gives each one a local tag, e.g. `lab-pinned/<name>:<digest prefix>`.
+- **Prune old pins.** `release.sh` tags every pinned image `lab-pinned/<repository>:sha256-<hex>` so `docker image prune` keeps it (DEPLOYMENT §0.5), but nothing removes the pins of retired releases yet. This belongs with per-release image pruning (§4).
 - **Juice Shop and Drupal 7600 GOAT images** (M1): each needs a Dockerfile, its `ci/build.sh`, `ci/check.sh` and `ci/expect_tools`, an oracle grader and its hygiene patches. Then build-images picks it up on its own.
 - **GitHub Actions upkeep:** `actions/checkout@v4`, `setup-uv@v5` and `gitleaks-action@v2` target Node 20, which runners now force onto Node 24. `ubuntu-latest` moved to Ubuntu 26 on 19 Oct 2026.
 - **A cosmetic leftover on CT 111:** Ubuntu's empty accept-only `table inet filter` is still loaded.
