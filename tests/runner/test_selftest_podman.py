@@ -87,7 +87,9 @@ def test_the_selftest_pair_in_real_cells(
         store=RunStore(engine),
         collector=collector,
         backend=ComposeBackend(SubprocessRunner(docker_env)),
-        settings=CellSettings(images=IMAGES, engine=CellEngine(engine_kind), require_digests=False),
+        settings=CellSettings(
+            images=IMAGES, engine=CellEngine(engine_kind), require_digests=False, dev=True
+        ),
         lab_key=KEY,
         runs_dir=tmp_path / "runs",
         work_dir=tmp_path / "work",

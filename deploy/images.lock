@@ -5,6 +5,8 @@
 # summary and the `goat-dvga-digest` artifact; copy that entry here by hand.
 #
 # expect_tools: commands a smoke check expects on PATH inside the image.
+# role: agent | target | infra | control. cell-guard lets an agent start only
+#   `agent` images (never a target, the harness's lab-cell or a control-plane image).
 images:
   # The pinned base of the GOAT images (multi-arch index digest,
   # python 3.10.22-bookworm). Seeded by hand; goat-dvga is added after the first
@@ -13,6 +15,7 @@ images:
     image: docker.io/library/python
     digest: sha256:f72a86806f92fe13a49f49aeca1db0b19ea5cf4a0470b842a01b0e14314945b8
     expect_tools: [curl, bash]
+    role: infra
 
   # The control-plane database (deploy/compose/control-plane.yml, service `db`):
   # official postgres 17.11-bookworm, multi-arch index digest, resolved 7 Nov 2026.
@@ -24,3 +27,4 @@ images:
     image: docker.io/library/postgres
     digest: sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
     expect_tools: [pg_dump, pg_restore, psql, pg_isready]
+    role: control

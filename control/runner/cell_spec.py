@@ -18,10 +18,19 @@ Rules this module guarantees (each asserted by ``tests/runner/test_cell_spec.py`
   safe-typed :class:`~control.runner.schedule.ScheduledRun` and the target spec, never
   from a reloaded manifest's ``target``/``agent`` (the manifest must agree with the run);
   all start with :data:`CELL_NAME_PREFIX`, never with cell-guard's ``<run id>-`` prefix;
-* cell networks are ``internal: true`` with an explicit subnet inside
-  ``LAB_CELL_NETWORKS`` and a gateway address (a connected route on the bridge, which
-  the host's strict reverse-path check needs; isolated gateway mode is never used), and
-  on Docker a bridge named ``labc<id>`` (at most 15 characters);
+* cell networks have an explicit subnet inside ``LAB_CELL_NETWORKS`` and a gateway
+  address (a connected route on the bridge, which the host's strict reverse-path check
+  needs; isolated gateway mode is never used), and on Docker a bridge named
+  ``labc<id>`` (at most 15 characters). All are ``internal: true`` except, in gateway
+  mode (``LAB_LLM_GATEWAY`` set: real models), the ``llm`` network: only the tap is on
+  it, and the host firewall lets a ``labc`` bridge reach nothing but the configured
+  gateway address and port. The gateway must lie outside ``LAB_CELL_NETWORKS`` and equal
+  the host's configured one (``/srv/lab/host.env``). With the stub LLM every network is
+  internal;
+* images: cell-guard's allow-list holds only ``images.lock`` entries with
+  ``role: agent``, so an agent can never start the target or a harness image;
+* ``LAB_ENGINE=podman`` and unpinned images (no ``labc`` bridge names, no digests) are
+  refused unless ``LAB_DEV=1``;
 * everything carries ``lab.run_id``; nothing carries ``lab.origin`` (cell-guard's mark);
 * no published port and no host path, except the real Docker socket mounted into the
   runner-created cell-guard; per-run inputs travel only as :class:`CellFile` s written
@@ -39,6 +48,7 @@ import copy
 import hashlib
 import ipaddress
 import json
+import logging
 import re
 import secrets
 from collections.abc import Iterable, Mapping, Sequence
@@ -61,6 +71,7 @@ __all__ = [
     "DEFAULT_CELL_NETWORK",
     "DEFAULT_EVIDENCE_PATH",
     "EVIDENCE_PREFIXES",
+    "IMAGE_ROLES",
     "REPO_ROOT",
     "ROLE_LABEL",
     "RUN_LABEL",
@@ -75,8 +86,11 @@ __all__ = [
     "allocate_subnets",
     "bridge_name",
     "project_name",
+    "read_host_env",
     "render_cell",
 ]
+
+log = logging.getLogger(__name__)
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 #: Every runner-created cell resource name starts with this (never with cell-guard's
@@ -129,7 +143,12 @@ class Engine(StrEnum):
 # --------------------------------------------------------------------------- settings
 
 
-def _load_lock(path: Path) -> dict[str, str]:
+#: ``images.lock`` roles. cell-guard lets an agent start only ``agent`` images.
+IMAGE_ROLES: Final = frozenset({"agent", "target", "infra", "control"})
+
+
+def _load_lock(path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """``images.lock`` as ``(name -> image@digest, name -> role)`` (role default infra)."""
     try:
         doc = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
@@ -138,11 +157,46 @@ def _load_lock(path: Path) -> dict[str, str]:
     if not isinstance(entries, list):
         raise CellError(f"LAB_IMAGES_LOCK: {path} has no images list")
     images: dict[str, str] = {}
+    roles: dict[str, str] = {}
     for entry in entries:
         if not isinstance(entry, dict) or not {"name", "image", "digest"} <= set(entry):
             raise CellError(f"LAB_IMAGES_LOCK: malformed entry {entry!r}")
+        role = str(entry.get("role", "infra"))
+        if role not in IMAGE_ROLES:
+            raise CellError(f"LAB_IMAGES_LOCK: unknown role {role!r} for {entry['name']!r}")
         images[str(entry["name"])] = f"{entry['image']}@{entry['digest']}"
-    return images
+        roles[str(entry["name"])] = role
+    return images, roles
+
+
+def read_host_env(path: Path) -> dict[str, str]:
+    """``KEY=VALUE`` lines of the host profile (``/srv/lab/host.env``); comments skipped."""
+    values: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, eq, value = line.partition("=")
+        if not eq:
+            raise CellError(f"{path}: not a KEY=VALUE line: {line!r}")
+        values[key.strip()] = value.strip()
+    return values
+
+
+def _gateway_url(raw: str) -> str | None:
+    """``addr:port`` (host.env's form) or ``http://addr:port`` -> URL; empty -> None."""
+    if not raw:
+        return None
+    hostport = raw.removeprefix("http://")
+    addr, colon, port = hostport.rpartition(":")
+    try:
+        ipaddress.IPv4Address(addr)
+        valid = colon == ":" and 1 <= int(port) <= 65535
+    except ValueError:
+        valid = False
+    if not valid or "/" in hostport:
+        raise CellError(f"LAB_LLM_GATEWAY: expected <IPv4>:<port>, got {raw!r}")
+    return f"http://{hostport}"
 
 
 def _parse_networks(raw: str) -> tuple[ipaddress.IPv4Network, ...]:
@@ -177,6 +231,26 @@ class CellSettings:
     llm_gateway: str | None = None
     require_digests: bool = True
     docker_socket: str = _DOCKER_SOCKET
+    #: ``images.lock`` role per logical name (absent: ``infra``).
+    roles: Mapping[str, str] = field(default_factory=dict)
+    #: Development host: Podman and unpinned images are allowed (``LAB_DEV=1``).
+    dev: bool = False
+
+    def __post_init__(self) -> None:
+        if (self.engine is Engine.PODMAN or not self.require_digests) and not self.dev:
+            raise CellError(
+                "LAB_ENGINE=podman and LAB_REQUIRE_DIGESTS=0 are for development only: "
+                "the labc bridge names and digest pins the host firewall and the study rely "
+                "on are missing there; set LAB_DEV=1 to allow them on a development host"
+            )
+        if self.llm_gateway is not None:
+            url = _gateway_url(self.llm_gateway) or ""
+            addr = ipaddress.IPv4Address(url.removeprefix("http://").rpartition(":")[0])
+            if any(addr in net for net in self.cell_networks):
+                raise CellError(
+                    f"LAB_LLM_GATEWAY {self.llm_gateway} lies inside LAB_CELL_NETWORKS: the "
+                    "gateway must be outside the cells' address pool"
+                )
 
     def image(self, name: str) -> str:
         ref = self.images.get(name)
@@ -186,37 +260,62 @@ class CellSettings:
             raise CellError(f"image {name!r} is not pinned by digest: {ref!r}")
         return ref
 
+    def role(self, name: str) -> str:
+        return self.roles.get(name, "infra")
+
     @classmethod
-    def from_env(cls, env: Mapping[str, str]) -> CellSettings:
-        """Read ``LAB_CELL_NETWORKS`` (required), ``LAB_IMAGES_LOCK``, ``LAB_IMAGE_OVERRIDES``
-        (``name=ref,...``), ``LAB_ENGINE``, ``LAB_LLM_GATEWAY``, ``LAB_REQUIRE_DIGESTS``
-        and ``LAB_DOCKER_SOCKET``."""
-        networks = _parse_networks(env.get("LAB_CELL_NETWORKS", ""))
-        lock = Path(env.get("LAB_IMAGES_LOCK") or REPO_ROOT / "deploy" / "images.lock")
-        images = _load_lock(lock)
-        for item in (p.strip() for p in env.get("LAB_IMAGE_OVERRIDES", "").split(",")):
+    def from_env(
+        cls, env: Mapping[str, str], *, host_env: Mapping[str, str] | None = None
+    ) -> CellSettings:
+        """Read the runner's settings.
+
+        ``host_env`` is the host profile (``/srv/lab/host.env``, :func:`read_host_env`):
+        when given, ``LAB_CELL_NETWORKS`` and ``LAB_LLM_GATEWAY`` come from it (the values
+        the host firewall was built with) and ``env`` may only repeat them, never differ.
+        From ``env``: ``LAB_IMAGES_LOCK``, ``LAB_IMAGE_OVERRIDES`` (``name=ref,...``),
+        ``LAB_ENGINE``, ``LAB_REQUIRE_DIGESTS``, ``LAB_DEV`` and ``LAB_DOCKER_SOCKET``.
+        """
+        merged = dict(env)
+        if host_env is not None:
+            for key in ("LAB_CELL_NETWORKS", "LAB_LLM_GATEWAY"):
+                host_value = host_env.get(key, "")
+                if key in env and env[key] != host_value:
+                    raise CellError(
+                        f"{key} {env[key]!r} differs from the host's configured {host_value!r}"
+                    )
+                merged[key] = host_value
+        networks = _parse_networks(merged.get("LAB_CELL_NETWORKS", ""))
+        lock = Path(merged.get("LAB_IMAGES_LOCK") or REPO_ROOT / "deploy" / "images.lock")
+        images, roles = _load_lock(lock)
+        for item in (p.strip() for p in merged.get("LAB_IMAGE_OVERRIDES", "").split(",")):
             if item:
                 name, eq, ref = item.partition("=")
                 if not eq or not name or not ref:
                     raise CellError(f"LAB_IMAGE_OVERRIDES: malformed entry {item!r}")
                 images[name.strip()] = ref.strip()
         try:
-            engine = Engine(env.get("LAB_ENGINE") or Engine.DOCKER.value)
+            engine = Engine(merged.get("LAB_ENGINE") or Engine.DOCKER.value)
         except ValueError as exc:
             raise CellError(f"LAB_ENGINE: {exc}") from exc
-        gateway = env.get("LAB_LLM_GATEWAY") or None
-        if gateway and "://" not in gateway:
-            gateway = f"http://{gateway}"
-        require = env.get("LAB_REQUIRE_DIGESTS", "1")
+        require = merged.get("LAB_REQUIRE_DIGESTS", "1")
         if require not in ("0", "1"):
             raise CellError(f"LAB_REQUIRE_DIGESTS: expected 0 or 1, got {require!r}")
+        dev = merged.get("LAB_DEV", "0") == "1"
+        if dev and (engine is Engine.PODMAN or require == "0"):
+            log.warning(
+                "LAB_DEV=1: engine %s, digests %s -- development settings, never for study runs",
+                engine.value,
+                "required" if require == "1" else "NOT required",
+            )
         return cls(
             images=images,
             cell_networks=networks,
             engine=engine,
-            llm_gateway=gateway,
+            llm_gateway=_gateway_url(merged.get("LAB_LLM_GATEWAY", "")),
             require_digests=require == "1",
-            docker_socket=env.get("LAB_DOCKER_SOCKET") or _DOCKER_SOCKET,
+            docker_socket=merged.get("LAB_DOCKER_SOCKET") or _DOCKER_SOCKET,
+            roles=roles,
+            dev=dev,
         )
 
 
@@ -462,11 +561,12 @@ def _agent_script(
 
 
 def _images_lock(settings: CellSettings) -> bytes:
+    """cell-guard's allow-list: only ``agent`` images, never the target or harness ones."""
     entries = []
     for name, ref in sorted(settings.images.items()):
         image, at, digest = ref.partition("@")
-        if at:
-            entries.append({"name": name, "image": image, "digest": digest})
+        if at and settings.role(name) == "agent":
+            entries.append({"name": name, "image": image, "digest": digest, "role": "agent"})
     return yaml.safe_dump({"images": entries}, sort_keys=False).encode()
 
 

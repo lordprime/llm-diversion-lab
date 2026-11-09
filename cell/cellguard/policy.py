@@ -77,11 +77,13 @@ from urllib.parse import parse_qsl, urlencode
 import yaml
 
 __all__ = [
+    "AGENT_ROLE",
     "ALLOWED_CAPS",
     "DEFAULT_MEMORY_BYTES",
     "DEFAULT_NANO_CPUS",
     "DEFAULT_PIDS_LIMIT",
     "DIGEST_PATTERN",
+    "IMAGE_ROLES",
     "MIN_API_VERSION",
     "ORIGIN",
     "ORIGIN_LABEL",
@@ -143,6 +145,9 @@ _RUN_ID_RE = re.compile(RUN_ID_PATTERN)
 _REPO_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*(?::[0-9]+)?(?:/[a-z0-9][a-z0-9._-]*)*$")
 _TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 _LOGICAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@-]*$")
+#: ``images.lock`` entry roles; cell-guard allows only ``agent`` images.
+IMAGE_ROLES: Final = frozenset({"agent", "target", "infra", "control"})
+AGENT_ROLE: Final = "agent"
 _NAME = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
 _NAME_RE = re.compile(f"^{_NAME}$")
 _PREFIX_RE = re.compile(r"^[a-z0-9][a-z0-9_.]*-$")
@@ -207,8 +212,13 @@ class AllowedImage:
     image: str
     digest: str
     expect_tools: tuple[str, ...] = ()
+    #: ``agent`` | ``target`` | ``infra`` | ``control``; only ``agent`` images may be
+    #: started through cell-guard (:meth:`CellGuardConfig.from_env` filters on it).
+    role: str = "infra"
 
     def __post_init__(self) -> None:
+        if self.role not in IMAGE_ROLES:
+            raise ValueError(f"images.lock: unknown role {self.role!r} for {self.name!r}")
         if not _LOGICAL_RE.fullmatch(self.name):
             raise ValueError(f"images.lock: malformed logical name {self.name!r}")
         if not _DIGEST_RE.fullmatch(self.digest):
@@ -238,8 +248,9 @@ def load_images_lock(
 ) -> tuple[AllowedImage, ...]:
     """Load the allow-list from an ``images.lock`` file (YAML or JSON) or parsed data.
 
-    The document maps ``images`` to a list of ``{name, image, digest, expect_tools}``
-    entries (a bare list is accepted too); ``expect_tools`` is optional. Anything
+    The document maps ``images`` to a list of ``{name, image, digest, expect_tools,
+    role}`` entries (a bare list is accepted too); ``expect_tools`` is optional and
+    ``role`` defaults to ``infra``. Anything
     malformed raises :class:`ValueError`.
     """
     data: Any = source
@@ -262,7 +273,10 @@ def load_images_lock(
             raise ValueError(f"images.lock: entry needs a name, an image and a digest: {entry!r}")
         if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
             raise ValueError(f"images.lock: expect_tools must be a list of strings: {entry!r}")
-        images.append(AllowedImage(str(name), str(image), str(digest), tuple(tools)))
+        role = entry.get("role", "infra")
+        if not isinstance(role, str):
+            raise ValueError(f"images.lock: role must be a string: {entry!r}")
+        images.append(AllowedImage(str(name), str(image), str(digest), tuple(tools), role))
     if len({i.name for i in images}) != len(images):
         raise ValueError("images.lock: duplicate logical name")
     return tuple(images)

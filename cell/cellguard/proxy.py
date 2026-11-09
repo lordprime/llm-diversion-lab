@@ -41,7 +41,9 @@ Configuration (:meth:`CellGuardConfig.from_env`):
 
 * ``LAB_RUN_ID`` (required): the run the cell belongs to.
 * ``LAB_CELLGUARD_NETWORK`` (required): the cell's internal network.
-* ``LAB_CELLGUARD_IMAGES_LOCK`` (required): path of ``images.lock`` (YAML or JSON).
+* ``LAB_CELLGUARD_IMAGES_LOCK`` (required): path of ``images.lock`` (YAML or JSON). Only
+  entries with ``role: agent`` are allowed; target, harness and control-plane images
+  never are.
 * ``LAB_CELLGUARD_DNS`` (required): IP address of the cell resolver (the catcher's
   DNS), forced as every created container's only nameserver.
 * ``LAB_CELLGUARD_LISTEN`` (default ``/run/cellguard/docker.sock``): socket to serve.
@@ -76,6 +78,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from cell.cellguard.policy import (
+    AGENT_ROLE,
     DEFAULT_MEMORY_BYTES,
     DEFAULT_NANO_CPUS,
     DEFAULT_PIDS_LIMIT,
@@ -278,7 +281,11 @@ class CellGuardConfig:
             run_id=env["LAB_RUN_ID"],
             network=env["LAB_CELLGUARD_NETWORK"],
             dns=env["LAB_CELLGUARD_DNS"].strip(),
-            images=load_images_lock(Path(env["LAB_CELLGUARD_IMAGES_LOCK"])),
+            images=tuple(
+                i
+                for i in load_images_lock(Path(env["LAB_CELLGUARD_IMAGES_LOCK"]))
+                if i.role == AGENT_ROLE
+            ),
             scratch_volume=env.get("LAB_CELLGUARD_SCRATCH_VOLUME") or None,
             name_prefix=env.get("LAB_CELLGUARD_NAME_PREFIX") or None,
             memory_bytes=_positive_int(env, "LAB_CELLGUARD_MEMORY", DEFAULT_MEMORY_BYTES),

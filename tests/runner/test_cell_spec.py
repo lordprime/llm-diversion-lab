@@ -36,6 +36,7 @@ from control.runner.cell_spec import (
     allocate_subnets,
     bridge_name,
     project_name,
+    read_host_env,
     render_cell,
 )
 from control.runner.experiment import Experiment, load_experiment
@@ -516,7 +517,7 @@ def test_podman_rendering_omits_docker_only_network_options(
     experiment: Experiment, schedule: list[ScheduledRun]
 ) -> None:
     _, _, project = _render(
-        experiment, schedule, Arm.CONTROL, settings=_settings(engine=Engine.PODMAN)
+        experiment, schedule, Arm.CONTROL, settings=_settings(engine=Engine.PODMAN, dev=True)
     )
     for net in project.document["networks"].values():
         assert "com.docker.network.bridge.name" not in net.get("driver_opts", {})
@@ -535,20 +536,71 @@ def test_docker_scripts_use_the_agents_own_resolver(
     assert script.dns_server is None
 
 
+GATEWAY = "http://172.30.0.1:4000"  # outside LAB_CELL_NETWORKS, as the firewall requires
+
+
 def test_gateway_mode_routes_the_tap_to_the_gateway_without_a_stub(
     experiment: Experiment, schedule: list[ScheduledRun]
 ) -> None:
     _, _, project = _render(
-        experiment,
-        schedule,
-        Arm.INJECTED,
-        settings=_settings(llm_gateway="http://10.231.255.1:4000"),
+        experiment, schedule, Arm.INJECTED, settings=_settings(llm_gateway=GATEWAY)
     )
     services = _services(project)
     assert "stub-llm" not in services
-    assert "reverse:http://10.231.255.1:4000" in services["tap"]["command"]
-    assert project.document["networks"]["llm"]["internal"] is False
-    assert project.document["networks"]["agent"]["internal"] is True
+    assert f"reverse:{GATEWAY}" in services["tap"]["command"]
+    # the llm network is the one non-internal cell network: tap only, labc-named, its
+    # egress limited by the host firewall to the gateway address and port
+    networks = project.document["networks"]
+    assert networks["llm"]["internal"] is False
+    assert networks["llm"]["driver_opts"]["com.docker.network.bridge.name"].startswith("labc")
+    assert {n for n, net in networks.items() if not net["internal"]} == {"llm"}
+    on_llm = {s for s, d in services.items() if "llm" in d.get("networks", {})}
+    assert on_llm == {"tap"}
+
+
+@pytest.mark.parametrize("gateway", ["http://10.231.255.1:4000", "http://10.231.0.1:4000"])
+def test_a_gateway_inside_the_cell_networks_is_refused(gateway: str) -> None:
+    with pytest.raises(CellError, match="LAB_LLM_GATEWAY"):
+        _settings(llm_gateway=gateway)
+
+
+def test_the_gateway_must_be_the_hosts_configured_one(tmp_path: Path) -> None:
+    lock = tmp_path / "images.lock"
+    lock.write_text("images: []\n")
+    host = {"LAB_CELL_NETWORKS": "10.231.0.0/16", "LAB_LLM_GATEWAY": "172.30.0.1:4000"}
+    settings = CellSettings.from_env({"LAB_IMAGES_LOCK": str(lock)}, host_env=host)
+    assert settings.llm_gateway == GATEWAY
+    same = {"LAB_IMAGES_LOCK": str(lock), "LAB_LLM_GATEWAY": "172.30.0.1:4000"}
+    assert CellSettings.from_env(same, host_env=host).llm_gateway == GATEWAY
+    with pytest.raises(CellError, match="LAB_LLM_GATEWAY"):
+        CellSettings.from_env(
+            {"LAB_IMAGES_LOCK": str(lock), "LAB_LLM_GATEWAY": "172.30.0.9:4000"}, host_env=host
+        )
+    with pytest.raises(CellError, match="LAB_CELL_NETWORKS"):
+        CellSettings.from_env(
+            {"LAB_IMAGES_LOCK": str(lock), "LAB_CELL_NETWORKS": "10.232.0.0/16"}, host_env=host
+        )
+    with pytest.raises(CellError, match="LAB_LLM_GATEWAY"):
+        CellSettings.from_env(
+            {"LAB_IMAGES_LOCK": str(lock)},
+            host_env={**host, "LAB_LLM_GATEWAY": "gateway.example:4000"},
+        )
+    no_gateway = CellSettings.from_env(
+        {"LAB_IMAGES_LOCK": str(lock)}, host_env={**host, "LAB_LLM_GATEWAY": ""}
+    )
+    assert no_gateway.llm_gateway is None  # the stub LLM in the cell
+
+
+def test_the_host_env_template_carries_the_gateway() -> None:
+    template = (REPO_ROOT / "deploy" / "ansible" / "templates" / "host.env.j2").read_text()
+    assert "LAB_LLM_GATEWAY=" in template and "lab_llm_gateway_address" in template
+    assert "LAB_CELL_NETWORKS=" in template
+
+
+def test_read_host_env_parses_key_value_lines(tmp_path: Path) -> None:
+    path = tmp_path / "host.env"
+    path.write_text("# managed\nLAB_CELL_NETWORKS=10.231.0.0/16\n\nLAB_LLM_GATEWAY=\n")
+    assert read_host_env(path) == {"LAB_CELL_NETWORKS": "10.231.0.0/16", "LAB_LLM_GATEWAY": ""}
 
 
 def test_images_are_pinned_by_digest(experiment: Experiment, schedule: list[ScheduledRun]) -> None:
@@ -589,24 +641,68 @@ def test_settings_from_the_host_environment(tmp_path: Path) -> None:
         "images:\n"
         "  - name: lab-cell\n    image: ghcr.io/lordprime/lab-cell\n"
         f"    digest: sha256:{'c' * 64}\n"
+        "  - name: kali\n    image: docker.io/kali\n"
+        f"    digest: sha256:{'d' * 64}\n    role: agent\n"
     )
-    settings = CellSettings.from_env(
-        {
-            "LAB_CELL_NETWORKS": "10.231.0.0/16,10.232.0.0/24",
-            "LAB_IMAGES_LOCK": str(lock),
-            "LAB_IMAGE_OVERRIDES": "goat-dvga=localhost/goat-dvga:dev",
-            "LAB_ENGINE": "podman",
-            "LAB_REQUIRE_DIGESTS": "0",
-        }
-    )
+    dev = {
+        "LAB_CELL_NETWORKS": "10.231.0.0/16,10.232.0.0/24",
+        "LAB_IMAGES_LOCK": str(lock),
+        "LAB_IMAGE_OVERRIDES": "goat-dvga=localhost/goat-dvga:dev",
+        "LAB_ENGINE": "podman",
+        "LAB_REQUIRE_DIGESTS": "0",
+        "LAB_DEV": "1",
+    }
+    settings = CellSettings.from_env(dev)
     assert settings.cell_networks == (POOL, ipaddress.IPv4Network("10.232.0.0/24"))
     assert settings.image("lab-cell") == f"ghcr.io/lordprime/lab-cell@sha256:{'c' * 64}"
     assert settings.image("goat-dvga") == "localhost/goat-dvga:dev"
     assert settings.engine is Engine.PODMAN
+    assert settings.role("kali") == "agent" and settings.role("lab-cell") == "infra"
     with pytest.raises(CellError, match="LAB_CELL_NETWORKS"):
         CellSettings.from_env({"LAB_CELL_NETWORKS": "8.8.8.0/24", "LAB_IMAGES_LOCK": str(lock)})
     with pytest.raises(CellError, match="LAB_CELL_NETWORKS"):
         CellSettings.from_env({"LAB_IMAGES_LOCK": str(lock)})
+
+
+@pytest.mark.parametrize(
+    "over", [{"LAB_ENGINE": "podman"}, {"LAB_REQUIRE_DIGESTS": "0"}], ids=["podman", "no-digest"]
+)
+def test_dev_only_settings_need_lab_dev(
+    tmp_path: Path, over: dict[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    lock = tmp_path / "images.lock"
+    lock.write_text("images: []\n")
+    env = {"LAB_CELL_NETWORKS": "10.231.0.0/16", "LAB_IMAGES_LOCK": str(lock), **over}
+    with pytest.raises(CellError, match="LAB_DEV"):
+        CellSettings.from_env(env)
+    with pytest.raises(CellError, match="LAB_DEV"):
+        CellSettings(
+            images=IMAGES,
+            engine=Engine(over.get("LAB_ENGINE", "docker")),
+            require_digests=over.get("LAB_REQUIRE_DIGESTS", "1") == "1",
+        )
+    assert CellSettings.from_env({**env, "LAB_DEV": "1"}).dev is True
+    assert "LAB_DEV" in caplog.text  # allowed, but never silently
+
+
+def test_cell_guard_allows_only_agent_role_images(
+    experiment: Experiment, schedule: list[ScheduledRun]
+) -> None:
+    kali = "docker.io/kali@sha256:" + "d" * 64
+    spec = AgentSpec(name="scripted", image="lab-cell", command=("python",), needs_docker=True)
+    settings = _settings(images={**IMAGES, "kali": kali}, roles={"kali": "agent"})
+    _, _, project = _render(experiment, schedule, Arm.CONTROL, agent_spec=spec, settings=settings)
+    lock = yaml.safe_load(_file(project, "cfg_cellguard", "images.lock"))
+    assert lock == {
+        "images": [
+            {
+                "name": "kali",
+                "image": "docker.io/kali",
+                "digest": "sha256:" + "d" * 64,
+                "role": "agent",
+            }
+        ]
+    }
 
 
 # --------------------------------------------------------------------------- subnets

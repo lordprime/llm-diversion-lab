@@ -1517,9 +1517,42 @@ def test_decision_log_rejects_bad_run_id(tmp_path: Path) -> None:
         DecisionLog("../escape", tmp_path / "x.jsonl")
 
 
+def test_only_agent_role_images_are_allowed(tmp_path: Path) -> None:
+    lock = tmp_path / "images.lock"
+    lock.write_text(
+        "images:\n"
+        f"  - {{name: kali, image: kali, digest: {DIGEST_B}, role: agent}}\n"
+        f"  - {{name: goat-dvga, image: goat, digest: {DIGEST_B}, role: target}}\n"
+        f"  - {{name: lab-cell, image: cell, digest: {DIGEST_B}, role: infra}}\n"
+        f"  - {{name: base, image: base, digest: {DIGEST_B}}}\n"
+        f"  - {{name: postgres, image: pg, digest: {DIGEST_B}, role: control}}\n"
+    )
+    every = load_images_lock(lock)
+    assert {i.name: i.role for i in every} == {
+        "kali": "agent",
+        "goat-dvga": "target",
+        "lab-cell": "infra",
+        "base": "infra",  # the default
+        "postgres": "control",
+    }
+    env = {
+        "LAB_RUN_ID": RUN,
+        "LAB_CELLGUARD_NETWORK": NETWORK,
+        "LAB_CELLGUARD_DNS": CELL_DNS,
+        "LAB_CELLGUARD_IMAGES_LOCK": str(lock),
+        "LAB_EVIDENCE_DIR": str(tmp_path / "ev"),
+    }
+    config = CellGuardConfig.from_env(env)
+    assert [i.name for i in config.context.images] == ["kali"]
+    with pytest.raises(ValueError, match="role"):
+        load_images_lock([{"name": "x", "image": "x", "digest": DIGEST_B, "role": "root"}])
+
+
 def test_config_from_env(tmp_path: Path) -> None:
     lock = tmp_path / "images.lock"
-    lock.write_text(f"images:\n  - name: alpine-3\n    image: alpine\n    digest: {DIGEST_B}\n")
+    lock.write_text(
+        f"images:\n  - name: alpine-3\n    image: alpine\n    digest: {DIGEST_B}\n    role: agent\n"
+    )
     env = {
         "LAB_RUN_ID": RUN,
         "LAB_EVIDENCE_DIR": str(tmp_path / "ev"),
@@ -1537,7 +1570,7 @@ def test_config_from_env(tmp_path: Path) -> None:
     config = CellGuardConfig.from_env(env)
     assert config.context.run_id == RUN
     assert config.context.network == NETWORK
-    assert config.context.images == (AllowedImage("alpine-3", "alpine", DIGEST_B),)
+    assert config.context.images == (AllowedImage("alpine-3", "alpine", DIGEST_B, role="agent"),)
     assert config.max_connections == 8
     assert config.context.memory_bytes == 268435456
     assert config.context.pids_limit == 128

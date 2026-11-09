@@ -56,6 +56,21 @@ def test_entry_format(index: int) -> None:
     assert all(isinstance(t, str) and t for t in tools), f"{name}: tools must be names"
     assert len(set(tools)) == len(tools), f"{name}: duplicate tools"
 
+    # agent | target | infra | control; cell-guard lets agents start only `agent` ones
+    role = entry.get("role")
+    assert role in ("agent", "target", "infra", "control"), f"{name}: role {role!r}"
+
+
+def test_both_loaders_read_the_same_roles() -> None:
+    from cell.cellguard.policy import load_images_lock
+    from control.runner.cell_spec import CellSettings
+
+    by_guard = {i.name: i.role for i in load_images_lock(LOCK_FILE)}
+    settings = CellSettings.from_env(
+        {"LAB_CELL_NETWORKS": "10.231.0.0/16", "LAB_IMAGES_LOCK": str(LOCK_FILE)}
+    )
+    assert {n: settings.role(n) for n in by_guard} == by_guard
+
 
 def test_names_are_unique() -> None:
     names = [e.get("name") for e in _entries()]
