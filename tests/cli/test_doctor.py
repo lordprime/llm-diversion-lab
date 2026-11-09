@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import socketserver
 import threading
 from collections.abc import Iterator
@@ -117,6 +118,18 @@ def _config(tmp_path: Path, **kw: Any) -> DoctorConfig:
 def _write_host_env(tmp_path: Path, text: str = VALID_HOST_ENV) -> None:
     (tmp_path / "lab").mkdir(exist_ok=True)
     (tmp_path / "lab" / "host.env").write_text(text, encoding="utf-8")
+
+
+ME = pwd.getpwuid(os.getuid()).pw_name
+
+
+def _write_lab_env(tmp_path: Path, mode: int = 0o600) -> Path:
+    secrets = tmp_path / "lab" / "secrets"
+    secrets.mkdir(parents=True, exist_ok=True)
+    path = secrets / "lab.env"
+    path.write_text("LAB_DB_PASSWORD=" + "a" * 64 + "\n", encoding="utf-8")
+    path.chmod(mode)
+    return path
 
 
 def _by_name(results: list[CheckResult]) -> dict[str, CheckResult]:
@@ -393,11 +406,13 @@ def test_all_checks_pass_end_to_end(
     tmp_path: Path, db_url: str, engine: Engine, docker_socket: Path, collector_client: TestClient
 ) -> None:
     _write_host_env(tmp_path)
+    _write_lab_env(tmp_path)
     cfg = _config(
         tmp_path,
         settings=LabSettings.from_environ(
             {"LAB_ROOT": str(tmp_path / "lab"), "LAB_COLLECTOR_URL": "http://testserver"}
         ),
+        secrets_owners=frozenset({ME}),
         database_url=db_url,
         docker_host=f"unix://{docker_socket}",
         egress_command=_egress(tmp_path, 0),
@@ -407,3 +422,71 @@ def test_all_checks_pass_end_to_end(
     assert {r.name: r.status for r in results} == dict.fromkeys(CHECK_NAMES, Status.OK)
     assert exit_code(results) == 0
     assert os.environ.get("LAB_ROOT") is None  # nothing leaked into the process env
+
+
+# --------------------------------------------------------------------- lab.env
+
+
+def test_secrets_skipped_off_host(tmp_path: Path) -> None:
+    result = doctor.check_secrets(_config(tmp_path))
+    assert result.status is Status.SKIP
+
+
+def test_secrets_ok_when_0600_and_owned_by_an_allowed_user(tmp_path: Path) -> None:
+    _write_host_env(tmp_path)
+    _write_lab_env(tmp_path)
+    result = doctor.check_secrets(_config(tmp_path, secrets_owners=frozenset({ME})))
+    assert result.status is Status.OK, result.detail
+    assert "0600" in result.detail
+
+
+@pytest.mark.parametrize("mode", [0o640, 0o644, 0o604, 0o700])
+def test_secrets_fail_on_a_loose_mode(tmp_path: Path, mode: int) -> None:
+    _write_host_env(tmp_path)
+    _write_lab_env(tmp_path, mode)
+    result = doctor.check_secrets(_config(tmp_path, secrets_owners=frozenset({ME})))
+    assert result.status is Status.FAIL
+    assert oct(mode)[2:] in result.detail
+
+
+def test_secrets_fail_on_a_foreign_owner(tmp_path: Path) -> None:
+    _write_host_env(tmp_path)
+    _write_lab_env(tmp_path)
+    result = doctor.check_secrets(_config(tmp_path))  # default owners: root, lab
+    if ME in {"root", "lab"}:
+        pytest.skip("the test user is an allowed owner")
+    assert result.status is Status.FAIL
+    assert ME in result.detail
+
+
+def test_secrets_fail_when_missing_on_the_host(tmp_path: Path) -> None:
+    _write_host_env(tmp_path)
+    result = doctor.check_secrets(_config(tmp_path))
+    assert result.status is Status.FAIL
+    assert "lab.env" in result.detail
+
+
+def test_default_secret_owners() -> None:
+    assert frozenset({"root", "lab"}) == doctor.DEFAULT_SECRETS_OWNERS
+
+
+def test_metrics_need_a_positive_database_up(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="# TYPE lab_runs_total counter\n")
+
+    cfg = _config(
+        tmp_path,
+        settings=LabSettings.from_environ(
+            {"LAB_ROOT": str(tmp_path), "LAB_COLLECTOR_URL": "http://collector"}
+        ),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    result = doctor.check_metrics(cfg)
+    assert result.status is Status.FAIL
+    assert "lab_metrics_database_up" in result.detail
+
+
+def test_unparsable_database_url_is_a_clean_failure(tmp_path: Path) -> None:
+    result = doctor.check_database(_config(tmp_path, database_url="not a url"))
+    assert result.status is Status.FAIL
+    assert "not a valid" in result.detail

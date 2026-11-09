@@ -9,6 +9,8 @@ Environment overrides (tests and development):
 
 * ``LAB_ROOT``: the lab tree (default ``/srv/lab``);
 * ``LAB_COLLECTOR_URL``: the Collector's base URL;
+* ``LAB_SELFTEST_STATUS_FILE``: the self-test status (default
+  ``<LAB_ROOT>/state/selftest.json``);
 * ``DATABASE_URL``: the database. Without it, labctl builds the URL from
   :data:`DB_PASSWORD_VAR` in ``<LAB_ROOT>/secrets/lab.env`` (the same file compose
   reads with ``--env-file``). The password never appears in argv or in output.
@@ -25,6 +27,7 @@ from typing import Final
 
 from sqlalchemy.engine import URL
 
+from control.core.selftest_status import SELFTEST_STATUS_ENV
 from control.db.engine import DATABASE_URL_ENV, database_url
 
 __all__ = [
@@ -102,6 +105,13 @@ class LabSettings:
     @property
     def release_file(self) -> Path:
         return self.lab_root / "current" / "RELEASE"
+
+    @property
+    def selftest_status_file(self) -> Path:
+        """``$LAB_SELFTEST_STATUS_FILE``, else ``<LAB_ROOT>/state/selftest.json``."""
+        if env := self.environ.get(SELFTEST_STATUS_ENV):
+            return Path(env)
+        return self.lab_root / "state" / "selftest.json"
 
     def database_url(self) -> str:
         """``$DATABASE_URL``, else the host's control-plane database from lab.env.

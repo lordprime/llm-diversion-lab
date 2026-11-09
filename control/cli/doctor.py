@@ -13,6 +13,9 @@ failed (skips allowed), 1 when any check failed, 2 for a usage error.
 * ``host_env``: ``/srv/lab/host.env`` exists and ``LAB_CELL_NETWORKS`` is a
   comma-separated list of IPv4 networks, each written strictly (no host bits),
   inside :data:`DEFAULT_CELL_RANGE` (``--cell-range``), not overlapping.
+* ``secrets``: on the lab host, ``/srv/lab/secrets/lab.env`` exists, is mode
+  ``0600`` and is owned by root or ``lab`` (:data:`DEFAULT_SECRETS_OWNERS`;
+  secrets.sh writes it ``0600 lab``). Skipped off the host.
 * ``firewall``: on the lab host, ``lab-cell-egress check`` (both firewall layers
   loaded and as expected) must pass. Off the host (neither host.env nor the tool
   present) it is skipped with a message. On the host a missing tool is a failure.
@@ -26,6 +29,9 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import pwd
+import re
+import stat
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -36,7 +42,7 @@ from typing import Final
 
 import httpx
 from sqlalchemy import pool
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 
 from control.cli.migrations import current_revisions, head_revisions
 from control.cli.settings import ConfigError, LabSettings, read_env_file
@@ -48,6 +54,7 @@ __all__ = [
     "DEFAULT_CELL_RANGE",
     "DEFAULT_DOCKER_SOCKET",
     "DEFAULT_EGRESS_COMMAND",
+    "DEFAULT_SECRETS_OWNERS",
     "CheckResult",
     "DoctorConfig",
     "Status",
@@ -61,6 +68,8 @@ __all__ = [
 DEFAULT_CELL_RANGE: Final = IPv4Network("10.231.0.0/16")
 DEFAULT_DOCKER_SOCKET: Final = Path("/var/run/docker.sock")
 DEFAULT_EGRESS_COMMAND: Final = Path("/usr/local/sbin/lab-cell-egress")
+#: Who may own lab.env: root, or the lab user secrets.sh writes it as.
+DEFAULT_SECRETS_OWNERS: Final = frozenset({"root", "lab"})
 TIMEOUT_S: Final = 10.0
 _DETAIL_CHARS: Final = 400
 
@@ -91,6 +100,7 @@ class DoctorConfig:
     #: the database to check; ``None`` resolves it from :attr:`settings`
     database_url: str | None = None
     timeout: float = TIMEOUT_S
+    secrets_owners: frozenset[str] = DEFAULT_SECRETS_OWNERS
 
     @property
     def on_lab_host(self) -> bool:
@@ -117,6 +127,9 @@ def check_database(cfg: DoctorConfig) -> CheckResult:
         engine = create_db_engine(
             url, poolclass=pool.NullPool, connect_args={"connect_timeout": int(cfg.timeout)}
         )
+    except ArgumentError:
+        # never echo the URL: it may hold a password
+        return CheckResult(name, Status.FAIL, "DATABASE_URL is not a valid database URL")
     except (ConfigError, ValueError) as exc:
         return CheckResult(name, Status.FAIL, _detail(str(exc)))
     try:
@@ -176,13 +189,17 @@ def check_metrics(cfg: DoctorConfig) -> CheckResult:
         return CheckResult(name, Status.FAIL, f"{where} answered HTTP {r.status_code}")
     if "# TYPE lab_runs_total counter" not in r.text:
         return CheckResult(name, Status.FAIL, f"{where} does not serve lab_runs_total")
-    if "lab_metrics_database_up 0" in r.text:
+    if not _DB_UP.search(r.text):
         return CheckResult(
             name,
             Status.FAIL,
             f"{where} is up but cannot read the database (lab_metrics_database_up 0)",
         )
     return CheckResult(name, Status.OK, f"{where} serves the lab metrics")
+
+
+#: The Collector read the database in this scrape (a positive sample, not just no 0).
+_DB_UP = re.compile(r"^lab_metrics_database_up 1(?:\.0)?$", re.M)
 
 
 # --------------------------------------------------------------------- docker
@@ -279,6 +296,35 @@ def check_host_env(cfg: DoctorConfig) -> CheckResult:
     )
 
 
+# --------------------------------------------------------------------- lab.env
+
+
+def check_secrets(cfg: DoctorConfig) -> CheckResult:
+    name = "secrets"
+    path = cfg.settings.secrets_env_file
+    if not cfg.on_lab_host:
+        return CheckResult(name, Status.SKIP, "not on the lab host")
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return CheckResult(name, Status.FAIL, f"{path} is missing (bootstrap.sh, secrets.sh)")
+    except OSError as exc:
+        return CheckResult(name, Status.FAIL, f"{path} unreadable: " + _error(exc))
+    mode = stat.S_IMODE(st.st_mode)
+    try:
+        owner = pwd.getpwuid(st.st_uid).pw_name
+    except KeyError:
+        owner = str(st.st_uid)
+    problems = []
+    if mode != 0o600:
+        problems.append(f"mode {mode:04o}, expected 0600")
+    if owner not in cfg.secrets_owners:
+        problems.append(f"owned by {owner}, expected {' or '.join(sorted(cfg.secrets_owners))}")
+    if problems:
+        return CheckResult(name, Status.FAIL, f"{path}: " + "; ".join(problems))
+    return CheckResult(name, Status.OK, f"{path}: mode 0600, owner {owner}")
+
+
 # --------------------------------------------------------------------- firewall
 
 
@@ -315,6 +361,7 @@ _CHECKS: Final[tuple[tuple[str, str], ...]] = (
     ("metrics", "check_metrics"),
     ("docker", "check_docker"),
     ("host_env", "check_host_env"),
+    ("secrets", "check_secrets"),
     ("firewall", "check_firewall"),
 )
 CHECK_NAMES: Final[tuple[str, ...]] = tuple(name for name, _ in _CHECKS)

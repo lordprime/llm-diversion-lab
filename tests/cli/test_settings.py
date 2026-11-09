@@ -78,3 +78,12 @@ def test_empty_password_is_not_accepted(tmp_path: Path) -> None:
     (tmp_path / "secrets" / "lab.env").write_text(f"{DB_PASSWORD_VAR}=\n", encoding="utf-8")
     with pytest.raises(ConfigError):
         LabSettings.from_environ({"LAB_ROOT": str(tmp_path)}).database_url()
+
+
+def test_selftest_status_file_defaults_under_lab_root(tmp_path: Path) -> None:
+    s = LabSettings.from_environ({"LAB_ROOT": str(tmp_path)})
+    assert s.selftest_status_file == tmp_path / "state" / "selftest.json"
+    s = LabSettings.from_environ(
+        {"LAB_ROOT": str(tmp_path), "LAB_SELFTEST_STATUS_FILE": str(tmp_path / "x.json")}
+    )
+    assert s.selftest_status_file == tmp_path / "x.json"

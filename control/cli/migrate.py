@@ -15,7 +15,7 @@ import logging
 from collections.abc import Sequence
 
 from sqlalchemy import pool
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 
 from control.cli.migrations import current_revisions, head_revisions, upgrade_head
 from control.cli.settings import ConfigError, LabSettings
@@ -36,6 +36,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         engine = create_db_engine(
             LabSettings.from_environ().database_url(), poolclass=pool.NullPool
         )
+    except ArgumentError:
+        log.error("migrate: DATABASE_URL is not a valid database URL")
+        return 1
     except (ConfigError, ValueError) as exc:
         log.error("migrate: %s", exc)
         return 1

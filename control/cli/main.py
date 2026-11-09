@@ -9,7 +9,7 @@ Commands (each takes ``--json`` for scripting):
 * ``labctl selftest [--quick]``: **not built yet** (Task 15b-2); exits 2.
 
 Exit status: 0 success; 1 a check failed, the database is unreachable or the run does
-not exist; 2 usage error (and the selftest stub).
+not exist; 2 usage error (an unparsable ``DATABASE_URL`` included) and the selftest stub.
 
 Every command first calls :func:`~control.core.logging.configure_logging` (redacted
 JSON on **stderr**, level WARNING), so any log line, ours or a library's, is redacted
@@ -29,7 +29,7 @@ from ipaddress import IPv4Network
 from typing import Any, Final
 
 from sqlalchemy import Engine, pool
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from control.cli import doctor, queries
@@ -49,7 +49,11 @@ SELFTEST_STUB_MESSAGE: Final = "labctl selftest: not built yet (Task 15b-2)"
 
 
 class _Failure(Exception):
-    """A command failed; the message goes to stderr and labctl exits 1."""
+    """A command failed; the message goes to stderr and labctl exits ``code`` (1)."""
+
+    def __init__(self, message: str, code: int = EXIT_FAIL) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # --------------------------------------------------------------------- helpers
@@ -67,6 +71,10 @@ def _engine(settings: LabSettings) -> Engine:
     try:
         url = settings.database_url()
         return create_db_engine(url, poolclass=pool.NullPool, connect_args={"connect_timeout": 10})
+    except ArgumentError:
+        # an unparsable DATABASE_URL: a usage error; never echo the URL (it may hold
+        # a password)
+        raise _Failure("DATABASE_URL is not a valid database URL", EXIT_USAGE) from None
     except (ConfigError, ValueError) as exc:
         raise _Failure(str(exc)) from None
 
@@ -120,7 +128,9 @@ def _cmd_status(args: argparse.Namespace, settings: LabSettings) -> int:
         settings, lambda s: (queries.run_status_counts(s), queries.experiment_count(s))
     )
     try:
-        selftest: dict[str, Any] | None = read_selftest_status().to_json()
+        selftest: dict[str, Any] | None = read_selftest_status(
+            settings.selftest_status_file
+        ).to_json()
         selftest_error = None
     except SelftestStatusError as exc:
         selftest, selftest_error = None, str(exc)
@@ -328,7 +338,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         return int(args.handler(args, settings))
     except _Failure as exc:
         sys.stderr.write(f"labctl {args.command}: {exc}\n")
-        return EXIT_FAIL
+        return exc.code
 
 
 def main(argv: Sequence[str] | None = None) -> int:

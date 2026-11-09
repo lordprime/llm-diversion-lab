@@ -289,3 +289,30 @@ def test_status_without_release_or_selftest(
     assert rc == 0
     assert "release: none" in out
     assert "self-test: never run" in out
+
+
+def test_unparsable_database_url_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", "not a url")
+    rc, out, err = _run(capsys, "runs", "ls")
+    assert rc == 2
+    assert "DATABASE_URL" in err
+    assert "Traceback" not in out + err
+
+
+def test_status_finds_the_selftest_under_lab_root(
+    lab_db: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("LAB_SELFTEST_STATUS_FILE")
+    record_selftest_result(
+        SelftestResult(passed=True, finished_at=1_800_000_000.0, quick=True),
+        tmp_path / "lab" / "state" / "selftest.json",
+    )
+    rc, out, _ = _run(capsys, "status", "--json")
+    assert rc == 0
+    assert json.loads(out)["selftest"]["last_success"]["finished_at"] == 1_800_000_000.0
+
