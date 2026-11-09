@@ -2,26 +2,41 @@ name: build-images
 
 # Builds the lab's own images, checks each one and pushes it to GHCR:
 #
-# * goat-dvga  (role target)  targets/dvga/Dockerfile: the DVGA lab fork + CVE-Bench
-#   evaluator, from the fork commits pinned in targets/dvga/source.yaml and
-#   cell/oracle/source.yaml.
+# * goat-<name> (role target) one per GOAT that has an image recipe, i.e. every
+#   targets/<name>/Dockerfile. The GOAT's own scripts build and check it
+#   (targets/<name>/ci/build.sh and check.sh), from the fork commit pinned in
+#   targets/<name>/source.yaml and the CVE-Bench evaluator pinned in
+#   cell/oracle/source.yaml; targets/<name>/ci/expect_tools holds its images.lock
+#   expect_tools. A target without a Dockerfile is listed as not built yet.
 # * lab-cell   (role infra)   cell/Dockerfile, context the repository root (the root
 #   .dockerignore allow-list): injector, tap, catcher, stub LLM, cell-guard, probe.
 # * control    (role control) deploy/compose/control.Dockerfile, context the
 #   repository root (its own control.Dockerfile.dockerignore): Collector + migrate.
 #
-# Each job publishes the digest it pushed in its job summary and a
-# `<job>-digest` artifact holding a ready deploy/images.lock entry. Recording a
+# Every image of one run gets the same tag, chosen by the `plan` job: the `version`
+# input of a manual run (e.g. v0.2.0), else the pushed `lab-v*` git tag, else
+# sha-<12 hex of the commit>. A named version is pushed once: a tag that already
+# exists on GHCR is refused, never moved.
+#
+# Each image job publishes the digest it pushed in its job summary and a
+# `<image>-digest` artifact holding a ready deploy/images.lock entry. Recording a
 # digest in deploy/images.lock is a normal reviewed commit, never done here.
 #
 # Rules every job keeps (tests/deploy/test_build_images_workflow.py checks them):
 # actions pinned by full commit SHA, checkout with persist-credentials: false,
-# permissions granted per job (contents: read, packages: write) and none at the top.
+# permissions granted per job (contents: read, plus packages: write for the jobs
+# that push) and none at the top.
 on:
   push:
     tags:
       - "lab-v*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag for every image, e.g. v0.2.0. Leave empty for sha-<commit>. An existing tag is refused."
+        required: false
+        default: ""
+        type: string
 
 permissions: {}
 
@@ -30,14 +45,79 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  goat-dvga:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      goats: ${{ steps.goats.outputs.goats }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Choose the image tag
+        id: tag
+        env:
+          VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          tag="sha-${GITHUB_SHA::12}"
+          if [[ "$REF_TYPE" == tag ]]; then tag="$REF_NAME"; fi
+          if [[ -n "${VERSION:-}" ]]; then
+            [[ "$VERSION" != sha-* ]] || { echo "::error::sha-* tags are kept for unnamed builds: $VERSION" >&2; exit 1; }
+            tag="$VERSION"
+          fi
+          [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || { echo "::error::not a valid image tag: $tag" >&2; exit 1; }
+          [[ "$tag" != latest ]] || { echo "::error::latest is not a version" >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Image tag for this run: \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Find the GOATs with an image recipe
+        id: goats
+        run: |
+          set -euo pipefail
+          goats=()
+          pending=()
+          for dir in targets/*/; do
+            g=$(basename "$dir")
+            if [[ ! -f "targets/$g/Dockerfile" ]]; then pending+=("$g"); continue; fi
+            [[ "$g" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "::error::bad GOAT directory name: $g" >&2; exit 1; }
+            for need in source.yaml ci/build.sh ci/check.sh ci/expect_tools; do
+              [[ -f "targets/$g/$need" ]] || { echo "::error::targets/$g has a Dockerfile but no $need" >&2; exit 1; }
+            done
+            goats+=("$g")
+          done
+          (( ${#goats[@]} )) || { echo "::error::no targets/<name>/Dockerfile found" >&2; exit 1; }
+          # names are [a-z0-9-] (checked above), so a plain JSON list needs no escaping
+          json=$(printf '"%s",' "${goats[@]}")
+          echo "goats=[${json%,}]" >> "$GITHUB_OUTPUT"
+          {
+            echo
+            echo "GOAT images built: ${goats[*]}"
+            if (( ${#pending[@]} )); then echo; echo "Not built yet (no Dockerfile): ${pending[*]}"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  goat:
+    name: goat-${{ matrix.goat }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        goat: ${{ fromJSON(needs.plan.outputs.goats) }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read
       packages: write
     env:
-      IMAGE: ghcr.io/lordprime/goat-dvga
+      GOAT: ${{ matrix.goat }}
+      IMAGE: ghcr.io/lordprime/goat-${{ matrix.goat }}
+      TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -49,26 +129,26 @@ jobs:
           set -euo pipefail
           # top-level `key: value` of a source.yaml (indented upstream keys don't match)
           read_pin() { sed -n "s/^$2:[[:space:]]*\([^[:space:]#]*\).*/\1/p" "$1"; }
-          dvga_repo=$(read_pin targets/dvga/source.yaml repo)
-          dvga_commit=$(read_pin targets/dvga/source.yaml build_commit)
+          app_repo=$(read_pin "targets/$GOAT/source.yaml" repo)
+          app_commit=$(read_pin "targets/$GOAT/source.yaml" build_commit)
           eval_repo=$(read_pin cell/oracle/source.yaml repo)
           eval_commit=$(read_pin cell/oracle/source.yaml build_commit)
-          [[ "$dvga_repo" == https://github.com/* && "$eval_repo" == https://github.com/* ]] \
+          [[ "$app_repo" == https://github.com/* && "$eval_repo" == https://github.com/* ]] \
             || { echo "unexpected fork repo URL" >&2; exit 1; }
-          for c in "$dvga_commit" "$eval_commit"; do
+          for c in "$app_commit" "$eval_commit"; do
             [[ "$c" =~ ^[0-9a-f]{40}$ ]] || { echo "not a full commit sha: $c" >&2; exit 1; }
           done
           {
-            echo "dvga_repo=$dvga_repo"
-            echo "dvga_commit=$dvga_commit"
+            echo "app_repo=$app_repo"
+            echo "app_commit=$app_commit"
             echo "eval_repo=$eval_repo"
             echo "eval_commit=$eval_commit"
           } >> "$GITHUB_OUTPUT"
 
       - name: Clone forks at the pinned commits
         env:
-          DVGA_REPO: ${{ steps.pins.outputs.dvga_repo }}
-          DVGA_COMMIT: ${{ steps.pins.outputs.dvga_commit }}
+          APP_REPO: ${{ steps.pins.outputs.app_repo }}
+          APP_COMMIT: ${{ steps.pins.outputs.app_commit }}
           EVAL_REPO: ${{ steps.pins.outputs.eval_repo }}
           EVAL_COMMIT: ${{ steps.pins.outputs.eval_commit }}
         run: |
@@ -79,70 +159,25 @@ jobs:
             git -C "$3" checkout --quiet --detach FETCH_HEAD
             test "$(git -C "$3" rev-parse HEAD)" = "$2"
           }
-          fetch "$DVGA_REPO" "$DVGA_COMMIT" "$RUNNER_TEMP/dvga"
+          fetch "$APP_REPO" "$APP_COMMIT" "$RUNNER_TEMP/app"
           fetch "$EVAL_REPO" "$EVAL_COMMIT" "$RUNNER_TEMP/cvebench"
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build
         env:
-          DVGA_COMMIT: ${{ steps.pins.outputs.dvga_commit }}
+          APP_COMMIT: ${{ steps.pins.outputs.app_commit }}
           EVAL_COMMIT: ${{ steps.pins.outputs.eval_commit }}
         run: |
           set -euo pipefail
-          docker buildx build --load \
-            -f targets/dvga/Dockerfile \
-            --build-context dvga="$RUNNER_TEMP/dvga" \
-            --build-context cvebench="$RUNNER_TEMP/cvebench" \
-            --build-arg DVGA_COMMIT="$DVGA_COMMIT" \
-            --build-arg EVALUATOR_COMMIT="$EVAL_COMMIT" \
-            --label org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
-            --label org.opencontainers.image.revision="${GITHUB_SHA}" \
-            -t goat-dvga:ci \
-            targets/dvga
-
-      - name: Check tools and permissions inside the image
-        run: |
-          set -euo pipefail
-          # tools the app and CVE-Bench's scripts need
-          docker run --rm --entrypoint /bin/bash goat-dvga:ci -c 'command -v curl && command -v bash'
-          # as the app user: nothing that decides the result is readable
-          docker run --rm --user dvga --entrypoint /bin/bash goat-dvga:ci -c '
-            set -u
-            fail=0
-            for p in /opt/support/grader.py /opt/support/launch.sh /cve_metadata.yml /entrypoint.sh; do
-              if cat "$p" >/dev/null 2>&1; then echo "readable by dvga: $p"; fail=1; fi
-            done
-            for d in /opt/support /run/secrets; do
-              if ls "$d" >/dev/null 2>&1; then echo "listable by dvga: $d"; fail=1; fi
-            done
-            for v in APPLICATION_NAME GRADER_OBJECTIVE; do
-              if [ -n "${!v:-}" ]; then echo "image-wide env leaks $v"; fail=1; fi
-            done
-            exit $fail'
-          # ownership and modes, as root
-          docker run --rm --entrypoint /bin/bash goat-dvga:ci -c '
-            set -eu
-            test "$(stat -c %U:%G:%a /opt/support)" = root:root:700
-            test "$(stat -c %U:%G:%a /run/secrets)" = root:root:700
-            test "$(stat -c %U:%G:%a /cve_metadata.yml)" = root:root:400
-            test "$(stat -c %U:%G:%a /opt/support/launch.sh)" = root:root:700
-            test ! -e /opt/dvga/requirements.txt
-            test ! -e /opt/dvga/README.md
-            test ! -e /opt/dvga/tests
-            # the base image ships one requirements.txt (mercurial help text); no other
-            test -z "$(find / -xdev -name requirements.txt ! -path "/usr/lib/python3/dist-packages/mercurial/*" -print -quit)"
-            ! grep -rli diversion /opt/dvga /opt/venv /opt/support /cve_metadata.yml /entrypoint.sh'
+          APP_SRC="$RUNNER_TEMP/app" EVAL_SRC="$RUNNER_TEMP/cvebench" \
+            SOURCE_URL="https://github.com/${GITHUB_REPOSITORY}" REVISION="${GITHUB_SHA}" \
+            bash "targets/$GOAT/ci/build.sh" "goat-$GOAT:ci"
 
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
-      - name: Run the image's behaviour tests (health, done, permissions, objective, crash)
-        env:
-          GOAT_DVGA_IMAGE: goat-dvga:ci
-          GOAT_DVGA_REQUIRE: "1"
-        run: |
-          uv sync --frozen
-          uv run pytest -v tests/targets/test_dvga_image.py
+      - name: Check the image (the GOAT's own checks and behaviour tests)
+        run: bash "targets/$GOAT/ci/check.sh" "goat-$GOAT:ci"
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -153,50 +188,49 @@ jobs:
 
       - name: Push
         id: push
-        env:
-          REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
-          tag="sha-${GITHUB_SHA::12}"
-          if [[ "$REF_TYPE" == tag ]]; then tag="$REF_NAME"; fi
-          docker tag goat-dvga:ci "$IMAGE:$tag"
-          docker push "$IMAGE:$tag" | tee push.log
+          # a named version is pushed once: never move a tag that already exists
+          if [[ "$TAG" != sha-* ]] && docker buildx imagetools inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
+            echo "::error::$IMAGE:$TAG already exists; choose a new version" >&2; exit 1
+          fi
+          docker tag "goat-$GOAT:ci" "$IMAGE:$TAG"
+          docker push "$IMAGE:$TAG" | tee push.log
           # the digest the registry reported for this push (the daemon's RepoDigests
           # can list the local build name first, so it is not used)
           digest=$(sed -n 's/^.*digest: \(sha256:[0-9a-f]*\) size: [0-9]*$/\1/p' push.log | tail -n1)
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad digest: $digest" >&2; exit 1; }
           # and the registry must now serve exactly that digest at the tag
-          served=$(docker buildx imagetools inspect "$IMAGE:$tag" --format '{{json .Manifest}}' | jq -r .digest)
-          [[ "$served" == "$digest" ]] || { echo "registry serves $served at $IMAGE:$tag, push said $digest" >&2; exit 1; }
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          served=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest}}' | jq -r .digest)
+          [[ "$served" == "$digest" ]] || { echo "registry serves $served at $IMAGE:$TAG, push said $digest" >&2; exit 1; }
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Record the digest
         env:
-          TAG: ${{ steps.push.outputs.tag }}
           DIGEST: ${{ steps.push.outputs.digest }}
-          DVGA_COMMIT: ${{ steps.pins.outputs.dvga_commit }}
+          APP_COMMIT: ${{ steps.pins.outputs.app_commit }}
           EVAL_COMMIT: ${{ steps.pins.outputs.eval_commit }}
         run: |
           set -euo pipefail
+          expect_tools=$(head -n1 "targets/$GOAT/ci/expect_tools")
+          [[ "$expect_tools" =~ ^\[[a-z0-9_.,\ -]+\]$ ]] || { echo "bad expect_tools: $expect_tools" >&2; exit 1; }
           cat > images.lock.entry.yml <<EOF
           # Paste into deploy/images.lock in a reviewed commit.
-            - name: goat-dvga
+            - name: goat-${GOAT}
               image: ${IMAGE}
               digest: ${DIGEST}
-              expect_tools: [curl, bash]
+              expect_tools: ${expect_tools}
               role: target
-              # tag ${TAG}; dvga ${DVGA_COMMIT}; evaluator ${EVAL_COMMIT}
+              # tag ${TAG}; ${GOAT} ${APP_COMMIT}; evaluator ${EVAL_COMMIT}
           EOF
           {
-            echo "## goat-dvga"
+            echo "## goat-${GOAT}"
             echo
             echo "Pushed \`${IMAGE}:${TAG}\`"
             echo
             echo "**Digest:** \`${DIGEST}\`"
             echo
-            echo "- DVGA fork commit: \`${DVGA_COMMIT}\`"
+            echo "- ${GOAT} fork commit: \`${APP_COMMIT}\`"
             echo "- CVE-Bench fork commit: \`${EVAL_COMMIT}\`"
             echo
             echo "deploy/images.lock entry (commit it by hand, after review):"
@@ -208,10 +242,11 @@ jobs:
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: goat-dvga-digest
+          name: goat-${{ matrix.goat }}-digest
           path: images.lock.entry.yml
 
   lab-cell:
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -219,6 +254,7 @@ jobs:
       packages: write
     env:
       IMAGE: ghcr.io/lordprime/lab-cell
+      TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -275,13 +311,13 @@ jobs:
 
       - name: Push
         id: push
-        env:
-          REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
-          tag="sha-${GITHUB_SHA::12}"
-          if [[ "$REF_TYPE" == tag ]]; then tag="$REF_NAME"; fi
+          tag="$TAG"
+          # a named version is pushed once: never move a tag that already exists
+          if [[ "$tag" != sha-* ]] && docker buildx imagetools inspect "$IMAGE:$tag" >/dev/null 2>&1; then
+            echo "::error::$IMAGE:$tag already exists; choose a new version" >&2; exit 1
+          fi
           docker tag lab-cell:ci "$IMAGE:$tag"
           docker push "$IMAGE:$tag" | tee push.log
           # the digest the registry reported for this push (the daemon's RepoDigests
@@ -331,6 +367,7 @@ jobs:
           path: images.lock.entry.yml
 
   control:
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -338,6 +375,7 @@ jobs:
       packages: write
     env:
       IMAGE: ghcr.io/lordprime/control
+      TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -388,13 +426,13 @@ jobs:
 
       - name: Push
         id: push
-        env:
-          REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
-          tag="sha-${GITHUB_SHA::12}"
-          if [[ "$REF_TYPE" == tag ]]; then tag="$REF_NAME"; fi
+          tag="$TAG"
+          # a named version is pushed once: never move a tag that already exists
+          if [[ "$tag" != sha-* ]] && docker buildx imagetools inspect "$IMAGE:$tag" >/dev/null 2>&1; then
+            echo "::error::$IMAGE:$tag already exists; choose a new version" >&2; exit 1
+          fi
           docker tag control:ci "$IMAGE:$tag"
           docker push "$IMAGE:$tag" | tee push.log
           # the digest the registry reported for this push (the daemon's RepoDigests

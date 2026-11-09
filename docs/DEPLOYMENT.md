@@ -207,18 +207,18 @@ The runner sets `LAB_MAX_PARALLEL` and a per-agent concurrency cap from these nu
 
    This replaces call (p) in the plan.
 
-   **Built today** (`.github/workflows/build-images.yml`, no SBOMs yet): one job per image, each pushing `ghcr.io/lordprime/<name>`.
+   **Built today** (`.github/workflows/build-images.yml`, no SBOMs yet): a `plan` job picks the run's tag and finds the GOATs to build, then one job per image pushes `ghcr.io/lordprime/<name>`. The `goat` job is a matrix with one entry per `targets/<name>/Dockerfile` (image `goat-<name>`). Each GOAT brings its own `targets/<name>/ci/build.sh`, `ci/check.sh` and `ci/expect_tools`; `plan` fails if a GOAT with a Dockerfile lacks one of them. A target without a Dockerfile (today `juice-shop` and `drupal-7600`, which are M1 work) is listed in the run summary as not built yet.
 
    | Job / name | Dockerfile, build context | `images.lock` role | Checked before the push |
    |---|---|---|---|
-   | `goat-dvga` | `targets/dvga/Dockerfile`, the two fork checkouts pinned in `targets/dvga/source.yaml` and `cell/oracle/source.yaml` | `target` | tools, file modes, nothing grader-related readable by the app user, `tests/targets/test_dvga_image.py` |
+   | `goat-dvga` (`goat` matrix) | `targets/dvga/Dockerfile` via `targets/dvga/ci/build.sh`, the two fork checkouts pinned in `targets/dvga/source.yaml` and `cell/oracle/source.yaml` | `target` | `targets/dvga/ci/check.sh`: tools, file modes, nothing grader-related readable by the app user, `tests/targets/test_dvga_image.py` |
    | `lab-cell` | `cell/Dockerfile`, the repository root (root `.dockerignore` allow-list) | `infra` | runs as 10001:10001; every in-cell module imports; `mitmdump`, `uvicorn`; `/evidence` 10001 0750; no control-plane code beyond `control/core` |
    | `control` | `deploy/compose/control.Dockerfile`, the repository root (`control.Dockerfile.dockerignore`) | `control` | runs as 10001:10001; `python -m control.api --help` and `python -m control.cli.migrate --help`; the Alembic head is found; no in-cell code, mitmproxy or pytest |
 
-   Every job pins its actions by commit SHA, checks out with `persist-credentials: false` and holds only `contents: read` and `packages: write` (`tests/deploy/test_build_images_workflow.py` checks these). The workflow never edits `images.lock`.
+   Every job pins its actions by commit SHA, checks out with `persist-credentials: false` and holds only `contents: read`, plus `packages: write` for the jobs that push (`tests/deploy/test_build_images_workflow.py` checks these). The workflow never edits `images.lock`.
 
    **Building and pinning a digest:**
-   1. Trigger the workflow: push a `lab-vN` tag (e.g. `git tag lab-v1 && git push origin lab-v1`; the image tag is then `lab-v1`), or run it by hand (`gh workflow run build-images.yml --ref main`, or *Actions → build-images → Run workflow*; the image tag is then `sha-<12 hex>`).
+   1. Trigger the workflow. By hand: *Actions → build-images → Run workflow*, choose the branch and optionally fill in **version** (e.g. `v0.2.0`), or `gh workflow run build-images.yml --ref main -f version=v0.2.0`. Every image of the run is tagged with that version; left empty, the tag is `sha-<12 hex>`. Or push a `lab-vN` git tag (e.g. `git tag lab-v1 && git push origin lab-v1`; the image tag is then `lab-v1`). A version must match `[A-Za-z0-9][A-Za-z0-9._-]*` (at most 128 characters) and may not be `latest` or start with `sha-`. A named version is pushed once: if that tag already exists for an image, its job fails before pushing, so choose a new version rather than moving a tag.
    2. Each job takes the digest from the `docker push` output, checks it is `sha256:` + 64 hex and that the registry serves that same digest at the tag (`docker buildx imagetools inspect`), and writes a ready `images.lock` entry to its job summary and to the `<name>-digest` artifact (`gh run download <run-id> -n lab-cell-digest`).
    3. Paste the entry into `deploy/images.lock` (replacing an older entry of the same name) with its `name`, `image` (the repository, no tag), `digest`, `expect_tools` and `role`: `goat-dvga` → `target`, `lab-cell` → `infra`, `control` → `control`. cell-guard lets an agent start only `role: agent` images, so none of these three can be started from inside a cell.
    4. Commit it for review, then tag the release: `release.sh` pulls every `images.lock` entry by digest.

@@ -1,8 +1,9 @@
 # Logical image name -> pinned digest. Cells pull `image@digest`, never a tag.
 #
 # Entries change only in reviewed commits. The build-images workflow
-# (.github/workflows/build-images.yml; runs on a `lab-v*` tag or by hand) builds
-# goat-dvga, lab-cell and control and pushes ghcr.io/lordprime/<name>. Pinning a
+# (.github/workflows/build-images.yml; runs on a `lab-v*` tag or by hand, with an
+# optional version tag) builds goat-<name> for every targets/<name>/Dockerfile,
+# lab-cell and control, and pushes ghcr.io/lordprime/<name>. Pinning a
 # CI-built digest (docs/DEPLOYMENT.md §0.5):
 #   1. take the entry from the run's job summary or its `<name>-digest` artifact
 #      (images.lock.entry.yml): name, image, digest, expect_tools and role;
