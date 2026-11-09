@@ -53,10 +53,19 @@ Every transition is a timestamped row (`run_transitions`), so per-stage duration
 **Evidence shipping rule (M0 runner, `control/runner/runner.py`).** Every run that reached collection (its cell came up and its producers' evidence was copied out) ships all its event lines and artifacts to the Collector, valid or not. The oracle **verdict** is posted only for a run that passed every validity check (no failure in the cell, injector alive with its pre-flight probe in its evidence, the oracle answered and reported nothing unexpected, at least one LLM call); otherwise the run has no verdict, never `outcome: false`. A run that failed before collection (manifest refused, cell never came up) ships only its manifest. Invalid reasons are the bounded `runs.invalid_reason` set; all problems of a run are kept in `runs.invalid_detail`, and a failed teardown is always the reason when it happened. Retrying an invalid run (a new attempt) is a queue policy outside the runner.
 
 Evidence integrity rules that make a run invalid rather than silently incomplete:
-- **Recording failures.** A run is `recording_failed` if a cell component could not record, or if an evidence line was skipped or torn. A component that "could not record" includes the tap, cell-guard and the catcher (it logs `catcher: cannot record …` first). So is a run where the tap, catcher or cell-guard exits non-zero after the stop, for example 137. For the injector, the same failures give `injector_failed`.
+- **Recording failures.** A run is `recording_failed` if a cell component could not record, or if an evidence line was skipped or torn. A component that "could not record" includes the tap, cell-guard and the catcher (it logs `catcher: cannot record …` first). For the injector, the same failures give `injector_failed`.
+- **Stop exit codes.** After the agent, the runner stops the infrastructure with a 15-second timeout (`STOP_TIMEOUT_S`). Exit status 0 (the service shut down by itself) and 143 (ended by the SIGTERM it was sent) are clean (`CLEAN_STOP_EXIT_CODES`). Any other status, for example 137 (killed at the timeout, perhaps while draining), or a service still not stopped, makes the run `recording_failed` for the tap, the catcher and cell-guard, and `injector_failed` for the injector. Every one of them handles SIGTERM itself: mitmdump (injector, tap), the catcher's supervisor and cell-guard's proxy (exit 0), and uvicorn (stub LLM). Cell-guard also runs under an init process (`init: true`).
 - **Oracle before the agent.** The probe phase needs one answered oracle poll that reports `false` before the agent starts. Otherwise the run is `probe_failed`.
 - **Placements.** A served placement that is not in the run's manifest makes the run `contaminated`.
 - **Body size limits.** The injector stops at 64 MiB of body and the tap at 32 MiB. An oversized flow ends in the error path: the injector records it with status `null`, and the tap never forwards it.
+- **Collector refusals.** A run whose evidence the Collector refuses (`409`, `422` or `500`), or that cannot reach the Collector at all, is `collector_rejected`.
+
+**What the Collector stores (M0, `control/api/collector.py`, `control/db/repo.py`).**
+- **NUL characters** (which Postgres text and JSONB cannot hold) are stored as U+FFFD, in every string and mapping key. The replacement is deterministic, so a re-post is still a duplicate, and a NUL is never a reason to refuse a batch. An event's content hash is that of the event as posted.
+- **Verdicts are stored only for valid runs.** A verdict posted for a run that is not `valid` (queued, running or invalid) is refused with `409` (a conflict on `status`) and kept in `rejected_batches`. Outcome therefore has one source, the verdict of a valid run.
+- **Invalid runs keep `end_status`**, how the agent ended if it ran; a valid run's `end_status` comes with its verdict.
+- **Database errors carry the SQLSTATE and constraint name only** (`{"error": {"sqlstate": "23514", "constraint": "ck_..."}}`), never the database's own message, which can echo row values.
+- **Migration 0006** makes `target_access.method`, `callbacks.method` and `callbacks.qtype` unbounded `TEXT`: an unusual HTTP verb or DNS type the agent chose is evidence, never a reason to refuse a batch.
 
 **Schedule.** `enabled` ⇄ `paused`, then `removed`. Each firing is recorded with the runs it enqueued.
 
@@ -144,7 +153,7 @@ Built in M0 (`control/api/metrics.py`, served by the Collector at `/metrics`): `
 
 `control/runner/selftest.py`. It runs `experiments/selftest.yaml` through the real runner: one injected and one matched control DVGA cell, the scripted agent and the stub LLM (no model is called, no tokens are spent). Each invocation registers a fresh experiment `exp_selftest_<ULID>` (the file's text with that id), so it can be repeated and survives new image builds. It holds the host's runner lock (the runner's own `runner_lock_path`, `/srv/lab/state/runner.lock`) for the whole self-test, so it never runs beside another runner.
 
-Before the pair runs it sweeps what **earlier self-tests** left: containers, volumes and networks labelled with a run of an `exp_selftest_*` experiment, and their `cells/` work directories (none of them can be running: the lock is held). Resources of study runs, or of run ids the database does not know, are never touched.
+Before the pair runs it sweeps what **earlier self-tests** left: containers, volumes and networks labelled with a run of an `exp_selftest_*` experiment, and their `cells/` work directories (none of them can be running: the lock is held). In the same step it marks every earlier self-test run still `running` (its self-test was killed) or still `queued` (never to run: each self-test registers a fresh experiment) as invalid (`internal`, "abandoned"). Study runs, their resources, and resources of run ids the database does not know are never touched.
 
 It **passes** only if all of these hold:
 
@@ -154,7 +163,7 @@ It **passes** only if all of these hold:
 | `<arm>: valid`, `<arm>: completed` | Both runs `valid` **and** the agent ended `completed` (a crashed agent gives a valid run; that is not enough). A run that left its cell behind stops the runner: its result is kept and `run the pair` fails |
 | `injected: funnel`, `injected: oracle` | Access, Visible, Uptake and Outcome all true; the **stored** verdict (`runs.outcome` true, `runs.decided_at` set) |
 | `injected: callbacks` | A callback on **both** channels (HTTP and DNS) whose token is the one the lab key derives for one of the run's own placements |
-| `control: funnel`, `control: oracle` | Access, Visible and Uptake false (all four stages labelled); a stored verdict |
+| `control: funnel`, `control: oracle` | Access, Visible and Uptake false (all four stages labelled); a stored verdict with Outcome **true** (`runs.outcome` true, `runs.decided_at` set). The scripted agent calls `importPaste` in both arms, so a control whose Outcome is false means the oracle is not working |
 | `control: no tags` | No token callback reached it, and no file of its evidence holds any injected run's tag or callback token, case-insensitively and with base64 fields (`body_b64`) decoded (the labeller's forbidden-tag check already makes a leaking control `contaminated`) |
 | `<arm>: contained` | Before the cell's agent starts, `cell/probe/containment.py` runs in a sibling container on the agent network with `--host-gateway` (the network's `.1`), `--lan` (`LAB_PROBE_LAN`), `--sinkhole` (catcher `.2`), `--reach` injector `.3:80` and tap `.4:8080`, and must-fail `--dest`s for the control plane (the Collector's and the database's container addresses on the control network, and that network's gateway on the published ports, read from `deploy/compose/control-plane.yml` and the engine) and for the host's own LAN address on the host ports. IP literals only. Anything reachable, a failed must-reach, a destination missing from the report, or no complete report is **CRITICAL**, and that cell's agent never starts (the run is invalid `cell_failed`). A blocked result proves something only about real addresses: the host gateway must be one of this host's own addresses (`bind` succeeds) before each probe, else the check fails without being critical; a cell that fails before its agent would start is reported as a cell failure ("not probed"), not as containment |
 | `<arm>: nothing left` | After teardown no container, volume or network carries the run's `lab.run_id`, and its `cells/labcell-<run>` work directory is gone |
@@ -171,7 +180,7 @@ Inputs on the host: `secrets/hmac.key`; the host profile `host.env` (read by the
 
 **Interrupted self-tests.**
 - SIGTERM and SIGHUP end `labctl` like an exception, so a self-test still records its result. Before the pair runs, the self-test records an "in progress" marker. A self-test killed outright therefore shows as aborted in `labctl status`, not as the previous pass.
-- Under the runner lock, the next self-test's sweep marks the earlier self-test runs still `queued`/`running` as invalid (`internal`, "abandoned").
+- Under the runner lock, the next self-test's sweep marks the earlier self-test runs still `queued` or `running` as invalid (`internal`, "abandoned: still queued …" or "abandoned: still running …"), in one transaction.
 - Not built: requeuing or retrying a self-test run.
 
 ### 3.4 Programmatic tracking: the APIs
