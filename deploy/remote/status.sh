@@ -72,7 +72,7 @@ section firewall
 # Both layers: the nft table (input + forward drops) and the DOCKER-USER rules.
 if /usr/local/sbin/lab-cell-egress check 2>&1 | sed 's/^/  /'; then
 	nft list chain inet lab_host forward 2>/dev/null |
-		awk '/counter packets/ && /drop/ {print "  forward drops (cells, IPv6): " $0}'
+		awk '/counter packets/ && /drop/ {sub(/^[ \t]+/, ""); print "  forward drop: " $0}'
 else
 	problems+=("firewall")
 fi
