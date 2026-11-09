@@ -2,7 +2,10 @@
 # Docker CE 29.x from Docker's apt repository, pinned to one minor (DEPLOYMENT §4.3).
 # The newest patch of this minor is installed once; after that the installed
 # version is kept (and apt-held) until the minor is changed here on purpose.
-docker_ce_minor: "29.1"
+# 29.8: Docker's noble repository no longer carries 29.1.x (on 9 Nov 2026 it lists
+# 29.5.2 to 29.9.3, with containerd.io 2.4.x); 29.8 is the newest patch line of the
+# minor before the current one, so it has had time to age.
+docker_ce_minor: "29.8"
 # Never installed, whatever the minor: 29.1.0 is excluded by the deployment spec.
 docker_ce_forbidden_versions:
   - "29.1.0"

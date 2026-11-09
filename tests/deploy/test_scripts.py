@@ -617,6 +617,8 @@ def test_docker_role_pins_29_minor_and_never_29_1_0() -> None:
     role = ANSIBLE / "roles" / "docker"
     defaults = _load_yaml(role / "defaults" / "main.yml")
     assert re.fullmatch(r"29\.\d+", str(defaults["docker_ce_minor"]))
+    # The repository no longer carries 29.1.x (bootstrap failed closed on CT 111).
+    assert defaults["docker_ce_minor"] == "29.8"
     assert defaults["docker_ce_forbidden_versions"] == ["29.1.0"]
     assert defaults["docker_compose_min_version"] == "2.24.0"
     tasks = (role / "tasks" / "main.yml").read_text(encoding="utf-8")
