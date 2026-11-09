@@ -182,6 +182,8 @@ def _cmd_status(args: argparse.Namespace, settings: LabSettings) -> int:
         mode = "quick" if last["quick"] else "full"
         verdict = "passed" if last["passed"] else "FAILED"
         _out(f"self-test: last {mode} run {verdict} at {_when(last['finished_at'])}")
+        if not last["passed"] and last["summary"]:  # e.g. still in progress, or aborted
+            _out(f"self-test: {last['summary'][:300]}")
         _out(f"self-test: last success at {_when(ok['finished_at']) if ok else 'never'}")
     if disk:
         free, total = disk["free_bytes"] / 2**30, disk["total_bytes"] / 2**30

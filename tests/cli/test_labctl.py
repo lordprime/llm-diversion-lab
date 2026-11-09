@@ -318,6 +318,20 @@ def test_status_without_release_or_selftest(
     assert "self-test: never run" in out
 
 
+def test_status_shows_why_the_last_self_test_failed(
+    lab_db: Engine, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    status = tmp_path / "lab" / "state" / "st.json"
+    record_selftest_result(SelftestResult(True, 1_800_000_000.0, True, "passed: 9 checks"), status)
+    record_selftest_result(
+        SelftestResult(False, 1_800_000_500.0, True, "in progress since ... (aborted)"), status
+    )
+    rc, out, _ = _run(capsys, "status")
+    assert rc == 0
+    assert "FAILED" in out and "in progress since ... (aborted)" in out
+    assert "last success at 2027-01-15" in out
+
+
 def test_unparsable_database_url_is_a_usage_error(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
