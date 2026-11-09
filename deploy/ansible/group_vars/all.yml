@@ -24,6 +24,13 @@ lab_llm_gateway_port: 4000
 # docker role refuses an empty or loopback value.
 lab_upstream_dns: []
 
+# Home-LAN addresses the self-test's containment probe tries from inside a cell; each
+# must be UNreachable (labctl selftest; written to host.env as LAB_PROBE_LAN). IP
+# literals of real LAN hosts only (no TEST-NET placeholders: the probe refuses them).
+# Default: the upstream resolvers above, which in the LXC profile are the LXC's
+# gateway, the home router. Add the Proxmox host's LAN address per host if wanted.
+lab_probe_lan: "{{ lab_upstream_dns }}"
+
 # Docker's pools for every other network (control plane, compose defaults). They
 # must not overlap the cell networks, the home LAN (192.168.0.0/16; Docker's
 # built-in defaults include 192.168.0.0/16) or Twingate/CGNAT (100.64.0.0/10).
