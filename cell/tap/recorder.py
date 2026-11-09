@@ -282,7 +282,7 @@ class Recorder:
     On construction it resumes from an existing evidence directory (a restarted tap):
     numbering continues after the highest ``NNNN`` file present, and ``first_tag_seq``
     is recomputed from the stored request files, so nothing is renumbered or
-    overwritten.
+    overwritten. A torn last line in ``events.jsonl`` is closed with a newline first.
     """
 
     def __init__(self, config: TapConfig) -> None:
@@ -300,6 +300,7 @@ class Recorder:
         return self._config
 
     def _resume(self) -> tuple[int, int | None]:
+        self._close_torn_line()
         seqs: set[int] = set()
         for entry in self._llm_dir.iterdir():
             match = _EVIDENCE_NAME.fullmatch(entry.name)
@@ -312,6 +313,22 @@ class Recorder:
                 first_tag_seq = seq
                 break
         return (max(seqs) + 1 if seqs else 0), first_tag_seq
+
+    def _close_torn_line(self) -> None:
+        """End a torn last event line (a crash mid-write) so the next line stands alone.
+
+        The torn line itself is kept as it is, never rewritten.
+        """
+        if not self._events.is_file():
+            return
+        with self._events.open("rb") as fh:
+            torn = fh.seek(0, os.SEEK_END) > 0 and fh.seek(-1, os.SEEK_END) >= 0
+            torn = torn and fh.read(1) != b"\n"
+        if torn:
+            with self._events.open("ab") as fh:
+                fh.write(b"\n")
+                fh.flush()
+                os.fsync(fh.fileno())
 
     def begin(
         self, request_body: bytes, ts: datetime, meta: RequestMeta | None = None

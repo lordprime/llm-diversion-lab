@@ -418,6 +418,23 @@ def test_restart_resumes_seq_and_first_tag_seq(tmp_path: Path) -> None:
     assert len((tmp_path / EVENTS_FILE).read_bytes().splitlines()) == 3
 
 
+def test_restart_closes_a_torn_last_event_line(tmp_path: Path) -> None:
+    first = _recorder(tmp_path)
+    first.record(_request("one"), _response(), TS)
+    events = tmp_path / EVENTS_FILE
+    with events.open("ab") as fh:
+        fh.write(b'{"run_id":"torn')  # the tap died mid-line
+
+    again = _recorder(tmp_path)
+    assert events.read_bytes().endswith(b"\n")
+    call = again.record(_request("two"), _response(), TS)
+    lines = events.read_bytes().splitlines()
+    assert lines[1] == b'{"run_id":"torn'
+    assert LlmCall.model_validate_json(lines[2]) == call  # not glued onto the torn line
+    _recorder(tmp_path)  # a clean file is left alone
+    assert events.read_bytes().splitlines() == lines
+
+
 def test_seq_numbering_widens_past_four_digits(tmp_path: Path) -> None:
     llm = tmp_path / "llm"
     llm.mkdir()
