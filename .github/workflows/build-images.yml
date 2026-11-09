@@ -1,30 +1,43 @@
 name: build-images
 
-# Builds the DVGA GOAT image (DVGA lab fork + CVE-Bench evaluator) from the fork
-# commits pinned in targets/dvga/source.yaml and cell/oracle/source.yaml, checks
-# it, and pushes it to GHCR. The pushed digest goes to the job summary and an
-# artifact; recording it in deploy/images.lock is a normal reviewed commit.
+# Builds the lab's own images, checks each one and pushes it to GHCR:
+#
+# * goat-dvga  (role target)  targets/dvga/Dockerfile: the DVGA lab fork + CVE-Bench
+#   evaluator, from the fork commits pinned in targets/dvga/source.yaml and
+#   cell/oracle/source.yaml.
+# * lab-cell   (role infra)   cell/Dockerfile, context the repository root (the root
+#   .dockerignore allow-list): injector, tap, catcher, stub LLM, cell-guard, probe.
+# * control    (role control) deploy/compose/control.Dockerfile, context the
+#   repository root (its own control.Dockerfile.dockerignore): Collector + migrate.
+#
+# Each job publishes the digest it pushed in its job summary and a
+# `<job>-digest` artifact holding a ready deploy/images.lock entry. Recording a
+# digest in deploy/images.lock is a normal reviewed commit, never done here.
+#
+# Rules every job keeps (tests/deploy/test_build_images_workflow.py checks them):
+# actions pinned by full commit SHA, checkout with persist-credentials: false,
+# permissions granted per job (contents: read, packages: write) and none at the top.
 on:
   push:
     tags:
       - "lab-v*"
   workflow_dispatch:
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}
 
 concurrency:
   group: build-images-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  IMAGE: ghcr.io/lordprime/goat-dvga
-
 jobs:
   goat-dvga:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/lordprime/goat-dvga
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -171,6 +184,7 @@ jobs:
               image: ${IMAGE}
               digest: ${DIGEST}
               expect_tools: [curl, bash]
+              role: target
               # tag ${TAG}; dvga ${DVGA_COMMIT}; evaluator ${EVAL_COMMIT}
           EOF
           {
@@ -193,4 +207,232 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: goat-dvga-digest
+          path: images.lock.entry.yml
+
+  lab-cell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/lordprime/lab-cell
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Require cell/Dockerfile and the root context allow-list
+        run: |
+          set -euo pipefail
+          test -f cell/Dockerfile || { echo "::error::cell/Dockerfile is missing on ${GITHUB_REF}" >&2; exit 1; }
+          # no cell/Dockerfile.dockerignore: the root .dockerignore allow-list is the context
+          test ! -e cell/Dockerfile.dockerignore
+          test -f .dockerignore
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          docker buildx build --load \
+            -f cell/Dockerfile \
+            --label org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
+            --label org.opencontainers.image.revision="${GITHUB_SHA}" \
+            -t lab-cell:ci \
+            .
+
+      - name: Check the image (uid 10001, cell modules import, no control plane)
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{.Config.User}}' lab-cell:ci)" = 10001:10001
+          run() { docker run --rm --network none lab-cell:ci "$@"; }
+          test "$(run id -u):$(run id -g)" = 10001:10001
+          # what the cell compose files run (and the images.lock expect_tools)
+          run sh -c 'command -v python && command -v mitmdump && command -v uvicorn && command -v true'
+          # every in-cell module imports as the unprivileged user
+          run python -c "import cell.injector.placement, cell.injector.preflight, cell.tap.recorder, cell.catcher.http_app, cell.catcher.dns_server, cell.catcher.serve, cell.stub_llm.app, cell.cellguard.proxy, agents.scripted.agent"
+          run mitmdump --version >/dev/null
+          run sh -c '
+            set -eu
+            test "$(stat -c %u:%g:%a /evidence)" = 10001:10001:750
+            test -f /opt/lab/cell/injector/addon.py
+            test -f /opt/lab/cell/tap/addon.py
+            # of the control plane only control/core; no build or repository leftovers
+            for p in control/runner control/api control/db control/cli control/labeler \
+                     cell/Dockerfile tests docs deploy .git .venv/bin/pytest; do
+              if [ -e "/opt/lab/$p" ]; then echo "unexpected in the image: /opt/lab/$p"; exit 1; fi
+            done'
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        id: push
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          tag="sha-${GITHUB_SHA::12}"
+          if [[ "$REF_TYPE" == tag ]]; then tag="$REF_NAME"; fi
+          docker tag lab-cell:ci "$IMAGE:$tag"
+          docker push "$IMAGE:$tag"
+          # the registry digest of what was just pushed, as recorded by the daemon
+          repo_digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$tag")
+          [[ "$repo_digest" == "$IMAGE@"* ]] || { echo "unexpected RepoDigest: $repo_digest" >&2; exit 1; }
+          digest=${repo_digest#*@}
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad digest: $digest" >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Record the digest
+        env:
+          TAG: ${{ steps.push.outputs.tag }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cat > images.lock.entry.yml <<EOF
+          # Paste into deploy/images.lock in a reviewed commit.
+            - name: lab-cell
+              image: ${IMAGE}
+              digest: ${DIGEST}
+              expect_tools: [python, mitmdump, uvicorn]
+              role: infra
+              # tag ${TAG}; repository commit ${GITHUB_SHA}
+          EOF
+          {
+            echo "## lab-cell"
+            echo
+            echo "Pushed \`${IMAGE}:${TAG}\`"
+            echo
+            echo "**Digest:** \`${DIGEST}\`"
+            echo
+            echo "- Repository commit: \`${GITHUB_SHA}\`"
+            echo
+            echo "deploy/images.lock entry (commit it by hand, after review):"
+            echo
+            echo '```yaml'
+            cat images.lock.entry.yml
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: lab-cell-digest
+          path: images.lock.entry.yml
+
+  control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/lordprime/control
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          # context: the repository root, as deploy/compose/control-plane.yml builds it;
+          # BuildKit narrows it with deploy/compose/control.Dockerfile.dockerignore
+          test -f deploy/compose/control.Dockerfile.dockerignore
+          docker buildx build --load \
+            -f deploy/compose/control.Dockerfile \
+            --label org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
+            --label org.opencontainers.image.revision="${GITHUB_SHA}" \
+            -t control:ci \
+            .
+
+      - name: Check the image (uid 10001, entry points, migrations, no in-cell code)
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{.Config.User}}' control:ci)" = 10001:10001
+          run() { docker run --rm --network none control:ci "$@"; }
+          test "$(run id -u):$(run id -g)" = 10001:10001
+          # both entry points of control-plane.yml import and parse arguments (no database)
+          run python -m control.api --help >/dev/null
+          run python -m control.cli.migrate --help >/dev/null
+          # the Alembic scripts ship with the image and have a head
+          run python -c "from control.cli.migrations import head_revisions; assert head_revisions()"
+          run sh -c '
+            set -eu
+            # no in-cell code, no in-cell extras (mitmproxy), no dev group (pytest)
+            for p in /app/cell /app/agents /app/tests /app/deploy /app/.git; do
+              if [ -e "$p" ]; then echo "unexpected in the image: $p"; exit 1; fi
+            done
+            for m in mitmproxy pytest; do
+              if python -c "import $m" 2>/dev/null; then echo "unexpected module: $m"; exit 1; fi
+            done'
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        id: push
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          tag="sha-${GITHUB_SHA::12}"
+          if [[ "$REF_TYPE" == tag ]]; then tag="$REF_NAME"; fi
+          docker tag control:ci "$IMAGE:$tag"
+          docker push "$IMAGE:$tag"
+          # the registry digest of what was just pushed, as recorded by the daemon
+          repo_digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$tag")
+          [[ "$repo_digest" == "$IMAGE@"* ]] || { echo "unexpected RepoDigest: $repo_digest" >&2; exit 1; }
+          digest=${repo_digest#*@}
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad digest: $digest" >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Record the digest
+        env:
+          TAG: ${{ steps.push.outputs.tag }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cat > images.lock.entry.yml <<EOF
+          # Paste into deploy/images.lock in a reviewed commit.
+            - name: control
+              image: ${IMAGE}
+              digest: ${DIGEST}
+              expect_tools: [python]
+              role: control
+              # tag ${TAG}; repository commit ${GITHUB_SHA}
+          EOF
+          {
+            echo "## control"
+            echo
+            echo "Pushed \`${IMAGE}:${TAG}\`"
+            echo
+            echo "**Digest:** \`${DIGEST}\`"
+            echo
+            echo "- Repository commit: \`${GITHUB_SHA}\`"
+            echo
+            echo "deploy/images.lock entry (commit it by hand, after review):"
+            echo
+            echo '```yaml'
+            cat images.lock.entry.yml
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: control-digest
           path: images.lock.entry.yml
