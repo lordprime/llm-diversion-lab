@@ -71,6 +71,7 @@ __all__ = [
     "DEFAULT_CELL_NETWORK",
     "DEFAULT_EVIDENCE_PATH",
     "EVIDENCE_PREFIXES",
+    "HOST_ENV_FILE",
     "IMAGE_ROLES",
     "REPO_ROOT",
     "ROLE_LABEL",
@@ -121,6 +122,8 @@ _PLACEHOLDER = re.compile(r"@[A-Z_]+@")
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 _TAP_URL: Final = "http://tap:8080"
 _GUARD_DIR: Final = "/run/cellguard"
+#: The host profile written by the Ansible site play (deploy/ansible/templates/host.env.j2).
+HOST_ENV_FILE: Final = "/srv/lab/host.env"
 _DOCKER_SOCKET: Final = "/var/run/docker.sock"
 #: Where every cell service but cell-guard keeps its evidence (owned by uid 10001).
 DEFAULT_EVIDENCE_PATH: Final = "/evidence"
@@ -243,6 +246,11 @@ class CellSettings:
                 "the labc bridge names and digest pins the host firewall and the study rely "
                 "on are missing there; set LAB_DEV=1 to allow them on a development host"
             )
+        if self.llm_gateway is not None and self.engine is Engine.PODMAN:
+            raise CellError(
+                "gateway mode is refused on Podman: its llm bridge would have no labc "
+                "name, so the host firewall could not limit the tap's egress"
+            )
         if self.llm_gateway is not None:
             url = _gateway_url(self.llm_gateway) or ""
             addr = ipaddress.IPv4Address(url.removeprefix("http://").rpartition(":")[0])
@@ -269,12 +277,30 @@ class CellSettings:
     ) -> CellSettings:
         """Read the runner's settings.
 
-        ``host_env`` is the host profile (``/srv/lab/host.env``, :func:`read_host_env`):
-        when given, ``LAB_CELL_NETWORKS`` and ``LAB_LLM_GATEWAY`` come from it (the values
-        the host firewall was built with) and ``env`` may only repeat them, never differ.
+        The host profile (``host_env``, else the file ``LAB_HOST_ENV``, default
+        :data:`HOST_ENV_FILE`, read with :func:`read_host_env`) is the source of
+        ``LAB_CELL_NETWORKS`` and ``LAB_LLM_GATEWAY``: the values the host firewall was
+        built with. ``env`` may only repeat them, never differ. A host with a profile is
+        a production host and refuses ``LAB_DEV=1``; without one, settings are refused
+        unless ``LAB_DEV=1`` (a development host, which then takes both from ``env``).
         From ``env``: ``LAB_IMAGES_LOCK``, ``LAB_IMAGE_OVERRIDES`` (``name=ref,...``),
         ``LAB_ENGINE``, ``LAB_REQUIRE_DIGESTS``, ``LAB_DEV`` and ``LAB_DOCKER_SOCKET``.
         """
+        dev = env.get("LAB_DEV", "0") == "1"
+        if host_env is None:
+            path = Path(env.get("LAB_HOST_ENV") or HOST_ENV_FILE)
+            if path.is_file():
+                host_env = read_host_env(path)
+            elif not dev:
+                raise CellError(
+                    f"host profile {path} is missing: it holds LAB_CELL_NETWORKS and "
+                    "LAB_LLM_GATEWAY as the host firewall knows them (set LAB_DEV=1 only "
+                    "on a development host)"
+                )
+        if host_env is not None and dev:
+            raise CellError(
+                "LAB_DEV=1 is refused on a host with a host profile (a production host)"
+            )
         merged = dict(env)
         if host_env is not None:
             for key in ("LAB_CELL_NETWORKS", "LAB_LLM_GATEWAY"):
@@ -300,7 +326,6 @@ class CellSettings:
         require = merged.get("LAB_REQUIRE_DIGESTS", "1")
         if require not in ("0", "1"):
             raise CellError(f"LAB_REQUIRE_DIGESTS: expected 0 or 1, got {require!r}")
-        dev = merged.get("LAB_DEV", "0") == "1"
         if dev and (engine is Engine.PODMAN or require == "0"):
             log.warning(
                 "LAB_DEV=1: engine %s, digests %s -- development settings, never for study runs",
@@ -597,6 +622,12 @@ def render_cell(
     if not isinstance(meta, dict) or meta.get("target") != run.target:
         raise CellError(f"cell.{run.target}.yml: x-lab.target must be {run.target!r}")
     services: dict[str, Any] = copy.deepcopy(cell["services"])
+    for logical in (str(meta["cell_image"]), str(meta["target_image"])):
+        if settings.role(logical) == "agent":
+            raise CellError(
+                f"image {logical!r} has images.lock role agent: a target or harness image "
+                "must never be one an agent may start"
+            )
     cell_image = settings.image(str(meta["cell_image"]))
 
     # the target service, inlined from the target's own compose file

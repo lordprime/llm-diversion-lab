@@ -178,6 +178,8 @@ class Engine:
     volumes: set[str] = field(default_factory=set)
     networks: set[str] = field(default_factory=set)
     fail: set[str] = field(default_factory=set)  # steps that fail: "cp", "up", "ls"
+    #: volumes that exist without this run's label (a label filter never lists them)
+    unlabelled: set[str] = field(default_factory=set)
 
     def __call__(self, argv: tuple[str, ...], stdin: bytes | None) -> CommandResult | None:
         ok = CommandResult(argv, 0)
@@ -201,7 +203,12 @@ class Engine:
                 return ok
             if sub[0] == "down":
                 self.containers = {k: v for k, v in self.containers.items() if v != self.project}
-                self.volumes = {v for v in self.volumes if not v.startswith(self.project + "_")}
+                # down -v removes the volumes the project declares (never an unknown one)
+                self.volumes = {
+                    v
+                    for v in self.volumes
+                    if not v.startswith(self.project + "_") or v in self.unlabelled
+                }
                 if any(v is None for v in self.containers.values()):
                     return CommandResult(argv, 1, b"", b"network has active endpoints")
                 self.networks.clear()
@@ -226,7 +233,7 @@ class Engine:
                 self.containers.pop(c, None)
             return ok
         if sub[0] in ("volume", "network") and sub[1] == "ls":
-            items = self.volumes if sub[0] == "volume" else self.networks
+            items = self.volumes - self.unlabelled if sub[0] == "volume" else self.networks
             return CommandResult(argv, 0, "".join(f"{i}\n" for i in sorted(items)).encode())
         if sub[:2] == ("volume", "rm"):
             self.volumes -= set(sub[3:])
@@ -266,11 +273,37 @@ def test_the_scratch_volume_is_created_labelled_and_removed_by_name(
     backend.up(cell)
     assert guarded.scratch_volume is not None
     create = ("docker", "volume", "create", "--label", f"lab.run_id={guarded.run_id}")
-    assert docker.argvs()[0] == (*create, guarded.scratch_volume)  # before anything starts
+    # checked absent, then created, before anything starts
+    assert docker.argvs()[0] == ("docker", "volume", "inspect", guarded.scratch_volume)
+    assert docker.argvs()[1] == (*create, guarded.scratch_volume)
     assert guarded.scratch_volume in engine.volumes
     assert not any("lab.origin" in " ".join(a) for a in docker.argvs())
     backend.teardown(cell)
     assert engine.empty
+
+
+def test_an_existing_scratch_volume_is_refused_and_left_alone(
+    tmp_path: Path, guarded: ComposeProject
+) -> None:
+    assert guarded.scratch_volume is not None
+    other = guarded.scratch_volume
+    engine = Engine(guarded.name, volumes={other}, unlabelled={other})  # someone else's
+    docker = FakeDocker([engine])
+    backend = ComposeBackend(docker)
+    cell = backend.prepare(guarded, tmp_path)
+    with pytest.raises(CellError, match="already exists"):
+        backend.up(cell)
+    assert not any(a[1:3] == ("volume", "create") for a in docker.argvs())
+    backend.teardown(cell)  # the runner still tears down: never by that name
+    assert engine.volumes == {guarded.scratch_volume}
+
+
+def test_a_failed_log_read_raises(tmp_path: Path, project: ComposeProject) -> None:
+    def refuse(argv: tuple[str, ...], _stdin: bytes | None) -> CommandResult | None:
+        return CommandResult(argv, 1, b"", b"no such service") if "logs" in argv else None
+
+    with pytest.raises(CellError, match="no such service"):
+        ComposeBackend(FakeDocker([refuse])).logs(CellHandle(project, tmp_path / "c.yml"), "tap")
 
 
 def test_teardown_removes_cell_guard_containers_before_compose_down(

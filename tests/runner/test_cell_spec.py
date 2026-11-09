@@ -655,16 +655,23 @@ def test_the_yaml_round_trips_and_escapes_compose_interpolation(
         assert "$" not in value.replace("$$", ""), value
 
 
-def test_settings_from_the_host_environment(tmp_path: Path) -> None:
+def _lock(tmp_path: Path, text: str = "images: []\n") -> Path:
     lock = tmp_path / "images.lock"
-    lock.write_text(
+    lock.write_text(text)
+    return lock
+
+
+def test_settings_on_a_development_host(tmp_path: Path) -> None:
+    lock = _lock(
+        tmp_path,
         "images:\n"
         "  - name: lab-cell\n    image: ghcr.io/lordprime/lab-cell\n"
         f"    digest: sha256:{'c' * 64}\n"
         "  - name: kali\n    image: docker.io/kali\n"
-        f"    digest: sha256:{'d' * 64}\n    role: agent\n"
+        f"    digest: sha256:{'d' * 64}\n    role: agent\n",
     )
     dev = {
+        "LAB_HOST_ENV": str(tmp_path / "no-host.env"),  # a development host has none
         "LAB_CELL_NETWORKS": "10.231.0.0/16,10.232.0.0/24",
         "LAB_IMAGES_LOCK": str(lock),
         "LAB_IMAGE_OVERRIDES": "goat-dvga=localhost/goat-dvga:dev",
@@ -676,12 +683,41 @@ def test_settings_from_the_host_environment(tmp_path: Path) -> None:
     assert settings.cell_networks == (POOL, ipaddress.IPv4Network("10.232.0.0/24"))
     assert settings.image("lab-cell") == f"ghcr.io/lordprime/lab-cell@sha256:{'c' * 64}"
     assert settings.image("goat-dvga") == "localhost/goat-dvga:dev"
-    assert settings.engine is Engine.PODMAN
+    assert settings.engine is Engine.PODMAN and settings.dev is True
     assert settings.role("kali") == "agent" and settings.role("lab-cell") == "infra"
     with pytest.raises(CellError, match="LAB_CELL_NETWORKS"):
-        CellSettings.from_env({"LAB_CELL_NETWORKS": "8.8.8.0/24", "LAB_IMAGES_LOCK": str(lock)})
+        CellSettings.from_env({**dev, "LAB_CELL_NETWORKS": "8.8.8.0/24"})
     with pytest.raises(CellError, match="LAB_CELL_NETWORKS"):
-        CellSettings.from_env({"LAB_IMAGES_LOCK": str(lock)})
+        CellSettings.from_env({k: v for k, v in dev.items() if k != "LAB_CELL_NETWORKS"})
+
+
+def test_the_host_env_file_is_read_by_default_and_enforced(tmp_path: Path) -> None:
+    lock = _lock(tmp_path)
+    host_env = tmp_path / "host.env"
+    host_env.write_text(
+        "# managed\nLAB_CELL_NETWORKS=10.231.0.0/16\nLAB_LLM_GATEWAY=172.30.0.1:4000\n"
+    )
+    env = {"LAB_HOST_ENV": str(host_env), "LAB_IMAGES_LOCK": str(lock)}
+    settings = CellSettings.from_env(env)  # nothing passed: the file is the source
+    assert settings.cell_networks == (POOL,) and settings.llm_gateway == GATEWAY
+    with pytest.raises(CellError, match="LAB_LLM_GATEWAY"):
+        CellSettings.from_env({**env, "LAB_LLM_GATEWAY": "172.30.0.9:4000"})
+    with pytest.raises(CellError, match="LAB_CELL_NETWORKS"):
+        CellSettings.from_env({**env, "LAB_CELL_NETWORKS": "10.232.0.0/16"})
+    # a production host (it has the file) never runs development settings
+    with pytest.raises(CellError, match="LAB_DEV"):
+        CellSettings.from_env({**env, "LAB_DEV": "1"})
+
+
+def test_a_missing_host_env_is_an_error_off_a_development_host(tmp_path: Path) -> None:
+    env = {
+        "LAB_HOST_ENV": str(tmp_path / "missing.env"),
+        "LAB_IMAGES_LOCK": str(_lock(tmp_path)),
+        "LAB_CELL_NETWORKS": "10.231.0.0/16",
+    }
+    with pytest.raises(CellError, match=r"missing\.env"):
+        CellSettings.from_env(env)
+    assert CellSettings.from_env({**env, "LAB_DEV": "1"}).dev is True
 
 
 @pytest.mark.parametrize(
@@ -690,19 +726,36 @@ def test_settings_from_the_host_environment(tmp_path: Path) -> None:
 def test_dev_only_settings_need_lab_dev(
     tmp_path: Path, over: dict[str, str], caplog: pytest.LogCaptureFixture
 ) -> None:
-    lock = tmp_path / "images.lock"
-    lock.write_text("images: []\n")
-    env = {"LAB_CELL_NETWORKS": "10.231.0.0/16", "LAB_IMAGES_LOCK": str(lock), **over}
+    env = {
+        "LAB_CELL_NETWORKS": "10.231.0.0/16",
+        "LAB_IMAGES_LOCK": str(_lock(tmp_path)),
+        **over,
+    }
+    host = {"LAB_CELL_NETWORKS": "10.231.0.0/16", "LAB_LLM_GATEWAY": ""}
     with pytest.raises(CellError, match="LAB_DEV"):
-        CellSettings.from_env(env)
+        CellSettings.from_env(env, host_env=host)
     with pytest.raises(CellError, match="LAB_DEV"):
         CellSettings(
             images=IMAGES,
             engine=Engine(over.get("LAB_ENGINE", "docker")),
             require_digests=over.get("LAB_REQUIRE_DIGESTS", "1") == "1",
         )
-    assert CellSettings.from_env({**env, "LAB_DEV": "1"}).dev is True
+    dev = {**env, "LAB_DEV": "1", "LAB_HOST_ENV": str(tmp_path / "none.env")}
+    assert CellSettings.from_env(dev).dev is True
     assert "LAB_DEV" in caplog.text  # allowed, but never silently
+
+
+def test_gateway_mode_is_refused_on_podman() -> None:
+    with pytest.raises(CellError, match="Podman"):
+        CellSettings(images=IMAGES, engine=Engine.PODMAN, dev=True, llm_gateway=GATEWAY)
+
+
+@pytest.mark.parametrize("image", ["goat-dvga", "lab-cell"])
+def test_an_agent_role_image_never_runs_as_the_target_or_the_harness(
+    experiment: Experiment, schedule: list[ScheduledRun], image: str
+) -> None:
+    with pytest.raises(CellError, match="role"):
+        _render(experiment, schedule, Arm.CONTROL, settings=_settings(roles={image: "agent"}))
 
 
 def test_cell_guard_allows_only_agent_role_images(

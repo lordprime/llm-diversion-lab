@@ -67,7 +67,8 @@ def test_both_loaders_read_the_same_roles() -> None:
 
     by_guard = {i.name: i.role for i in load_images_lock(LOCK_FILE)}
     settings = CellSettings.from_env(
-        {"LAB_CELL_NETWORKS": "10.231.0.0/16", "LAB_IMAGES_LOCK": str(LOCK_FILE)}
+        {"LAB_IMAGES_LOCK": str(LOCK_FILE)},
+        host_env={"LAB_CELL_NETWORKS": "10.231.0.0/16", "LAB_LLM_GATEWAY": ""},
     )
     assert {n: settings.role(n) for n in by_guard} == by_guard
 

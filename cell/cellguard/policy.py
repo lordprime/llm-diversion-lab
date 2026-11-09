@@ -1301,9 +1301,18 @@ def _targeted(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
     if not _NAME_RE.fullmatch(target.id):
         raise _Denied("target.malformed", f"{r.target_kind} id {target.id!r} is malformed")
     body = b""
+    path = r.with_ref(target.id)
+    forced: tuple[str, ...] = ()
     if r.op == "container.remove":
-        if any(k == "link" and _truthy(v) for k, v in parse_qsl(r.query)):
+        pairs = parse_qsl(r.query, keep_blank_values=True)
+        if any(k == "link" and _truthy(v) for k, v in pairs):
             raise _Denied("remove.link", "removing links is not allowed")
+        # v=1 is forced: the container's anonymous (image VOLUME) volumes go with it,
+        # so an agent never leaves unlabelled volumes behind (Podman labels none)
+        kept = [(k, v) for k, v in pairs if k != "v"]
+        query = urlencode([*kept, ("v", "1")])
+        path = r.rebuild(path.partition("?")[0].removeprefix(f"/v{r.version}"), query)
+        forced = ("v",)
     elif r.op == "exec.create":
         doc = _rebuild(_json_object(req.body, "exec.body"), _EXEC_CREATE, "", "exec.field")
         named = doc.pop("Container", None)
@@ -1321,8 +1330,9 @@ def _targeted(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
         op=r.op,
         rule=r.op,
         reason=f"{r.target_kind} belongs to this cell",
-        path=r.with_ref(target.id),
+        path=path,
         body=body,
+        forced=forced,
         upgrade=r.op in _UPGRADE_OPS,
     )
 

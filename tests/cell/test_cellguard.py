@@ -567,6 +567,19 @@ def test_upgrade_routes_are_marked() -> None:
     assert not start.upgrade
 
 
+@pytest.mark.parametrize("query", ["", "?force=1", "?v=0", "?v=false&force=1", "?v=1&v=0"])
+def test_remove_always_takes_the_containers_anonymous_volumes(query: str) -> None:
+    """``v=1`` is forced: an agent's container never leaves unlabelled volumes behind."""
+    decision = evaluate(
+        DockerRequest("DELETE", f"/v1.44/containers/{CID}{query}", target=own()), CTX
+    )
+    assert decision.allowed
+    params = parse_qs(urlsplit(decision.path).query)
+    assert params["v"] == ["1"]
+    assert params.get("force", ["1"]) == ["1"]
+    assert "v" in decision.forced
+
+
 def test_remove_with_link_is_denied() -> None:
     path = f"/v1.44/containers/{CID}?link=1"
     assert not evaluate(DockerRequest("DELETE", path, target=own()), CTX).allowed

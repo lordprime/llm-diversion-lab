@@ -276,6 +276,8 @@ class ComposeBackend:
         self._run = runner or SubprocessRunner()
         self._docker = docker
         self._health_interval_s = health_interval_s
+        #: scratch volumes this backend created (only those are removed by name)
+        self._scratch_created: set[str] = set()
 
     # helpers
 
@@ -334,7 +336,15 @@ class ComposeBackend:
         return CellHandle(project, compose_file)
 
     def up(self, cell: CellHandle) -> None:
-        """Create the cell and start its infrastructure; on any failure tear it down."""
+        """Create the cell and start its infrastructure; on any failure tear it down.
+
+        A scratch volume of the same name that already exists is refused before anything
+        is created (``volume create`` would silently reuse it, unlabelled, with someone
+        else's contents), and is then not this cell's to remove.
+        """
+        scratch = cell.project.scratch_volume
+        if scratch is not None and self._volume_exists(scratch):
+            raise CellError(f"{cell.project.name}: scratch volume {scratch} already exists")
         try:
             self._up(cell)
         except BaseException:
@@ -351,6 +361,7 @@ class ComposeBackend:
             # create it (no service mounts it) and cell-guard would create it unlabelled.
             label = f"{RUN_LABEL}={project.run_id}"
             self._must([self._docker, "volume", "create", "--label", label, project.scratch_volume])
+            self._scratch_created.add(project.scratch_volume)
         self._must(self._compose(cell, "create", project.writer_service))
         writer = self._container(cell, project.writer_service)
         if writer is None:
@@ -407,7 +418,8 @@ class ComposeBackend:
         self._must(self._compose(cell, "stop", "-t", str(timeout_s), *services))
 
     def logs(self, cell: CellHandle, service: str) -> str:
-        return self._run(self._compose(cell, "logs", "--no-color", service)).text
+        """A service's logs; a failed read raises (it must never read as "no failure")."""
+        return self._must(self._compose(cell, "logs", "--no-color", service)).text
 
     def collect(
         self, cell: CellHandle, dest: Path, services: Sequence[str] | None = None
@@ -485,8 +497,10 @@ class ComposeBackend:
             if containers:
                 self._run([self._docker, "rm", "-f", "-v", *containers])
             volumes = self._listed([self._docker, "volume", "ls", "-q", "--filter", label])
-            if project.scratch_volume is not None:
-                volumes.append(project.scratch_volume)
+            scratch = project.scratch_volume
+            ours = scratch is not None and scratch in self._scratch_created
+            if ours and scratch is not None:
+                volumes.append(scratch)
             if volumes:
                 self._run([self._docker, "volume", "rm", "-f", *sorted(set(volumes))])
             networks = self._listed([self._docker, "network", "ls", "-q", "--filter", label])
@@ -497,8 +511,11 @@ class ComposeBackend:
                 "volumes": self._listed([self._docker, "volume", "ls", "-q", "--filter", label]),
                 "networks": self._listed([self._docker, "network", "ls", "-q", "--filter", label]),
             }
-            if project.scratch_volume is not None and self._volume_exists(project.scratch_volume):
-                left["volumes"].append(project.scratch_volume)
+            if ours and scratch is not None:
+                if self._volume_exists(scratch):
+                    left["volumes"].append(scratch)
+                else:
+                    self._scratch_created.discard(scratch)
             remaining = {k: v for k, v in left.items() if v}
             if remaining:
                 raise CellError(
