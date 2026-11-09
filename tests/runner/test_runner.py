@@ -13,6 +13,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import threading
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -45,7 +46,7 @@ from control.db import tables as t
 from control.db.engine import session_scope
 from control.db.repo import invalid_runs_by_reason
 from control.runner import runner as runner_module
-from control.runner.cell_spec import CellError, CellSettings, ComposeProject
+from control.runner.cell_spec import AgentSpec, CellError, CellSettings, ComposeProject
 from control.runner.compose_backend import CellHandle, CollectReport, CommandResult, ContainerState
 from control.runner.experiment import read_experiment
 from control.runner.oracle import OUTBOUND_SUCCESS, PREVIOUSLY_SUCCESSFUL, OracleScore, parse_done
@@ -997,3 +998,165 @@ def test_the_runner_lock_is_host_wide_reentrant_and_fails_closed(
     blocked.write_text("")
     with pytest.raises(HostLockError), host_lock(blocked / "runner.lock"):
         pass  # a path that cannot be created is an error, never "run unlocked"
+
+
+# --------------------------------------------------------------------------- fix round 3
+
+
+GUARDED = AgentSpec(
+    name="scripted",
+    image="lab-cell",
+    command=("python", "-m", "agents.scripted.agent", "--script", "/etc/lab/agent/script.json"),
+    needs_docker=True,
+)
+
+
+def _guarded_runner(
+    engine: Engine, collector: CollectorClient, backend: FakeBackend, tmp_path: Path
+) -> Runner:
+    """A runner whose agent starts containers, so its cell has a cell-guard."""
+    return Runner(
+        store=RunStore(engine),
+        collector=collector,
+        backend=backend,
+        settings=CellSettings(images=IMAGES),
+        lab_key=KEY,
+        runs_dir=tmp_path / "runs",
+        work_dir=tmp_path / "work",
+        oracle_interval_s=0,
+        tick_s=0,
+        sleep=lambda _s: None,
+        agent_specs={"scripted": GUARDED},
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        ContainerState("restarting"),
+        ContainerState("paused"),
+        ContainerState("running", None, 1),  # restarted once already
+    ],
+    ids=["restarting", "paused", "restarted"],
+)
+def test_infrastructure_must_be_exactly_running_and_never_restarted(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, state: ContainerState
+) -> None:
+    backend = FakeBackend(dead_before_start={"tap": state})
+    results = _single(engine, collector, backend, tmp_path)
+    assert {r.reason for r in results} == {InvalidReason.CELL_FAILED}
+
+
+def test_a_dead_cell_guard_before_the_agent_is_a_cell_failure(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    backend = FakeBackend(dead_before_start={"cellguard": ContainerState("exited", 1)})
+    results = _guarded_runner(engine, collector, backend, tmp_path).run_experiment(
+        read_experiment(SELFTEST)
+    )
+    assert {r.reason for r in results} == {InvalidReason.CELL_FAILED}
+    assert all("cellguard" in r.detail for r in results)
+
+
+def test_a_cell_guard_dying_during_the_run_is_a_recording_failure(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    backend = FakeBackend(dead_after_start={"cellguard": ContainerState("exited", 137)})
+    results = _guarded_runner(engine, collector, backend, tmp_path).run_experiment(
+        read_experiment(SELFTEST)
+    )
+    assert {r.reason for r in results} == {InvalidReason.RECORDING_FAILED}
+
+
+@pytest.mark.parametrize("service", ["goat", "stub-llm"])
+def test_the_target_or_the_stub_llm_dying_during_the_run_invalidates_it(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, service: str
+) -> None:
+    backend = FakeBackend(dead_after_start={service: ContainerState("exited", 137)})
+    results = _single(engine, collector, backend, tmp_path)
+    assert {r.reason for r in results} == {InvalidReason.CELL_FAILED}
+    assert all(service in r.detail for r in results)
+    for result in results:
+        assert _run_row(engine, result.run_id).outcome is None
+
+
+def test_an_unanswered_final_poll_gives_no_verdict(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    # the first poll answers success; every later one (the final one included) fails
+    backend = FakeBackend(done=[(0, SUCCESS), (1, "")])
+    results = _single(engine, collector, backend, tmp_path)
+    assert {r.reason for r in results} == {InvalidReason.ORACLE_UNREACHABLE}
+    # the first run had an answered success earlier: only its final poll failed
+    assert "final oracle poll" in results[0].detail
+    for result in results:
+        assert _run_row(engine, result.run_id).outcome is None
+
+
+def test_the_verdict_is_posted_even_when_its_file_cannot_be_written(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(path: Path, data: bytes) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runner_module, "write_atomic", broken)
+    results = _single(engine, collector, FakeBackend(), tmp_path)
+    for result in results:
+        assert result.status is RunStatus.VALID
+        assert _run_row(engine, result.run_id).outcome is True  # posted all the same
+
+
+def test_verdict_files_pending_then_final_and_none_for_an_invalid_run(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    ef = read_experiment(SELFTEST)
+
+    def leak(project: ComposeProject) -> str | None:
+        manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
+        if manifest.arm is Arm.INJECTED:
+            return None
+        schedule = RunStore(engine).load_schedule(ef.experiment.experiment_id)
+        return next(r.tag for r in schedule if r.pair_id == manifest.pair_id and r.tag)
+
+    results = _single(engine, collector, FakeBackend(leak=leak), tmp_path)
+    runs = tmp_path / "runs"
+    control, injected = _by_arm(results, Arm.CONTROL), _by_arm(results, Arm.INJECTED)
+    assert control.reason is InvalidReason.CONTAMINATED
+    assert not list(runs.glob(f"{control.run_id}.verdict*"))  # pending file removed
+    assert [p.name for p in runs.glob(f"{injected.run_id}.verdict*")] == [
+        f"{injected.run_id}.verdict.json"
+    ]
+
+
+def test_development_settings_are_recorded_when_the_run_is_claimed(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    ef = read_experiment(SELFTEST)
+    store = RunStore(engine)
+    schedule = _runner(engine, collector, FakeBackend(), tmp_path).register(ef)
+    claimed = store.claim_next(ef.experiment.experiment_id, schedule, dev=True)
+    assert claimed is not None
+    row = _run_row(engine, claimed.run_id)
+    assert row.status is RunStatus.RUNNING and row.dev is True
+    plain = store.claim_next(ef.experiment.experiment_id, schedule)
+    assert plain is not None and _run_row(engine, plain.run_id).dev is False
+
+
+def test_the_host_lock_refuses_another_thread(tmp_path: Path) -> None:
+    lock = tmp_path / "runner.lock"
+    errors: list[BaseException] = []
+
+    def other() -> None:
+        try:
+            with host_lock(lock):
+                pass
+        except BaseException as exc:
+            errors.append(exc)
+
+    with host_lock(lock):
+        thread = threading.Thread(target=other)
+        thread.start()
+        thread.join()
+    assert len(errors) == 1 and isinstance(errors[0], HostLockError)
+    with host_lock(lock):  # released: this thread takes it again
+        pass

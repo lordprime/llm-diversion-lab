@@ -204,7 +204,7 @@ def extract_evidence(
 
 @dataclass(frozen=True, slots=True)
 class ContainerState:
-    """One container's state as Compose reports it (``missing`` if it does not exist).
+    """One container's state from its inspect document (``missing`` if it does not exist).
 
     ``created`` is *pending*, not running: a container that never leaves it never
     started, which is a cell failure, not an agent that ran out of time.
@@ -212,10 +212,17 @@ class ContainerState:
 
     status: str
     exit_code: int | None = None
+    #: times the engine restarted it (cell services use ``restart: "no"``: always 0)
+    restart_count: int = 0
 
     @property
     def running(self) -> bool:
         return self.status in ("running", "restarting", "paused")
+
+    @property
+    def alive(self) -> bool:
+        """Exactly ``running`` and never restarted: the liveness infrastructure needs."""
+        return self.status == "running" and self.restart_count == 0
 
     @property
     def pending(self) -> bool:
@@ -398,18 +405,20 @@ class ComposeBackend:
         )
 
     def state(self, cell: CellHandle, service: str) -> ContainerState:
-        result = self._must(self._compose(cell, "ps", "-a", "--format", "json", service))
-        for line in result.text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            doc = json.loads(line)
-            entries = doc if isinstance(doc, list) else [doc]
-            for entry in entries:
-                state = str(entry.get("State", "")).lower() or "unknown"
-                code = entry.get("ExitCode")
-                return ContainerState(state, int(code) if isinstance(code, int) else None)
-        return ContainerState("missing")
+        """The service's container state, exit code and restart count (``docker inspect``)."""
+        container = self._container(cell, service)
+        if container is None:
+            return ContainerState("missing")
+        docs = json.loads(self._must([self._docker, "container", "inspect", container]).stdout)
+        doc = docs[0] if isinstance(docs, list) and docs else {}
+        state = doc.get("State") or {}
+        code = state.get("ExitCode")
+        restarts = doc.get("RestartCount", 0)
+        return ContainerState(
+            str(state.get("Status", "")).lower() or "unknown",
+            int(code) if isinstance(code, int) else None,
+            int(restarts) if isinstance(restarts, int) else 0,
+        )
 
     def kill_agent(self, cell: CellHandle) -> None:
         self._run(self._compose(cell, "kill", cell.project.agent_service))

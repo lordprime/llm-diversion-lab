@@ -24,6 +24,7 @@ from cell.catcher.callback_log import CatcherConfig
 from cell.injector.serve_log import InjectorConfig
 from control.core.models import Arm, RunManifest
 from control.core.tokens import TAG_PATTERN
+from control.runner import cell_spec
 from control.runner.cell_spec import (
     AGENT_SPECS,
     CELL_NAME_PREFIX,
@@ -59,6 +60,12 @@ SECRET_FILES = {
     ("secret_attack_success_canary", "attack_success_canary"),
 }
 INFRA = ("goat", "injector", "tap", "stub-llm", "catcher", "agent")
+
+
+@pytest.fixture(autouse=True)
+def no_default_host_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests never depend on whether this machine has /srv/lab/host.env."""
+    monkeypatch.setattr(cell_spec, "HOST_ENV_FILE", str(tmp_path / "default-host.env"))
 
 
 @pytest.fixture(scope="module")
@@ -691,7 +698,9 @@ def test_settings_on_a_development_host(tmp_path: Path) -> None:
         CellSettings.from_env({k: v for k, v in dev.items() if k != "LAB_CELL_NETWORKS"})
 
 
-def test_the_host_env_file_is_read_by_default_and_enforced(tmp_path: Path) -> None:
+def test_the_host_env_file_is_read_by_default_and_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     lock = _lock(tmp_path)
     host_env = tmp_path / "host.env"
     host_env.write_text(
@@ -704,9 +713,30 @@ def test_the_host_env_file_is_read_by_default_and_enforced(tmp_path: Path) -> No
         CellSettings.from_env({**env, "LAB_LLM_GATEWAY": "172.30.0.9:4000"})
     with pytest.raises(CellError, match="LAB_CELL_NETWORKS"):
         CellSettings.from_env({**env, "LAB_CELL_NETWORKS": "10.232.0.0/16"})
-    # a production host (it has the file) never runs development settings
+    # a production host (it has the default file) never runs development settings
+    monkeypatch.setattr(cell_spec, "HOST_ENV_FILE", str(host_env))
     with pytest.raises(CellError, match="LAB_DEV"):
         CellSettings.from_env({**env, "LAB_DEV": "1"})
+
+
+def test_dev_is_refused_on_a_production_host_whatever_lab_host_env_says(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    production = tmp_path / "srv-lab-host.env"
+    production.write_text("LAB_CELL_NETWORKS=10.231.0.0/16\nLAB_LLM_GATEWAY=\n")
+    monkeypatch.setattr(cell_spec, "HOST_ENV_FILE", str(production))
+    env = {
+        "LAB_DEV": "1",
+        "LAB_HOST_ENV": str(tmp_path / "nonexistent.env"),  # ignored in dev mode
+        "LAB_IMAGES_LOCK": str(_lock(tmp_path)),
+        "LAB_CELL_NETWORKS": "10.231.0.0/16",
+    }
+    with pytest.raises(CellError, match="LAB_DEV"):
+        CellSettings.from_env(env)
+    production.unlink()  # a development host: no default profile, LAB_HOST_ENV ignored
+    other = tmp_path / "other.env"
+    other.write_text("LAB_CELL_NETWORKS=10.99.0.0/16\n")
+    assert CellSettings.from_env({**env, "LAB_HOST_ENV": str(other)}).cell_networks == (POOL,)
 
 
 def test_a_missing_host_env_is_an_error_off_a_development_host(tmp_path: Path) -> None:

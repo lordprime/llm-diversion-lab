@@ -280,14 +280,23 @@ class CellSettings:
         The host profile (``host_env``, else the file ``LAB_HOST_ENV``, default
         :data:`HOST_ENV_FILE`, read with :func:`read_host_env`) is the source of
         ``LAB_CELL_NETWORKS`` and ``LAB_LLM_GATEWAY``: the values the host firewall was
-        built with. ``env`` may only repeat them, never differ. A host with a profile is
-        a production host and refuses ``LAB_DEV=1``; without one, settings are refused
-        unless ``LAB_DEV=1`` (a development host, which then takes both from ``env``).
-        From ``env``: ``LAB_IMAGES_LOCK``, ``LAB_IMAGE_OVERRIDES`` (``name=ref,...``),
-        ``LAB_ENGINE``, ``LAB_REQUIRE_DIGESTS``, ``LAB_DEV`` and ``LAB_DOCKER_SOCKET``.
+        built with. ``env`` may only repeat them, never differ. Without a profile,
+        settings are refused unless ``LAB_DEV=1`` (a development host, which then takes
+        both from ``env``). ``LAB_DEV=1`` is refused wherever the *default* profile
+        :data:`HOST_ENV_FILE` exists (a production host), and ``LAB_HOST_ENV`` is ignored
+        in dev mode, so no environment variable can turn a production host into a
+        development one. From ``env``: ``LAB_IMAGES_LOCK``, ``LAB_IMAGE_OVERRIDES``
+        (``name=ref,...``), ``LAB_ENGINE``, ``LAB_REQUIRE_DIGESTS``, ``LAB_DEV`` and
+        ``LAB_DOCKER_SOCKET``.
         """
         dev = env.get("LAB_DEV", "0") == "1"
-        if host_env is None:
+        if dev and Path(HOST_ENV_FILE).exists():
+            raise CellError(
+                f"LAB_DEV=1 is refused: {HOST_ENV_FILE} exists, so this is a production host"
+            )
+        if host_env is None and dev:
+            pass  # a development host has no profile; LAB_HOST_ENV is not consulted
+        elif host_env is None:
             path = Path(env.get("LAB_HOST_ENV") or HOST_ENV_FILE)
             if path.is_file():
                 host_env = read_host_env(path)

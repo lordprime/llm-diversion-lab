@@ -332,11 +332,17 @@ class RunStore:
         ]
 
     def claim_next(
-        self, experiment_id: str, schedule: Sequence[ScheduledRun]
+        self, experiment_id: str, schedule: Sequence[ScheduledRun], *, dev: bool = False
     ) -> ScheduledRun | None:
-        """Claim the next queued run of the experiment (it must be in ``schedule``)."""
+        """Claim the next queued run of the experiment (it must be in ``schedule``).
+
+        ``dev`` (the host runs development settings) is recorded on the run in the
+        claiming transaction, so a run is marked from the moment it starts.
+        """
         with session_scope(self._engine) as s:
             row = claim_next_run(s, experiment_id=experiment_id)
+            if row is not None and dev:
+                s.execute(update(t.Run).where(t.Run.run_id == row.run_id).values(dev=True))
         if row is None:
             return None
         for run in schedule:

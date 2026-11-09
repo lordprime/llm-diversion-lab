@@ -383,19 +383,51 @@ def test_health_polls_the_targets_own_script_until_it_passes(
     assert never.health(cell, timeout_s=0) is False
 
 
-def test_state_parses_compose_ps_json(tmp_path: Path, project: ComposeProject) -> None:
+def test_state_reads_the_containers_inspect_document(
+    tmp_path: Path, project: ComposeProject
+) -> None:
     cell = CellHandle(project, tmp_path / "compose.yml")
-    for out, expected in [
-        (b'{"State":"running","ExitCode":0}\n', ContainerState("running", 0)),
-        (b'[{"State":"exited","ExitCode":3}]', ContainerState("exited", 3)),
-        (b"", ContainerState("missing")),
+
+    def engine(doc: object) -> FakeDocker:
+        def respond(argv: tuple[str, ...], _stdin: bytes | None) -> CommandResult | None:
+            if _after_compose(argv)[:3] == ("ps", "-a", "-q"):
+                return CommandResult(argv, 0, b"" if doc is None else b"cid-agent\n")
+            if argv[1:3] == ("container", "inspect"):
+                assert argv[3] == "cid-agent"
+                return CommandResult(argv, 0, json.dumps([doc]).encode())
+            return None
+
+        return FakeDocker([respond])
+
+    for doc, expected in [
+        (
+            {"State": {"Status": "running", "ExitCode": 0}, "RestartCount": 0},
+            ContainerState("running", 0, 0),
+        ),
+        (
+            {"State": {"Status": "exited", "ExitCode": 3}, "RestartCount": 0},
+            ContainerState("exited", 3, 0),
+        ),
+        (
+            {"State": {"Status": "running", "ExitCode": 0}, "RestartCount": 2},
+            ContainerState("running", 0, 2),
+        ),
+        (None, ContainerState("missing")),
     ]:
-        docker = FakeDocker([lambda a, _, o=out: CommandResult(a, 0, o)])
-        assert ComposeBackend(docker).state(cell, "agent") == expected
+        assert ComposeBackend(engine(doc)).state(cell, "agent") == expected
     assert ContainerState("running").running and not ContainerState("exited", 0).running
     created = ContainerState("created")
     assert created.pending and not created.running and not created.ended
     assert ContainerState("exited", 0).ended and ContainerState("dead").ended
+    # infrastructure counts as alive only exactly running and never restarted
+    assert ContainerState("running", None, 0).alive
+    for dead in (
+        ContainerState("restarting"),
+        ContainerState("paused"),
+        ContainerState("running", None, 1),
+        ContainerState("exited", 0),
+    ):
+        assert not dead.alive, dead
 
 
 def test_subnets_in_use_reads_every_networks_ipam(tmp_path: Path) -> None:

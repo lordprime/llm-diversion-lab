@@ -18,14 +18,16 @@ queued: a leaked cell may still hold a Docker socket, an agent or a gateway rout
    file, no lab key), keep its handle, then bring up its infrastructure;
 3. **probe** -- the target's own health script, then the injector's pre-flight probe:
    every probed path must answer its expected status (the P7 path its 404, robots.txt
-   200); then every infrastructure service must be running. A failure stops here: the
+   200); then every infrastructure service must be exactly ``running``, never
+   restarted. A failure stops here: the
    agent never starts, no token is spent;
 4. **run** -- start the agent; poll the oracle (``/opt/support/done.sh`` only) every
    15 s while it runs, stop it at the run's ``timeout_s``, poll once more after. An
    agent that never leaves ``created`` is a cell failure, not a timeout;
-5. **collect** -- note which infrastructure died while the agent ran (the injector:
-   ``injector_failed``; the tap, catcher or cell-guard: ``recording_failed``; so do an
-   unreadable log or a recording-failure line in one), stop the agent, then the
+5. **collect** -- note which infrastructure is no longer exactly ``running`` with no
+   restart (the injector: ``injector_failed``; the tap, catcher or cell-guard:
+   ``recording_failed``, as are an unreadable log or a recording-failure line in one;
+   the target or the stub LLM: ``cell_failed``), stop the agent, then the
    infrastructure with SIGTERM (the tap drains in-flight calls), copy each producer's
    evidence out of its stopped container;
 6. **teardown** -- always, once the handle exists (a failed provision included):
@@ -34,14 +36,17 @@ queued: a leaked cell may still hold a Docker socket, an agent or a gateway rout
    stored event line verbatim and every artifact with its sha256 (no verdict);
 8. **decide** -- the run is invalid if anything above failed, if the injector's events
    lack the pre-flight probe's accesses and serves (``injector_failed``), if the oracle
-   never answered or reported an unexpected success, or if the agent made no LLM call
-   at all (``no_llm_calls``, DEVELOPMENT_PLAN 5.4). The verdict is built here
-   (``decided_at`` = the final poll's time) but not yet posted;
+   never answered, did not answer the final poll after the agent, or reported an
+   unexpected success, or if the agent made no LLM call at all (``no_llm_calls``,
+   DEVELOPMENT_PLAN 5.4). The verdict is built here (``decided_at`` = the final,
+   answered poll) and kept as ``<run>.verdict.pending.json`` (atomic), not posted;
 9. **label** -- re-check the full schedule, load the evidence of the torn-down cell
    with the run's forbidden tags and the verdict, label the funnel; the labels and the
    final status (and whether the host ran development settings) are stored in one
-   transaction. Only a run finished valid then posts its verdict, so an invalid run
-   never has one; a failed post leaves it valid with the verdict file to re-send.
+   transaction (``dev`` is already set when the run is claimed). Only a run finished
+   valid renames its pending verdict to ``<run>.verdict.json`` and then, separately,
+   posts it, so an invalid run never has one (its pending file is deleted); a failed
+   post leaves it valid with the verdict file to re-send.
 
 Every failure maps to an invalid reason in exactly one place (:func:`_reason`); all of
 a run's problems are logged and kept in ``invalid_detail``, and a failed teardown (an
@@ -282,7 +287,8 @@ def catalog_for(
 
 #: The host-wide runner lock; the self-test takes the same one.
 DEFAULT_RUNNER_LOCK: Final = Path("/srv/lab/state/runner.lock")
-_held: dict[Path, int] = {}
+#: held locks of this process: path -> (pid, thread ident, depth)
+_held: dict[Path, tuple[int, int, int]] = {}
 _held_guard = threading.Lock()
 
 
@@ -298,20 +304,30 @@ def host_lock(path: Path) -> Iterator[None]:
     """Hold the host-wide runner lock (exclusive, non-blocking ``flock`` on ``path``).
 
     One runner (or self-test) per host: cell subnets are allocated first-free. The lock
-    is re-entrant within this process, so a self-test holding it can call
-    :meth:`Runner.run_experiment`. Any failure to take it is a :class:`HostLockError`.
+    is re-entrant for the thread that holds it, so a self-test holding it can call
+    :meth:`Runner.run_experiment`. It is meant for a single-threaded process and is not
+    fork-safe: another thread of the holder's process is refused, and a forked child
+    (whose inherited ``flock`` is the parent's) takes it like any other process, which
+    fails while the parent holds it. Any failure to take it is a :class:`HostLockError`.
     """
     key = path.resolve()
+    me = (os.getpid(), threading.get_ident())
     with _held_guard:
-        reentered = key in _held
-        if reentered:
-            _held[key] += 1
+        holder = _held.get(key)
+        if holder is not None and holder[0] == me[0]:
+            if holder[1] != me[1]:
+                raise HostLockError(f"{path} is held by another thread of this process")
+            _held[key] = (*me, holder[2] + 1)
+            reentered = True
+        else:
+            reentered = False
     if reentered:
         try:
             yield
         finally:
             with _held_guard:
-                _held[key] -= 1
+                pid, ident, depth = _held[key]
+                _held[key] = (pid, ident, depth - 1)
         return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -326,7 +342,7 @@ def host_lock(path: Path) -> Iterator[None]:
         except OSError as exc:  # ENOLCK and friends: never run unlocked
             raise HostLockError(f"cannot lock {path}: {exc}") from exc
         with _held_guard:
-            _held[key] = 1
+            _held[key] = (*me, 1)
         try:
             yield
         finally:
@@ -334,6 +350,21 @@ def host_lock(path: Path) -> Iterator[None]:
                 _held.pop(key, None)
     finally:
         os.close(fd)  # closing releases the lock
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` atomically: a temporary file, fsync, rename."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 @dataclass(slots=True)
@@ -350,6 +381,7 @@ class _RunState:
     end_status: EndStatus | None = None
     score: OracleScore = field(default_factory=OracleScore)
     final_poll_at: datetime | None = None
+    final_poll_answered: bool = False
     verdict: Verdict | None = None
     problems: list[BaseException] = field(default_factory=list)
 
@@ -422,7 +454,9 @@ class Runner:
             while True:
                 schedule = self._store.load_schedule(ef.experiment.experiment_id)
                 check_schedule(schedule, experiment=ef.experiment)
-                run = self._store.claim_next(ef.experiment.experiment_id, schedule)
+                run = self._store.claim_next(
+                    ef.experiment.experiment_id, schedule, dev=self._settings.dev
+                )
                 if run is None:
                     return results
                 result = self.run_one(run)
@@ -476,6 +510,7 @@ class Runner:
         )
 
     def _finish_invalid(self, state: _RunState, exc: BaseException) -> RunResult:
+        self._verdict_path(state, pending=True).unlink(missing_ok=True)  # never a verdict
         problems = exc.problems if isinstance(exc, _RunFailed) else (exc,)
         teardown = [p for p in problems if isinstance(p, _TeardownError)]
         reason = InvalidReason.TEARDOWN_FAILED if teardown else _reason(problems[0])
@@ -562,7 +597,7 @@ class Runner:
         not_running: dict[str, str] = {}
         for service in project.infra_services:
             status = self._backend.state(state.cell, service)
-            if not status.running:
+            if not status.alive:
                 not_running[service] = status.status
         if not_running:
             raise CellError(f"infrastructure not running before the agent: {not_running}")
@@ -630,6 +665,7 @@ class Runner:
         )
         poll = oracle_log.record(parsed)
         state.final_poll_at = poll.ts
+        state.final_poll_answered = not isinstance(parsed, str)
         state.score.add(parsed)
 
     def _collect_and_teardown(self, state: _RunState) -> None:
@@ -643,7 +679,7 @@ class Runner:
                 # infrastructure that died while the agent ran: its evidence is partial
                 for service in project.infra_services:
                     status = self._backend.state(cell, service)
-                    if status.running:
+                    if status.alive:
                         continue
                     if service == project.injector_service:
                         state.problems.append(
@@ -652,6 +688,13 @@ class Runner:
                     elif service in RECORDING_SERVICES:
                         state.problems.append(
                             _RecordingFailedError(f"{service} was {status.status}")
+                        )
+                    else:  # the target or the stub LLM: the run did not see its cell
+                        state.problems.append(
+                            CellError(
+                                f"{service} was {status.status} "
+                                f"(restarts {status.restart_count}) after the agent"
+                            )
                         )
                 if self._backend.state(cell, project.agent_service).running:
                     self._backend.kill_agent(cell)
@@ -726,6 +769,10 @@ class Runner:
             raise _OracleUnexpectedError(f"unexpected oracle success: {state.score.unexpected}")
         if not state.score.decided or state.final_poll_at is None:
             raise _OracleUnreachableError(f"none of {state.score.polls} oracle polls answered")
+        if not state.final_poll_answered:
+            raise _OracleUnreachableError(
+                "the final oracle poll, after the agent, was not answered"
+            )
         if not any(json.loads(line).get("kind") == "llm_call" for line in state.event_lines):
             raise _NoLlmCallsError("the agent made no LLM call")
         if state.end_status is None:  # pragma: no cover - set whenever the agent ran
@@ -737,25 +784,45 @@ class Runner:
             oracle_message=state.score.message,
             decided_at=state.final_poll_at,
         )
+        try:
+            write_atomic(
+                self._verdict_path(state, pending=True), state.verdict.model_dump_json().encode()
+            )
+        except OSError:
+            log.exception("run %s: cannot keep its pending verdict file", state.run.run_id)
+
+    def _verdict_path(self, state: _RunState, *, pending: bool) -> Path:
+        name = f"{state.run.run_id}.verdict{'.pending' if pending else ''}.json"
+        return state.evidence_dir.parent / name
 
     def _post_verdict(self, state: _RunState) -> None:
-        """Post a finished-valid run's verdict (kept on disk first, so it can be re-sent).
+        """Keep a finished-valid run's verdict, then post it (two separate steps).
 
-        Only a run already stored valid gets here, so an invalid run never has a verdict.
-        A failed post leaves the run valid; the verdict file re-posts identically.
+        The pending file written when the verdict was decided is renamed to the final
+        ``<run_id>.verdict.json`` (atomic); whatever happens to the file, the verdict is
+        then posted. Only a run already stored valid gets here, so an invalid run never
+        has a verdict. A failed post leaves the run valid; the log names the file to
+        re-post.
         """
         verdict = state.verdict
         if verdict is None:  # pragma: no cover - set by _decide
             raise RuntimeError("no verdict")
-        path = state.evidence_dir.parent / f"{state.run.run_id}.verdict.json"
+        final = self._verdict_path(state, pending=False)
         try:
-            path.write_bytes(verdict.model_dump_json().encode())
+            pending = self._verdict_path(state, pending=True)
+            if pending.exists():
+                os.replace(pending, final)
+            else:
+                write_atomic(final, verdict.model_dump_json().encode())
+        except OSError:
+            log.exception("run %s: cannot keep its verdict file %s", state.run.run_id, final)
+        try:
             self._collector.post_verdict(verdict)
         except Exception:
             log.exception(
                 "run %s is valid but its verdict was not stored; re-post %s",
                 state.run.run_id,
-                path,
+                final,
             )
 
     def _label(self, state: _RunState) -> tuple[FunnelLabel, ...]:
