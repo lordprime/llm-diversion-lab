@@ -1666,6 +1666,51 @@ def test_ansible_syntax_check(rendered_inventory: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def _all_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every task, with those inside block/rescue/always."""
+    found = []
+    for task in tasks or []:
+        found.append(task)
+        for key in ("block", "rescue", "always"):
+            found += _all_tasks(task.get(key, []))
+    return found
+
+
+def _role_tasks() -> list[tuple[Path, dict[str, Any]]]:
+    return [
+        (path, task)
+        for path in sorted((ANSIBLE / "roles").glob("*/tasks/*.yml"))
+        for task in _all_tasks(_load_yaml(path))
+    ]
+
+
+def test_every_apt_task_waits_long_enough_for_the_package_lock() -> None:
+    """unattended-upgrades holds the dpkg lock for minutes on a fresh container."""
+    timeout = int(_load_yaml(ANSIBLE / "group_vars" / "all.yml")["lab_apt_lock_timeout"])
+    assert timeout >= 600
+    apt = [(p, t) for p, t in _role_tasks() if "ansible.builtin.apt" in t]
+    assert len(apt) >= 8, "apt tasks not found"
+    for path, task in apt:
+        value = task["ansible.builtin.apt"].get("lock_timeout")
+        assert value == "{{ lab_apt_lock_timeout }}", f"{path.name}: {task['name']}"
+    selections = [(p, t) for p, t in _role_tasks() if "ansible.builtin.dpkg_selections" in t]
+    assert selections
+    for path, task in selections:  # dpkg --set-selections does not wait for the lock
+        assert task["until"] == f"{task['register']} is succeeded", f"{path.name}: {task['name']}"
+        assert task["retries"] == "{{ (lab_apt_lock_timeout | int) // 10 }}"
+        assert task["delay"] == 10
+    # Before the first apt task of the play: wait for apt-daily / unattended-upgrades.
+    base = _load_yaml(ANSIBLE / "roles" / "base" / "tasks" / "main.yml")
+    first = next(i for i, task in enumerate(base) if "ansible.builtin.apt" in task)
+    (wait,) = [task for task in base[:first] if "apt-daily-upgrade.service" in str(task)]
+    assert wait["until"].startswith("base_apt_daily.stdout_lines | intersect(")
+    assert "activating" in wait["vars"]["base_apt_busy_states"]
+    assert wait["retries"] == "{{ (lab_apt_lock_timeout | int) // 10 }}"
+    assert wait["delay"] == 10
+    roles = [r["role"] if isinstance(r, dict) else r for r in _load_yaml(SITE)[-1]["roles"]]
+    assert roles[0] == "base"
+
+
 MADISON = [
     " docker-ce | 5:29.9.3-1~ubuntu.24.04~noble | https://download.docker.com/linux/ubuntu"
     " noble/stable amd64 Packages",

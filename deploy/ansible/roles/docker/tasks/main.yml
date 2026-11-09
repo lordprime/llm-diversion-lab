@@ -36,6 +36,7 @@
 
 - name: Install the apt repository prerequisites
   ansible.builtin.apt:
+    lock_timeout: "{{ lab_apt_lock_timeout }}"
     name: [ca-certificates, curl, gnupg]
     state: present
 
@@ -102,6 +103,7 @@
 
 - name: Refresh the apt cache
   ansible.builtin.apt:
+    lock_timeout: "{{ lab_apt_lock_timeout }}"
     update_cache: true
   changed_when: false
 
@@ -153,6 +155,7 @@
 
 - name: Install Docker CE and the compose plugin, version {{ docker_ce_version }}
   ansible.builtin.apt:
+    lock_timeout: "{{ lab_apt_lock_timeout }}"
     name:
       - "docker-ce={{ docker_ce_version }}"
       - "docker-ce-cli={{ docker_ce_version }}"
@@ -169,6 +172,11 @@
   ansible.builtin.dpkg_selections:
     name: "{{ item }}"
     selection: hold
+  register: docker_hold
+  # dpkg --set-selections fails at once while the dpkg lock is held.
+  until: docker_hold is succeeded
+  retries: "{{ (lab_apt_lock_timeout | int) // 10 }}"
+  delay: 10
   loop: "{{ docker_held_packages }}"
   when: not ansible_check_mode
 

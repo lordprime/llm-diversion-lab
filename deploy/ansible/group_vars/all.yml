@@ -3,6 +3,12 @@
 # for that host in deploy/hosts.yml (they take precedence over this file).
 
 lab_root: /srv/lab
+
+# How long apt and dpkg wait for the package lock, in seconds. On a freshly started
+# container unattended-upgrades (apt-daily-upgrade.service) holds it for many
+# minutes; the apt module's default (60 s) then fails the bootstrap. Every apt task
+# uses this, and the base role first waits up to this long for apt-daily to finish.
+lab_apt_lock_timeout: 1200
 lab_user: lab
 
 # Run-cell networks. CONTRACT with the runner: every cell network is created with

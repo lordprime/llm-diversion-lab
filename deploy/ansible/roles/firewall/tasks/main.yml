@@ -139,6 +139,7 @@
 
 - name: Install nftables and iptables
   ansible.builtin.apt:
+    lock_timeout: "{{ lab_apt_lock_timeout }}"
     name: [nftables, iptables]
     state: present
 

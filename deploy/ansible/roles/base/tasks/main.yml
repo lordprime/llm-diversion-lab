@@ -1,6 +1,29 @@
 ---
+# On a freshly started container apt-daily / unattended-upgrades runs first and holds
+# the dpkg lock for many minutes. Wait for both units to finish (bounded by
+# lab_apt_lock_timeout) before the first apt task; the apt tasks themselves also wait
+# for the lock, in case a run starts later.
+- name: Wait (up to lab_apt_lock_timeout s) for apt-daily and unattended-upgrades to finish
+  vars:
+    base_apt_busy_states: [active, activating, deactivating, reloading]
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=ActiveState
+      - --value
+      - apt-daily.service
+      - apt-daily-upgrade.service
+  register: base_apt_daily
+  changed_when: false
+  check_mode: false
+  until: base_apt_daily.stdout_lines | intersect(base_apt_busy_states) | length == 0
+  retries: "{{ (lab_apt_lock_timeout | int) // 10 }}"
+  delay: 10
+
 - name: Install the base packages
   ansible.builtin.apt:
+    lock_timeout: "{{ lab_apt_lock_timeout }}"
     name: "{{ base_packages }}"
     state: present
     update_cache: true
@@ -8,6 +31,7 @@
 
 - name: Install chrony (a VM keeps its own clock; an LXC uses the host's, §0.5)
   ansible.builtin.apt:
+    lock_timeout: "{{ lab_apt_lock_timeout }}"
     name: chrony
     state: present
   when: isolation != 'lxc'
@@ -16,6 +40,7 @@
 # would lock everyone out; the Proxmox firewall already limits port 22 to it.
 - name: Install fail2ban (not behind Twingate)
   ansible.builtin.apt:
+    lock_timeout: "{{ lab_apt_lock_timeout }}"
     name: fail2ban
     state: present
   when: access != 'twingate'

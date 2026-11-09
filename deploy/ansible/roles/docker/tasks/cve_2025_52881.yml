@@ -26,6 +26,7 @@
   block:
     - name: Pin containerd.io to {{ docker_containerd_pin_version }}
       ansible.builtin.apt:
+        lock_timeout: "{{ lab_apt_lock_timeout }}"
         name: "containerd.io={{ docker_containerd_pin_version }}*"
         state: present
         allow_downgrade: true
@@ -35,6 +36,11 @@
       ansible.builtin.dpkg_selections:
         name: containerd.io
         selection: hold
+      register: docker_containerd_hold
+      # dpkg --set-selections fails at once while the dpkg lock is held.
+      until: docker_containerd_hold is succeeded
+      retries: "{{ (lab_apt_lock_timeout | int) // 10 }}"
+      delay: 10
 
     - name: Restart Docker on the pinned containerd
       ansible.builtin.systemd_service:

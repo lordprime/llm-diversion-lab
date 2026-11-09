@@ -10,6 +10,7 @@
 
 - name: Install Caddy (Ubuntu archive)
   ansible.builtin.apt:
+    lock_timeout: "{{ lab_apt_lock_timeout }}"
     name: caddy
     state: present
 

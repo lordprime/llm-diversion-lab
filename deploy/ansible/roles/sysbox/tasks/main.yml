@@ -28,6 +28,7 @@
 
 - name: Install Sysbox
   ansible.builtin.apt:
+    lock_timeout: "{{ lab_apt_lock_timeout }}"
     deb: "/var/cache/sysbox-ce_{{ sysbox_version }}.deb"
     state: present
 
