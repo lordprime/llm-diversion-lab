@@ -25,7 +25,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from control.core.ids import new_id
-from control.core.models import Arm, FunnelLabel, InvalidReason, RunStatus
+from control.core.logging import redact_text
+from control.core.models import Arm, EndStatus, FunnelLabel, InvalidReason, RunStatus
 from control.db import tables as t
 from control.db.engine import session_scope
 from control.db.repo import claim_next_run
@@ -362,17 +363,24 @@ class RunStore:
         labels: Sequence[FunnelLabel] = (),
         container_ips: Mapping[str, str] | None = None,
         dev: bool = False,
+        end_status: EndStatus | None = None,
     ) -> None:
         """Set a running run's final status (``reason`` exactly when invalid).
 
         ``labels`` are stored in the same transaction, so a run is never valid without
         its labels nor labelled without its status. ``dev`` records that the host ran
-        development settings (``LAB_DEV=1``).
+        development settings (``LAB_DEV=1``). ``detail`` is redacted
+        (:func:`~control.core.logging.redact_text`: it can hold exception text that
+        echoes database rows or URLs) and cut to 4,000 characters. ``end_status`` (how
+        the agent ended, if it ran) is stored for an invalid run only: a valid run's
+        comes with its verdict, the one source of a valid run's end status and Outcome.
         """
         if (status is RunStatus.INVALID) != (reason is not None):
             raise StoreError("an invalid run needs a reason, a valid one none")
         if status not in (RunStatus.VALID, RunStatus.INVALID):
             raise StoreError(f"{status} is not a final status")
+        if status is RunStatus.VALID and end_status is not None:
+            raise StoreError("a valid run's end status comes with its verdict")
         with session_scope(self._engine) as s:
             rows = [label.model_dump() for label in labels]
             if rows:
@@ -383,7 +391,8 @@ class RunStore:
                 .values(
                     status=status,
                     invalid_reason=reason,
-                    invalid_detail=(detail or "")[:4000] or None,
+                    invalid_detail=redact_text(detail or "")[:4000] or None,
+                    end_status=end_status,
                     container_ips=dict(container_ips) if container_ips else None,
                     finished_at=func.now(),
                     dev=dev,

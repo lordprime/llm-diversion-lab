@@ -19,8 +19,9 @@ queued: a leaked cell may still hold a Docker socket, an agent or a gateway rout
 3. **probe** -- the target's own health script, then the injector's pre-flight probe:
    every probed path must answer its expected status (the P7 path its 404, robots.txt
    200); then every infrastructure service must be exactly ``running``, never
-   restarted. A failure stops here: the
-   agent never starts, no token is spent;
+   restarted; then the oracle must answer "not yet" (one answered poll, ``status``
+   false, kept in the oracle evidence). A failure stops here: the agent never starts,
+   no token is spent;
 4. **run** -- start the agent; poll the oracle (``/opt/support/done.sh`` only) every
    15 s while it runs, stop it at the run's ``timeout_s``, poll once more after. An
    agent that never leaves ``created`` is a cell failure, not a timeout;
@@ -28,12 +29,17 @@ queued: a leaked cell may still hold a Docker socket, an agent or a gateway rout
    restart (the injector: ``injector_failed``; the tap, catcher or cell-guard:
    ``recording_failed``, as are an unreadable log or a recording-failure line in one;
    the target or the stub LLM: ``cell_failed``), stop the agent, then the
-   infrastructure with SIGTERM (the tap drains in-flight calls), copy each producer's
+   infrastructure with SIGTERM (the tap drains in-flight calls); a recorder or the
+   injector that then did not exit cleanly (0, or 143 from the SIGTERM; 137 is a kill
+   at the stop timeout, perhaps mid-drain) is the same failure; copy each producer's
    evidence out of its stopped container;
 6. **teardown** -- always, once the handle exists (a failed provision included):
    remove the cell and everything labelled with the run, verified by listing again;
 7. **ship evidence** -- for every run that reached collection, valid or not: every
-   stored event line verbatim and every artifact with its sha256 (no verdict);
+   stored event line verbatim and every artifact with its sha256 (no verdict); a torn
+   line (a producer killed mid-write) is skipped and makes the run
+   ``recording_failed``, a placement the run never planned (the Collector's
+   ``unknown_placement``) ``contaminated``;
 8. **decide** -- the run is invalid if anything above failed, if the injector's events
    lack the pre-flight probe's accesses and serves (``injector_failed``), if the oracle
    never answered, did not answer the final poll after the agent, or reported an
@@ -46,15 +52,20 @@ queued: a leaked cell may still hold a Docker socket, an agent or a gateway rout
    transaction (``dev`` is already set when the run is claimed). Only a run finished
    valid renames its pending verdict to ``<run>.verdict.json`` and then, separately,
    posts it, so an invalid run never has one (its pending file is deleted); a failed
-   post leaves it valid with the verdict file to re-send.
+   post leaves it valid with the verdict file to re-send. A run whose ``valid`` commit
+   went through although the call raised is kept valid, with its verdict. An invalid
+   run keeps how its agent ended (``end_status``), a valid run gets it with its
+   verdict.
 
 Every failure maps to an invalid reason in exactly one place (:func:`_reason`); all of
-a run's problems are logged and kept in ``invalid_detail``, and a failed teardown (an
-operator must clean up) is the reason whenever it happened. :meth:`run_one` never
+a run's problems are logged and kept, redacted, in ``invalid_detail``, and a failed
+teardown (an operator must clean up) is the reason whenever it happened. :meth:`run_one` never
 raises for a run-level failure, a database error included. The lab key is only ever
-an argument here; it never reaches a cell, a file or a log line. Retrying an invalid
-run (a new attempt), a SIGTERM handler, a start-up sweep of orphaned ``lab.run_id``
-resources and a reaper for runs stuck ``running`` are not done here (15b-2 / final).
+an argument here; it never reaches a cell, a file or a log line. ``labctl`` turns
+SIGTERM and SIGHUP into ``SystemExit``, so a killed run still tears its cell down (and
+stays ``running``; the self-test sweeps its own). Retrying an invalid run (a new
+attempt), a study start-up sweep of orphaned ``lab.run_id`` resources and a reaper for
+study runs stuck ``running`` are not done here (M1).
 """
 
 from __future__ import annotations
@@ -74,6 +85,7 @@ from pathlib import Path
 from typing import Final
 from urllib.parse import urlsplit
 
+from control.core.logging import redact_text
 from control.core.models import (
     Arm,
     EndStatus,
@@ -102,7 +114,7 @@ from control.runner.cell_spec import (
     allocate_subnets,
     render_cell,
 )
-from control.runner.compose_backend import CellBackend, CellHandle
+from control.runner.compose_backend import CellBackend, CellHandle, ContainerState
 from control.runner.experiment import ExperimentFile
 from control.runner.oracle import DONE_COMMAND, POLL_INTERVAL_S, OracleLog, OracleScore, parse_done
 from control.runner.render import forbidden_tags_for, render_manifest, verify_manifest_tokens
@@ -141,16 +153,23 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 PREFLIGHT_COMMAND: Final = ("python", "-m", "cell.injector.preflight", "--port", "80")
+#: Infrastructure whose death during a run means its evidence is incomplete.
+RECORDING_SERVICES: Final = frozenset({"tap", "catcher", "cellguard"})
 #: Log lines of cell components that mean evidence could not be recorded (the
 #: component then withheld the response, so the agent's path changed: invalid run).
 #: mitmdump runs with ``flow_detail=0``, so no agent-chosen text is logged per flow.
-#: Infrastructure whose death during a run means its evidence is incomplete.
-RECORDING_SERVICES: Final = frozenset({"tap", "catcher", "cellguard"})
 RECORDING_FAILURE_MARKERS: Final = {
     "injector": ("injector: cannot",),
     "tap": ("tap: cannot",),
+    "catcher": ("catcher: cannot",),
     "cellguard": ("cell-guard: cannot record",),
 }
+#: Exit codes of a recorder stopped with SIGTERM that lost nothing: it shut down by
+#: itself (0) or was ended by the SIGTERM it was sent (143). Anything else (137: killed
+#: at the stop timeout, perhaps while draining) means its evidence may be incomplete.
+CLEAN_STOP_EXIT_CODES: Final = frozenset({0, 143})
+#: Attempts at the probe poll (the oracle must answer "not yet" before the agent).
+PROBE_POLL_ATTEMPTS: Final = 3
 HEALTH_TIMEOUT_S: Final = 300.0
 STOP_TIMEOUT_S: Final = 15
 #: How long an agent container may stay ``created`` before the cell counts as failed.
@@ -229,6 +248,10 @@ def _reason(exc: BaseException) -> InvalidReason:
     if isinstance(exc, _NoLlmCallsError):
         return InvalidReason.NO_LLM_CALLS
     if isinstance(exc, ContaminationError):
+        return InvalidReason.CONTAMINATED
+    if isinstance(exc, CollectorError) and exc.reason == "unknown_placement":
+        # a serve of a placement this run never planned: contamination, which the
+        # Collector saw before the labeller could
         return InvalidReason.CONTAMINATED
     if isinstance(exc, IncompleteEvidenceError | LabelingError | EvidenceError):
         return InvalidReason.EVIDENCE_INCOMPLETE
@@ -383,6 +406,7 @@ class _RunState:
     final_poll_at: datetime | None = None
     final_poll_answered: bool = False
     verdict: Verdict | None = None
+    labels: tuple[FunnelLabel, ...] = ()
     problems: list[BaseException] = field(default_factory=list)
 
 
@@ -494,27 +518,58 @@ class Runner:
             if state.problems:
                 raise _RunFailed(state.problems)
             self._decide(state)
-            labels = self._label(state)
-            self._store.finish(run.run_id, RunStatus.VALID, labels=labels, dev=self._settings.dev)
+            state.labels = self._label(state)
+            self._store.finish(
+                run.run_id, RunStatus.VALID, labels=state.labels, dev=self._settings.dev
+            )
         except Exception as exc:  # every failure, a database error included
-            return self._finish_invalid(state, exc)
+            if not self._stored_valid(state, exc):
+                return self._finish_invalid(state, exc)
+        return self._finish_valid(state)
+
+    def _stored_valid(self, state: _RunState, exc: BaseException) -> bool:
+        """Whether the run is stored ``valid`` although finishing it raised ``exc`` (the
+        commit went through, its reply was lost): it then stays valid, with its verdict."""
+        if state.verdict is None:
+            return False
+        try:
+            status, _ = self._store.status(state.run.run_id)
+        except Exception:
+            log.exception("run %s: cannot read its stored status", state.run.run_id)
+            return False
+        if status is not RunStatus.VALID:
+            return False
+        log.warning(
+            "run %s is stored valid although finishing it raised %s; keeping it valid",
+            state.run.run_id,
+            _describe(exc),
+        )
+        return True
+
+    def _finish_valid(self, state: _RunState) -> RunResult:
         self._post_verdict(state)
         self._heartbeat(state, RunPhase.FINISHED, "valid", best_effort=True)
         return RunResult(
-            run_id=run.run_id,
-            arm=run.arm,
+            run_id=state.run.run_id,
+            arm=state.run.arm,
             status=RunStatus.VALID,
             end_status=state.end_status,
             outcome=state.verdict.outcome if state.verdict else None,
-            labels=labels,
+            labels=state.labels,
         )
 
     def _finish_invalid(self, state: _RunState, exc: BaseException) -> RunResult:
-        self._verdict_path(state, pending=True).unlink(missing_ok=True)  # never a verdict
+        pending = self._verdict_path(state, pending=True)
+        try:
+            pending.unlink(missing_ok=True)  # an invalid run never has a verdict
+        except OSError:
+            log.exception("run %s: cannot remove %s", state.run.run_id, pending)
         problems = exc.problems if isinstance(exc, _RunFailed) else (exc,)
         teardown = [p for p in problems if isinstance(p, _TeardownError)]
         reason = InvalidReason.TEARDOWN_FAILED if teardown else _reason(problems[0])
-        detail = "; ".join(_describe(p) for p in problems)
+        # exception text can echo database rows, URLs or headers: redacted before it is
+        # stored, returned (the self-test prints it) or logged
+        detail = redact_text("; ".join(_describe(p) for p in problems))
         for problem in problems:
             log.warning("run %s problem: %s", state.run.run_id, _describe(problem))
         log.warning("run %s invalid (%s)", state.run.run_id, reason.value)
@@ -525,6 +580,7 @@ class Runner:
                 reason=reason,
                 detail=detail,
                 dev=self._settings.dev,
+                end_status=state.end_status,
             )
         except Exception:
             log.exception("run %s: cannot record its invalid status", state.run.run_id)
@@ -593,17 +649,13 @@ class Runner:
 
         self._heartbeat(state, RunPhase.PROBING)
         self._probe(state.cell, project)
-
-        not_running: dict[str, str] = {}
-        for service in project.infra_services:
-            status = self._backend.state(state.cell, service)
-            if not status.alive:
-                not_running[service] = status.status
-        if not_running:
-            raise CellError(f"infrastructure not running before the agent: {not_running}")
+        _, dead = self._check_liveness(state.cell, before_agent=True)
+        if dead:
+            raise dead[0]
+        oracle_log = OracleLog(state.run.run_id, state.evidence_dir)
+        self._probe_oracle(state, oracle_log)
 
         self._heartbeat(state, RunPhase.AGENT_RUNNING)
-        oracle_log = OracleLog(state.run.run_id, state.evidence_dir)
         self._backend.start_agent(state.cell)
         state.agent_started = True
         started = self._clock()
@@ -654,7 +706,30 @@ class Runner:
         if wrong:
             raise ProbeFailedError(f"pre-flight statuses (expected, got): {wrong}")
 
-    def _poll(self, state: _RunState, oracle_log: OracleLog) -> None:
+    def _probe_oracle(self, state: _RunState, oracle_log: OracleLog) -> None:
+        """Before the agent: the oracle must answer, and answer "not yet" (``status``
+        false). An oracle that reports success from the start, or never answers, would
+        make any later verdict meaningless (:class:`ProbeFailedError`)."""
+        last = ""
+        for attempt in range(PROBE_POLL_ATTEMPTS):
+            if attempt:
+                self._sleep(min(self._oracle_interval_s, 5.0))
+            parsed = self._poll(state, oracle_log)
+            if isinstance(parsed, str):
+                last = parsed
+                continue
+            status, message = parsed
+            if status:
+                raise ProbeFailedError(
+                    f"the oracle reports success before the agent started: {message[:200]!r}"
+                )
+            return
+        raise ProbeFailedError(
+            f"the oracle never answered before the agent ({PROBE_POLL_ATTEMPTS} polls): "
+            f"{last[:300]}"
+        )
+
+    def _poll(self, state: _RunState, oracle_log: OracleLog) -> tuple[bool, str] | str:
         if state.cell is None:  # pragma: no cover - polled only in a cell
             raise RuntimeError("no cell")
         result = self._backend.exec(
@@ -667,6 +742,69 @@ class Runner:
         state.final_poll_at = poll.ts
         state.final_poll_answered = not isinstance(parsed, str)
         state.score.add(parsed)
+        return parsed
+
+    @staticmethod
+    def _infra_failure(service: str, project: ComposeProject, what: str) -> BaseException:
+        """What a failed infrastructure service (after the agent started) means."""
+        if service == project.injector_service:
+            return _InjectorFailedError(f"the injector {what}")
+        if service in RECORDING_SERVICES:
+            return _RecordingFailedError(f"{service} {what}")
+        return CellError(f"{service} {what}")  # the target or the stub LLM
+
+    def _check_liveness(
+        self, cell: CellHandle, *, before_agent: bool
+    ) -> tuple[list[str], list[BaseException]]:
+        """The infrastructure services that are not exactly ``running``, never restarted,
+        and what that means.
+
+        The one liveness check, before the agent and after it. Before, any such service
+        is one cell failure (the agent must not start there); after, each maps to what it
+        lost (:meth:`_infra_failure`).
+        """
+        project = cell.project
+        dead: dict[str, ContainerState] = {}
+        for service in project.infra_services:
+            status = self._backend.state(cell, service)
+            if not status.alive:
+                dead[service] = status
+        if not dead:
+            return [], []
+        if before_agent:
+            summary = {service: status.status for service, status in dead.items()}
+            return list(dead), [
+                CellError(f"infrastructure not running before the agent: {summary}")
+            ]
+        return list(dead), [
+            self._infra_failure(
+                service,
+                project,
+                f"was {status.status} (restarts {status.restart_count}) after the agent",
+            )
+            for service, status in dead.items()
+        ]
+
+    def _unclean_stops(self, cell: CellHandle, skip: Sequence[str]) -> list[BaseException]:
+        """Recorders (and the injector) that did not exit cleanly when stopped: killed at
+        the stop timeout while draining, their evidence may be incomplete."""
+        project = cell.project
+        problems: list[BaseException] = []
+        for service in project.infra_services:
+            if service in skip or not (
+                service == project.injector_service or service in RECORDING_SERVICES
+            ):
+                continue
+            status = self._backend.state(cell, service)
+            if status.ended and status.exit_code in CLEAN_STOP_EXIT_CODES:
+                continue
+            what = (
+                f"exited {status.exit_code} when stopped"
+                if status.ended
+                else f"was {status.status} after the stop"
+            )
+            problems.append(self._infra_failure(service, project, what))
+        return problems
 
     def _collect_and_teardown(self, state: _RunState) -> None:
         cell = state.cell
@@ -677,29 +815,13 @@ class Runner:
             if state.up_done:
                 self._heartbeat(state, RunPhase.COLLECTING, best_effort=True)
                 # infrastructure that died while the agent ran: its evidence is partial
-                for service in project.infra_services:
-                    status = self._backend.state(cell, service)
-                    if status.alive:
-                        continue
-                    if service == project.injector_service:
-                        state.problems.append(
-                            _InjectorFailedError(f"the injector was {status.status}")
-                        )
-                    elif service in RECORDING_SERVICES:
-                        state.problems.append(
-                            _RecordingFailedError(f"{service} was {status.status}")
-                        )
-                    else:  # the target or the stub LLM: the run did not see its cell
-                        state.problems.append(
-                            CellError(
-                                f"{service} was {status.status} "
-                                f"(restarts {status.restart_count}) after the agent"
-                            )
-                        )
+                dead_services, dead = self._check_liveness(cell, before_agent=False)
+                state.problems += dead
                 if self._backend.state(cell, project.agent_service).running:
                     self._backend.kill_agent(cell)
                 self._backend.stop(cell, [project.agent_service], timeout_s=STOP_TIMEOUT_S)
                 self._backend.stop(cell, list(project.infra_services), timeout_s=STOP_TIMEOUT_S)
+                state.problems += self._unclean_stops(cell, dead_services)
                 for service, markers in RECORDING_FAILURE_MARKERS.items():
                     if service not in project.document["services"]:
                         continue
@@ -741,6 +863,8 @@ class Runner:
             log.warning("run %s: torn event lines skipped: %s", state.run.run_id, skipped)
         self._collector.post_events(state.run.run_id, state.event_lines)
         self._collector.post_artifacts(state.run.run_id, scan_artifacts(state.evidence_dir))
+        if skipped:  # shipped all the same, but an event was lost: the run is not whole
+            raise _RecordingFailedError(f"torn event lines (an event was lost): {skipped[:10]}")
 
     def _check_injector(self, state: _RunState) -> None:
         """The injector's evidence must hold the pre-flight probe it served."""

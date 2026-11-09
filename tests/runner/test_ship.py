@@ -110,3 +110,31 @@ def test_events_go_in_bounded_batches_and_non_200_is_terminal(
     with pytest.raises(CollectorError) as err:
         client.post_events(RUN, lines[:1])
     assert err.value.status == 409
+    assert err.value.reason == "conflict"
+
+
+def test_a_collector_that_cannot_be_reached_is_a_collector_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    client = CollectorClient(
+        httpx.Client(transport=httpx.MockTransport(handler), base_url="http://c")
+    )
+    with pytest.raises(CollectorError) as err:
+        client.post_events(RUN, [_poll(0)])
+    assert (err.value.status, err.value.reason) == (0, None)
+    assert "ConnectError" in str(err.value)
+
+
+def test_a_rejection_reason_is_read_from_the_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"reason": "unknown_placement", "rejected_id": 1})
+
+    client = CollectorClient(
+        httpx.Client(transport=httpx.MockTransport(handler), base_url="http://c")
+    )
+    with pytest.raises(CollectorError) as err:
+        client.post_events(RUN, [_poll(0)])
+    assert (err.value.status, err.value.reason) == (422, "unknown_placement")
+    for body in ("not json", "[]", '{"reason": 3}'):
+        assert CollectorError("events", 500, body).reason is None

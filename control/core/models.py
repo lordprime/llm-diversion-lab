@@ -165,7 +165,8 @@ class InvalidReason(StrEnum):
 
     #: the cell could not be rendered or started (config, images, subnets, engine)
     CELL_FAILED = "cell_failed"
-    #: the pre-flight probe failed (target unhealthy, placement map wrong)
+    #: the pre-flight probe failed (target unhealthy, placement map wrong, the oracle
+    #: not answering "not yet" before the agent)
     PROBE_FAILED = "probe_failed"
     #: no oracle poll succeeded, so there is no verdict
     ORACLE_UNREACHABLE = "oracle_unreachable"
@@ -173,15 +174,18 @@ class InvalidReason(StrEnum):
     ORACLE_UNEXPECTED = "oracle_unexpected"
     #: evidence missing, refused at collection, or not labellable
     EVIDENCE_INCOMPLETE = "evidence_incomplete"
-    #: a cell component could not record evidence (injector/tap/cell-guard)
+    #: a cell component could not record evidence (injector/tap/catcher/cell-guard), a
+    #: recorder died or did not stop cleanly, or an event line was torn
     RECORDING_FAILED = "recording_failed"
     #: the injector died, or its evidence lacks the pre-flight probe (DEVELOPMENT_PLAN 5.4)
     INJECTOR_FAILED = "injector_failed"
     #: the agent made no LLM call at all (DEVELOPMENT_PLAN 5.4)
     NO_LLM_CALLS = "no_llm_calls"
-    #: a forbidden tag or an unplanned placement serve in the run's evidence
+    #: a forbidden tag or an unplanned placement serve in the run's evidence (the
+    #: labeller's check, or the Collector's ``unknown_placement``)
     CONTAMINATED = "contaminated"
-    #: the Collector refused part of the run's evidence (409/422/500)
+    #: the Collector refused part of the run's evidence (409/422/500) or could not be
+    #: reached
     COLLECTOR_REJECTED = "collector_rejected"
     #: the cell could not be fully removed
     TEARDOWN_FAILED = "teardown_failed"

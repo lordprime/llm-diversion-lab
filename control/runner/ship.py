@@ -10,8 +10,10 @@
 * Artifacts: every regular file below the evidence directory, with its sha256 and
   size, in batches under ``MAX_ARTIFACTS_PER_BATCH``. A symlink, special file or a
   path the Collector would refuse is an :class:`EvidenceError`.
-* :class:`CollectorClient`: every non-200 answer is terminal (:class:`CollectorError`):
-  409 means stored minus conflicts, 422 refused, 500 body kept; never retried blindly.
+* :class:`CollectorClient`: every non-200 answer is terminal (:class:`CollectorError`,
+  with the Collector's ``reason``): 409 means stored minus conflicts, 422 refused, 500
+  body kept; never retried blindly. A Collector that cannot be reached (connection,
+  timeout or protocol error) is a :class:`CollectorError` too, with status ``0``.
 
 The manifest is posted before any event batch (a batch naming an unplanned placement is
 refused whole).
@@ -71,12 +73,28 @@ class EvidenceError(ValueError):
 
 
 class CollectorError(RuntimeError):
-    """The Collector API did not store what was posted (terminal; the body is kept)."""
+    """The Collector API did not store what was posted (terminal; the body is kept).
+
+    ``status`` is the HTTP status, ``0`` if the Collector could not be reached;
+    ``reason`` the rejection's ``reason`` (``unknown_placement``, ``conflict``...)
+    when the body names one.
+    """
 
     def __init__(self, what: str, status: int, body: str) -> None:
         self.status = status
         self.body = body
-        super().__init__(f"Collector {what}: HTTP {status}: {body[:500]}")
+        self.reason = _reject_reason(body)
+        where = f"HTTP {status}" if status else "unreachable"
+        super().__init__(f"Collector {what}: {where}: {body[:500]}")
+
+
+def _reject_reason(body: str) -> str | None:
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return None
+    reason = doc.get("reason") if isinstance(doc, dict) else None
+    return reason if isinstance(reason, str) else None
 
 
 @dataclass(slots=True)
@@ -155,9 +173,12 @@ class CollectorClient:
         self._http = http
 
     def _post(self, what: str, url: str, content: bytes) -> None:
-        response = self._http.post(
-            url, content=content, headers={"content-type": "application/json"}
-        )
+        try:
+            response = self._http.post(
+                url, content=content, headers={"content-type": "application/json"}
+            )
+        except httpx.TransportError as exc:  # never posted, or no answer: not stored
+            raise CollectorError(what, 0, f"{type(exc).__name__}: {exc}") from exc
         if response.status_code != 200:
             raise CollectorError(what, response.status_code, response.text)
 

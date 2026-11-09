@@ -20,11 +20,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, func, select
 
 from control.api.app import create_app
+from control.core.ids import new_id
 from control.core.models import (
     AgentEvent,
     AgentEventType,
@@ -39,6 +41,7 @@ from control.core.models import (
     PlacementServe,
     RunManifest,
     RunStatus,
+    Surface,
     TargetAccessEvent,
     Verdict,
 )
@@ -96,6 +99,8 @@ def write_cell_evidence(
     llm_calls: bool = True,
     probe_serves: bool = True,
     probe_prefix: str | None = "",
+    unplanned_serve: bool = False,
+    torn_line: bool = False,
 ) -> None:
     """What a cell running the scripted agent leaves behind, for its own manifest."""
     manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
@@ -182,7 +187,28 @@ def write_cell_evidence(
                 status=200,
             )
         )
+    if unplanned_serve:  # a placement this run never planned (another run's, say)
+        access.append(
+            PlacementServe(
+                run_id=run_id,
+                stream="injector",
+                seq=seq + 1,
+                ts=TS,
+                flow_id="unplanned",
+                placement_id=new_id("pl"),
+                surface=Surface.P1,
+                url="/robots.txt",
+                status=200,
+                decoded_sha256="0" * 64,
+                wire_sha256="0" * 64,
+                byte_offset=0,
+                insert_ok=True,
+            )
+        )
     _write_events(dest / "injector" / "events.jsonl", access)
+    if torn_line:  # a producer killed mid-write
+        with (dest / "injector" / "events.jsonl").open("ab") as fh:
+            fh.write(b'{"kind": "target_access", "run_id"')
 
     if not llm_calls:
         return
@@ -252,7 +278,9 @@ class FakeBackend:
 
     healthy: bool = True
     probe_override: dict[str, int] = field(default_factory=dict)
-    done: list[tuple[int, str]] = field(default_factory=lambda: [(0, SUCCESS)])
+    #: done.sh answers of each run, in order (the last repeats); the first is the probe
+    #: poll before the agent, which must answer "not yet"
+    done: list[tuple[int, str]] = field(default_factory=lambda: [(0, UNSUCCESSFUL), (0, SUCCESS)])
     agent_states: list[ContainerState] = field(
         default_factory=lambda: [ContainerState("running"), ContainerState("exited", 0)]
     )
@@ -267,6 +295,10 @@ class FakeBackend:
     leak: Callable[[ComposeProject], str | None] = lambda _p: None
     llm_calls: bool = True
     probe_serves: bool = True
+    unplanned_serve: bool = False
+    torn_line: bool = False
+    #: exit code of an infrastructure service after the runner stopped it (default 0)
+    stop_exit: dict[str, int] = field(default_factory=dict)
     calls: list[tuple[str, str]] = field(default_factory=list)
     projects: list[ComposeProject] = field(default_factory=list)
     collected_services: list[list[str]] = field(default_factory=list)
@@ -285,6 +317,8 @@ class FakeBackend:
     def up(self, cell: CellHandle) -> None:
         self.calls.append(("up", cell.project.run_id))
         self._started = False
+        self._done = list(self.done)  # each run's oracle starts afresh
+        self._stopped: set[str] = set()
         if self.up_error:
             raise CellError(self.up_error)
 
@@ -303,7 +337,7 @@ class FakeBackend:
             ]
             return CommandResult(tuple(argv), 0, json.dumps({"results": results}).encode())
         assert tuple(argv) == ("/opt/support/done.sh",)  # never done.py
-        code, out = self.done.pop(0) if len(self.done) > 1 else self.done[0]
+        code, out = self._done.pop(0) if len(self._done) > 1 else self._done[0]
         return CommandResult(tuple(argv), code, out.encode(), b"boom" if code else b"")
 
     def start_agent(self, cell: CellHandle) -> None:
@@ -315,6 +349,9 @@ class FakeBackend:
         if service == "agent":
             states = getattr(self, "_states", [ContainerState("missing")])
             return states.pop(0) if len(states) > 1 else states[0]
+        if service in getattr(self, "_stopped", ()):
+            dead = self.dead_after_start.get(service)
+            return dead or ContainerState("exited", self.stop_exit.get(service, 0))
         if getattr(self, "_started", False) and service in self.dead_after_start:
             return self.dead_after_start[service]
         return self.dead_before_start.get(service, ContainerState("running"))
@@ -325,6 +362,7 @@ class FakeBackend:
 
     def stop(self, cell: CellHandle, services: Sequence[str], *, timeout_s: int) -> None:
         self.calls.append(("stop", ",".join(services)))
+        self._stopped.update(s for s in services if s != "agent")
 
     def logs(self, cell: CellHandle, service: str) -> str:
         if service in self.logs_fail:
@@ -343,6 +381,8 @@ class FakeBackend:
             llm_calls=self.llm_calls,
             probe_serves=self.probe_serves,
             probe_prefix=self.probe_prefix,
+            unplanned_serve=self.unplanned_serve,
+            torn_line=self.torn_line,
         )
         return CollectReport(files=["..."], refused=list(self.refuse))
 
@@ -507,11 +547,12 @@ def test_an_unhealthy_target_fails_the_probe(
 def test_an_unreachable_oracle_gives_no_verdict(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    results = _single(engine, collector, FakeBackend(done=[(1, "")]), tmp_path)
+    backend = FakeBackend(done=[(0, UNSUCCESSFUL), (1, "")])  # answers only the probe
+    results = _single(engine, collector, backend, tmp_path)
     for result in results:
         assert result.reason is InvalidReason.ORACLE_UNREACHABLE
         row = _run_row(engine, result.run_id)
-        assert row.outcome is None and row.end_status is None  # never outcome=false
+        assert row.outcome is None and row.decided_at is None  # never outcome=false
         assert _labels(engine, result.run_id) == {}
 
 
@@ -519,7 +560,8 @@ def test_an_unexpected_oracle_success_invalidates_the_run(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
     other = json.dumps({"status": True, "message": "Remote code execution successful."})
-    results = _single(engine, collector, FakeBackend(done=[(0, other)]), tmp_path)
+    backend = FakeBackend(done=[(0, UNSUCCESSFUL), (0, other)])
+    results = _single(engine, collector, backend, tmp_path)
     assert {r.reason for r in results} == {InvalidReason.ORACLE_UNEXPECTED}
 
 
@@ -1083,8 +1125,9 @@ def test_the_target_or_the_stub_llm_dying_during_the_run_invalidates_it(
 def test_an_unanswered_final_poll_gives_no_verdict(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    # the first poll answers success; every later one (the final one included) fails
-    backend = FakeBackend(done=[(0, SUCCESS), (1, "")])
+    # the probe poll answers "not yet", the next success; every later one (the final one
+    # included) fails
+    backend = FakeBackend(done=[(0, UNSUCCESSFUL), (0, SUCCESS), (1, "")])
     results = _single(engine, collector, backend, tmp_path)
     assert {r.reason for r in results} == {InvalidReason.ORACLE_UNREACHABLE}
     # the first run had an answered success earlier: only its final poll failed
@@ -1160,3 +1203,231 @@ def test_the_host_lock_refuses_another_thread(tmp_path: Path) -> None:
     assert len(errors) == 1 and isinstance(errors[0], HostLockError)
     with host_lock(lock):  # released: this thread takes it again
         pass
+
+
+# --------------------------------------------------------------------------- final fix pass
+
+
+@pytest.mark.parametrize(
+    ("done", "why"),
+    [
+        ([(0, SUCCESS)], "success before the agent"),
+        ([(1, "")], "never answered before the agent"),
+        ([(0, "not json")], "never answered before the agent"),
+    ],
+    ids=["already-successful", "unreachable", "garbled"],
+)
+def test_the_oracle_must_answer_not_yet_before_the_agent_starts(
+    engine: Engine,
+    collector: CollectorClient,
+    tmp_path: Path,
+    done: list[tuple[int, str]],
+    why: str,
+) -> None:
+    """An oracle that reports success from the start (or never answers) proves nothing:
+    the probe fails and no agent starts."""
+    backend = FakeBackend(done=done)
+    results = _single(engine, collector, backend, tmp_path)
+    assert {r.reason for r in results} == {InvalidReason.PROBE_FAILED}
+    assert all(why in r.detail for r in results)
+    assert not any(c == "start_agent" for c, _ in backend.calls)
+    for result in results:  # the probe poll is evidence like any other
+        assert _count(engine, t.OraclePoll, result.run_id) >= 1
+
+
+def test_the_probe_poll_is_kept_and_the_verdict_still_comes_from_the_final_poll(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    results = _single(engine, collector, FakeBackend(), tmp_path)
+    for result in results:
+        assert result.status is RunStatus.VALID and result.outcome is True
+        with session_scope(engine) as s:
+            polls = s.scalars(
+                select(t.OraclePoll)
+                .where(t.OraclePoll.run_id == result.run_id)
+                .order_by(t.OraclePoll.seq)
+            ).all()
+        assert polls[0].status is False  # the probe poll, before the agent
+        assert polls[-1].status is True
+
+
+def test_a_torn_event_line_is_a_recording_failure(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    results = _single(engine, collector, FakeBackend(torn_line=True), tmp_path)
+    assert {r.reason for r in results} == {InvalidReason.RECORDING_FAILED}
+    assert all("injector/events.jsonl" in r.detail for r in results)
+    for result in results:  # every whole line was shipped all the same
+        assert _count(engine, t.TargetAccess, result.run_id) >= 2
+
+
+@pytest.mark.parametrize(
+    ("stop_exit", "reason"),
+    [
+        ({"tap": 137}, InvalidReason.RECORDING_FAILED),
+        ({"catcher": 1}, InvalidReason.RECORDING_FAILED),
+        ({"injector": 137}, InvalidReason.INJECTOR_FAILED),
+        ({"tap": 143, "catcher": 0, "injector": 0}, None),
+        ({"stub-llm": 137, "goat": 137}, None),  # not recorders: their exit is no loss
+    ],
+    ids=["tap-killed", "catcher-failed", "injector-killed", "clean", "non-recorders"],
+)
+def test_a_recorder_that_did_not_stop_cleanly_invalidates_the_run(
+    engine: Engine,
+    collector: CollectorClient,
+    tmp_path: Path,
+    stop_exit: dict[str, int],
+    reason: InvalidReason | None,
+) -> None:
+    """SIGKILLed after the stop timeout (137) while draining, a recorder lost evidence."""
+    results = _single(engine, collector, FakeBackend(stop_exit=stop_exit), tmp_path)
+    assert {r.reason for r in results} == {reason}
+    if reason is not None:
+        service = next(iter(stop_exit))
+        assert all(f"{service} exited {stop_exit[service]}" in r.detail for r in results)
+
+
+def test_a_cell_guard_killed_at_stop_is_a_recording_failure(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    backend = FakeBackend(stop_exit={"cellguard": 137})
+    results = _guarded_runner(engine, collector, backend, tmp_path).run_experiment(
+        read_experiment(SELFTEST)
+    )
+    assert {r.reason for r in results} == {InvalidReason.RECORDING_FAILED}
+
+
+def test_a_catcher_recording_failure_line_invalidates_the_run(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    backend = FakeBackend(logs_text={"catcher": "catcher: cannot record callback: ENOSPC"})
+    results = _single(engine, collector, backend, tmp_path)
+    assert {r.reason for r in results} == {InvalidReason.RECORDING_FAILED}
+    assert all("catcher could not record" in r.detail for r in results)
+
+
+def test_a_run_stored_valid_before_a_later_error_stays_valid_with_its_verdict(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """finish(VALID) committed, then the call raised (a lost reply): the run is valid, so
+    it keeps and posts its verdict instead of being half-invalidated."""
+    real = RunStore.finish
+
+    def committed_then_raised(self: RunStore, run_id: str, status: RunStatus, **kw: Any) -> None:
+        real(self, run_id, status, **kw)
+        if status is RunStatus.VALID:
+            raise RuntimeError("server closed the connection after COMMIT")
+
+    monkeypatch.setattr(RunStore, "finish", committed_then_raised)
+    results = _single(engine, collector, FakeBackend(), tmp_path)
+    for result in results:
+        assert (result.status, result.outcome) == (RunStatus.VALID, True)
+        assert len(result.labels) == len(FunnelStage)
+        row = _run_row(engine, result.run_id)
+        assert (row.status, row.outcome, row.invalid_reason) == (RunStatus.VALID, True, None)
+        assert (tmp_path / "runs" / f"{result.run_id}.verdict.json").is_file()
+
+
+def test_an_unplanned_placement_serve_is_contamination(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    """The Collector refuses the batch (unknown_placement) before labelling: that is the
+    contamination it is, not a Collector problem."""
+    results = _single(engine, collector, FakeBackend(unplanned_serve=True), tmp_path)
+    assert {r.reason for r in results} == {InvalidReason.CONTAMINATED}
+    assert all("unknown_placement" in r.detail for r in results)
+
+
+def test_invalid_detail_is_redacted(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    backend = FakeBackend(up_error="compose: postgresql://lab:s3cretpassw0rd@db:5432/lab down")
+    results = _single(engine, collector, backend, tmp_path)
+    for result in results:
+        assert result.reason is InvalidReason.CELL_FAILED
+        assert "s3cretpassw0rd" not in result.detail
+        stored = _run_row(engine, result.run_id).invalid_detail or ""
+        assert "s3cretpassw0rd" not in stored and "REDACTED" in stored
+
+
+def test_store_finish_redacts_the_detail(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    ef = read_experiment(SELFTEST)
+    store = RunStore(engine)
+    schedule = _runner(engine, collector, FakeBackend(), tmp_path).register(ef)
+    run = store.claim_next(ef.experiment.experiment_id, schedule)
+    assert run is not None
+    store.finish(
+        run.run_id,
+        RunStatus.INVALID,
+        reason=InvalidReason.COLLECTOR_REJECTED,
+        detail="Failing row contains (x, X-Api-Key: abcdefabcdefabcdef)",
+    )
+    stored = _run_row(engine, run.run_id).invalid_detail or ""
+    assert "abcdefabcdefabcdef" not in stored and "REDACTED" in stored
+
+
+def test_an_invalid_run_keeps_its_end_status(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    backend = FakeBackend(
+        llm_calls=False, agent_states=[ContainerState("exited", 1)], done=[(0, UNSUCCESSFUL)]
+    )
+    results = _single(engine, collector, backend, tmp_path)
+    for result in results:
+        assert result.reason is InvalidReason.NO_LLM_CALLS
+        row = _run_row(engine, result.run_id)
+        assert (row.end_status, row.outcome) == (EndStatus.CRASHED, None)
+
+
+def test_a_valid_finish_never_takes_an_end_status(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    """A valid run's end status comes with its verdict only (one source)."""
+    ef = read_experiment(SELFTEST)
+    store = RunStore(engine)
+    schedule = _runner(engine, collector, FakeBackend(), tmp_path).register(ef)
+    run = store.claim_next(ef.experiment.experiment_id, schedule)
+    assert run is not None
+    with pytest.raises(StoreError, match="end status"):
+        store.finish(run.run_id, RunStatus.VALID, end_status=EndStatus.COMPLETED)
+
+
+def test_a_pending_verdict_that_cannot_be_removed_never_escapes_run_one(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def as_directory(path: Path, data: bytes) -> None:
+        path.mkdir()  # unlink() then fails with IsADirectoryError
+
+    monkeypatch.setattr(runner_module, "write_atomic", as_directory)
+    ef = read_experiment(SELFTEST)
+
+    def leak(project: ComposeProject) -> str | None:
+        manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
+        if manifest.arm is Arm.INJECTED:
+            return None
+        schedule = RunStore(engine).load_schedule(ef.experiment.experiment_id)
+        return next(r.tag for r in schedule if r.pair_id == manifest.pair_id and r.tag)
+
+    results = _single(engine, collector, FakeBackend(leak=leak), tmp_path)
+    control = _by_arm(results, Arm.CONTROL)
+    assert control.reason is InvalidReason.CONTAMINATED
+    assert _run_row(engine, control.run_id).status is RunStatus.INVALID
+
+
+def test_a_collector_that_cannot_be_reached_is_collector_rejected(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    http = collector._http
+    real = http.post
+
+    def flaky(url: str, **kwargs: Any) -> Any:
+        if url.endswith("/events:batch"):
+            raise httpx.ConnectError("connection refused")
+        return real(url, **kwargs)
+
+    monkeypatch.setattr(http, "post", flaky)
+    results = _single(engine, collector, FakeBackend(), tmp_path)
+    assert {r.reason for r in results} == {InvalidReason.COLLECTOR_REJECTED}
+    assert all("ConnectError" in r.detail for r in results)
