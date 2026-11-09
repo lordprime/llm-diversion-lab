@@ -1632,6 +1632,37 @@ def test_egress_check_fails_without_the_host_table(firewall_default: Path) -> No
     assert "lab_host" in result.stderr
 
 
+
+# A wrapper `nft` that prints the real listing, then far more than a pipe buffer:
+# a reader that stops at its first match (grep -q) makes the writer die of SIGPIPE.
+LOUD_NFT = """\
+#!/bin/bash
+"$REAL_NFT" "$@" || exit
+if [ "$1" = list ]; then yes '# padding' | head -n 200000; fi
+"""
+
+
+def test_egress_check_does_not_fail_when_grep_stops_early(firewall_default: Path) -> None:
+    # Regression: under pipefail, `nft list ... | grep -q` failed whenever grep exited on
+    # its match before nft finished writing; after a reboot on CT 111 this made the check
+    # fail about one run in fifteen with the table loaded.
+    (firewall_default / "loud-bin").mkdir(exist_ok=True)
+    shim = firewall_default / "loud-bin" / "nft"
+    shim.write_text(LOUD_NFT, encoding="utf-8")
+    shim.chmod(0o755)
+    script = (
+        "set -euo pipefail\n"
+        "nft --file host.nft\n"
+        "iptables -N DOCKER-USER && iptables -A FORWARD -j DOCKER-USER\n"
+        "bash lab-cell-egress.sh apply\n"
+        'export REAL_NFT="$(command -v nft)" PATH="$PWD/loud-bin:$PATH"\n'
+        "for _ in 1 2 3 4 5; do bash lab-cell-egress.sh check; done\n"
+    )
+    result = _in_netns(script, firewall_default)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("OK: cell egress rules") == 6  # apply + 5 checks
+
+
 @pytest.fixture
 def rendered_inventory(tmp_path: Path) -> Path:
     out = tmp_path / "inventory.json"

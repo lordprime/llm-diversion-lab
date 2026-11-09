@@ -244,7 +244,8 @@ cmd_migrate() {
 		echo "this release has no 'migrate' service: no migrations to run"
 		return 0
 	fi
-	if compose "$tree" ps --status running --services | grep -qx db; then
+	running=$(compose "$tree" ps --status running --services)
+	if grep -qx db <<<"$running"; then
 		db_up=true
 		# Before anything stops: a rollback must be possible for this database.
 		compose "$tree" exec -T db sh -c "$NAME_CHECK_DB" </dev/null

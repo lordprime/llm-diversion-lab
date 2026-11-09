@@ -63,8 +63,13 @@ check() {
 		echo "FORWARD does not jump to DOCKER-USER" >&2
 		return 1
 	fi
-	if ! nft list chain inet lab_host forward 2>/dev/null | grep -q '"lab: cell egress"' ||
-		! nft list chain inet lab_host prerouting 2>/dev/null | grep -Eq 'fib saddr \. iif (oif|check) missing'; then
+	# Capture first, then grep: under pipefail, `nft list | grep -q` fails whenever
+	# grep exits on its match before nft has written everything (SIGPIPE).
+	local fwd pre
+	fwd=$(nft list chain inet lab_host forward 2>/dev/null || true)
+	pre=$(nft list chain inet lab_host prerouting 2>/dev/null || true)
+	if ! grep -q '"lab: cell egress"' <<<"$fwd" ||
+		! grep -Eq 'fib saddr \. iif (oif|check) missing' <<<"$pre"; then
 		echo "nftables table inet lab_host (forward drop, reverse-path check) is not loaded" >&2
 		return 1
 	fi
