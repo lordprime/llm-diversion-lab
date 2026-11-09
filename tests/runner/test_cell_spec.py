@@ -289,6 +289,27 @@ def test_bridge_names_are_short_stable_and_distinct_per_run(schedule: list[Sched
         assert len(bridge_name(a.run_id, role)) <= 15
 
 
+def test_low_ports_are_bound_unprivileged_and_mitmdump_logs_no_flows(
+    control: tuple[ScheduledRun, RunManifest, ComposeProject],
+) -> None:
+    _, _, project = control
+    services = _services(project)
+    for name in ("injector", "catcher"):
+        service = services[name]
+        assert "user" not in service and "cap_add" not in service, name
+        assert service["sysctls"] == {"net.ipv4.ip_unprivileged_port_start": 0}, name
+    for name in ("injector", "tap"):
+        command = services[name]["command"]
+        assert command[command.index("flow_detail=0") - 1] == "--set", name
+
+
+def test_the_cell_image_keeps_evidence_private_to_its_user() -> None:
+    dockerfile = (REPO_ROOT / "cell" / "Dockerfile").read_text()
+    assert "1777 /evidence" not in dockerfile
+    assert "chown 10001:10001 /evidence" in dockerfile
+    assert "chmod 0750 /evidence" in dockerfile
+
+
 def test_no_published_ports_no_host_paths_no_privileges(
     control: tuple[ScheduledRun, RunManifest, ComposeProject],
     injected: tuple[ScheduledRun, RunManifest, ComposeProject],
@@ -300,12 +321,11 @@ def test_no_published_ports_no_host_paths_no_privileges(
             assert not service.get("privileged"), name
             assert service.get("network_mode") in (None, "none"), name
             assert "ALL" in service.get("cap_drop", []), name
-            assert set(service.get("cap_add", [])) <= {
-                "NET_BIND_SERVICE",
-                "SETUID",
-                "SETGID",
-                "KILL",
-            }, name
+            # only the target's PID 1 adds any (to drop to its app user)
+            allowed = {"SETUID", "SETGID", "KILL"} if name == "goat" else set()
+            assert set(service.get("cap_add", [])) <= allowed, name
+            if name not in ("goat", "secrets-writer"):
+                assert "user" not in service, name  # the image's uid 10001
             assert "no-new-privileges:true" in service.get("security_opt", []), name
             assert "logging" not in service, name  # the daemon's bounded driver applies
             for volume in service.get("volumes", []):

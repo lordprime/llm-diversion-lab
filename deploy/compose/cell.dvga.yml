@@ -65,9 +65,9 @@ services:
 
   injector:
     <<: *infra
-    # binds :80; root with every capability dropped but NET_BIND_SERVICE
-    user: "0:0"
-    cap_add: [NET_BIND_SERVICE]
+    # binds :80 as uid 10001: the namespaced sysctl lets it, no capability needed
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
     command:
       - mitmdump
       - --mode
@@ -79,6 +79,9 @@ services:
       # the app sees the Host the agent used, so its own links point back here
       - --set
       - keep_host_header=true
+      # no per-flow log lines: the logs are scanned for recording failures
+      - --set
+      - flow_detail=0
       - -s
       - /opt/lab/cell/injector/addon.py
     environment:
@@ -106,6 +109,8 @@ services:
       # the gateway routes on its own Host name
       - --set
       - keep_host_header=false
+      - --set
+      - flow_detail=0
       - -s
       - /opt/lab/cell/tap/addon.py
     environment:
@@ -124,9 +129,9 @@ services:
 
   catcher:
     <<: *infra
-    # binds DNS :53 and HTTP :80
-    user: "0:0"
-    cap_add: [NET_BIND_SERVICE]
+    # binds DNS :53 and HTTP :80 as uid 10001 (see the injector)
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
     command: [python, -m, cell.catcher.serve]
     environment:
       LAB_TOKENS: /etc/lab/catcher/tokens.json
