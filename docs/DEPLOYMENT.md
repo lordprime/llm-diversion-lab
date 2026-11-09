@@ -73,7 +73,7 @@ pct create <CTID> <template-storage>:vztmpl/<ubuntu-24.04-template>.tar.zst \
 | Outbound | Allow DNS to the LAN resolver. **Drop** 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 and 100.64.0.0/10. Allow everything else: provider APIs, registries, Cloudflare. |
 | IPv6 | Drop inbound. Outbound: drop the LAN `/64`, `fe80::/10` and `fc00::/7`. IPv6 is also disabled inside the container (§0.5). |
 
-Docker's internal cell networks live *inside* the container's network namespace, so this firewall never interferes with traffic inside a cell. `labctl doctor` (not built in M0; Task 14b/15b) is to check it from inside the LXC by trying to reach a LAN address, which must fail, and a provider API, which must succeed.
+Docker's internal cell networks live *inside* the container's network namespace, so this firewall never interferes with traffic inside a cell. `labctl doctor` (built: control/cli/doctor.py) checks the database and schema head, the Collector's `/healthz` and `/metrics`, the Docker socket, `host.env` (`LAB_CELL_NETWORKS`), `lab.env`'s mode and owner and `lab-cell-egress check`. It does **not yet** check the Proxmox firewall or the clock-sync flag; that check, still to be built, is to try a LAN address from inside the LXC, which must fail, and a provider API, which must succeed.
 
 **Access for the operator and for automation:** add the operator workstation's SSH public key to `root`'s `authorized_keys` in the container, and add the container's ports 22 and 443 as Twingate resources.
 - **Documented exception (LXC profile only):** the container is provisioned as `root`, with key-only login, because CT 111 was set up with root SSH over Twingate. Root inside the unprivileged container maps to an unprivileged user on the Proxmox host.
@@ -117,7 +117,7 @@ Selected with `isolation: lxc` in `hosts.yml`.
   - Task 17 checks that cells cannot resolve external names.
 - **Proxmox host modules.** An unprivileged container may not autoload kernel modules, so the Proxmox host must have the modules the rules use: `nft_fib_inet` (fib; `nft_fib_ipv4`/`nft_fib_ipv6` come as dependencies), `nft_log` + `nf_log_syslog` (log), `nft_limit`, `nft_ct`, and for the DOCKER-USER rules `nft_compat`, `xt_comment` and `xt_tcpudp` (where it is a separate module). Put them in `/etc/modules-load.d/llm-lab.conf` on the host. The role checks `/sys/module` (and `modules.builtin`) first and stops with the names of missing modules. If one is missing anyway, `lab-firewall.service` fails and Docker does not start (closed).
 - **Applying a changed ruleset** by hand: `systemctl reload lab-firewall` replaces the table atomically. Do not `restart` it: that also restarts Docker, through its `Requires=`.
-- The Proxmox-level firewall is the manual step in §0.1. `labctl doctor` (not built in M0; Task 14b/15b) is to verify it.
+- The Proxmox-level firewall is the manual step in §0.1. `labctl doctor` does not verify it yet (see §0.1).
 
 ### 0.3 cell-guard (new component)
 
@@ -175,7 +175,7 @@ The runner sets `LAB_MAX_PARALLEL` and a per-agent concurrency cap from these nu
 | Disk | 300 GB ZFS subvolume (ZFS 2.4.4) |
 | overlay2 prerequisites | Overlay mount on the ZFS rootfs works; nested user namespaces work |
 | Netfilter | `nft` and `iptables` present |
-| Time | Clock synchronised by the host (the container can't run its own NTP, and doesn't need to; `labctl doctor` checks the synchronised flag) |
+| Time | Clock synchronised by the host (the container can't run its own NTP, and doesn't need to; `labctl doctor` is to check the synchronised flag; not built yet) |
 | Docker | Not installed yet (the bootstrap installs it) |
 | Outbound IPv4 | **Broken: no default route** (`net0` has no `gw=`). Fixed on the host with `gw=192.168.1.1`. |
 | Outbound IPv6 | Works through a public IPv6 prefix from the ISP router. **Disabled for the lab** (see below). |
@@ -255,7 +255,8 @@ cp deploy/hosts.example.yml deploy/hosts.yml   # lab1: 192.168.1.145, root, isol
                                                 #   (--allow-build only as a fallback)
 ./deploy/tunnel.sh lab1                         # Twingate: prints the URLs; no tunnel needed
 # then open https://<lxc-ip>/ over Twingate; login: ssh root@<lxc-ip> cat /srv/lab/secrets/web-basic-auth
-labctl --remote lab1 pilot                      # labctl arrives with a later M0 task
+ssh root@<lxc-ip> labctl doctor                # labctl is installed per release (§4.2);
+                                                #   `labctl --remote` and `pilot` are not built yet
 ```
 
 ## 1. Topology
@@ -305,13 +306,13 @@ Whichever is chosen, the website, the APIs and Grafana are reached **only** thro
 
 | # | Change | Plan section affected |
 |---|---|---|
-| 1 | **`labctl` becomes client/server.** The CLI runs on the server *or* on the workstation (`labctl --remote lab1 …`) against the Control API over HTTPS with an API token. Every command works either way. | Plan §3.3 C, §5 |
+| 1 | **`labctl` becomes client/server.** The CLI runs on the server *or* on the workstation (`labctl --remote lab1 …`) against the Control API over HTTPS with an API token. Every command works either way. **In M0** labctl runs on the server only (installed per release, §4.2); `--remote` and the Control API token are **not built**. | Plan §3.3 C, §5 |
 | 2 | **Web UI, APIs and Grafana are behind Caddy with auth**, bound to the private interface (or localhost + SSH tunnel). They are no longer "localhost-only on the laptop". Roles: `viewer`, `operator` (start, pause, schedule), `admin` (tokens, deploys). | Plan §6 |
 | 3 | **Secrets live only on the server:** `/srv/lab/secrets/lab.env`, mode 0600, owner `lab`. They are pushed once with `deploy/secrets.sh` and never stored on the workstation after the push (the script reads them from the prompt or a file and doesn't keep a copy). | Plan §5.1 |
 | 4 | **Images are built on the server** in a separate build phase. The host has internet, the cells don't. Images are pushed to the server's local registry (`127.0.0.1:5000`) and pinned in `images.lock`. CI can build and push instead, using the same registry over the private channel. | Feasibility §6.2 |
 | 5 | **Services are managed by systemd** (wrapping `docker compose`), restart automatically, and survive reboot. On start, the runner **reconciles**: it finds cells left over from a crash, records those runs as `invalid: host_restart`, reaps the cells and re-queues the runs. **In M0** `release.sh` starts the control plane with `docker compose up -d --wait` (compose project `lab`), and containers restart through their compose restart policy. The `lab` role's systemd units and timers are **not built in M0**. | Plan §5.4 |
 | 6 | **Pinned system packages.** Docker, containerd, Sysbox and the kernel are held (`dpkg` hold) and blocklisted for unattended upgrades, so they can't change mid-experiment. They are upgraded only through `deploy/upgrade-host.sh` (**not built in M0**) in a maintenance window, followed by a self-test. | Feasibility §6.1 |
-| 7 | **Time sync** is mandatory, because the evidence ordering across injector, tap, catcher and pcap depends on it. `labctl doctor` fails if clock offset > 50 ms. A VM runs chrony (installed by `base`). An LXC uses the Proxmox host's clock and cannot run its own NTP, so `labctl doctor` checks the synchronised flag. | Plan §3.1 |
+| 7 | **Time sync** is mandatory, because the evidence ordering across injector, tap, catcher and pcap depends on it. `labctl doctor` fails if clock offset > 50 ms. A VM runs chrony (installed by `base`). An LXC uses the Proxmox host's clock and cannot run its own NTP, so `labctl doctor` is to check the synchronised flag (neither clock check is built yet). | Plan §3.1 |
 | 8 | **Remote observability and alerts:** nobody is watching the box, so the server pushes notifications (see [TRACKING.md](TRACKING.md)). | new |
 | 9 | **Storage layout and backups:** XFS data volume, reflink golden roots, artifact retention, nightly restic backups, and a restore drill before the pilot. | new |
 | 10 | **Release tracking:** the deployed release tag + git SHA is recorded on every run and shown on every page footer. | Plan §5.5 |
@@ -325,14 +326,20 @@ Whichever is chosen, the website, the APIs and Grafana are reached **only** thro
 /srv/lab/
   host.env                 # host profile, not secret (isolation, LAB_CELL_NETWORKS, containerd pin, ...)
   releases/<tag>/          # unpacked release trees (code, compose files, configs) + RELEASE (tag, commit, sha256)
+  releases/<tag>/.venv/    # labctl for that release (uv sync --frozen from its uv.lock, host uv + Python)
   releases/.state/         # rollback target and pending pre-migration dump of the release in progress
   current -> releases/<tag>
   deployments.jsonl        # one line per deploy or rollback (M0; the deployments table comes later)
-  secrets/lab.env          # 0600 lab:lab  (provider keys, budgets, notify URLs; written by secrets.sh)
+  secrets/lab.env          # 0600 lab:lab  (provider keys, budgets, notify URLs; written by secrets.sh;
+                           #   LAB_DB_PASSWORD is generated once by bootstrap.sh and always kept)
   secrets/hmac.key         # callback-token key, 32 random bytes (generated once by bootstrap.sh)
   secrets/web-basic-auth   # Caddy login, root 0600 (generated once by bootstrap.sh)
   secrets/ca/              # lab CA for the callback catcher's TLS (generated by the catcher on first run)
-  db/                      # Postgres data (control plane)
+  db/                      # lab:lab 0700 (base role)
+  db/pgdata/               # Postgres data directory (PostgreSQL ≥ 13, image pinned in images.lock),
+                           #   mounted as the db container's data directory; created by release.sh,
+                           #   owned by postgres (uid 999) after the first start; never managed by Ansible
+  state/                   # 0755: selftest.json, the last self-test result (read-only in the Collector)
   cells/<run_id>/          # per-run state (sysbox profile: reflink clone + run volume); deleted after shipping
   artifacts/               # write-once run artifacts (separate disk recommended)
   ops/                     # prometheus, grafana, loki data
@@ -388,9 +395,10 @@ The scripts validate every host entry: an unknown key, a bad type or a bad value
 
 | Script | Purpose | What it does, in order | Target time |
 |---|---|---|---|
-| **`bootstrap.sh <host> [--check] [--format-data-disk] [--skip-doctor]`** | Turn a fresh Ubuntu 24.04 install into a lab server | 1. Validate the host in `hosts.yml` and render an Ansible inventory. 2. Run `ansible/site.yml` against the host with `uvx --from ansible-core==2.22.0 ansible-playbook` (nothing installed globally; `--check` is a `--check --diff` dry run). The roles are in §4.3; they generate the HMAC key and the web login on the server if absent. 3. Run `labctl doctor` remotely and print the report; if labctl is not installed yet, warn and continue. `--format-data-disk` is refused in the LXC profile and not built for the sysbox profile. *Not built in M0:* starting the registry and ops stack. | ≤ 20 min |
-| **`secrets.sh <host> [--from-file path] [--validate-only] [--no-test-calls]`** | Install or rotate provider keys and settings | 1. Prompt for (or read) each variable in `.env.example`: required (`ANTHROPIC_API_KEY`, `LAB_BUDGET_USD`) and optional (other providers, `NOTIFY_*`). Enter keeps the host's current value. 2. Validate each value against the type tag in its `.env.example` comment (shows variable **names** only, never values). 3. Write `secrets/lab.env` atomically over SSH (mode 0600, owner `lab`). Values travel on stdin, and an `END <count>` marker must arrive before the file is replaced. 4. Recreate the control-plane services whose environment changed. 5. Make one zero-cost test call per provider (a model-list request) from the server and report OK or failed (`--no-test-calls` for M0's placeholder key). | ≤ 2 min |
-| **`release.sh <host> --tag vX.Y.Z [--allow-build] [--skip-selftest]`** | Deploy a version | 1. Refuse if the git tree is dirty or the tag is missing; the tag must contain `deploy/compose/control-plane.yml` and a fully pinned `deploy/images.lock`. 2. If run cells are in flight (containers labelled `lab.run_id`): **refuse**. 3. `git archive` the tag and stream it over SSH into `releases/<tag>`, verified by SHA-256. A tag that moved to another commit is refused. 4. Pull every `images.lock` image by digest, plus the control-plane images, which must all be pinned by digest. `--allow-build` builds on the server instead, as a fallback only: images are built in CI (§0.5). Images that are pulled must still be pinned. 5. If the release has a `migrate` service: stop the app services (the database keeps running), take a `pg_dump`, then run `compose run --rm --no-deps migrate`. If a release is deployed but its database is not running, it refuses (no migration without a dump). 6. Swap the `current` symlink and restart the services (`compose up --wait`). 7. `labctl selftest --quick` (one target, no tokens), if labctl is installed. 8. On failure in 5–7: **automatic rollback**: stop the app services, check the dump (`pg_restore --list`), restore it into a scratch database `<db>_rb` (`CONNECTION LIMIT 0`, `--single-transaction --exit-on-error`), and only then swap it in, in one transaction: the live database is renamed to `<db>_old` and the scratch one into its place (so a database always exists under the live name, and the rollback can be run again), then `<db>_old` is dropped. The rollback needs **PostgreSQL ≥ 13** (`DROP DATABASE … WITH (FORCE)`), and `POSTGRES_DB` may be at most 59 bytes (so `<db>_rb` / `<db>_old` fit PostgreSQL's 63-byte names; `migrate` checks it before it stops anything). Then swap `current` back, start the previous release and exit non-zero. A bad dump or a failed restore drops the scratch copy and leaves the live database untouched. Any failure prints where `current` and the database stand, and the dump path. 9. Record the deployment (tag, SHA, who, when) in `/srv/lab/deployments.jsonl`; the `deployments` table comes with the control plane. *Not built in M0:* `--drain` (there is no queue pause yet). | ≤ 10 min (warm caches) |
+| **`bootstrap.sh <host> [--check] [--format-data-disk] [--skip-doctor]`** | Turn a fresh Ubuntu 24.04 install into a lab server | 1. Validate the host in `hosts.yml` and render an Ansible inventory. 2. Run `ansible/site.yml` against the host with `uvx --from ansible-core==2.22.0 ansible-playbook` (nothing installed globally; `--check` is a `--check --diff` dry run). The roles are in §4.3; they generate the HMAC key, the web login and `LAB_DB_PASSWORD` (in `lab.env`) on the server if absent, and install a pinned `uv` and labctl's Python. 3. Run `labctl doctor` remotely and print the report; if labctl is not installed yet, warn and continue. `--format-data-disk` is refused in the LXC profile and not built for the sysbox profile. *Not built in M0:* starting the registry and ops stack. | ≤ 20 min |
+| **`secrets.sh <host> [--from-file path] [--validate-only] [--no-test-calls]`** | Install or rotate provider keys and settings | 1. Prompt for (or read) each variable in `.env.example`: required (`ANTHROPIC_API_KEY`, `LAB_BUDGET_USD`) and optional (other providers, `NOTIFY_*`). Enter keeps the host's current value. 2. Validate each value against the type tag in its `.env.example` comment (shows variable **names** only, never values). 3. Write `secrets/lab.env` atomically over SSH (mode 0600, owner `lab`). Values travel on stdin, and an `END <count>` marker must arrive before the file is replaced. `LAB_DB_PASSWORD` is not operator-supplied: bootstrap.sh generates it once on the host; every write carries it over unchanged and a value for it is refused (Postgres keeps the password it was initialised with). 4. Recreate the control-plane services whose environment changed. 5. Make one zero-cost test call per provider (a model-list request) from the server and report OK or failed (`--no-test-calls` for M0's placeholder key). | ≤ 2 min |
+| **`release.sh <host> --tag vX.Y.Z [--allow-build] [--skip-selftest]`** | Deploy a version | 1. Refuse if the git tree is dirty or the tag is missing; the tag must contain `deploy/compose/control-plane.yml` and a fully pinned `deploy/images.lock`. 2. If run cells are in flight (containers labelled `lab.run_id`): **refuse**. 3. `git archive` the tag and stream it over SSH into `releases/<tag>`, verified by SHA-256. A tag that moved to another commit is refused. 4. Pull every `images.lock` image by digest, plus the control-plane images, which must all be pinned by digest. `--allow-build` builds on the server instead, as a fallback only: images are built in CI (§0.5). Images that are pulled must still be pinned. **Until CI publishes a pinned control-plane image, every release needs `--allow-build`**: the Collector/migrate image is built from the release tree and tagged per release, `lab/control:<tag>` (release.sh sets `LAB_RELEASE_TAG` on every compose call, so a rollback starts the previous release's own image, never the failed release's migrate). Then install labctl for the tag into `releases/<tag>/.venv` with the host's pinned uv (`uv sync --frozen --no-dev`); `/usr/local/bin/labctl` links to `current/.venv/bin/labctl`, so activating or rolling back switches labctl too. A labctl that cannot be installed stops the release before anything changes. 5. If the release has a `migrate` service: stop the app services (the database keeps running), take a `pg_dump`, then run `compose run --rm --no-deps migrate`. If a release is deployed but its database is not running, it refuses (no migration without a dump). 6. Swap the `current` symlink and restart the services (`compose up --wait`). 7. `labctl selftest --quick` (one target, no tokens), if labctl is installed. **Until Task 15b-2 lands, `labctl selftest` is a stub that exits 2, so releases need `--skip-selftest`** (otherwise they roll back). 8. On failure in 5–7: **automatic rollback**: stop the app services, check the dump (`pg_restore --list`), restore it into a scratch database `<db>_rb` (`CONNECTION LIMIT 0`, `--single-transaction --exit-on-error`), and only then swap it in, in one transaction: the live database is renamed to `<db>_old` and the scratch one into its place (so a database always exists under the live name, and the rollback can be run again), then `<db>_old` is dropped. The rollback needs **PostgreSQL ≥ 13** (`DROP DATABASE … WITH (FORCE)`), and `POSTGRES_DB` may be at most 59 bytes (so `<db>_rb` / `<db>_old` fit PostgreSQL's 63-byte names; `migrate` checks it before it stops anything). Then swap `current` back, start the previous release and exit non-zero. A bad dump or a failed restore drops the scratch copy and leaves the live database untouched. Any failure prints where `current` and the database stand, and the dump path. 9. Record the deployment (tag, SHA, who, when) in `/srv/lab/deployments.jsonl`; the `deployments` table comes with the control plane. *Not built in M0:* `--drain` (there is no queue pause yet). | ≤ 10 min (warm caches) |
+| **Control-plane services** | `deploy/compose/control-plane.yml` (project `lab`) | `db` (Postgres, published on `127.0.0.1:5432` for labctl), `migrate` (one-shot `alembic upgrade head`), `collector` (Collector API and `/metrics`, published on `127.0.0.1:8100`; **not** behind Caddy, whose `127.0.0.1:8000` upstream is for the Control/Results API). Nothing binds anything but 127.0.0.1; the network is 172.31.231.0/24, outside the cell range. No container gets the Docker socket. | — |
 | **`status.sh <host>`** | Quick health | Deployed tag; host profile; Docker version and storage driver; control-plane services; run cells in flight; queue and spend vs budget (via `labctl status` once installed); `lab.env` variable count, mode and owner; both firewall layers (`lab-cell-egress check`) and drop counters; disk free; memory. Last backup time is n/a in M0. Exits 1 when degraded. | seconds |
 | **`tunnel.sh <host> [--local-port N]`** | Private access | With `access: twingate`: no tunnel, prints the URLs and where the web login is. With `access: ssh-tunnel`: `ssh -N -L 127.0.0.1:8443:<address>:443` to Caddy. | seconds |
 | **`rollback.sh <host> [--to vX.Y.Z]`** *(not built in M0; `release.sh` rolls back on failure)* | Return to a previous release | Swap the symlink back, run down-migrations to that release's schema (or restore the pre-migration dump), restart, run the self-test | ≤ 5 min |
@@ -425,7 +433,9 @@ The scripts validate every host entry: an unknown key, a bad type or a bad value
 - Updates and packages: git, jq, curl, tcpdump, nftables, iptables, restic, openssl, rsync. chrony only on a VM. fail2ban only when not behind Twingate (all clients share the connector's IP).
 - Locale `C.UTF-8`.
 - Creates the `lab` user and the `/srv/lab` tree with ownership.
-- Generates the HMAC key once.
+- Generates the HMAC key once, and `LAB_DB_PASSWORD` in `secrets/lab.env` once (256 bits, never regenerated).
+- Creates `state/` (the self-test status) with the rest of the tree; never `db/pgdata`.
+- Installs a pinned `uv` (release tarball checked against its SHA-256) on root's PATH and, with it, labctl's pinned Python 3.12 under `/opt/lab/python`.
 - **SSH hardening.** Key-only login, turned on only after a key-only login is proven. `PermitRootLogin` depends on the profile: `prohibit-password` for the LXC (§0.1 exception), `no` on a VM.
 - Unattended security upgrades, with docker-ce, containerd, sysbox and linux-image held and blocklisted.
 
@@ -439,10 +449,10 @@ cp deploy/hosts.example.yml deploy/hosts.yml     # set address, sudo user, disks
 ./deploy/secrets.sh cispa1                        # paste ANTHROPIC_API_KEY + budget
 ./deploy/release.sh cispa1 --tag v0.1.0           # deploy, pull images by digest, self-test
 ./deploy/tunnel.sh cispa1                         # access: ssh-tunnel → open https://localhost:8443
-labctl --remote cispa1 pilot                      # or: ssh cispa1 'labctl pilot'
+ssh cispa1 labctl doctor                          # `labctl --remote` and `pilot` are not built yet
 ```
 
-Beyond that, the user only fills in `.env` values. Everything else is scripted, idempotent and verified by `labctl doctor` and the self-test (labctl is not built in M0; Task 14b/15b).
+Beyond that, the user only fills in `.env` values. Everything else is scripted, idempotent and verified by `labctl doctor` and the self-test (labctl doctor, status, runs ls and run show are built; `selftest` arrives with Task 15b-2; `--remote` and `pilot` are not built).
 
 ---
 

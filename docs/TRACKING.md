@@ -100,7 +100,7 @@ Prometheus scrapes **node-exporter** (host), **cAdvisor** (containers) and the *
 | `lab_runs_in_flight` | gauge | `agent` |
 | `lab_queue_depth` | gauge | `provider` |
 | `lab_run_stage_seconds` | histogram | `stage` |
-| `lab_invalid_runs_total` | counter | `reason` |
+| `lab_invalid_runs_total` | counter | `reason` (`unrecorded` until runs record why they were invalid) |
 | `lab_llm_requests_total` | counter | `provider`, `model`, `http_status` |
 | `lab_llm_refusals_total` | counter | `model`, `category` |
 | `lab_llm_spend_usd_total` | counter | `provider`, `model` |
@@ -111,6 +111,9 @@ Prometheus scrapes **node-exporter** (host), **cAdvisor** (containers) and the *
 | `lab_budget_remaining_usd` | gauge | — |
 | `lab_selftest_last_success_timestamp` | gauge | — |
 | `lab_orphan_cells` | gauge | — |
+| `lab_metrics_database_up` | gauge | — (1 if the latest database read succeeded: this scrape's, or, while another scrape's read is in flight, the one before; at 0 the run families are absent, never 0) |
+
+Built in M0 (`control/api/metrics.py`, served by the Collector at `/metrics`): `lab_runs_total`, `lab_invalid_runs_total`, `lab_runs_in_flight`, `lab_selftest_last_success_timestamp`, `lab_metrics_database_up`. They are **derived at scrape time** from the runs table and the self-test status file (`/srv/lab/state/selftest.json`), not counted in a process's memory, so they survive restarts; `lab_selftest_last_success_timestamp` is 0 until a self-test passes.
 
 ### 3.3 Command-line tracking: `labctl`
 
