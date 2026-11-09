@@ -1118,8 +1118,13 @@ def test_rollback_swap_failure_points_at_the_restored_copy(
     assert result.returncode != 0
     assert "_rb" in result.stderr
     assert str(dump) in result.stderr
-    # The manual recovery names every step, the connection limit included.
+    # The manual recovery names every step, the connection limit included, with the
+    # renames in one transaction and the drop of _old only after it committed.
     assert "CONNECTION LIMIT -1" in result.stderr
+    manual = result.stderr[result.stderr.index("by hand in psql") :]
+    begin, commit = manual.index("BEGIN;"), manual.index("COMMIT;")
+    assert begin < manual.index("RENAME TO") < manual.index("CONNECTION LIMIT -1") < commit
+    assert commit < manual.index('DROP DATABASE "${POSTGRES_DB}_old"')
     assert not any(" up -d" in line for line in _docker_log(env))
 
 
@@ -1188,12 +1193,22 @@ def test_swap_keeps_a_database_under_the_live_name(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "old=lab_old" in lines[0] and "rb=lab_rb" in lines[0] and "db=lab" in lines[0]
     sql = lines[1:]
+    probe = sql.index(
+        "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'db') AS live_exists \\gset"
+    )
+    if_live = sql.index("\\if :live_exists")
+    else_, endif = sql.index("\\else"), sql.index("\\endif")
     stale = sql.index('DROP DATABASE IF EXISTS :"old" WITH (FORCE);')
+    back = sql.index('ALTER DATABASE :"old" RENAME TO :"db";')
     begin, commit = sql.index("BEGIN;"), sql.index("COMMIT;")
     aside = sql.index('ALTER DATABASE :"db" RENAME TO :"old";')
     into = sql.index('ALTER DATABASE :"rb" RENAME TO :"db";')
     limit = sql.index('ALTER DATABASE :"db" CONNECTION LIMIT -1;')
-    assert stale < begin < aside < into < limit < commit
+    # A stale _old is dropped only while the live name exists; without it, _old is the
+    # former live database (a manual swap stopped after its first rename): renamed back.
+    assert probe < if_live < stale < else_ < back < endif < begin
+    assert begin < aside < into < limit < commit
+    assert sql.count('DROP DATABASE IF EXISTS :"old" WITH (FORCE);') == 1
     assert not any(line.startswith('DROP DATABASE :"db"') for line in sql)
     (tmp_path / "drop").mkdir()
     result, lines = _run_snippet(tmp_path / "drop", "DROP_OLD_DB")

@@ -318,7 +318,10 @@ rollback_fail() {
 # 4. SWAP      in ONE transaction: end the live database's connections, rename it to
 #              ${POSTGRES_DB}_old, rename the scratch one into its place and lift the
 #              connection limit. A ${POSTGRES_DB}_old left by an earlier run is dropped
-#              first, so the rollback can be run again;
+#              first, so the rollback can be run again, but only while a database
+#              exists under the live name: if it does not (a manual swap stopped after
+#              its first rename), ${POSTGRES_DB}_old IS the former live database and is
+#              renamed back instead of dropped;
 # 5. CLEANUP   drop ${POSTGRES_DB}_old (a failure only warns: the restore is live).
 # Each snippet runs inside the db container (official postgres image; PostgreSQL >= 13
 # for DROP DATABASE ... WITH (FORCE)), where POSTGRES_USER and POSTGRES_DB are set;
@@ -336,7 +339,7 @@ read -r -d '' RESTORE_DB <<'SH' || true
 pg_restore --single-transaction --exit-on-error -U "$POSTGRES_USER" -d "${POSTGRES_DB}_rb"
 SH
 read -r -d '' SWAP_DB <<'SH' || true
-printf '%s\n' 'DROP DATABASE IF EXISTS :"old" WITH (FORCE);' 'BEGIN;' "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = :'db' AND pid <> pg_backend_pid();" 'ALTER DATABASE :"db" RENAME TO :"old";' 'ALTER DATABASE :"rb" RENAME TO :"db";' 'ALTER DATABASE :"db" CONNECTION LIMIT -1;' 'COMMIT;' | psql -X -q -v ON_ERROR_STOP=1 -v db="$POSTGRES_DB" -v rb="${POSTGRES_DB}_rb" -v old="${POSTGRES_DB}_old" -U "$POSTGRES_USER" -d template1 >/dev/null
+printf '%s\n' "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'db') AS live_exists \gset" '\if :live_exists' 'DROP DATABASE IF EXISTS :"old" WITH (FORCE);' '\else' 'ALTER DATABASE :"old" RENAME TO :"db";' '\endif' 'BEGIN;' "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = :'db' AND pid <> pg_backend_pid();" 'ALTER DATABASE :"db" RENAME TO :"old";' 'ALTER DATABASE :"rb" RENAME TO :"db";' 'ALTER DATABASE :"db" CONNECTION LIMIT -1;' 'COMMIT;' | psql -X -q -v ON_ERROR_STOP=1 -v db="$POSTGRES_DB" -v rb="${POSTGRES_DB}_rb" -v old="${POSTGRES_DB}_old" -U "$POSTGRES_USER" -d template1 >/dev/null
 SH
 read -r -d '' DROP_OLD_DB <<'SH' || true
 printf '%s\n' 'DROP DATABASE IF EXISTS :"old" WITH (FORCE);' | psql -X -q -v ON_ERROR_STOP=1 -v old="${POSTGRES_DB}_old" -U "$POSTGRES_USER" -d template1
@@ -346,8 +349,10 @@ printf '%s\n' 'DROP DATABASE IF EXISTS :"rb" WITH (FORCE);' | psql -X -q -v ON_E
 SH
 
 # What to run by hand if the swap did not complete (POSTGRES_DB as in the db container).
+# The renames are one transaction, so a half-done manual swap cannot leave the live
+# name empty; _old is dropped only after COMMIT succeeded.
 # shellcheck disable=SC2016 # printed for the operator, not expanded here
-MANUAL_SWAP='ALTER DATABASE "$POSTGRES_DB" RENAME TO "${POSTGRES_DB}_old"; ALTER DATABASE "${POSTGRES_DB}_rb" RENAME TO "$POSTGRES_DB"; ALTER DATABASE "$POSTGRES_DB" CONNECTION LIMIT -1; then DROP DATABASE "${POSTGRES_DB}_old"'
+MANUAL_SWAP='(connected to template1, app services stopped) BEGIN; ALTER DATABASE "$POSTGRES_DB" RENAME TO "${POSTGRES_DB}_old"; ALTER DATABASE "${POSTGRES_DB}_rb" RENAME TO "$POSTGRES_DB"; ALTER DATABASE "$POSTGRES_DB" CONNECTION LIMIT -1; COMMIT; then, only if COMMIT succeeded: DROP DATABASE "${POSTGRES_DB}_old"'
 
 db_exec() {
 	compose "$LAB/current" exec -T db sh -c "$1"
