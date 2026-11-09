@@ -1159,10 +1159,11 @@ def test_the_gate_latches_after_any_cell_not_proven_contained() -> None:
     assert calls == [] and len(gate.records) == 1
 
 
-def test_stale_running_selftest_runs_are_marked_abandoned_and_study_runs_never(
+def test_stale_running_and_queued_selftest_runs_are_marked_abandoned_and_study_runs_never(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    def claimed(ef: Any, where: Path) -> str:
+    def claimed(ef: Any, where: Path) -> tuple[str, list[str]]:
+        """Register ``ef``, claim its first run; return it and the runs left queued."""
         runner = Runner(
             store=RunStore(engine),
             collector=collector,
@@ -1175,21 +1176,29 @@ def test_stale_running_selftest_runs_are_marked_abandoned_and_study_runs_never(
         schedule = runner.register(ef)
         run = RunStore(engine).claim_next(ef.experiment.experiment_id, schedule)
         assert run is not None
-        return run.run_id
+        queued = [r.run_id for r in schedule if r.run_id != run.run_id]
+        assert queued
+        return run.run_id, queued
 
-    killed = claimed(derive_experiment(SELFTEST_YAML, quick=True), tmp_path / "k")
-    study = claimed(read_experiment(SELFTEST_YAML), tmp_path / "s")
+    killed, never_run = claimed(derive_experiment(SELFTEST_YAML, quick=True), tmp_path / "k")
+    study, study_queued = claimed(read_experiment(SELFTEST_YAML), tmp_path / "s")
     report = run_selftest(_deps(engine, collector, tmp_path / "b"), quick=True)
     assert report.passed, _failed(report)
     with session_scope(engine) as s:
-        old = s.get(t.Run, killed)
-        assert old is not None
-        assert (old.status, old.invalid_reason) == (RunStatus.INVALID, InvalidReason.INTERNAL)
-        assert "abandoned" in (old.invalid_detail or "") and old.finished_at is not None
+        for run_id, was in [(killed, "running"), *((q, "queued") for q in never_run)]:
+            old = s.get(t.Run, run_id)
+            assert old is not None
+            assert (old.status, old.invalid_reason) == (RunStatus.INVALID, InvalidReason.INTERNAL)
+            assert old.invalid_detail is not None and old.finished_at is not None
+            assert old.invalid_detail.startswith(f"abandoned: still {was}")
         other = s.get(t.Run, study)
         assert other is not None and other.status is RunStatus.RUNNING
+        for run_id in study_queued:
+            row = s.get(t.Run, run_id)
+            assert row is not None and row.status is RunStatus.QUEUED
     swept = next(c for c in report.checks if c.name == "earlier self-tests swept")
-    assert "1 abandoned" in swept.detail
+    assert "1 abandoned running" in swept.detail
+    assert f"{len(never_run)} abandoned queued" in swept.detail
 
 
 def test_selftest_runs_are_left_out_of_the_in_flight_gauge(

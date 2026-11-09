@@ -45,7 +45,8 @@ container engine. It **passes** only if all of these hold:
 Before the pair runs, resources left by **earlier self-tests** are swept: those
 labelled ``lab.run_id`` with a run of an ``exp_selftest_*`` experiment (none can be
 running: the self-test holds the runner lock), and such runs still ``running`` (a
-killed self-test's) are marked invalid (``internal``, abandoned). Study runs and their
+killed self-test's) or still ``queued`` (never to run: each self-test registers a fresh
+experiment) are marked invalid (``internal``, abandoned). Study runs and their
 resources are never touched.
 
 A cell that fails before its agent would start (so before the probe) is reported as a
@@ -1043,14 +1044,21 @@ ABANDONED_DETAIL: Final = (
     "abandoned: still running when a later self-test took the runner lock (the self-test "
     "that ran it was killed)"
 )
+#: ``invalid_detail`` of a self-test run found still ``queued`` by a later self-test.
+ABANDONED_QUEUED_DETAIL: Final = (
+    "abandoned: still queued when a later self-test took the runner lock (the self-test "
+    "that registered it ended before running it)"
+)
 
 
 def _sweep_earlier(deps: SelftestDeps) -> Check:
     """Remove what earlier self-tests left (never a study run's resources).
 
-    Called holding the runner lock, so no self-test run can be running: any still
-    ``running`` belongs to a killed self-test and is marked invalid (``internal``,
-    :data:`ABANDONED_DETAIL`). Study runs are never touched.
+    Called holding the runner lock, so no self-test run can be running, and every
+    self-test registers its own fresh experiment: any earlier self-test run still
+    ``running`` belongs to a killed self-test, any still ``queued`` will never run. Both
+    are marked invalid (``internal``, :data:`ABANDONED_DETAIL` or
+    :data:`ABANDONED_QUEUED_DETAIL`), in one transaction. Study runs are never touched.
     """
     try:
         labelled = deps.resources.labelled_run_ids()
@@ -1059,22 +1067,30 @@ def _sweep_earlier(deps: SelftestDeps) -> Check:
     selftest_experiment = t.Run.experiment_id.startswith(
         SELFTEST_EXPERIMENT_PREFIX, autoescape=True
     )
+    abandoned: dict[RunStatus, list[str]] = {}
     with session_scope(deps.engine) as s:
-        abandoned = list(
-            s.scalars(
-                update(t.Run)
-                .where(selftest_experiment, t.Run.status == RunStatus.RUNNING)
-                .values(
-                    status=RunStatus.INVALID,
-                    invalid_reason=InvalidReason.INTERNAL,
-                    invalid_detail=ABANDONED_DETAIL,
-                    finished_at=func.now(),
+        for status, detail in (
+            (RunStatus.RUNNING, ABANDONED_DETAIL),
+            (RunStatus.QUEUED, ABANDONED_QUEUED_DETAIL),
+        ):
+            abandoned[status] = list(
+                s.scalars(
+                    update(t.Run)
+                    .where(selftest_experiment, t.Run.status == status)
+                    .values(
+                        status=RunStatus.INVALID,
+                        invalid_reason=InvalidReason.INTERNAL,
+                        invalid_detail=detail,
+                        finished_at=func.now(),
+                    )
+                    .returning(t.Run.run_id)
                 )
-                .returning(t.Run.run_id)
             )
-        )
-    if abandoned:
-        log.warning("selftest: earlier self-test runs left running, now invalid: %s", abandoned)
+    for status, run_ids in abandoned.items():
+        if run_ids:
+            log.warning(
+                "selftest: earlier self-test runs left %s, now invalid: %s", status.value, run_ids
+            )
     with session_scope(deps.engine) as s:
         selftest_runs = set(
             s.scalars(
@@ -1122,8 +1138,9 @@ def _sweep_earlier(deps: SelftestDeps) -> Check:
     notes = []
     if removed:
         notes.append(f"removed resources of {len(removed)} earlier self-test runs")
-    if abandoned:
-        notes.append(f"marked {len(abandoned)} abandoned running self-test runs invalid")
+    for status, run_ids in abandoned.items():
+        if run_ids:
+            notes.append(f"marked {len(run_ids)} abandoned {status.value} self-test runs invalid")
     detail = "; ".join(notes)
     if left:
         return Check("earlier self-tests swept", False, f"still there: {json.dumps(left)[:300]}")
