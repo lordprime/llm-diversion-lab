@@ -82,6 +82,10 @@ services:
       # no per-flow log lines: the logs are scanned for recording failures
       - --set
       - flow_detail=0
+      # bounded bodies (mem_limit 512m): an oversized request or response ends in the
+      # error hook (logged with status null, never forwarded) instead of an OOM kill
+      - --set
+      - body_size_limit=64m
       - -s
       - /opt/lab/cell/injector/addon.py
     environment:
@@ -111,6 +115,9 @@ services:
       - keep_host_header=false
       - --set
       - flow_detail=0
+      # bounded bodies (see the injector): an oversized LLM call is never forwarded
+      - --set
+      - body_size_limit=32m
       - -s
       - /opt/lab/cell/tap/addon.py
     environment:
