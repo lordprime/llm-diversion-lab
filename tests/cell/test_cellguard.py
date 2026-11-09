@@ -15,7 +15,10 @@ import asyncio
 import contextlib
 import json
 import os
+import signal
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -28,7 +31,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 import pytest
 from pydantic import TypeAdapter
 
-from cell.cellguard import policy
+from cell.cellguard import policy, proxy
 from cell.cellguard.policy import (
     ORIGIN,
     ORIGIN_LABEL,
@@ -2170,6 +2173,86 @@ async def test_proxy_403_body_caps_echoed_agent_text(tmp_path: Path) -> None:
         assert len(message) < 400
     [record] = records_of(tmp_path)
     assert len(record["reason"]) <= policy.MAX_REASON_CHARS
+
+
+# --------------------------------------------------------------------------- stopping
+
+
+def _guard_env(tmp_path: Path, d: Path) -> dict[str, str]:
+    lock = tmp_path / "images.lock"
+    lock.write_text(f"images:\n  - {{name: kali, image: kali, digest: {DIGEST_B}, role: agent}}\n")
+    return {
+        "LAB_RUN_ID": RUN,
+        "LAB_CELLGUARD_NETWORK": NETWORK,
+        "LAB_CELLGUARD_DNS": CELL_DNS,
+        "LAB_CELLGUARD_IMAGES_LOCK": str(lock),
+        "LAB_CELLGUARD_LISTEN": str(d / "guard.sock"),
+        "LAB_CELLGUARD_UPSTREAM": str(d / "no-daemon.sock"),  # a denial never asks it
+        "LAB_EVIDENCE_DIR": str(tmp_path / "ev"),
+    }
+
+
+def test_sigterm_stops_the_proxy_with_status_0_and_its_log_closed(tmp_path: Path) -> None:
+    # PID 1 in a container ignores a signal it has no handler for, so `docker stop`
+    # would end in SIGKILL (137, recording_failed); the handler makes the stop clean.
+    root = Path(__file__).resolve().parents[2]
+    with short_tmp() as d:
+        env = {**os.environ, "PYTHONPATH": str(root), **_guard_env(tmp_path, d)}
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "cell.cellguard.proxy"],
+            cwd=root,
+            env=env,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            listen = d / "guard.sock"
+            deadline = time.monotonic() + 30
+            while not listen.is_socket():
+                assert proc.poll() is None, proc.stderr.read() if proc.stderr else b""
+                assert time.monotonic() < deadline, "cell-guard never listened"
+                time.sleep(0.05)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+                conn.settimeout(10)
+                conn.connect(str(listen))
+                conn.sendall(req("POST", "/v1.44/images/create?fromImage=alpine"))
+                assert conn.recv(4096).startswith(b"HTTP/1.1 403")
+            proc.send_signal(signal.SIGTERM)
+            _, err = proc.communicate(timeout=20)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    assert proc.returncode == 0, err
+    assert b"cell-guard: stopped" in err
+    raw = (tmp_path / "ev" / DECISIONS_FILE).read_bytes()
+    assert raw.endswith(b"\n")
+    [record] = [json.loads(line) for line in raw.splitlines()]
+    assert (record["op"], record["allowed"]) == ("image.pull", False)
+
+
+async def test_a_stop_cuts_off_connections_in_flight_and_closes_the_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(proxy, "STOP_DRAIN_S", 0.2)
+    with short_tmp() as d:
+        config = CellGuardConfig.from_env(_guard_env(tmp_path, d))
+        stop = asyncio.Event()
+        serving = asyncio.create_task(proxy.serve_until_stopped(config, stop))
+        listen = d / "guard.sock"
+        while not listen.is_socket():
+            await asyncio.sleep(0.01)
+        # a client that never finishes its request head
+        reader, writer = await asyncio.open_unix_connection(str(listen))
+        writer.write(b"GET /v1.44/version HTTP/1.1\r\n")
+        await writer.drain()
+        await asyncio.sleep(0.05)
+        stop.set()
+        log = await asyncio.wait_for(serving, timeout=5)
+        assert await asyncio.wait_for(reader.read(), timeout=5) == b""  # cut off
+        writer.close()
+    assert log.closed
+    with pytest.raises(OSError, match="closed"):
+        log.record(DockerRequest("GET", "/version"), Decision(True, "x", "x", "", "", b""))
 
 
 # --------------------------------------------------------------------------- podman integration

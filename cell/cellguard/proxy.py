@@ -61,6 +61,11 @@ Configuration (:meth:`CellGuardConfig.from_env`):
 * ``LAB_CELLGUARD_SOCKET_MODE`` (octal, default ``660``).
 * ``LAB_CELLGUARD_MAX_CONNECTIONS`` (default 32): concurrent connections before ``503``.
 * ``LAB_EVIDENCE_DIR`` (default ``./evidence``): the run's evidence volume.
+
+SIGTERM or SIGINT stops it cleanly with exit status 0: no new connections are
+accepted, those in flight get :data:`STOP_DRAIN_S` seconds (inside the runner's 15 s
+stop timeout) and are then cut off, and the decision log is closed after any append in
+progress. The cell also runs it under an init process (``init: true``).
 """
 
 from __future__ import annotations
@@ -71,6 +76,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import stat
 import sys
 import threading
@@ -107,10 +113,12 @@ __all__ = [
     "FORWARDED_HEADERS",
     "MAX_BODY",
     "MAX_HEAD",
+    "STOP_DRAIN_S",
     "CellGuard",
     "CellGuardConfig",
     "DecisionLog",
     "main",
+    "serve_until_stopped",
 ]
 
 #: Producer stream name of cell-guard's decision records.
@@ -130,6 +138,8 @@ _REQUEST_TIMEOUT_S: Final = 60.0
 #: Concurrent client connections served before new ones are refused with ``503``.
 DEFAULT_MAX_CONNECTIONS: Final = 32
 _LOOKUP_TIMEOUT_S: Final = 30.0
+#: On SIGTERM, how long connections in flight may finish before they are cut off.
+STOP_DRAIN_S: Final = 10.0
 
 _RUN_ID_RE = re.compile(RUN_ID_PATTERN)
 _DECIMAL_RE = re.compile(r"[0-9]{1,12}")
@@ -182,11 +192,21 @@ class DecisionLog:
         self._path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._closed = False
         self._next_seq = self._resume()
 
     @property
     def path(self) -> Path:
         return self._path
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        """Wait for an append in progress, then refuse any further one."""
+        with self._lock:
+            self._closed = True
 
     def _resume(self) -> int:
         """Next ``seq`` after the highest one stored; closes a torn last line."""
@@ -211,10 +231,13 @@ class DecisionLog:
     ) -> dict[str, Any]:
         """Append and fsync the record of one decision; return it.
 
-        A failed append raises and still consumes its ``seq``.
+        A failed append raises and still consumes its ``seq``. Once the log is closed,
+        every call raises :class:`OSError`.
         """
         target = request.target
         with self._lock:
+            if self._closed:
+                raise OSError(f"{self._path}: decision log closed")
             seq = self._next_seq
             self._next_seq += 1
             event = CellGuardDecision(
@@ -494,6 +517,7 @@ class CellGuard:
         self._log = log
         self._max_connections = max_connections
         self._active = 0
+        self._tasks: set[asyncio.Task[Any]] = set()
 
     async def serve(self, path: Path, mode: int = 0o660) -> asyncio.Server:
         """Listen on Unix socket ``path`` (a stale socket there is replaced)."""
@@ -529,6 +553,10 @@ class CellGuard:
         with a recorded ``503``. Any unexpected error before the request's decision is
         recorded is itself recorded as an ``http.500`` denial (fail closed).
         """
+        task = asyncio.current_task()
+        if task is not None:  # for drain()
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
         if self._active >= self._max_connections:
             reason = f"more than {self._max_connections} concurrent connections"
             await self._refuse(
@@ -552,6 +580,17 @@ class CellGuard:
         finally:
             self._active -= 1
             _close(writer)
+
+    async def drain(self, timeout: float) -> int:
+        """Wait up to ``timeout`` seconds for the connections in flight, then cancel the
+        rest; return how many were cancelled. For after the server is closed."""
+        pending = {t for t in self._tasks if not t.done()}
+        if pending:
+            _, pending = await asyncio.wait(pending, timeout=timeout)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        return len(pending)
 
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, state: _State
@@ -767,16 +806,43 @@ def _target(kind: str, ident: Any, name: Any, labels: Any) -> Target | None:
 # --------------------------------------------------------------------------- entry point
 
 
-async def _serve_forever(config: CellGuardConfig) -> None:
+_STOP_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
+
+
+async def serve_until_stopped(
+    config: CellGuardConfig, stop: asyncio.Event | None = None
+) -> DecisionLog:
+    """Serve until SIGTERM or SIGINT (or until ``stop`` is set), then stop cleanly.
+
+    The listener is closed first, the connections in flight get :data:`STOP_DRAIN_S`
+    seconds, and the decision log is closed last. Returns the (closed) log.
+    """
+    stop = stop or asyncio.Event()
     log = DecisionLog(config.context.run_id, config.log_path)
     guard = CellGuard(config.context, config.upstream, log, config.max_connections)
-    server = await guard.serve(config.listen, config.socket_mode)
-    print(
-        f"cell-guard: run {config.context.run_id} on {config.listen} -> {config.upstream}",
-        file=sys.stderr,
-    )
-    async with server:
-        await server.serve_forever()
+    loop = asyncio.get_running_loop()
+    for sig in _STOP_SIGNALS:
+        loop.add_signal_handler(sig, stop.set)
+    cut = 0
+    try:
+        server = await guard.serve(config.listen, config.socket_mode)
+        print(
+            f"cell-guard: run {config.context.run_id} on {config.listen} -> {config.upstream}",
+            file=sys.stderr,
+        )
+        try:
+            await stop.wait()
+        finally:
+            server.close()
+            cut = await guard.drain(STOP_DRAIN_S)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(server.wait_closed(), timeout=1.0)
+    finally:
+        log.close()
+        for sig in _STOP_SIGNALS:
+            loop.remove_signal_handler(sig)
+    print(f"cell-guard: stopped, {cut} connection(s) cut off", file=sys.stderr)
+    return log
 
 
 def main() -> None:
@@ -786,7 +852,7 @@ def main() -> None:
     except ValueError as exc:
         print(f"cell-guard: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
-    asyncio.run(_serve_forever(config))
+    asyncio.run(serve_until_stopped(config))
 
 
 if __name__ == "__main__":

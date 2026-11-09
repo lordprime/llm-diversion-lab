@@ -530,6 +530,8 @@ def test_an_agent_that_starts_containers_gets_a_cell_guard(
     assert env["LAB_EVIDENCE_DIR"] == project.evidence_paths["cellguard"] != "/evidence"
     assert "LAB_CELLGUARD_NAME_PREFIX" not in env  # the default <run id>- prefix
     assert "networks" not in guard and guard.get("network_mode") == "none"  # sockets only
+    # PID 1 under an init, so `stop` delivers SIGTERM and ends 0 rather than 137
+    assert guard["init"] is True
     assert services["agent"]["environment"]["DOCKER_HOST"].startswith("unix:///run/cellguard/")
     agent_mounts = {v.split(":")[0] for v in services["agent"]["volumes"]}
     assert "cellguard_sock" in agent_mounts

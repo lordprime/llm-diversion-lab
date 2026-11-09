@@ -718,6 +718,9 @@ def render_cell(
         services["cellguard"] = {
             "image": cell_image,
             "command": ["python", "-m", "cell.cellguard.proxy"],
+            # an init as PID 1 (signals forwarded, children reaped) on top of the
+            # proxy's own SIGTERM handler: a stop must exit 0, never time out to 137
+            "init": True,
             # root, every capability dropped: it only needs the Docker socket's owner
             # bits; its evidence path is not in the image, so root owns that volume
             "user": "0:0",
