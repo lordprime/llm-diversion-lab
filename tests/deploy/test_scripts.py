@@ -1632,7 +1632,6 @@ def test_egress_check_fails_without_the_host_table(firewall_default: Path) -> No
     assert "lab_host" in result.stderr
 
 
-
 # A wrapper `nft` that prints the real listing, then far more than a pipe buffer:
 # a reader that stops at its first match (grep -q) makes the writer die of SIGPIPE.
 LOUD_NFT = """\
