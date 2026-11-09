@@ -14,9 +14,10 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, func, select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from control.api.app import create_app
+from control.api.collector import _db_error
 from control.core import models as m
 from control.core.ids import new_id
 from control.core.models import Arm, EndStatus, Event
@@ -112,6 +113,16 @@ def _run(engine: Engine, run_id: str) -> t.Run:
         run = s.get(t.Run, run_id)
         assert run is not None
         return run
+
+
+def _mark_valid(engine: Engine, run_id: str) -> None:
+    """Move a run to ``valid`` (a verdict is only stored for a run finished valid)."""
+    with session_scope(engine) as s:
+        s.execute(
+            t.Run.__table__.update()
+            .where(t.Run.run_id == run_id)
+            .values(status=m.RunStatus.VALID.value)
+        )
 
 
 def _verdict(run_id: str, **overrides: Any) -> m.Verdict:
@@ -284,11 +295,18 @@ def test_event_for_a_placement_of_no_such_run_is_422(client: TestClient, engine:
 def test_batch_the_database_refuses_is_422_and_persisted(
     client: TestClient, engine: Engine
 ) -> None:
-    """Schema-valid but unstorable (method longer than its column): nothing half-written."""
+    """Schema-valid but unstorable (stop_reason longer than its column): nothing half-written."""
     run_id, _ = _injected_run(engine)
     ok = m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=False)
-    bad = m.TargetAccessEvent(
-        run_id=run_id, stream="injector", seq=0, ts=TS, flow_id="f", method="X" * 40, url="/"
+    bad = m.LlmCall(
+        run_id=run_id,
+        stream="tap",
+        seq=0,
+        ts=TS,
+        tag_present=False,
+        request_sha256=SHA,
+        request_artifact="llm/0000.req.json",
+        stop_reason="X" * 80,
     )
     r = client.post(f"/v1/runs/{run_id}/events:batch", content=_batch_json(run_id, [ok, bad]))
     assert r.status_code == 422, r.text
@@ -298,17 +316,123 @@ def test_batch_the_database_refuses_is_422_and_persisted(
     assert [x.reason for x in _rejected(engine)] == [m.RejectReason.CONSTRAINT]
 
 
-def test_nul_in_text_is_422_and_persisted(client: TestClient, engine: Engine) -> None:
+def test_a_constraint_rejection_names_only_the_sqlstate_and_constraint(
+    client: TestClient, engine: Engine
+) -> None:
+    """No raw database text (which echoes row values) in the response or the kept detail."""
+    run_id, _ = _injected_run(engine)
+    bad = m.LlmCall(
+        run_id=run_id,
+        stream="tap",
+        seq=0,
+        ts=TS,
+        tag_present=False,
+        request_sha256=SHA,
+        request_artifact="llm/0000.req.json",
+        stop_reason="secretish-" + "Y" * 80,
+    )
+    r = client.post(f"/v1/runs/{run_id}/events:batch", content=_batch_json(run_id, [bad]))
+    assert r.status_code == 422, r.text
+    body = r.json()
+    assert body["error"] == {"sqlstate": "22001", "constraint": None}
+    assert "secretish" not in r.text and "YYYY" not in r.text
+    [rejected] = _rejected(engine)
+    assert rejected.detail == {"error": {"sqlstate": "22001", "constraint": None}}
+
+
+def test_a_check_violation_names_its_constraint(engine: Engine) -> None:
+    run_id, _ = _injected_run(engine)
+    with pytest.raises(IntegrityError) as err, session_scope(engine) as s:
+        s.execute(
+            t.Artifact.__table__.insert().values(
+                run_id=run_id, path="y", sha256="not-hex", size_bytes=1
+            )
+        )
+    assert _db_error(err.value) == {
+        "sqlstate": "23514",
+        "constraint": "ck_artifacts_sha256_format",
+    }
+
+
+def test_a_long_method_or_qtype_is_stored(client: TestClient, engine: Engine) -> None:
+    """Verb tampering and odd DNS types are evidence, not a reason to refuse the batch."""
+    run_id, _ = _injected_run(engine)
+    method = "PROPFIND-" + "X" * 31  # 40 characters
+    events: list[Event] = [
+        m.TargetAccessEvent(
+            run_id=run_id, stream="injector", seq=0, ts=TS, flow_id="f", method=method, url="/"
+        ),
+        m.Callback(
+            run_id=run_id,
+            stream="catcher-http",
+            seq=0,
+            ts=TS,
+            channel="http",
+            method=method,
+            url="/cb",
+        ),
+        m.Callback(
+            run_id=run_id,
+            stream="catcher-dns",
+            seq=0,
+            ts=TS,
+            channel="dns",
+            qname="x.cb.lab.test.",
+            qtype="TYPE65534-" + "9" * 30,
+        ),
+    ]
+    r = client.post(f"/v1/runs/{run_id}/events:batch", content=_batch_json(run_id, events))
+    assert r.status_code == 200, r.text
+    assert r.json()["inserted"] == 3
+    with session_scope(engine) as s:
+        assert s.scalar(select(t.TargetAccess.method)) == method
+        assert set(s.scalars(select(t.Callback.method))) == {method, None}
+
+
+def test_nul_in_text_and_jsonb_is_stored_replaced_deterministically(
+    client: TestClient, engine: Engine
+) -> None:
+    """NUL (which Postgres text and JSONB cannot hold) becomes U+FFFD; never a 422."""
     run_id, _ = _injected_run(engine)
     ev = m.AgentEvent(
-        run_id=run_id, stream="agent", seq=0, ts=TS, event_type="message", text="a\x00b"
+        run_id=run_id,
+        stream="agent",
+        seq=0,
+        ts=TS,
+        event_type="tool_call",
+        tool_name="sh\x00ell",
+        tool_args={"cmd\x00": ["a\x00b", {"k": "\x00"}]},
+        text="a\x00b",
     )
     body = _batch_json(run_id, [ev])
     r = client.post(f"/v1/runs/{run_id}/events:batch", content=body)
-    assert r.status_code == 422, r.text
-    assert _event_rows(engine) == 0
-    [rejected] = _rejected(engine)
-    assert rejected.body == body.encode()
+    assert r.status_code == 200, r.text
+    assert r.json()["inserted"] == 1
+    with session_scope(engine) as s:
+        row = s.scalars(select(t.AgentEvent)).one()
+        assert (row.text, row.tool_name) == ("a\ufffdb", "sh\ufffdell")
+        assert row.tool_args == {"cmd\ufffd": ["a\ufffdb", {"k": "\ufffd"}]}
+    again = client.post(f"/v1/runs/{run_id}/events:batch", content=body)
+    assert again.status_code == 200, again.text
+    assert again.json() == {"run_id": run_id, "inserted": 0, "duplicates": 1, "conflicts": []}
+    assert _rejected(engine) == []
+
+
+def test_nul_in_a_heartbeat_or_oracle_message_is_stored_replaced(
+    client: TestClient, engine: Engine
+) -> None:
+    run_id, _ = _injected_run(engine)
+    hb = m.RunHeartbeat(run_id=run_id, seq=0, phase="claimed", ts=TS, message="x\x00y")
+    for _ in range(2):
+        r = client.post(f"/v1/runs/{run_id}/status", content=hb.model_dump_json())
+        assert r.status_code == 200, r.text
+    _mark_valid(engine, run_id)
+    verdict = _verdict(run_id, oracle_message="ok\x00")
+    for result in ("stored", "duplicate"):
+        r = client.post(f"/v1/runs/{run_id}/verdict", content=verdict.model_dump_json())
+        assert r.status_code == 200, r.text
+        assert r.json()["result"] == result
+    assert _run(engine, run_id).oracle_message == "ok\ufffd"
 
 
 # --------------------------------------------------------------------- verdict
@@ -316,6 +440,7 @@ def test_nul_in_text_is_422_and_persisted(client: TestClient, engine: Engine) ->
 
 def test_verdict_sets_end_status_and_outcome(client: TestClient, engine: Engine) -> None:
     run_id, _ = _injected_run(engine)
+    _mark_valid(engine, run_id)
     r = client.post(f"/v1/runs/{run_id}/verdict", content=_verdict(run_id).model_dump_json())
     assert r.status_code == 200, r.text
     assert r.json() == {"run_id": run_id, "result": "stored"}
@@ -328,6 +453,7 @@ def test_verdict_sets_end_status_and_outcome(client: TestClient, engine: Engine)
 
 def test_verdict_is_write_once(client: TestClient, engine: Engine) -> None:
     run_id, _ = _injected_run(engine)
+    _mark_valid(engine, run_id)
     url = f"/v1/runs/{run_id}/verdict"
     assert client.post(url, content=_verdict(run_id).model_dump_json()).status_code == 200
 
@@ -349,12 +475,37 @@ def test_verdict_same_instant_other_timezone_is_a_duplicate(
     client: TestClient, engine: Engine
 ) -> None:
     run_id, _ = _injected_run(engine)
+    _mark_valid(engine, run_id)
     url = f"/v1/runs/{run_id}/verdict"
     assert client.post(url, content=_verdict(run_id).model_dump_json()).status_code == 200
     shifted = TS.astimezone(timezone(timedelta(hours=2)))
     r = client.post(url, content=_verdict(run_id, decided_at=shifted).model_dump_json())
     assert r.status_code == 200
     assert r.json()["result"] == "duplicate"
+
+
+@pytest.mark.parametrize("status", ["queued", "running", "invalid"])
+def test_a_verdict_is_stored_only_for_a_run_finished_valid(
+    client: TestClient, engine: Engine, status: str
+) -> None:
+    """One source of Outcome: a verdict for a run not (yet) valid is a conflict, kept."""
+    run_id, _ = _injected_run(engine)
+    if status != "queued":
+        with session_scope(engine) as s:
+            s.execute(
+                t.Run.__table__.update()
+                .where(t.Run.run_id == run_id)
+                .values(
+                    status=status,
+                    invalid_reason="internal" if status == "invalid" else None,
+                )
+            )
+    r = client.post(f"/v1/runs/{run_id}/verdict", content=_verdict(run_id).model_dump_json())
+    assert r.status_code == 409, r.text
+    assert r.json()["fields"] == ["status"]
+    run = _run(engine, run_id)
+    assert (run.outcome, run.end_status, run.decided_at) == (None, None, None)
+    assert [x.reason for x in _rejected(engine)] == [m.RejectReason.CONFLICT]
 
 
 def test_verdict_run_id_mismatch_is_422(client: TestClient, engine: Engine) -> None:

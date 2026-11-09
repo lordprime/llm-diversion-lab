@@ -1,14 +1,18 @@
 import re
+import uuid
+from typing import Any
 
+import psycopg
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
+from psycopg import sql
 from sqlalchemy import inspect
 
 from control.core.models import EventKind, InvalidReason
 from control.db.engine import create_db_engine
 from control.db.tables import Base
-from tests.conftest import alembic_config
+from tests.conftest import _libpq_url, alembic_config
 
 EXPECTED_TABLES = {
     "experiments",
@@ -120,3 +124,61 @@ def test_event_tables_have_stream_idempotency_key(db_url: str) -> None:
             assert not any(set(u) == {"run_id", "kind", "seq"} for u in uniques), table
     finally:
         eng.dispose()
+
+
+def _constraints(url: str) -> dict[tuple[str, str], Any]:
+    """Every CHECK (normalised text), unique constraint, index and foreign key by name."""
+    eng = create_db_engine(url)
+    try:
+        insp = inspect(eng)
+        found: dict[tuple[str, str], Any] = {}
+        for table in insp.get_table_names():
+            if table == "alembic_version":
+                continue
+            for c in insp.get_check_constraints(table):
+                found[(table, f"CK:{c['name']}")] = " ".join(c["sqltext"].split())
+            for c in insp.get_unique_constraints(table):
+                found[(table, f"UQ:{c['name']}")] = tuple(c["column_names"])
+            for c in insp.get_indexes(table):
+                found[(table, f"IX:{c['name']}")] = (
+                    tuple(c["column_names"]),
+                    bool(c.get("unique")),
+                    str(c.get("dialect_options")),
+                )
+            for c in insp.get_foreign_keys(table):
+                found[(table, f"FK:{c['name']}")] = (
+                    tuple(c["constrained_columns"]),
+                    c["referred_table"],
+                    tuple(c["referred_columns"]),
+                )
+        return found
+    finally:
+        eng.dispose()
+
+
+def test_migrated_constraints_match_create_all(db_url: str, pg_server_url: str) -> None:
+    """The migrated schema's CHECKs (by text), uniques, indexes and FKs are exactly what
+    ``Base.metadata.create_all`` builds: ``compare_metadata`` does not compare CHECK
+    text, so a migration that forgot a CHECK change would otherwise pass."""
+    command.upgrade(alembic_config(db_url), "head")
+    migrated = _constraints(db_url)
+    name = f"test_{uuid.uuid4().hex}"
+    with psycopg.connect(pg_server_url, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+    try:
+        eng = create_db_engine(_libpq_url(pg_server_url, database=name))
+        try:
+            Base.metadata.create_all(eng)
+        finally:
+            eng.dispose()
+        created = _constraints(_libpq_url(pg_server_url, database=name))
+    finally:
+        with psycopg.connect(pg_server_url, autocommit=True) as admin:
+            admin.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name))
+            )
+    assert any(key.startswith("CK:") for _, key in migrated)  # the comparison sees CHECKs
+    only_migrated = {k: v for k, v in migrated.items() if created.get(k) != v}
+    only_created = {k: v for k, v in created.items() if migrated.get(k) != v}
+    assert only_migrated == {}
+    assert only_created == {}

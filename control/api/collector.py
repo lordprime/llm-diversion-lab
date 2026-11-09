@@ -30,6 +30,15 @@ Status codes
   stored).
 * ``500`` ``db_error``: any other database failure while storing. The storing
   transaction is rolled back (nothing stored) and the body is kept in a fresh one.
+
+A database refusal is described by its SQLSTATE and constraint name only
+(``{"error": {"sqlstate": "23514", "constraint": "ck_..."}}``), never by the
+database's own message, which can echo row values ("Failing row contains ...").
+
+NUL characters, which Postgres text and JSONB cannot hold, are stored as U+FFFD
+(:func:`control.db.repo.without_nul`): deterministic, so a re-post is still a
+duplicate, and never a reason to refuse a batch. An event's content hash is that of
+the event as posted.
 """
 
 from __future__ import annotations
@@ -230,11 +239,17 @@ class _Intake:
             with session_scope(engine) as session:
                 return work(session)
         except _STORAGE_ERRORS as exc:
-            error = _db_message(exc)
+            error = _db_error(exc)
             return self.reject(engine, RejectReason.CONSTRAINT, {"error": error}, error=error)
         except DBAPIError as exc:
-            log.exception("collector %s: database error for run %r", self.endpoint, self.run_id)
-            error = _db_message(exc)
+            error = _db_error(exc)
+            log.error(
+                "collector %s: database error for run %r: %s (sqlstate %s)",
+                self.endpoint,
+                self.run_id,
+                type(exc).__name__,
+                error["sqlstate"],
+            )
             detail: JsonValue = {"error": error, "type": type(exc).__name__}
             return self.reject(engine, RejectReason.DB_ERROR, detail, error=error)
 
@@ -251,8 +266,17 @@ class _Intake:
         return WriteAck(run_id=self.run_id, result=result_value)
 
 
-def _db_message(exc: DBAPIError) -> str:
-    return str(exc.orig) if exc.orig is not None else str(exc)
+def _db_error(exc: DBAPIError) -> dict[str, JsonValue]:
+    """A database error as its SQLSTATE and constraint name only: the database's message
+    (and SQLAlchemy's, with its bound parameters) can echo the refused values."""
+    orig = exc.orig
+    sqlstate = getattr(orig, "sqlstate", None)
+    diag = getattr(orig, "diag", None)
+    constraint = getattr(diag, "constraint_name", None)
+    return {
+        "sqlstate": sqlstate if isinstance(sqlstate, str) else None,
+        "constraint": constraint if isinstance(constraint, str) else None,
+    }
 
 
 # --------------------------------------------------------------------- routes

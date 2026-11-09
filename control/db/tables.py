@@ -408,7 +408,8 @@ class TargetAccess(EventRow):
     __tablename__ = "target_access"
 
     flow_id: Mapped[str] = mapped_column(Text)
-    method: Mapped[str] = mapped_column(String(16))
+    #: unbounded: the agent chooses it (verb tampering is evidence, not a refusal)
+    method: Mapped[str] = mapped_column(Text)
     url: Mapped[str] = mapped_column(Text)
     status: Mapped[int | None] = mapped_column(Integer)
     probe: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
@@ -461,7 +462,8 @@ class Callback(EventRow):
     source_ip: Mapped[str | None] = mapped_column(String(64))
     token: Mapped[str | None] = mapped_column(String(32), index=True)
     placement_id: Mapped[str | None] = mapped_column(_ID, ForeignKey("placements.placement_id"))
-    method: Mapped[str | None] = mapped_column(String(16))
+    #: ``method`` and ``qtype`` are unbounded: whoever calls back chooses them
+    method: Mapped[str | None] = mapped_column(Text)
     url: Mapped[str | None] = mapped_column(Text)
     host: Mapped[str | None] = mapped_column(Text)
     #: ordered raw headers as a JSON list of ``[name, value]`` pairs
@@ -477,7 +479,7 @@ class Callback(EventRow):
         Boolean, default=False, server_default=text("false")
     )
     qname: Mapped[str | None] = mapped_column(Text)
-    qtype: Mapped[str | None] = mapped_column(String(16))
+    qtype: Mapped[str | None] = mapped_column(Text)
 
 
 class OraclePoll(EventRow):

@@ -70,6 +70,7 @@ __all__ = [
     "record_verdict",
     "register_artifacts",
     "run_exists",
+    "without_nul",
 ]
 
 
@@ -86,6 +87,27 @@ def _chunks[T](items: Sequence[T], size: int = BULK_CHUNK_ROWS) -> Iterator[Sequ
 
 #: ``reason`` of an invalid run without a recorded one (a CHECK makes that impossible).
 UNRECORDED_REASON: Final = "unrecorded"
+
+
+#: What a NUL character becomes in stored text and JSONB (Postgres can hold neither).
+NUL_REPLACEMENT: Final = "\ufffd"
+
+
+def without_nul(value: Any) -> Any:
+    """``value`` with every NUL in a string (keys of mappings included) replaced by
+    :data:`NUL_REPLACEMENT`, recursively through lists, tuples and dicts.
+
+    Deterministic, so re-posting the same body stores (or matches) the same row: the
+    content hash of an event is taken from the event as posted, the row is stored
+    replaced. Other values are returned unchanged.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", NUL_REPLACEMENT) if "\x00" in value else value
+    if isinstance(value, list | tuple):
+        return type(value)(without_nul(v) for v in value)
+    if isinstance(value, dict):
+        return {without_nul(k): without_nul(v) for k, v in value.items()}
+    return value
 
 
 def not_selftest() -> ColumnElement[bool]:
@@ -258,7 +280,7 @@ def insert_events(session: Session, events: Iterable[Event]) -> InsertResult:
     rows: defaultdict[type[EventRow], list[dict[str, Any]]] = defaultdict(list)
     for key, (event, _) in first.items():  # batch order, not set order
         if key in claimed:
-            rows[EVENT_TABLES[event.kind]].append(event.model_dump(exclude={"kind"}))
+            rows[EVENT_TABLES[event.kind]].append(without_nul(event.model_dump(exclude={"kind"})))
     # Plain INSERT: the per-table unique (run_id, stream, seq) constraint raises if a
     # row exists without its ledger entry, which would be a bug, not a re-ship.
     for table, table_rows in rows.items():
@@ -359,26 +381,37 @@ def record_manifest(session: Session, manifest: m.RunManifest) -> WriteResult:
             return WriteResult(WriteOutcome.DUPLICATE)
         return WriteResult(WriteOutcome.CONFLICT, ("manifest_sha256",))
     if manifest.placements:
-        session.execute(pg_insert(Placement).values([p.model_dump() for p in manifest.placements]))
+        session.execute(
+            pg_insert(Placement).values([without_nul(p.model_dump()) for p in manifest.placements])
+        )
     return WriteResult(WriteOutcome.STORED)
 
 
 def record_verdict(session: Session, verdict: m.Verdict) -> WriteResult:
-    """Set the run's oracle verdict and end status, write-once.
+    """Set the run's oracle verdict and end status, write-once, for a run finished valid.
 
-    ``UPDATE runs ... WHERE outcome IS NULL AND end_status IS NULL``: the first verdict
-    wins; re-posting the same verdict is a duplicate and a different one a conflict
-    (the stored verdict is never overwritten).
+    ``UPDATE runs ... WHERE status = 'valid' AND outcome IS NULL AND end_status IS
+    NULL``: the first verdict wins; re-posting the same verdict is a duplicate and a
+    different one a conflict (the stored verdict is never overwritten). A run that is
+    not ``valid`` (queued, running or invalid) never gets one: a conflict on
+    ``status``, so Outcome has one source, the verdict of a valid run.
     """
-    values: dict[str, Any] = {
-        "end_status": verdict.end_status,
-        "outcome": verdict.outcome,
-        "oracle_message": verdict.oracle_message,
-        "decided_at": verdict.decided_at,
-    }
+    values: dict[str, Any] = without_nul(
+        {
+            "end_status": verdict.end_status,
+            "outcome": verdict.outcome,
+            "oracle_message": verdict.oracle_message,
+            "decided_at": verdict.decided_at,
+        }
+    )
     claimed = session.execute(
         update(Run)
-        .where(Run.run_id == verdict.run_id, Run.outcome.is_(None), Run.end_status.is_(None))
+        .where(
+            Run.run_id == verdict.run_id,
+            Run.status == RunStatus.VALID,
+            Run.outcome.is_(None),
+            Run.end_status.is_(None),
+        )
         .values(**values)
         .returning(Run.run_id)
         .execution_options(synchronize_session=False)
@@ -386,12 +419,14 @@ def record_verdict(session: Session, verdict: m.Verdict) -> WriteResult:
     if claimed is not None:
         return WriteResult(WriteOutcome.STORED)
     stored = session.execute(
-        select(Run.end_status, Run.outcome, Run.oracle_message, Run.decided_at).where(
+        select(Run.status, Run.end_status, Run.outcome, Run.oracle_message, Run.decided_at).where(
             Run.run_id == verdict.run_id
         )
     ).one_or_none()
     if stored is None:
         return WriteResult(WriteOutcome.UNKNOWN_RUN)
+    if stored.status is not RunStatus.VALID:
+        return WriteResult(WriteOutcome.CONFLICT, ("status",))
     differing = tuple(k for k, v in values.items() if getattr(stored, k) != v)
     if differing:
         return WriteResult(WriteOutcome.CONFLICT, differing)
@@ -453,11 +488,9 @@ def record_heartbeat(session: Session, heartbeat: m.RunHeartbeat) -> WriteResult
 
     The run must exist (checked by the caller; the foreign key enforces it).
     """
-    values: dict[str, Any] = {
-        "phase": heartbeat.phase,
-        "ts": heartbeat.ts,
-        "message": heartbeat.message,
-    }
+    values: dict[str, Any] = without_nul(
+        {"phase": heartbeat.phase, "ts": heartbeat.ts, "message": heartbeat.message}
+    )
     claimed = session.scalar(
         pg_insert(RunHeartbeatRow)
         .values(run_id=heartbeat.run_id, seq=heartbeat.seq, **values)
@@ -492,23 +525,13 @@ def record_rejected(
     cannot hold) are replaced by U+FFFD in ``run_id`` and ``detail`` only.
     """
     row = RejectedBatch(
-        run_id=run_id.replace("\x00", "\ufffd"),
+        run_id=without_nul(run_id),
         endpoint=endpoint,
         reason=reason,
         body=body,
         body_sha256=hashlib.sha256(body).hexdigest(),
-        detail=_without_nul(detail),
+        detail=without_nul(detail),
     )
     session.add(row)
     session.flush()
     return row.id
-
-
-def _without_nul(value: JsonValue) -> JsonValue:
-    if isinstance(value, str):
-        return value.replace("\x00", "\ufffd")
-    if isinstance(value, list):
-        return [_without_nul(v) for v in value]
-    if isinstance(value, dict):
-        return {k.replace("\x00", "\ufffd"): _without_nul(v) for k, v in value.items()}
-    return value
