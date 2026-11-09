@@ -856,6 +856,18 @@ def test_docker_dns_upstream_is_explicit_and_not_loopback() -> None:
     assert "127" in tasks  # loopback refused
 
 
+def test_docker_keeps_the_overlay2_graph_driver() -> None:
+    # Docker 29 defaults fresh installs to the containerd image store, whose driver is
+    # the "overlayfs" snapshotter; the verify step asserts overlay2.
+    config = _load_yaml(ANSIBLE / "roles" / "docker" / "defaults" / "main.yml")[
+        "docker_daemon_config"
+    ]
+    assert config["storage-driver"] == "overlay2"
+    assert config["features"] == {"containerd-snapshotter": False}
+    verify = (ANSIBLE / "roles" / "docker" / "tasks" / "verify.yml").read_text(encoding="utf-8")
+    assert "Driver == 'overlay2'" in verify
+
+
 def test_docker_key_is_checked_before_it_is_trusted() -> None:
     tasks = _load_yaml(ANSIBLE / "roles" / "docker" / "tasks" / "main.yml")
     names = [str(t.get("name", "")) for t in tasks]
@@ -1935,6 +1947,10 @@ def test_base_role_installs_a_pinned_uv_and_python() -> None:
     assert "{{ base_uv_version }}" in get_url["url"]
     assert get_url["url"].startswith("https://github.com/astral-sh/uv/releases/download/")
     assert get_url["checksum"] == "sha256:{{ base_uv_sha256[base_uv_arch] }}"
+    # --check downloads nothing, so it must not try to unpack the missing tarball.
+    assert download["when"] == "not ansible_check_mode"
+    (unpack,) = [t for t in tasks if "ansible.builtin.unarchive" in t]
+    assert unpack["when"] == "not ansible_check_mode"
     (python,) = [t for t in tasks if "ansible.builtin.command" in t]
     assert python["ansible.builtin.command"]["argv"] == [
         "/usr/local/bin/uv",

@@ -17,6 +17,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "build-images.yml"
+CI = ROOT / ".github" / "workflows" / "ci.yml"
 
 #: job -> (images.lock role, Dockerfile it builds)
 JOBS = {
@@ -57,6 +58,13 @@ def test_the_expected_jobs_exist() -> None:
 
 def test_no_permissions_at_the_top() -> None:
     assert _workflow().get("permissions") == {}, "grant permissions per job, none at the top"
+
+
+def test_ci_holds_a_read_only_token() -> None:
+    ci = yaml.safe_load(CI.read_text(encoding="utf-8"))
+    assert ci.get("permissions") == {"contents": "read"}
+    for name, job in ci["jobs"].items():
+        assert "permissions" not in job, f"ci.yml job {name} widens the token"
 
 
 @pytest.mark.parametrize("job", sorted(JOBS))

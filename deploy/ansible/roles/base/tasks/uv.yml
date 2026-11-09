@@ -3,6 +3,9 @@
 # installs labctl per release with them (deploy/remote/release.sh `labctl`):
 # releases/<tag>/.venv from the release's uv.lock, /usr/local/bin/labctl ->
 # /srv/lab/current/.venv/bin/labctl. Nothing here is used by the containers.
+# In --check mode nothing is downloaded, so there is nothing to unpack either: the
+# download and the unpack are skipped (the PATH links and the Python install report
+# what they would do).
 
 - name: Download the pinned uv release (checked against its SHA-256)
   ansible.builtin.get_url:
@@ -12,6 +15,7 @@
     owner: root
     group: root
     mode: "0644"
+  when: not ansible_check_mode
 
 - name: Create the directory for this uv version
   ansible.builtin.file:
@@ -30,6 +34,7 @@
     owner: root
     group: root
     creates: "/usr/local/lib/lab-uv-{{ base_uv_version }}/uv"
+  when: not ansible_check_mode
 
 - name: Put uv and uvx on root's PATH
   ansible.builtin.file:

@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+# Read-only token for every job: CI checks code, it never writes to the repository.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest

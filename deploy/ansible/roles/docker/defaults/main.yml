@@ -33,6 +33,11 @@ docker_log_max_file: "5"
 
 docker_daemon_config:
   storage-driver: overlay2
+  # Docker 29 uses the containerd image store (snapshotter "overlayfs") on fresh
+  # installs; the lab keeps the classic overlay2 graph driver that the verify step
+  # and DEPLOYMENT §0.2 expect.
+  features:
+    containerd-snapshotter: false
   log-driver: json-file
   log-opts:
     max-size: "{{ docker_log_max_size }}"
