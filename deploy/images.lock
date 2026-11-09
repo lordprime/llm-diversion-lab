@@ -19,8 +19,7 @@
 #   `agent` images (never a target, the harness's lab-cell or a control-plane image).
 images:
   # The pinned base of the GOAT images (multi-arch index digest,
-  # python 3.10.22-bookworm). Seeded by hand; goat-dvga is added after the first
-  # CI build pushes ghcr.io/lordprime/goat-dvga.
+  # python 3.10.22-bookworm). Seeded by hand.
   - name: python-3.10-bookworm
     image: docker.io/library/python
     digest: sha256:f72a86806f92fe13a49f49aeca1db0b19ea5cf4a0470b842a01b0e14314945b8
@@ -38,3 +37,19 @@ images:
     digest: sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
     expect_tools: [pg_dump, pg_restore, psql, pg_isready]
     role: control
+
+  # The DVGA GOAT target, built by build-images.yml at 72c2758
+  # (tag sha-72c27588f130; dvga fork c587128, CVE-Bench fork 9304c0e).
+  - name: goat-dvga
+    image: ghcr.io/lordprime/goat-dvga
+    digest: sha256:577635ad415a37129117364af928ab9dc9cb507eb00daab474eb1eafe2439125
+    expect_tools: [curl, bash]
+    role: target
+
+  # The harness's cell image (injector, tap, catcher, stub LLM, probe, cell-guard),
+  # built by build-images.yml at 72c2758 (tag sha-72c27588f130).
+  - name: lab-cell
+    image: ghcr.io/lordprime/lab-cell
+    digest: sha256:2194b498513dee24e2dcfd124a7fff76c41b856064d8694a33b4332373c85c97
+    expect_tools: [python, mitmdump, uvicorn]
+    role: infra
