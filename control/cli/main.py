@@ -11,9 +11,10 @@ Commands (each takes ``--json`` for scripting):
   scripted agent and the stub LLM, a containment probe, and the checks; the result is
   recorded in the self-test status file (``labctl status``, ``/metrics``).
 
-Exit status: 0 success (the self-test passed); 1 a check failed, the self-test failed,
-the database is unreachable or the run does not exist; 2 usage error (an unparsable
-``DATABASE_URL`` included). Never 3: ``deploy/remote/release.sh`` reads 3 as "labctl
+Exit status: 0 success (the self-test passed); 1 a check failed, the self-test failed
+(an unusable ``DATABASE_URL`` included: it is recorded), the database is unreachable or
+the run does not exist; 2 usage error (for the read-only commands, an unparsable
+``DATABASE_URL`` too). Never 3: ``deploy/remote/release.sh`` reads 3 as "labctl
 is not installed".
 
 Every command first calls :func:`~control.core.logging.configure_logging` (redacted
@@ -274,37 +275,53 @@ def _cmd_run_show(args: argparse.Namespace, settings: LabSettings) -> int:
 
 
 def _cmd_selftest(args: argparse.Namespace, settings: LabSettings) -> int:
-    """Run the self-test, record its result once, print it; 0 passed, 1 failed."""
+    """Run the self-test, record its result once, print it; 0 passed, 1 failed.
+
+    Every failure past argument parsing is recorded, a bad ``DATABASE_URL`` and an
+    internal error included (exit 1; exit 2 is only for argparse usage errors).
+    """
     # progress (runs, phases, problems) goes to stderr; the result to stdout
     configure_logging(level="INFO", stream=sys.stderr)
     try:
-        engine = _engine(settings)
-    except _Failure as exc:
-        if exc.code == EXIT_USAGE:
-            raise
-        report = selftest.failed_report(args.quick, "configuration", str(exc))
-    else:
-        try:
-            context = selftest.LabContext(
-                lab_root=settings.lab_root,
-                environ=settings.environ,
-                collector_url=settings.collector_url,
-                engine=engine,
-            )
-            report = selftest.run_lab_selftest(context, quick=args.quick)
-        finally:
-            engine.dispose()
-    _out(json.dumps(report.to_json(), indent=2, default=str) if args.json else report.render_text())
-    try:
-        record_selftest_result(
-            SelftestResult(report.passed, report.finished_at, args.quick, report.summary),
-            settings.selftest_status_file,
+        report = _selftest_report(args, settings)
+    except Exception as exc:  # never unrecorded
+        report = selftest.failed_report(
+            args.quick, "internal", redact_text(f"{type(exc).__name__}: {exc}")[:300]
         )
-    except OSError as exc:
-        raise _Failure(
-            f"the result could not be recorded in {settings.selftest_status_file}: {exc}"
-        ) from None
+    try:
+        _out(
+            json.dumps(report.to_json(), indent=2, default=str)
+            if args.json
+            else report.render_text()
+        )
+    finally:
+        try:
+            record_selftest_result(
+                SelftestResult(report.passed, report.finished_at, args.quick, report.summary),
+                settings.selftest_status_file,
+            )
+        except OSError as exc:
+            raise _Failure(
+                f"the result could not be recorded in {settings.selftest_status_file}: {exc}"
+            ) from None
     return EXIT_OK if report.passed else EXIT_FAIL
+
+
+def _selftest_report(args: argparse.Namespace, settings: LabSettings) -> selftest.SelftestReport:
+    try:
+        engine = _engine(settings)
+    except _Failure as exc:  # no database (or an unparsable URL): a failed self-test
+        return selftest.failed_report(args.quick, "configuration", str(exc))
+    try:
+        context = selftest.LabContext(
+            lab_root=settings.lab_root,
+            environ=settings.environ,
+            collector_url=settings.collector_url,
+            engine=engine,
+        )
+        return selftest.run_lab_selftest(context, quick=args.quick)
+    finally:
+        engine.dispose()
 
 
 # --------------------------------------------------------------------- parser

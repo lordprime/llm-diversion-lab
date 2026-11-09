@@ -2,30 +2,47 @@
 
 It runs ``experiments/selftest.yaml`` (one injected and one matched control DVGA cell,
 the scripted agent, the stub LLM; no model is called) through the real
-:class:`~control.runner.runner.Runner`, and then checks the result from the database,
-the evidence on disk and the container engine. It **passes** only if all of these
-hold:
+:class:`~control.runner.runner.Runner`, holding the host's runner lock for the whole
+self-test, and then checks the result from the database, the evidence on disk and the
+container engine. It **passes** only if all of these hold:
 
 * both runs are ``valid`` **and** ended ``completed`` (a crashed agent still gives a
   valid run: crashing is an outcome, so ``valid`` alone is not enough);
-* injected run: Access, Visible, Uptake and Outcome are all true; the oracle's verdict
-  is true; the catcher recorded a callback on **both** channels (HTTP and DNS) whose
-  token is the one the lab key derives for one of the run's own placements;
-* control run: Access, Visible and Uptake are false, its oracle verdict is decided,
-  no token callback reached it, and no file of its evidence holds any injected run's
-  tag (the labeller's forbidden-tag check already made a leaking control
-  ``contaminated``; the file scan repeats it independently);
+* injected run: Access, Visible, Uptake and Outcome are all true; the stored verdict
+  (``runs.outcome``, ``runs.decided_at``) is true; the catcher recorded a callback on
+  **both** channels (HTTP and DNS) whose token is the one the lab key derives for one
+  of the run's own placements;
+* control run: Access, Visible and Uptake are false, its verdict is stored, no token
+  callback reached it, and no file of its evidence holds any injected run's tag or
+  token, base64 fields (``body_b64``) decoded (the labeller's forbidden-tag check
+  already made a leaking control ``contaminated``; the scan repeats it independently);
 * **containment** (critical): before a cell is trusted, i.e. after the runner's health
-  check and pre-flight probe and before its agent starts, ``cell/probe/containment.py``
-  runs in a sibling container on the cell's agent network (the agent's own network
-  position, the lab-cell image, the run's label, no capabilities) with the full flag
-  set: ``--host-gateway`` (the agent network's gateway, ``.1``), ``--lan`` (from
-  ``LAB_PROBE_LAN``), ``--sinkhole`` (the catcher, ``.2``) and ``--reach`` the
-  injector (``.3``) and the tap (``.4``), IP literals only. Anything reachable on the
-  internet, the host or the LAN, a must-reach that failed, or a probe that gave no
-  complete report fails the self-test critically, and that cell's agent never starts
-  (:class:`ContainmentGate` raises, so the run is invalid ``cell_failed``);
-* after teardown nothing (container, volume, network) is labelled with either run id.
+  check, pre-flight probe and liveness check and before its agent starts,
+  ``cell/probe/containment.py`` runs in a sibling container on the cell's agent network
+  (the agent's own network position, the lab-cell image, the run's label, no
+  capabilities) with the full flag set: ``--host-gateway`` (the agent network's
+  gateway, ``.1``), ``--lan`` (``LAB_PROBE_LAN``), ``--sinkhole`` (the catcher, ``.2``),
+  ``--reach`` the injector (``.3``) and the tap (``.4``), and must-fail ``--dest`` s for
+  the control plane (the Collector's and the database's container addresses and the
+  control network's gateway with the published ports, read from the engine and
+  ``deploy/compose/control-plane.yml``) and the host's own LAN address on the host
+  ports. IP literals only. Anything reachable, a must-reach that failed, or a probe
+  without a complete report fails the self-test as CRITICAL and that cell's agent never
+  starts (:class:`ContainmentGate` raises: the run is invalid ``cell_failed``);
+* a "blocked" result proves something only about real addresses: the host gateway must
+  be one of this host's own addresses (checked with ``bind``) before each probe, and
+  each LAN address must answer from the host (TCP on 80/443, else ICMP) before the
+  self-test starts. Otherwise the self-test fails (not critical: nothing was reached,
+  but nothing was proven);
+* after teardown nothing (container, volume, network) is labelled with either run id,
+  and the runs' cell work directories are gone.
+
+Before the pair runs, resources left by **earlier self-tests** are swept: those
+labelled ``lab.run_id`` with a run of an ``exp_selftest_*`` experiment (none can be
+running: the self-test holds the runner lock). Study runs' resources are never touched.
+
+A cell that fails before its agent would start (so before the probe) is reported as a
+cell failure, not as a containment failure.
 
 ``--quick`` is what ``deploy/remote/release.sh`` runs after every deploy. It keeps the
 **first target only** (one matched pair: two cells, the smallest unit the matched-pair
@@ -36,60 +53,71 @@ M0's single target, full mode differs from quick mode only by probing every cell
 
 Each invocation registers a **fresh experiment** (``exp_selftest_<ULID>``; the file's
 text with that id and a provenance comment), so self-tests can be repeated and a new
-release's image builds are never refused as "registered with other builds".
+release's image builds are never refused as "registered with other builds". Study
+metrics leave these experiments out (:data:`SELFTEST_EXPERIMENT_PREFIX`).
 
 The lab wiring (:func:`run_lab_selftest`) reads, on the host (``LAB_ROOT=/srv/lab``):
 
 * ``secrets/hmac.key`` (the lab key; read by root only);
-* ``host.env`` (``LAB_CELL_NETWORKS``, ``LAB_LLM_GATEWAY``, ``LAB_PROBE_LAN``;
-  ``$LAB_HOST_ENV`` overrides the path; a missing file is an error unless ``LAB_DEV=1``);
-* the release tree ``current/`` (``$LAB_RELEASE_TREE`` overrides): the experiment, the
-  cell templates and ``deploy/images.lock`` (labctl is installed non-editable, so the
-  package's own directory holds none of them);
+* the host profile through :meth:`CellSettings.from_env` (``LAB_CELL_NETWORKS``,
+  ``LAB_LLM_GATEWAY``) and, in production only from the profile, ``LAB_PROBE_LAN``;
+* the release tree ``current/`` (``$LAB_RELEASE_TREE`` overrides), resolved once: the
+  experiment, the cell templates, ``deploy/compose/control-plane.yml`` and, in
+  production always, ``deploy/images.lock`` (labctl is installed non-editable, so the
+  package's own directory holds none of them; ``LAB_IMAGES_LOCK`` and
+  ``LAB_IMAGE_OVERRIDES`` count only in development);
 * runs' evidence under ``artifacts/``, cell work files under ``cells/``, the runner's
-  host lock at ``state/runner.lock`` (``$LAB_RUNNER_LOCK``), shared with the runner.
+  host lock from :func:`~control.runner.runner.runner_lock_path`.
 
-``LAB_PROBE_HOST_GATEWAY`` (development only, ``LAB_DEV=1``) replaces the probed host
-address: under rootless Podman the network's gateway is the rootless network
-namespace, not the host, and answers with a reset.
+Development (``settings.dev``, which :meth:`CellSettings.from_env` refuses on a host
+with a profile): ``LAB_PROBE_LAN`` comes from the environment, a missing control plane
+is tolerated, and, on Podman only, ``LAB_PROBE_HOST_GATEWAY`` replaces the probed host
+address (under rootless Podman the network's gateway is the rootless network
+namespace, not the host, and answers with a reset). It must still be an address of
+this host.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
 import hashlib
 import ipaddress
 import json
 import logging
 import re
+import shutil
+import socket
+import subprocess
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Protocol
 
 import httpx
 import yaml
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, func, select
 
+from cell.probe.containment import HOST_PORTS, LAN_PORTS
 from control.core.ids import new_id
-from control.core.models import (
-    Arm,
-    CallbackChannel,
-    EndStatus,
-    FunnelStage,
-    RunStatus,
-)
-from control.core.selftest_status import MAX_SUMMARY_CHARS
+from control.core.models import Arm, CallbackChannel, EndStatus, FunnelStage, RunStatus
+from control.core.selftest_status import MAX_SUMMARY_CHARS, SELFTEST_EXPERIMENT_PREFIX
 from control.core.tokens import derive_token
 from control.db import tables as t
 from control.db.engine import session_scope
 from control.runner.cell_spec import (
+    CELL_NAME_PREFIX,
+    HOST_ENV_FILE,
     REPO_ROOT,
     RUN_LABEL,
     CellError,
     CellSettings,
     read_host_env,
+)
+from control.runner.cell_spec import (
+    Engine as CellEngine,
 )
 from control.runner.compose_backend import (
     CellBackend,
@@ -102,43 +130,59 @@ from control.runner.compose_backend import (
     SubprocessRunner,
 )
 from control.runner.experiment import ExperimentFile, parse_experiment
-from control.runner.runner import HostLockError, Runner, RunResult
+from control.runner.runner import (
+    CellLeftBehindError,
+    HostLockError,
+    Runner,
+    RunResult,
+    host_lock,
+    runner_lock_path,
+)
 from control.runner.ship import CollectorClient
 from control.runner.store import RunStore
 
 __all__ = [
+    "CONTROL_PLANE_FILE",
+    "CONTROL_PLANE_PROJECT",
     "SELFTEST_EXPERIMENT",
     "CellLayout",
+    "CellResources",
     "Check",
     "ContainmentGate",
     "ContainmentProbe",
     "DockerContainmentProbe",
     "DockerLeftovers",
     "LabContext",
-    "LeftoverCheck",
     "ProbeRecord",
     "SelftestConfigError",
     "SelftestDeps",
     "SelftestReport",
     "cell_layout",
+    "control_plane_destinations",
     "derive_experiment",
     "failed_report",
+    "is_local_address",
+    "lan_answers",
     "run_lab_selftest",
     "run_selftest",
-    "runner_lock_path",
 ]
 
 log = logging.getLogger(__name__)
 
 #: The self-test experiment, relative to the release tree.
 SELFTEST_EXPERIMENT: Final = Path("experiments") / "selftest.yaml"
+#: The control-plane compose file (relative to the release tree) and its project.
+CONTROL_PLANE_FILE: Final = Path("deploy") / "compose" / "control-plane.yml"
+CONTROL_PLANE_PROJECT: Final = "lab"
 #: Seconds per probed destination (the probe allows 1-60).
 PROBE_TIMEOUT_S: Final = 2.0
-#: Most seconds the probe container may take (about 15 destinations at 2 s each).
+#: Most seconds the probe container may take (about 30 destinations at 2 s each).
 PROBE_RUN_TIMEOUT_S: Final = 300.0
 #: Port the tap listens on (deploy/compose/cell.<target>.yml).
 _TAP_PORT_DEFAULT: Final = 8080
 _EXPERIMENT_ID_LINE = re.compile(r"^experiment_id:[ \t]*\S+[ \t]*$", re.MULTILINE)
+#: Evidence files larger than this are scanned as raw bytes only (no JSON decoding).
+_MAX_JSON_SCAN_BYTES: Final = 64 * 1024 * 1024
 
 
 class SelftestConfigError(RuntimeError):
@@ -150,7 +194,7 @@ class SelftestConfigError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class Check:
-    """One assertion of the self-test. ``critical``: a containment failure."""
+    """One assertion of the self-test. ``critical``: a containment breach."""
 
     name: str
     ok: bool
@@ -163,17 +207,25 @@ class Check:
 
 @dataclass(frozen=True, slots=True)
 class ProbeRecord:
-    """The containment probe's verdict on one cell (``report``: the probe's JSON)."""
+    """The containment probe's verdict on one cell (``report``: the probe's JSON).
+
+    ``breach``: the probe ran and the cell is not proven contained (something reached,
+    a must-reach failed, or no complete report): critical. Not contained without a
+    breach means the probe could not prove anything (e.g. the host gateway is not this
+    host's address): a failure, not critical.
+    """
 
     run_id: str
     contained: bool
     report: Mapping[str, Any] | None
     problems: tuple[str, ...] = ()
+    breach: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
             "contained": self.contained,
+            "breach": self.breach,
             "problems": list(self.problems),
             "report": self.report,
         }
@@ -233,11 +285,12 @@ class SelftestReport:
         for run in self.runs:
             labels = run.get("labels") or {}
             shown = " ".join(f"{k}={str(v).lower()}" for k, v in labels.items()) or "no labels"
+            outcome = run.get("outcome")
             lines.append(
                 f"  run {run['run_id']} {run['arm']}: {run['status']}"
                 + (f" ({run['reason']})" if run.get("reason") else "")
                 + f", end {run.get('end_status') or '-'}, outcome "
-                + f"{'-' if run.get('outcome') is None else str(run['outcome']).lower()}, {shown}"
+                + f"{'-' if outcome is None else str(outcome).lower()}, {shown}"
             )
         for check in self.checks:
             mark = "ok  " if check.ok else ("CRIT" if check.critical else "FAIL")
@@ -263,7 +316,7 @@ def failed_report(
         experiment_id=None,
         started_at=now if started_at is None else started_at,
         finished_at=now,
-        checks=(Check(name, False, detail),),
+        checks=(Check(name, False, detail[:MAX_SUMMARY_CHARS]),),
     )
 
 
@@ -283,6 +336,8 @@ def derive_experiment(
     text = data.decode("utf-8")
     source_sha = hashlib.sha256(data).hexdigest()
     new = experiment_id or f"exp_{new_id('selftest')}"
+    if not new.startswith(SELFTEST_EXPERIMENT_PREFIX):
+        raise ValueError(f"a self-test experiment id must start with {SELFTEST_EXPERIMENT_PREFIX}")
     if len(_EXPERIMENT_ID_LINE.findall(text)) != 1:
         raise ValueError(f"{path}: expected exactly one top-level experiment_id line")
     body = _EXPERIMENT_ID_LINE.sub(f"experiment_id: {new}", text)
@@ -300,6 +355,61 @@ def derive_experiment(
         definition_yaml=final,
         definition_sha256=hashlib.sha256(final.encode("utf-8")).hexdigest(),
     )
+
+
+# --------------------------------------------------------------------------- addresses
+
+
+def is_local_address(addr: str) -> bool:
+    """True if ``addr`` is one of this host's own addresses (it can be bound here)."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.bind((str(ip), 0))
+    except OSError:
+        return False
+    return True
+
+
+def lan_answers(addr: str, *, timeout_s: float = 2.0) -> bool:
+    """True if ``addr`` answers from this host: TCP on a probed LAN port (a connection or
+    a refusal both answer), else one ICMP echo (``ping``)."""
+    for port in LAN_PORTS:
+        try:
+            with socket.create_connection((addr, port), timeout=timeout_s):
+                return True
+        except ConnectionRefusedError:
+            return True
+        except OSError:
+            continue
+    ping = shutil.which("ping")
+    if ping is None:
+        return False
+    try:
+        done = subprocess.run(  # noqa: S603 - fixed argv, an IP literal
+            [ping, "-c", "1", "-W", str(int(timeout_s)), addr],
+            capture_output=True,
+            timeout=timeout_s + 3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return done.returncode == 0
+
+
+def own_address_towards(addr: str) -> str | None:
+    """This host's source address towards ``addr`` (a UDP connect sends nothing)."""
+    family = socket.AF_INET6 if ipaddress.ip_address(addr).version == 6 else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as sock:
+            sock.connect((addr, 9))
+            return str(sock.getsockname()[0])
+    except OSError:
+        return None
 
 
 # --------------------------------------------------------------------------- containment
@@ -348,10 +458,10 @@ def cell_layout(project: Any) -> CellLayout:
             tap=address("tap"),
             tap_port=_listen_port(services["tap"], _TAP_PORT_DEFAULT),
         )
+        for value in (layout.gateway, layout.catcher, layout.injector, layout.tap):
+            ipaddress.IPv4Address(value)  # IP literals only
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise CellError(f"{project.name}: cannot read the agent network layout: {exc!r}") from exc
-    for value in (layout.gateway, layout.catcher, layout.injector, layout.tap):
-        ipaddress.IPv4Address(value)  # IP literals only
     return layout
 
 
@@ -364,8 +474,10 @@ class DockerContainmentProbe:
 
     The container uses the cell's own image (``lab-cell``), the agent's resolver (the
     catcher), no capabilities, a read-only root and the run's label, so teardown removes
-    it whatever happens. A report counts as contained only if the probe exited 0, said
-    so, covered every category and reached both the injector and the tap.
+    it whatever happens. Before it runs, the host gateway must be an address of this
+    host (``is_local``), or the probe proves nothing. A report counts as contained only
+    if the probe exited 0, said so, covered every category, every result is ok and both
+    the injector and the tap were reached.
     """
 
     def __init__(
@@ -376,6 +488,8 @@ class DockerContainmentProbe:
         lan: Sequence[str],
         docker: str = "docker",
         host_gateway: str | None = None,
+        extra_destinations: Sequence[str] = (),
+        is_local: Callable[[str], bool] = is_local_address,
         timeout_s: float = PROBE_TIMEOUT_S,
     ) -> None:
         if not lan:
@@ -385,6 +499,8 @@ class DockerContainmentProbe:
         self._lan = tuple(lan)
         self._docker = docker
         self._host_gateway = host_gateway
+        self._extra = tuple(dict.fromkeys(extra_destinations))
+        self._is_local = is_local
         self._timeout_s = timeout_s
 
     def argv(self, cell: CellHandle) -> list[str]:
@@ -408,6 +524,8 @@ class DockerContainmentProbe:
         ]
         for addr in self._lan:
             probe += ["--lan", addr]
+        for dest in self._extra:
+            probe += ["--dest", dest]
         return [
             self._docker,
             "run",
@@ -438,10 +556,21 @@ class DockerContainmentProbe:
     def __call__(self, cell: CellHandle) -> ProbeRecord:
         run_id = cell.project.run_id
         try:
+            layout = cell_layout(cell.project)
             argv = self.argv(cell)
-        except (CellError, ValueError) as exc:
+        except CellError as exc:
             return ProbeRecord(run_id, False, None, (f"probe not run: {exc}",))
-        layout = cell_layout(cell.project)
+        gateway = self._host_gateway or layout.gateway
+        if not self._is_local(gateway):
+            return ProbeRecord(
+                run_id,
+                False,
+                None,
+                (
+                    f"probe not run: the host gateway {gateway} is not an address of this "
+                    "host, so a blocked result there would prove nothing",
+                ),
+            )
         result = self._run(argv, timeout=PROBE_RUN_TIMEOUT_S)
         if result.returncode not in (0, 1):
             # the probe never judged (usage error, engine failure, timeout): fail closed
@@ -453,6 +582,7 @@ class DockerContainmentProbe:
                 False,
                 None,
                 (f"the probe gave no report (exit {result.returncode}): {err or out}",),
+                breach=True,
             )
         return self._judge(run_id, result, layout)
 
@@ -464,7 +594,11 @@ class DockerContainmentProbe:
                 raise TypeError("not an object")
         except (IndexError, ValueError, TypeError):
             return ProbeRecord(
-                run_id, False, None, (f"the probe gave no report: {result.text[-300:]!r}",)
+                run_id,
+                False,
+                None,
+                (f"the probe gave no report: {result.text[-300:]!r}",),
+                breach=True,
             )
         problems: list[str] = []
         results = doc.get("results")
@@ -478,6 +612,9 @@ class DockerContainmentProbe:
                 label = item.get("label") if isinstance(item, dict) else item
                 outcome = item.get("outcome") if isinstance(item, dict) else "?"
                 problems.append(f"{label} {outcome}")
+        tried = {
+            f"{item.get('target')}:{item.get('port')}" for item in results if isinstance(item, dict)
+        }
         reached = {
             f"{item.get('target')}:{item.get('port')}"
             for item in results
@@ -489,10 +626,14 @@ class DockerContainmentProbe:
         ):
             if need not in reached:
                 problems.append(f"must-reach {need} not reached")
+        for dest in self._extra:
+            where = dest.split(":", 2)[2]
+            if where not in tried:
+                problems.append(f"{dest} was not probed")
         if doc.get("contained") is not True or result.returncode != 0:
             problems.append(f"probe verdict: contained={doc.get('contained')!r}")
         problems = list(dict.fromkeys(problems))
-        return ProbeRecord(run_id, not problems, doc, tuple(problems))
+        return ProbeRecord(run_id, not problems, doc, tuple(problems), breach=bool(problems))
 
 
 class ContainmentGate:
@@ -500,7 +641,8 @@ class ContainmentGate:
 
     Everything is delegated to ``inner``; :meth:`start_agent` first runs ``probe`` (for
     the first ``limit`` cells, all if ``None``) and raises :class:`CellError` if the cell
-    is not contained, so the agent never starts there and the runner tears it down.
+    is not proven contained, so the agent never starts there and the runner tears it
+    down.
     """
 
     def __init__(
@@ -517,7 +659,7 @@ class ContainmentGate:
             self.records.append(record)
             if not record.contained:
                 log.error(
-                    "selftest: cell of run %s is NOT contained: %s",
+                    "selftest: cell of run %s is NOT proven contained: %s",
                     record.run_id,
                     "; ".join(record.problems),
                 )
@@ -565,35 +707,142 @@ class ContainmentGate:
         self._inner.teardown(cell)
 
 
-# --------------------------------------------------------------------------- leftovers
+# --------------------------------------------------------------------------- control plane
 
 
-class LeftoverCheck(Protocol):
-    def __call__(self, run_id: str) -> dict[str, list[str]]: ...
+def control_plane_destinations(
+    run: CommandRunner,
+    compose_file: Path,
+    *,
+    docker: str = "docker",
+    project: str = CONTROL_PLANE_PROJECT,
+) -> list[str]:
+    """Must-fail probe destinations for the running control plane.
+
+    From ``compose_file``: the control network's subnet and each service's published
+    ports (``host:host_port:container_port``). From the engine: the address of each
+    published service's container on that network. Gives ``host:tcp:<container>:<port>``
+    for every container port and ``host:tcp:<network gateway>:<host port>`` for every
+    published port. Raises :class:`SelftestConfigError` if a published service has no
+    running container there.
+    """
+    try:
+        doc = yaml.safe_load(compose_file.read_text(encoding="utf-8"))
+        nets = doc["networks"]
+        subnets = [
+            ipaddress.ip_network(cfg["subnet"])
+            for net in nets.values()
+            for cfg in (net.get("ipam") or {}).get("config") or []
+        ]
+        published: dict[str, list[tuple[int, int]]] = {}
+        for name, service in doc["services"].items():
+            for spec in service.get("ports") or []:
+                parts = str(spec).split(":")
+                published.setdefault(name, []).append((int(parts[-2]), int(parts[-1])))
+    except (OSError, yaml.YAMLError, KeyError, TypeError, ValueError, IndexError) as exc:
+        raise SelftestConfigError(f"cannot read {compose_file}: {exc!r}") from exc
+    if not subnets:
+        raise SelftestConfigError(f"{compose_file}: the control network has no subnet")
+    dests: list[str] = []
+    for net in subnets:
+        dests += [
+            f"host:tcp:{next(net.hosts())}:{host_port}"
+            for ports in published.values()
+            for host_port, _ in ports
+        ]
+    for service, ports in sorted(published.items()):
+        listing = run(
+            [
+                docker,
+                "ps",
+                "-q",
+                "--filter",
+                f"label=com.docker.compose.project={project}",
+                "--filter",
+                f"label=com.docker.compose.service={service}",
+            ]
+        )
+        ids = listing.text.split()
+        if listing.returncode != 0 or not ids:
+            raise SelftestConfigError(
+                f"the control plane's {service} is not running (compose project {project})"
+            )
+        inspected = run([docker, "inspect", *ids])
+        try:
+            containers = json.loads(inspected.stdout or b"[]")
+        except ValueError:
+            containers = []
+        addresses = sorted(
+            {
+                str(ep.get("IPAddress"))
+                for c in containers
+                for ep in ((c.get("NetworkSettings") or {}).get("Networks") or {}).values()
+                if ep.get("IPAddress")
+                and any(ipaddress.ip_address(ep["IPAddress"]) in net for net in subnets)
+            }
+        )
+        if inspected.returncode != 0 or not addresses:
+            raise SelftestConfigError(f"no address of the control plane's {service} found")
+        dests += [f"host:tcp:{addr}:{port}" for addr in addresses for _, port in ports]
+    return list(dict.fromkeys(dests))
+
+
+# --------------------------------------------------------------------------- cell resources
+
+
+class CellResources(Protocol):
+    """What is still on the engine for a run, and removing it (the sweep)."""
+
+    def leftovers(self, run_id: str) -> dict[str, list[str]]: ...
+    def labelled_run_ids(self) -> set[str]: ...
+    def remove(self, run_id: str) -> dict[str, list[str]]: ...
 
 
 class DockerLeftovers:
-    """Containers, volumes and networks still labelled with a run (a failed listing
-    is reported as a leftover, never as "none")."""
+    """Containers, volumes and networks labelled with a run (a failed listing is
+    reported as a leftover, never as "none")."""
+
+    _KINDS: Final = (
+        ("containers", ["ps", "-a"], '{{.Label "lab.run_id"}}'),
+        ("volumes", ["volume", "ls"], '{{.Label "lab.run_id"}}'),
+        ("networks", ["network", "ls"], '{{.Label "lab.run_id"}}'),
+    )
 
     def __init__(self, run: CommandRunner, *, docker: str = "docker") -> None:
         self._run = run
         self._docker = docker
 
-    def __call__(self, run_id: str) -> dict[str, list[str]]:
+    def leftovers(self, run_id: str) -> dict[str, list[str]]:
         label = f"label={RUN_LABEL}={run_id}"
         left: dict[str, list[str]] = {}
-        for kind, argv in (
-            ("containers", ["ps", "-a", "-q"]),
-            ("volumes", ["volume", "ls", "-q"]),
-            ("networks", ["network", "ls", "-q"]),
-        ):
-            result = self._run([self._docker, *argv, "--filter", label])
+        for kind, argv, _ in self._KINDS:
+            result = self._run([self._docker, *argv, "-q", "--filter", label])
             if result.returncode != 0:
                 left[kind] = [f"listing failed (exit {result.returncode})"]
             elif words := result.text.split():
                 left[kind] = words
         return left
+
+    def labelled_run_ids(self) -> set[str]:
+        ids: set[str] = set()
+        for kind, argv, fmt in self._KINDS:
+            result = self._run(
+                [self._docker, *argv, "--filter", f"label={RUN_LABEL}", "--format", fmt]
+            )
+            if result.returncode != 0:
+                raise SelftestConfigError(f"cannot list labelled {kind} (exit {result.returncode})")
+            ids.update(word for word in result.text.split() if word)
+        return ids
+
+    def remove(self, run_id: str) -> dict[str, list[str]]:
+        left = self.leftovers(run_id)
+        if containers := left.get("containers"):
+            self._run([self._docker, "rm", "-f", "-v", *containers])
+        if volumes := self.leftovers(run_id).get("volumes"):
+            self._run([self._docker, "volume", "rm", "-f", *volumes])
+        if networks := self.leftovers(run_id).get("networks"):
+            self._run([self._docker, "network", "rm", *networks])
+        return self.leftovers(run_id)
 
 
 # --------------------------------------------------------------------------- the self-test
@@ -607,7 +856,7 @@ class SelftestDeps:
     collector: CollectorClient
     backend: CellBackend
     probe: ContainmentProbe
-    leftovers: LeftoverCheck
+    resources: CellResources
     settings: CellSettings
     lab_key: bytes = field(repr=False)
     runs_dir: Path
@@ -618,10 +867,14 @@ class SelftestDeps:
     runner_options: Mapping[str, Any] = field(default_factory=dict)
 
 
+def _cell_dir(work_dir: Path, run_id: str) -> Path:
+    return work_dir / f"{CELL_NAME_PREFIX}{run_id.lower()}"
+
+
 def run_selftest(
     deps: SelftestDeps, *, quick: bool, clock: Callable[[], float] = time.time
 ) -> SelftestReport:
-    """Run the self-test pair and check it; never raises for a failed self-test."""
+    """Run the self-test pair under the host lock and check it; never raises."""
     started = clock()
     try:
         ef = derive_experiment(deps.templates_root / SELFTEST_EXPERIMENT, quick=quick)
@@ -629,35 +882,43 @@ def run_selftest(
         return failed_report(quick, "experiment", str(exc)[:300], started_at=started)
     experiment_id = ef.experiment.experiment_id
     gate = ContainmentGate(deps.backend, deps.probe, limit=1 if quick else None)
-    runner = Runner(
-        store=RunStore(deps.engine),
-        collector=deps.collector,
-        backend=gate,
-        settings=deps.settings,
-        lab_key=deps.lab_key,
-        runs_dir=deps.runs_dir,
-        work_dir=deps.work_dir,
-        lock_path=deps.lock_path,
-        templates_root=deps.templates_root,
-        **deps.runner_options,
-    )
-    log.info("selftest: running %s (%s)", experiment_id, "quick" if quick else "full")
     checks: list[Check] = []
     results: list[RunResult] = []
     try:
-        results = runner.run_experiment(ef)
+        with host_lock(deps.lock_path):
+            checks.append(_sweep_earlier(deps))
+            runner = Runner(
+                store=RunStore(deps.engine),
+                collector=deps.collector,
+                backend=gate,
+                settings=deps.settings,
+                lab_key=deps.lab_key,
+                runs_dir=deps.runs_dir,
+                work_dir=deps.work_dir,
+                lock_path=deps.lock_path,
+                templates_root=deps.templates_root,
+                **deps.runner_options,
+            )
+            log.info("selftest: running %s (%s)", experiment_id, "quick" if quick else "full")
+            try:
+                results = runner.run_experiment(ef)
+            except CellLeftBehindError as exc:
+                results = list(exc.results)
+                checks.append(Check("run the pair", False, f"stopped: {exc}"[:500]))
+            checks += _check_results(deps, ef, results, gate.records, quick=quick)
     except HostLockError as exc:
         checks.append(Check("run the pair", False, f"another runner is active: {exc}"))
     except Exception as exc:
-        log.exception("selftest: the runner failed")
+        log.exception("selftest: failed")
         checks.append(Check("run the pair", False, f"{type(exc).__name__}: {str(exc)[:300]}"))
-    if not checks:
-        try:
-            checks += _check_results(deps, ef, results, gate.records, quick=quick)
-        except Exception as exc:
-            log.exception("selftest: checking the results failed")
-            checks.append(Check("check results", False, f"{type(exc).__name__}: {exc}"[:300]))
-    runs = tuple(_run_summary(deps.engine, r) for r in results)
+    try:
+        runs = tuple(_run_summary(deps.engine, r) for r in results)
+    except Exception as exc:
+        log.exception("selftest: cannot summarise the runs")
+        runs = tuple(
+            {"run_id": r.run_id, "arm": r.arm.value, "status": r.status.value} for r in results
+        )
+        checks.append(Check("summarise runs", False, f"{type(exc).__name__}: {exc}"[:300]))
     report = SelftestReport(
         quick=quick,
         experiment_id=experiment_id,
@@ -671,20 +932,84 @@ def run_selftest(
     return report
 
 
+def _sweep_earlier(deps: SelftestDeps) -> Check:
+    """Remove what earlier self-tests left (never a study run's resources)."""
+    try:
+        labelled = deps.resources.labelled_run_ids()
+    except Exception as exc:
+        return Check("earlier self-tests swept", False, f"cannot list: {exc}"[:300])
+    with session_scope(deps.engine) as s:
+        selftest_runs = set(
+            s.scalars(
+                select(t.Run.run_id).where(
+                    t.Run.experiment_id.startswith(SELFTEST_EXPERIMENT_PREFIX, autoescape=True)
+                )
+            ).all()
+        )
+        stale_dirs = (
+            [
+                d
+                for d in deps.work_dir.iterdir()
+                if d.is_dir() and d.name.startswith(CELL_NAME_PREFIX)
+            ]
+            if deps.work_dir.is_dir()
+            else []
+        )
+        by_dir = {
+            _cell_dir(deps.work_dir, run_id).name: run_id
+            for run_id in s.scalars(
+                select(t.Run.run_id).where(
+                    t.Run.experiment_id.startswith(SELFTEST_EXPERIMENT_PREFIX, autoescape=True),
+                    func.lower(t.Run.run_id).in_(
+                        [d.name.removeprefix(CELL_NAME_PREFIX) for d in stale_dirs]
+                    ),
+                )
+            ).all()
+        }
+    removed: list[str] = []
+    left: dict[str, Any] = {}
+    for run_id in sorted(labelled & selftest_runs):
+        remaining = deps.resources.remove(run_id)
+        removed.append(run_id)
+        if remaining:
+            left[run_id] = remaining
+    for directory in stale_dirs:
+        if directory.name in by_dir:
+            shutil.rmtree(directory, ignore_errors=True)
+            if directory.exists():
+                left[str(directory)] = "not removed"
+            elif by_dir[directory.name] not in removed:
+                removed.append(by_dir[directory.name])
+    if removed:
+        log.warning("selftest: swept what earlier self-tests left: %s", removed)
+    detail = f"removed resources of {len(removed)} earlier self-test runs" if removed else ""
+    if left:
+        return Check("earlier self-tests swept", False, f"still there: {json.dumps(left)[:300]}")
+    return Check("earlier self-tests swept", True, detail)
+
+
 def _labels(engine: Engine, run_id: str) -> dict[FunnelStage, bool]:
     with session_scope(engine) as s:
         rows = s.scalars(select(t.Label).where(t.Label.run_id == run_id)).all()
         return {row.stage: row.value for row in rows}
 
 
+def _stored_verdict(engine: Engine, run_id: str) -> tuple[bool | None, Any]:
+    with session_scope(engine) as s:
+        row = s.get(t.Run, run_id)
+        return (None, None) if row is None else (row.outcome, row.decided_at)
+
+
 def _run_summary(engine: Engine, result: RunResult) -> dict[str, Any]:
+    outcome, decided_at = _stored_verdict(engine, result.run_id)
     return {
         "run_id": result.run_id,
         "arm": result.arm.value,
         "status": result.status.value,
         "reason": result.reason.value if result.reason else None,
         "end_status": result.end_status.value if result.end_status else None,
-        "outcome": result.outcome,
+        "outcome": outcome,
+        "decided_at": None if decided_at is None else str(decided_at),
         "labels": {stage.value: value for stage, value in _labels(engine, result.run_id).items()},
     }
 
@@ -706,75 +1031,79 @@ def _check_results(
         if not any(r.arm is arm for r in results):
             checks.append(Check(f"{arm.value}: valid", False, "no run of this arm"))
     with session_scope(deps.engine) as s:
-        tags = {
-            row.tag
-            for row in s.scalars(
-                select(t.Run).where(t.Run.experiment_id == ef.experiment.experiment_id)
-            ).all()
-            if row.tag
-        }
+        rows = s.scalars(
+            select(t.Run).where(t.Run.experiment_id == ef.experiment.experiment_id)
+        ).all()
+        injected_ids = [row.run_id for row in rows if row.arm is Arm.INJECTED]
+        needles = {row.tag for row in rows if row.tag}
+        needles |= set(
+            s.scalars(select(t.Placement.token).where(t.Placement.run_id.in_(injected_ids))).all()
+        )
     probed = {p.run_id: p for p in probes}
     for result in results:
-        arm_name = result.arm.value
+        name = result.arm.value
         valid = result.status is RunStatus.VALID
         detail = "" if valid else f"{result.status.value} ({result.reason}): {result.detail[:300]}"
-        checks.append(Check(f"{arm_name}: valid", valid, detail))
+        checks.append(Check(f"{name}: valid", valid, detail))
         completed = result.end_status is EndStatus.COMPLETED
         checks.append(
             Check(
-                f"{arm_name}: completed",
+                f"{name}: completed",
                 completed,
                 "" if completed else f"agent end status {result.end_status or 'none'}",
             )
         )
         labels = _labels(deps.engine, result.run_id)
+        outcome, decided_at = _stored_verdict(deps.engine, result.run_id)
         if result.arm is Arm.INJECTED:
-            checks.append(_funnel_check(arm_name, labels, want_true=tuple(FunnelStage)))
+            checks.append(_funnel_check(name, labels, want_true=tuple(FunnelStage)))
+            ok = outcome is True and decided_at is not None
             checks.append(
                 Check(
-                    f"{arm_name}: oracle",
-                    result.outcome is True,
-                    "" if result.outcome is True else f"verdict {result.outcome}",
+                    f"{name}: oracle", ok, "" if ok else f"stored verdict {outcome}, {decided_at}"
                 )
             )
             checks.append(_callback_check(deps, result.run_id))
         else:
             checks.append(
                 _funnel_check(
-                    arm_name,
+                    name,
                     labels,
                     want_false=(FunnelStage.ACCESS, FunnelStage.VISIBLE, FunnelStage.UPTAKE),
                 )
             )
+            ok = outcome is not None and decided_at is not None
+            checks.append(Check(f"{name}: oracle", ok, "" if ok else "no stored verdict"))
+            checks.append(_control_clean(deps, result.run_id, needles))
+        record = probed.get(result.run_id)
+        if record is not None:
             checks.append(
                 Check(
-                    f"{arm_name}: oracle",
-                    result.outcome is not None,
-                    "" if result.outcome is not None else "no verdict",
+                    f"{name}: contained",
+                    record.contained,
+                    "; ".join(record.problems)[:500],
+                    critical=record.breach,
                 )
             )
-            checks.append(_control_clean(deps, result.run_id, tags))
-        if not quick or result.run_id in probed:
-            record = probed.get(result.run_id)
-            if record is None:
-                checks.append(
-                    Check(f"{arm_name}: contained", False, "the probe never ran", critical=True)
+        elif not quick:
+            checks.append(
+                Check(
+                    f"{name}: contained",
+                    False,
+                    "not probed: the cell failed before its agent would start",
                 )
-            else:
-                checks.append(
-                    Check(
-                        f"{arm_name}: contained",
-                        record.contained,
-                        "; ".join(record.problems)[:500],
-                        critical=not record.contained,
-                    )
-                )
-        left = deps.leftovers(result.run_id)
+            )
+        left: dict[str, Any] = dict(deps.resources.leftovers(result.run_id))
+        cell_dir = _cell_dir(deps.work_dir, result.run_id)
+        if cell_dir.exists():
+            left["work_dir"] = [str(cell_dir)]
         checks.append(
-            Check(f"{arm_name}: nothing left", not left, "" if not left else json.dumps(left)[:300])
+            Check(f"{name}: nothing left", not left, "" if not left else json.dumps(left)[:300])
         )
     if quick and not probes:
-        checks.append(Check("contained", False, "the probe never ran", critical=True))
+        checks.append(
+            Check("contained", False, "not probed: the first cell failed before its agent")
+        )
     return checks
 
 
@@ -819,7 +1148,44 @@ def _callback_check(deps: SelftestDeps, run_id: str) -> Check:
     return Check("injected: callbacks", not missing, detail)
 
 
-def _control_clean(deps: SelftestDeps, run_id: str, tags: set[str]) -> Check:
+def _b64_values(node: Any) -> Iterator[str]:
+    """Every string under a key ending in ``_b64`` (any depth)."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(key, str) and key.endswith("_b64") and isinstance(value, str):
+                yield value
+            else:
+                yield from _b64_values(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _b64_values(item)
+
+
+def _holds(data: bytes, needles: Iterable[bytes]) -> bool:
+    """True if ``data`` (case-folded) or a decoded base64 field in it holds a needle."""
+    needles = list(needles)
+    if any(n in data.lower() for n in needles):
+        return True
+    if len(data) > _MAX_JSON_SCAN_BYTES:
+        return False
+    for line in data.splitlines():
+        if b"_b64" not in line:
+            continue
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        for value in _b64_values(doc):
+            try:
+                decoded = base64.b64decode(value, validate=True).lower()
+            except (binascii.Error, ValueError):
+                continue
+            if any(n in decoded for n in needles):
+                return True
+    return False
+
+
+def _control_clean(deps: SelftestDeps, run_id: str, needles: set[str]) -> Check:
     problems: list[str] = []
     with session_scope(deps.engine) as s:
         tokened = [
@@ -829,17 +1195,19 @@ def _control_clean(deps: SelftestDeps, run_id: str, tags: set[str]) -> Check:
         ]
     if tokened:
         problems.append(f"token callbacks reached the control: {sorted(set(tokened))}")
-    needles = [tag.encode() for tag in tags]
+    wanted = [n.lower().encode() for n in needles]
     evidence = deps.runs_dir / run_id
+    if not evidence.is_dir():
+        problems.append("no evidence directory")
     leaked = sorted(
         str(path.relative_to(evidence))
         for path in _files(evidence)
-        if any(needle in path.read_bytes() for needle in needles)
+        if _holds(path.read_bytes(), wanted)
     )
     if leaked:
-        problems.append(f"an injected tag is in {len(leaked)} evidence files: {leaked[:5]}")
-    if not evidence.is_dir():
-        problems.append("no evidence directory")
+        problems.append(
+            f"an injected tag or token is in {len(leaked)} evidence files: {leaked[:5]}"
+        )
     return Check("control: no tags", not problems, "; ".join(problems))
 
 
@@ -862,29 +1230,10 @@ class LabContext:
     environ: Mapping[str, str]
     collector_url: str
     engine: Engine
-
-
-def runner_lock_path(lab_root: Path, environ: Mapping[str, str]) -> Path:
-    """The host's runner lock, shared with every runner (``$LAB_RUNNER_LOCK``)."""
-    return Path(environ.get("LAB_RUNNER_LOCK") or lab_root / "state" / "runner.lock")
-
-
-def _dev(environ: Mapping[str, str]) -> bool:
-    return environ.get("LAB_DEV") == "1"
-
-
-def _host_env(lab_root: Path, environ: Mapping[str, str]) -> dict[str, str] | None:
-    """``host.env`` (``$LAB_HOST_ENV``); missing is an error unless ``LAB_DEV=1``."""
-    path = Path(environ.get("LAB_HOST_ENV") or lab_root / "host.env")
-    try:
-        return read_host_env(path)
-    except FileNotFoundError:
-        if _dev(environ):
-            log.warning("selftest: no %s (LAB_DEV=1: settings from the environment)", path)
-            return None
-        raise SelftestConfigError(f"no host profile at {path} (set LAB_DEV=1 off-host)") from None
-    except (OSError, CellError) as exc:
-        raise SelftestConfigError(f"cannot read {path}: {exc}") from exc
+    #: is an address one of this host's own (tests replace it)
+    is_local: Callable[[str], bool] = is_local_address
+    #: does a LAN address answer from this host (tests replace it)
+    lan_answers: Callable[[str], bool] = lan_answers
 
 
 def _lab_key(lab_root: Path) -> bytes:
@@ -900,18 +1249,34 @@ def _lab_key(lab_root: Path) -> bytes:
     return key
 
 
-def _probe_lan(environ: Mapping[str, str], host_env: Mapping[str, str] | None) -> list[str]:
-    host_value = (host_env or {}).get("LAB_PROBE_LAN", "")
-    env_value = environ.get("LAB_PROBE_LAN", "")
-    if host_value and env_value and env_value != host_value:
-        raise SelftestConfigError(
-            f"LAB_PROBE_LAN {env_value!r} differs from the host's configured {host_value!r}"
-        )
-    raw = host_value or env_value
+def _release_tree(lab_root: Path, environ: Mapping[str, str]) -> Path:
+    """The release tree, resolved once (``current`` is a symlink a deploy may swap)."""
+    if tree := environ.get("LAB_RELEASE_TREE"):
+        return Path(tree).resolve(strict=False)
+    current = lab_root / "current"
+    if (current / SELFTEST_EXPERIMENT).is_file():
+        return current.resolve(strict=True)
+    return REPO_ROOT.resolve()  # a development checkout
+
+
+def _probe_lan(environ: Mapping[str, str], settings: CellSettings) -> list[str]:
+    """``LAB_PROBE_LAN``: from the host profile in production, the environment in dev."""
+    if settings.dev:
+        raw = environ.get("LAB_PROBE_LAN", "")
+        where = "the environment (LAB_DEV=1)"
+    else:
+        path = Path(environ.get("LAB_HOST_ENV") or HOST_ENV_FILE)
+        try:
+            raw = read_host_env(path).get("LAB_PROBE_LAN", "")
+        except (OSError, CellError) as exc:
+            raise SelftestConfigError(f"cannot read the host profile {path}: {exc}") from exc
+        where = str(path)
+        if environ.get("LAB_PROBE_LAN") not in (None, raw):
+            log.warning("selftest: LAB_PROBE_LAN in the environment is ignored (production)")
     lan = [part.strip() for part in raw.split(",") if part.strip()]
     if not lan:
         raise SelftestConfigError(
-            "no home-LAN address for the containment probe: set LAB_PROBE_LAN in host.env"
+            f"no home-LAN address for the containment probe: set LAB_PROBE_LAN in {where}"
         )
     for addr in lan:
         try:
@@ -921,60 +1286,93 @@ def _probe_lan(environ: Mapping[str, str], host_env: Mapping[str, str] | None) -
     return lan
 
 
-def _host_gateway_override(environ: Mapping[str, str]) -> str | None:
+def _host_gateway_override(
+    environ: Mapping[str, str], settings: CellSettings, is_local: Callable[[str], bool]
+) -> str | None:
     value = environ.get("LAB_PROBE_HOST_GATEWAY", "").strip()
     if not value:
         return None
-    if not _dev(environ):
-        raise SelftestConfigError("LAB_PROBE_HOST_GATEWAY is for development only (LAB_DEV=1)")
+    if not (settings.dev and settings.engine is CellEngine.PODMAN):
+        raise SelftestConfigError(
+            "LAB_PROBE_HOST_GATEWAY is for development on Podman only (LAB_DEV=1, "
+            "LAB_ENGINE=podman)"
+        )
     try:
         ipaddress.ip_address(value)
     except ValueError:
         raise SelftestConfigError(f"LAB_PROBE_HOST_GATEWAY: {value!r} is not an IP") from None
-    log.warning("selftest: LAB_DEV=1: probing %s as the host, not the cell gateway", value)
+    if not is_local(value):
+        raise SelftestConfigError(f"LAB_PROBE_HOST_GATEWAY {value} is not an address of this host")
+    log.warning("selftest: development: probing %s as the host, not the cell gateway", value)
     return value
 
 
-def _release_tree(lab_root: Path, environ: Mapping[str, str]) -> Path:
-    if tree := environ.get("LAB_RELEASE_TREE"):
-        return Path(tree)
-    current = lab_root / "current"
-    if (current / SELFTEST_EXPERIMENT).is_file():
-        return current
-    return REPO_ROOT  # a development checkout
+def _cell_env(environ: Mapping[str, str], tree: Path) -> dict[str, str]:
+    """The runner's environment: in production the tree's images.lock, no overrides."""
+    env = dict(environ)
+    lock = str(tree / "deploy" / "images.lock")
+    if env.get("LAB_DEV") == "1":
+        env.setdefault("LAB_IMAGES_LOCK", lock)
+        return env
+    for key in ("LAB_IMAGES_LOCK", "LAB_IMAGE_OVERRIDES"):
+        if env.get(key):
+            log.warning("selftest: %s is ignored outside development", key)
+    env.pop("LAB_IMAGE_OVERRIDES", None)
+    env["LAB_IMAGES_LOCK"] = lock
+    return env
 
 
 @contextlib.contextmanager
 def _lab_deps(context: LabContext) -> Iterator[SelftestDeps]:
     environ, lab_root = context.environ, context.lab_root
     lab_key = _lab_key(lab_root)
-    host_env = _host_env(lab_root, environ)
-    lan = _probe_lan(environ, host_env)
-    host_gateway = _host_gateway_override(environ)
     tree = _release_tree(lab_root, environ)
-    cell_env = dict(environ)
-    cell_env.setdefault("LAB_IMAGES_LOCK", str(tree / "deploy" / "images.lock"))
     try:
-        settings = CellSettings.from_env(cell_env, host_env=host_env)
+        settings = CellSettings.from_env(_cell_env(environ, tree))
         probe_image = settings.image("lab-cell")
     except CellError as exc:
         raise SelftestConfigError(str(exc)) from exc
+    lan = _probe_lan(environ, settings)
+    silent = [addr for addr in lan if not context.lan_answers(addr)]
+    if silent:
+        raise SelftestConfigError(
+            f"LAB_PROBE_LAN {silent} does not answer from this host, so a blocked result "
+            "from a cell would prove nothing"
+        )
+    host_gateway = _host_gateway_override(environ, settings, context.is_local)
     docker_env = {k: environ[k] for k in ("DOCKER_HOST",) if k in environ}
     commands = SubprocessRunner(docker_env)
+    extra: list[str] = []
+    try:
+        extra += control_plane_destinations(commands, tree / CONTROL_PLANE_FILE)
+    except SelftestConfigError as exc:
+        if not settings.dev:
+            raise
+        log.warning("selftest: development: no control-plane destinations (%s)", exc)
+    own = own_address_towards(lan[0])
+    if own is None or not context.is_local(own):
+        raise SelftestConfigError(f"cannot find this host's own address towards {lan[0]}")
+    extra += [f"host:tcp:{own}:{port}" for port in HOST_PORTS]
+    work_dir = lab_root / "cells"
     with httpx.Client(base_url=context.collector_url, timeout=60.0) as http:
         yield SelftestDeps(
             engine=context.engine,
             collector=CollectorClient(http),
             backend=ComposeBackend(commands),
             probe=DockerContainmentProbe(
-                commands, image=probe_image, lan=lan, host_gateway=host_gateway
+                commands,
+                image=probe_image,
+                lan=lan,
+                host_gateway=host_gateway,
+                extra_destinations=extra,
+                is_local=context.is_local,
             ),
-            leftovers=DockerLeftovers(commands),
+            resources=DockerLeftovers(commands),
             settings=settings,
             lab_key=lab_key,
             runs_dir=lab_root / "artifacts",
-            work_dir=lab_root / "cells",
-            lock_path=runner_lock_path(lab_root, environ),
+            work_dir=work_dir,
+            lock_path=runner_lock_path(environ, dev=settings.dev, work_dir=work_dir),
             templates_root=tree,
         )
 
@@ -988,3 +1386,8 @@ def run_lab_selftest(context: LabContext, *, quick: bool) -> SelftestReport:
     except SelftestConfigError as exc:
         log.error("selftest: %s", exc)
         return failed_report(quick, "configuration", str(exc), started_at=started)
+    except Exception as exc:
+        log.exception("selftest: internal error")
+        return failed_report(
+            quick, "internal", f"{type(exc).__name__}: {str(exc)[:300]}", started_at=started
+        )

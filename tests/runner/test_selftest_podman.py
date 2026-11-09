@@ -12,13 +12,14 @@ Needs the ``docker`` CLI with the compose plugin, a reachable socket, and the im
 Docker-only options (bridge names, DOCKER-USER) are not exercised here; their
 rendering is asserted in ``test_cell_spec.py``.
 
-``test_labctl_selftest_end_to_end`` runs ``labctl selftest`` itself (full mode): the
+``test_labctl_selftest_end_to_end`` runs ``labctl selftest`` itself (full mode) on a
+development host (``LAB_DEV=1``, no host profile, settings from the environment): the
 lab wiring from a temporary ``LAB_ROOT``, a Collector served over HTTP, the
 containment probe in both cells. ``LAB_E2E_LAN`` names the LAN address to probe
-(default: this machine's default gateway). Under rootless Podman the agent network's
-gateway is the rootless network namespace, which answers with a reset, so the probe's
-host address is this machine's own LAN-side address (``LAB_PROBE_HOST_GATEWAY``,
-development only).
+(default: this machine's default gateway); it must answer from this machine. Under
+rootless Podman the agent network's gateway is the rootless network namespace, which
+answers with a reset, so the probe's host address is this machine's own address
+(``LAB_PROBE_HOST_GATEWAY``, development on Podman only, checked to be local).
 """
 
 from __future__ import annotations
@@ -193,15 +194,15 @@ def test_labctl_selftest_end_to_end(
     root = tmp_path / "lab"
     (root / "secrets").mkdir(parents=True)
     (root / "secrets" / "hmac.key").write_bytes(os.urandom(32))
-    (root / "host.env").write_text(
-        f"LAB_CELL_NETWORKS=10.231.0.0/16\nLAB_LLM_GATEWAY=\nLAB_PROBE_LAN={lan}\n"
-    )
+    # a development host: no host profile; its settings come from the environment
     env = {
         "LAB_ROOT": str(root),
         "DATABASE_URL": db_url,
         "LAB_DEV": "1",
         "LAB_ENGINE": engine_kind,
         "LAB_REQUIRE_DIGESTS": "0",
+        "LAB_CELL_NETWORKS": "10.231.0.0/16",
+        "LAB_PROBE_LAN": lan,
         "LAB_IMAGE_OVERRIDES": ",".join(f"{k}={v}" for k, v in IMAGES.items()),
         "LAB_RELEASE_TREE": str(REPO_ROOT),
         **docker_env,
@@ -210,8 +211,15 @@ def test_labctl_selftest_end_to_end(
         env["LAB_PROBE_HOST_GATEWAY"] = _own_address(lan)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
-    for key in ("LAB_HOST_ENV", "LAB_RUNNER_LOCK", "LAB_SELFTEST_STATUS_FILE", "LAB_PROBE_LAN"):
+    for key in (
+        "LAB_HOST_ENV",
+        "LAB_RUNNER_LOCK",
+        "LAB_SELFTEST_STATUS_FILE",
+        "LAB_IMAGES_LOCK",
+        "LAB_LLM_GATEWAY",
+    ):
         monkeypatch.delenv(key, raising=False)
+    assert not list(root.rglob("host.env"))
 
     with _collector_server(engine) as url:
         monkeypatch.setenv("LAB_COLLECTOR_URL", url)
@@ -223,5 +231,10 @@ def test_labctl_selftest_end_to_end(
     assert report["passed"] and not report["quick"] and not failed
     assert len(report["runs"]) == 2 and len(report["probes"]) == 2
     assert all(p["contained"] for p in report["probes"])
+    # the host's own LAN address was probed as well (no control plane in development)
+    own = _own_address(lan)
+    for probe in report["probes"]:
+        targets = {(r["target"], r["port"]) for r in probe["report"]["results"]}
+        assert (own, 22) in targets
     last = read_selftest_status(root / "state" / "selftest.json").last_success
     assert last is not None and last.passed and not last.quick

@@ -9,6 +9,7 @@ self-test builds are the ones the probe accepts.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import io
@@ -33,6 +34,7 @@ from control.runner import selftest
 from control.runner.cell_spec import CellSettings, ComposeProject
 from control.runner.compose_backend import CellHandle, CollectReport, CommandResult, ContainerState
 from control.runner.experiment import parse_experiment, read_experiment
+from control.runner.runner import Runner
 from control.runner.selftest import (
     ContainmentGate,
     DockerContainmentProbe,
@@ -61,16 +63,36 @@ def _manifest(project: ComposeProject) -> RunManifest:
 class SelftestBackend(FakeBackend):
     """The fake cell, plus the catcher's HTTP callback (the DNS one is FakeBackend's)."""
 
-    def __init__(self, *, http_callback: bool = True, wrong_token: bool = False, **kw: Any):
+    def __init__(
+        self,
+        *,
+        http_callback: bool = True,
+        dns_callback: bool = True,
+        wrong_token: bool = False,
+        cell_dirs: bool = False,
+        extra: Callable[[RunManifest, Path], None] | None = None,
+        **kw: Any,
+    ):
         super().__init__(**kw)
         self.http_callback = http_callback
+        self.dns_callback = dns_callback
         self.wrong_token = wrong_token
+        self.cell_dirs = cell_dirs
+        self.on_collect = extra
+
+    def prepare(self, project: ComposeProject, workdir: Path) -> CellHandle:
+        handle = super().prepare(project, workdir)
+        if self.cell_dirs:  # a work directory teardown never removes
+            (workdir / project.name).mkdir(parents=True, exist_ok=True)
+        return handle
 
     def collect(
         self, cell: CellHandle, dest: Path, services: Sequence[str] | None = None
     ) -> CollectReport:
         report = super().collect(cell, dest, services)
         manifest = _manifest(cell.project)
+        if not self.dns_callback:
+            (dest / "catcher" / "dns" / "events.jsonl").unlink(missing_ok=True)
         if self.http_callback and manifest.placements and self.llm_calls:
             placement = manifest.placements[-1]
             token = "a" * 12 if self.wrong_token else placement.token
@@ -91,7 +113,34 @@ class SelftestBackend(FakeBackend):
                     )
                 ],
             )
+        if self.on_collect is not None:
+            self.on_collect(manifest, dest)
         return report
+
+
+class FakeResources:
+    """Labelled engine resources by run id; ``after`` is what every run leaves."""
+
+    def __init__(
+        self,
+        left: dict[str, dict[str, list[str]]] | None = None,
+        *,
+        after: dict[str, list[str]] | None = None,
+    ) -> None:
+        self.left = dict(left or {})
+        self.after = after or {}
+        self.removed: list[str] = []
+
+    def leftovers(self, run_id: str) -> dict[str, list[str]]:
+        return dict(self.left.get(run_id, self.after))
+
+    def labelled_run_ids(self) -> set[str]:
+        return set(self.left)
+
+    def remove(self, run_id: str) -> dict[str, list[str]]:
+        self.removed.append(run_id)
+        self.left.pop(run_id, None)
+        return {}
 
 
 def _network(
@@ -167,7 +216,10 @@ def _deps(
     tmp_path: Path,
     backend: FakeBackend | None = None,
     probe_engine: ProbeEngine | None = None,
-    leftovers: Callable[[str], dict[str, list[str]]] = lambda _r: {},
+    resources: FakeResources | None = None,
+    *,
+    is_local: Callable[[str], bool] = lambda _a: True,
+    extra_destinations: Sequence[str] = (),
 ) -> SelftestDeps:
     settings = CellSettings(images=IMAGES)
     backend = backend or SelftestBackend()
@@ -177,8 +229,14 @@ def _deps(
         engine=engine,
         collector=collector,
         backend=backend,
-        probe=DockerContainmentProbe(probe_engine, image=settings.image("lab-cell"), lan=[LAN]),
-        leftovers=leftovers,
+        probe=DockerContainmentProbe(
+            probe_engine,
+            image=settings.image("lab-cell"),
+            lan=[LAN],
+            is_local=is_local,
+            extra_destinations=extra_destinations,
+        ),
+        resources=resources or FakeResources(),
         settings=settings,
         lab_key=KEY,
         runs_dir=tmp_path / "runs",
@@ -380,7 +438,7 @@ def test_leftovers_after_teardown_fail(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
     report = run_selftest(
-        _deps(engine, collector, tmp_path, leftovers=lambda _r: {"networks": ["n1"]}),
+        _deps(engine, collector, tmp_path, resources=FakeResources(after={"networks": ["n1"]})),
         quick=True,
     )
     failed = _failed(report)
@@ -404,6 +462,275 @@ def test_another_runner_holding_the_host_lock_fails(
         os.close(fd)
     assert not report.passed
     assert "another runner" in _failed(report)["run the pair"]
+
+
+def test_a_missing_dns_callback_fails(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    backend = SelftestBackend(dns_callback=False)
+    report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=True)
+    assert _failed(report)["injected: callbacks"] == "no verified callback on dns"
+
+
+def test_a_host_gateway_that_is_not_this_hosts_fails_but_is_not_a_breach(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    backend = SelftestBackend()
+    report = run_selftest(
+        _deps(engine, collector, tmp_path, backend, is_local=lambda _a: False), quick=True
+    )
+    assert not report.passed and not report.critical
+    detail = next(d for n, d in _failed(report).items() if n.endswith("contained"))
+    assert "not an address of this host" in detail
+    assert ("probe", report.probes[0].run_id) not in backend.calls  # the probe never ran
+    assert ("start_agent", report.probes[0].run_id) not in backend.calls
+
+
+def test_a_cell_failing_before_its_agent_is_a_cell_failure_not_containment(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    for quick in (True, False):
+        report = run_selftest(
+            _deps(engine, collector, tmp_path / str(quick), SelftestBackend(healthy=False)),
+            quick=quick,
+        )
+        assert not report.passed and not report.critical
+        failed = _failed(report)
+        assert "probe_failed" in failed["injected: valid"]
+        assert all("not probed" in d for n, d in failed.items() if n.endswith("contained"))
+        assert not report.probes
+
+
+def test_a_cell_left_behind_keeps_the_results(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    report = run_selftest(
+        _deps(engine, collector, tmp_path, SelftestBackend(teardown_error="network left")),
+        quick=True,
+    )
+    failed = _failed(report)
+    assert "stopped" in failed["run the pair"] and "network left" in failed["run the pair"]
+    assert len(report.runs) == 1 and report.runs[0]["reason"] == "teardown_failed"
+    assert failed["runs"] == "1 runs, expected 2"
+
+
+def test_a_work_directory_left_behind_fails(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    report = run_selftest(
+        _deps(engine, collector, tmp_path, SelftestBackend(cell_dirs=True)), quick=True
+    )
+    assert "work_dir" in _failed(report)["injected: nothing left"]
+
+
+def test_a_failed_engine_listing_fails(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    def refuse(
+        argv: Sequence[str], *, stdin: bytes | None = None, timeout: float | None = None
+    ) -> CommandResult:
+        return CommandResult(tuple(argv), 1, b"", b"cannot connect")
+
+    leftovers = selftest.DockerLeftovers(refuse)
+    assert leftovers.leftovers("run_x") == {
+        kind: ["listing failed (exit 1)"] for kind in ("containers", "volumes", "networks")
+    }
+    report = run_selftest(_deps(engine, collector, tmp_path), quick=True)
+    deps = _deps(engine, collector, tmp_path / "b")
+    deps.resources = leftovers
+    report = run_selftest(deps, quick=True)
+    failed = _failed(report)
+    assert "listing failed" in failed["injected: nothing left"]
+    assert "cannot list" in failed["earlier self-tests swept"]
+
+
+def _injected_tag(engine: Engine, manifest: RunManifest) -> str:
+    schedule = RunStore(engine).load_schedule(manifest.experiment_id)
+    tag = next(r.tag for r in schedule if r.pair_id == manifest.pair_id and r.tag)
+    assert tag is not None
+    return tag
+
+
+def test_a_base64_tag_in_the_controls_catcher_evidence_fails(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    def extra(manifest: RunManifest, dest: Path) -> None:
+        if manifest.arm is not Arm.CONTROL:
+            return
+        body = f"hello {_injected_tag(engine, manifest)}".encode()
+        _write_events(
+            dest / "catcher" / "http" / "events.jsonl",
+            [
+                Callback(
+                    run_id=manifest.run_id,
+                    stream="catcher-http",
+                    seq=0,
+                    ts=TS,
+                    channel=CallbackChannel.HTTP,
+                    method="POST",
+                    url="http://other.cb.lab.test/",
+                    body_b64=base64.b64encode(body).decode(),
+                    body_size=len(body),
+                    body_sha256=hashlib.sha256(body).hexdigest(),
+                )
+            ],
+        )
+
+    report = run_selftest(
+        _deps(engine, collector, tmp_path, SelftestBackend(extra=extra)), quick=True
+    )
+    assert "catcher/http/events.jsonl" in _failed(report)["control: no tags"]
+
+
+def test_an_injected_token_in_the_control_fails(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    # the control runs first here: plant the injected run's token in the control's
+    # evidence on disk once the injected run's placements exist
+    def extra(manifest: RunManifest, dest: Path) -> None:
+        if manifest.arm is not Arm.INJECTED:
+            return
+        schedule = RunStore(engine).load_schedule(manifest.experiment_id)
+        control = next(r for r in schedule if r.pair_id == manifest.pair_id and not r.tag)
+        token = manifest.placements[0].token.upper()  # case does not hide it
+        path = tmp_path / "runs" / control.run_id / "llm" / "late.req.json"
+        path.write_text(json.dumps({"messages": [{"content": f"see {token}"}]}))
+
+    report = run_selftest(
+        _deps(engine, collector, tmp_path, SelftestBackend(extra=extra)), quick=True
+    )
+    assert "llm/late.req.json" in _failed(report)["control: no tags"]
+
+
+def test_earlier_selftest_leftovers_are_swept_and_study_runs_never(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    earlier = run_selftest(_deps(engine, collector, tmp_path / "a"), quick=True)
+    earlier_ids = [r["run_id"] for r in earlier.runs]
+    # a study experiment's runs (registered, as a runner would)
+    study = Runner(
+        store=RunStore(engine),
+        collector=collector,
+        backend=SelftestBackend(),
+        settings=CellSettings(images=IMAGES),
+        lab_key=KEY,
+        runs_dir=tmp_path / "s" / "runs",
+        work_dir=tmp_path / "s" / "work",
+    ).register(read_experiment(SELFTEST_YAML))  # experiment_id exp_selftest: no prefix
+    study_id = study[0].run_id
+    left = {rid: {"containers": [f"c-{rid}"]} for rid in [*earlier_ids, study_id, "run_unknown"]}
+    resources = FakeResources(left)
+    deps = _deps(engine, collector, tmp_path / "b", resources=resources)
+    for rid in (earlier_ids[0], study_id):
+        (deps.work_dir / f"labcell-{rid.lower()}").mkdir(parents=True)
+    report = run_selftest(deps, quick=True)
+    assert report.passed, _failed(report)
+    assert sorted(resources.removed) == sorted(earlier_ids)
+    assert set(resources.left) == {study_id, "run_unknown"}
+    assert not (deps.work_dir / f"labcell-{earlier_ids[0].lower()}").exists()
+    assert (deps.work_dir / f"labcell-{study_id.lower()}").exists()
+    swept = next(c for c in report.checks if c.name == "earlier self-tests swept")
+    assert "2 earlier" in swept.detail
+
+
+def test_selftest_runs_are_left_out_of_the_study_counters(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    from control.api.metrics import _query
+    from control.db.engine import session_scope
+    from control.db.repo import invalid_runs_by_reason
+
+    report = run_selftest(
+        _deps(engine, collector, tmp_path, SelftestBackend(healthy=False)), quick=True
+    )
+    assert not report.passed  # two invalid self-test runs exist
+    with session_scope(engine) as s:
+        assert invalid_runs_by_reason(s) == {}
+    counts = _query(engine)
+    assert counts.finished == [] and counts.invalid == []
+
+
+def test_extra_destinations_are_probed_and_must_appear_in_the_report(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    dests = ["host:tcp:172.31.231.5:8000", "host:tcp:192.168.1.97:22"]
+    probe_engine = ProbeEngine()
+    report = run_selftest(
+        _deps(engine, collector, tmp_path, probe_engine=probe_engine, extra_destinations=dests),
+        quick=True,
+    )
+    assert report.passed, _failed(report)
+    argv = next(a for a in probe_engine.argvs if a[:2] == ["docker", "run"])
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--dest"] == dests
+    # a probe that ignores a destination is not a pass
+    lying = ProbeEngine()
+    real = containment.main
+
+    def drop_dests(argv: Sequence[str] | None = None, **kw: Any) -> int:
+        args = list(argv or [])
+        while "--dest" in args:
+            i = args.index("--dest")
+            del args[i : i + 2]
+        return real(args, **kw)
+
+    import unittest.mock
+
+    with unittest.mock.patch.object(containment, "main", drop_dests):
+        report = run_selftest(
+            _deps(engine, collector, tmp_path / "b", probe_engine=lying, extra_destinations=dests),
+            quick=True,
+        )
+    detail = next(d for n, d in _failed(report).items() if n.endswith("contained"))
+    assert "host:tcp:172.31.231.5:8000 was not probed" in detail and report.critical
+
+
+def test_control_plane_destinations_come_from_the_compose_file_and_the_engine() -> None:
+    compose = REPO_ROOT / "deploy" / "compose" / "control-plane.yml"
+    addresses = {"db": "172.31.231.2", "collector": "172.31.231.3"}
+
+    def engine_cli(
+        argv: Sequence[str], *, stdin: bytes | None = None, timeout: float | None = None
+    ) -> CommandResult:
+        if argv[1] == "ps":
+            service = argv[-1].rpartition("=")[2]
+            return CommandResult(tuple(argv), 0, f"id-{service}\n".encode())
+        service = argv[-1].removeprefix("id-")
+        doc = [
+            {
+                "NetworkSettings": {
+                    "Networks": {
+                        "lab_control": {"IPAddress": addresses[service]},
+                        "x": {"IPAddress": "10.0.0.9"},
+                    }
+                }
+            }
+        ]
+        return CommandResult(tuple(argv), 0, json.dumps(doc).encode())
+
+    dests = selftest.control_plane_destinations(engine_cli, compose)
+    assert set(dests) == {
+        "host:tcp:172.31.231.1:5432",
+        "host:tcp:172.31.231.1:8100",
+        "host:tcp:172.31.231.2:5432",
+        "host:tcp:172.31.231.3:8000",
+    }
+
+    def nothing_running(
+        argv: Sequence[str], *, stdin: bytes | None = None, timeout: float | None = None
+    ) -> CommandResult:
+        return CommandResult(tuple(argv), 0, b"")
+
+    with pytest.raises(selftest.SelftestConfigError, match="not running"):
+        selftest.control_plane_destinations(nothing_running, compose)
+
+
+def test_address_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert selftest.is_local_address("127.0.0.1")
+    assert not selftest.is_local_address("192.0.2.1")
+    assert not selftest.is_local_address("not-an-ip")
+    assert selftest.lan_answers("127.0.0.1")  # refused on 80 and 443: it answered
+    monkeypatch.setattr(selftest.shutil, "which", lambda _n: None)
+    assert not selftest.lan_answers("192.0.2.1", timeout_s=0.2)
 
 
 # --------------------------------------------------------------------------- pieces
@@ -568,46 +895,176 @@ def test_labctl_selftest_without_configuration_fails_and_records_it(
     assert last is not None and not last.passed and "DATABASE_URL" in last.summary
 
 
-def test_lab_selftest_refuses_missing_secrets_before_any_cell(
-    engine: Engine, tmp_path: Path
+@pytest.mark.parametrize(
+    "argv_env",
+    [
+        {"DATABASE_URL": "not a url at all"},  # unparsable: still a recorded failure
+        {"DATABASE_URL": ""},
+    ],
+)
+def test_labctl_selftest_records_a_bad_database_url_as_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    argv_env: dict[str, str],
 ) -> None:
-    context = selftest.LabContext(
-        lab_root=tmp_path,
-        environ={"LAB_DEV": "1", "LAB_CELL_NETWORKS": "10.231.0.0/16", "LAB_PROBE_LAN": LAN},
+    monkeypatch.setenv("LAB_ROOT", str(tmp_path))
+    for key, value in argv_env.items():
+        monkeypatch.setenv(key, value)
+    assert cli.main(["selftest"]) == 1
+    last = read_selftest_status(tmp_path / "state" / "selftest.json").last_run
+    assert last is not None and not last.passed and "configuration" in last.summary
+
+
+def test_labctl_selftest_records_an_internal_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("LAB_ROOT", str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL", "postgresql://lab:x@127.0.0.1:9/lab")
+
+    def boom(context: selftest.LabContext, *, quick: bool) -> SelftestReport:
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(cli.selftest, "run_lab_selftest", boom)
+    assert cli.main(["selftest", "--quick"]) == 1
+    assert "FAILED" in capsys.readouterr().out
+    last = read_selftest_status(tmp_path / "state" / "selftest.json").last_run
+    assert last is not None and not last.passed and "RuntimeError" in last.summary
+
+
+def test_run_lab_selftest_turns_any_exception_into_a_failed_report(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(_root: Path) -> bytes:
+        raise ValueError("odd")
+
+    monkeypatch.setattr(selftest, "_lab_key", broken)
+    report = selftest.run_lab_selftest(_context(engine, tmp_path, {}), quick=True)
+    assert "ValueError: odd" in _failed(report)["internal"]
+
+
+# ----------------------------------------------------------------- the lab's configuration
+
+PINNED_LOCK = """images:
+  - name: lab-cell
+    image: ghcr.io/lordprime/lab-cell
+    digest: sha256:{a}
+    role: infra
+  - name: goat-dvga
+    image: ghcr.io/lordprime/goat-dvga
+    digest: sha256:{b}
+    role: target
+""".format(a="a" * 64, b="b" * 64)
+
+
+def _context(
+    engine: Engine,
+    root: Path,
+    environ: dict[str, str],
+    *,
+    key: bool = True,
+    is_local: Callable[[str], bool] = lambda _a: True,
+    lan_ok: bool = True,
+) -> selftest.LabContext:
+    if key:
+        (root / "secrets").mkdir(parents=True, exist_ok=True)
+        (root / "secrets" / "hmac.key").write_bytes(b"k" * 32)
+    return selftest.LabContext(
+        lab_root=root,
+        environ=environ,
         collector_url="http://127.0.0.1:9",
         engine=engine,
+        is_local=is_local,
+        lan_answers=lambda _a: lan_ok,
     )
-    report = selftest.run_lab_selftest(context, quick=True)
-    assert not report.passed
+
+
+def _production(tmp_path: Path, profile: str | None) -> dict[str, str]:
+    tree = tmp_path / "tree"
+    (tree / "deploy").mkdir(parents=True)
+    (tree / "deploy" / "images.lock").write_text(PINNED_LOCK)
+    env = {"LAB_RELEASE_TREE": str(tree), "LAB_HOST_ENV": str(tmp_path / "host.env")}
+    if profile is not None:
+        (tmp_path / "host.env").write_text(profile)
+    return env
+
+
+def _dev(**extra: str) -> dict[str, str]:
+    return {
+        "LAB_DEV": "1",
+        "LAB_ENGINE": "podman",
+        "LAB_REQUIRE_DIGESTS": "0",
+        "LAB_CELL_NETWORKS": "10.231.0.0/16",
+        "LAB_IMAGE_OVERRIDES": "lab-cell=localhost/lab-cell:dev,goat-dvga=localhost/goat:dev",
+        "LAB_PROBE_LAN": LAN,
+        **extra,
+    }
+
+
+def test_lab_selftest_refuses_a_missing_lab_key(engine: Engine, tmp_path: Path) -> None:
+    report = selftest.run_lab_selftest(_context(engine, tmp_path, _dev(), key=False), quick=True)
     assert "hmac.key" in _failed(report)["configuration"]
 
 
-def test_lab_selftest_needs_a_lan_address_and_host_env_off_dev(
+def test_production_needs_the_host_profile(engine: Engine, tmp_path: Path) -> None:
+    env = _production(tmp_path, None)
+    report = selftest.run_lab_selftest(_context(engine, tmp_path, env), quick=True)
+    assert "host profile" in _failed(report)["configuration"]
+
+
+def test_production_reads_the_probe_lan_from_the_profile_only(
     engine: Engine, tmp_path: Path
 ) -> None:
-    secrets_dir = tmp_path / "secrets"
-    secrets_dir.mkdir()
-    (secrets_dir / "hmac.key").write_bytes(b"k" * 32)
-    no_host_env = selftest.LabContext(
-        lab_root=tmp_path, environ={}, collector_url="http://127.0.0.1:9", engine=engine
-    )
-    assert (
-        "host.env" in _failed(selftest.run_lab_selftest(no_host_env, quick=True))["configuration"]
-    )
-    (tmp_path / "host.env").write_text("LAB_CELL_NETWORKS=10.231.0.0/16\nLAB_LLM_GATEWAY=\n")
-    no_lan = selftest.LabContext(
-        lab_root=tmp_path, environ={}, collector_url="http://127.0.0.1:9", engine=engine
-    )
-    assert (
-        "LAB_PROBE_LAN" in _failed(selftest.run_lab_selftest(no_lan, quick=True))["configuration"]
-    )
-    override = selftest.LabContext(
-        lab_root=tmp_path,
-        environ={"LAB_PROBE_HOST_GATEWAY": "192.168.1.50", "LAB_PROBE_LAN": LAN},
-        collector_url="http://127.0.0.1:9",
-        engine=engine,
-    )
-    assert "LAB_DEV" in _failed(selftest.run_lab_selftest(override, quick=True))["configuration"]
+    env = _production(tmp_path, "LAB_CELL_NETWORKS=10.231.0.0/16\nLAB_LLM_GATEWAY=\n")
+    env["LAB_PROBE_LAN"] = LAN  # ignored in production
+    report = selftest.run_lab_selftest(_context(engine, tmp_path, env), quick=True)
+    assert "LAB_PROBE_LAN" in _failed(report)["configuration"]
+
+
+def test_a_lan_address_that_does_not_answer_proves_nothing(engine: Engine, tmp_path: Path) -> None:
+    profile = f"LAB_CELL_NETWORKS=10.231.0.0/16\nLAB_LLM_GATEWAY=\nLAB_PROBE_LAN={LAN}\n"
+    env = _production(tmp_path, profile)
+    report = selftest.run_lab_selftest(_context(engine, tmp_path, env, lan_ok=False), quick=True)
+    assert "does not answer" in _failed(report)["configuration"]
+
+
+@pytest.mark.parametrize(
+    ("environ", "is_local", "expected"),
+    [
+        ({}, True, "development on Podman only"),  # production
+        ({"LAB_ENGINE": "docker"}, True, "development on Podman only"),  # dev, Docker
+        ({}, False, "not an address of this host"),  # dev, Podman, not local
+    ],
+)
+def test_the_host_gateway_override_is_dev_podman_and_local_only(
+    engine: Engine, tmp_path: Path, environ: dict[str, str], is_local: bool, expected: str
+) -> None:
+    if environ == {} and expected.startswith("development"):
+        profile = f"LAB_CELL_NETWORKS=10.231.0.0/16\nLAB_LLM_GATEWAY=\nLAB_PROBE_LAN={LAN}\n"
+        env = {**_production(tmp_path, profile), "LAB_PROBE_HOST_GATEWAY": "192.168.1.50"}
+    else:
+        env = _dev(LAB_PROBE_HOST_GATEWAY="192.168.1.50", **environ)
+    context = _context(engine, tmp_path, env, is_local=lambda _a: is_local)
+    report = selftest.run_lab_selftest(context, quick=True)
+    assert expected in _failed(report)["configuration"]
+
+
+def test_production_forces_the_trees_images_lock(tmp_path: Path) -> None:
+    tree = tmp_path / "tree"
+    env = {"LAB_IMAGES_LOCK": "/elsewhere.lock", "LAB_IMAGE_OVERRIDES": "lab-cell=evil:latest"}
+    prod = selftest._cell_env(env, tree)
+    assert prod["LAB_IMAGES_LOCK"] == str(tree / "deploy" / "images.lock")
+    assert "LAB_IMAGE_OVERRIDES" not in prod
+    dev = selftest._cell_env({**env, "LAB_DEV": "1"}, tree)
+    assert dev["LAB_IMAGES_LOCK"] == "/elsewhere.lock" and dev["LAB_IMAGE_OVERRIDES"]
+
+
+def test_the_release_tree_is_resolved_once(tmp_path: Path) -> None:
+    release = tmp_path / "releases" / "v1"
+    (release / "experiments").mkdir(parents=True)
+    (release / "experiments" / "selftest.yaml").write_text("x")
+    (tmp_path / "current").symlink_to(release)
+    assert selftest._release_tree(tmp_path, {}) == release.resolve()
 
 
 def test_the_host_profile_carries_the_probe_lan() -> None:
