@@ -15,7 +15,17 @@ from enum import StrEnum
 from typing import Any, Final
 
 from pydantic import BaseModel, JsonValue
-from sqlalchemy import BigInteger, Connection, String, column, func, select, update, values
+from sqlalchemy import (
+    BigInteger,
+    ColumnElement,
+    Connection,
+    String,
+    column,
+    func,
+    select,
+    update,
+    values,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -27,6 +37,7 @@ from control.core.models import (
     RejectReason,
     RunStatus,
 )
+from control.core.selftest_status import SELFTEST_EXPERIMENT_PREFIX
 from control.db.tables import (
     EVENT_TABLES,
     Artifact,
@@ -52,6 +63,7 @@ __all__ = [
     "insert_events",
     "invalid_runs_by_reason",
     "model_sha256",
+    "not_selftest",
     "record_heartbeat",
     "record_manifest",
     "record_rejected",
@@ -76,11 +88,17 @@ def _chunks[T](items: Sequence[T], size: int = BULK_CHUNK_ROWS) -> Iterator[Sequ
 UNRECORDED_REASON: Final = "unrecorded"
 
 
+def not_selftest() -> ColumnElement[bool]:
+    """Runs of study experiments only: not of a self-test (``exp_selftest_*``)."""
+    return ~Run.experiment_id.startswith(SELFTEST_EXPERIMENT_PREFIX, autoescape=True)
+
+
 def invalid_runs_by_reason(conn: Session | Connection) -> dict[str, int]:
-    """Invalid runs counted by ``runs.invalid_reason`` (``lab_invalid_runs_total``)."""
+    """Invalid study runs counted by ``runs.invalid_reason`` (``lab_invalid_runs_total``);
+    self-test runs are left out (:func:`not_selftest`)."""
     rows = conn.execute(
         select(Run.invalid_reason, func.count())
-        .where(Run.status == RunStatus.INVALID)
+        .where(Run.status == RunStatus.INVALID, not_selftest())
         .group_by(Run.invalid_reason)
     )
     return {

@@ -15,7 +15,12 @@ self-test) loses nothing and two Collector processes report the same values:
   set the runner records). A database CHECK makes every invalid run carry one;
   :data:`UNRECORDED_REASON` would only label a row that somehow had none.
 * ``lab_runs_in_flight`` (gauge; ``agent``): runs with ``status = 'running'``; ``0``
-  for every registered agent with none.
+  for every registered agent with none. Self-test runs count here (a cell is busy).
+
+The two counters leave the self-test's own experiments out (``exp_selftest_*``,
+:data:`~control.core.selftest_status.SELFTEST_EXPERIMENT_PREFIX`): a deliberately
+failing self-test must not move the study's invalid-run rate. The self-test reports
+through ``lab_selftest_last_success_timestamp`` instead.
 * ``lab_selftest_last_success_timestamp`` (gauge): Unix time of the last passing
   self-test, from the self-test status file (:mod:`control.core.selftest_status`);
   ``0`` when no self-test has passed (or the file is unreadable), so a staleness
@@ -71,7 +76,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from control.core.models import RunStatus
 from control.core.selftest_status import SelftestStatusError, read_selftest_status
-from control.db.repo import UNRECORDED_REASON, invalid_runs_by_reason
+from control.db.repo import UNRECORDED_REASON, invalid_runs_by_reason, not_selftest
 from control.db.tables import Agent, Run
 
 __all__ = [
@@ -203,7 +208,7 @@ class _RunCounts:
 def _query(engine: Engine) -> _RunCounts:
     finished_q = (
         select(Run.status, Run.end_status, Run.agent_id, Run.target_id, Run.arm, func.count())
-        .where(Run.status.in_([RunStatus.VALID, RunStatus.INVALID]))
+        .where(Run.status.in_([RunStatus.VALID, RunStatus.INVALID]), not_selftest())
         .group_by(Run.status, Run.end_status, Run.agent_id, Run.target_id, Run.arm)
     )
     in_flight_q = (

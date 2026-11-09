@@ -30,6 +30,7 @@ Lifecycle (:class:`ComposeBackend`):
 
 from __future__ import annotations
 
+import contextlib
 import io
 import ipaddress
 import json
@@ -532,3 +533,5 @@ class ComposeBackend:
                 )
         finally:
             cell.compose_file.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):  # the cell's own work directory, if empty
+                cell.compose_file.parent.rmdir()

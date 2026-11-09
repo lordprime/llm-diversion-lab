@@ -39,6 +39,7 @@ from typing import Any, Final
 __all__ = [
     "DEFAULT_SELFTEST_STATUS_FILE",
     "MAX_SUMMARY_CHARS",
+    "SELFTEST_EXPERIMENT_PREFIX",
     "SELFTEST_STATUS_ENV",
     "SelftestResult",
     "SelftestStatus",
@@ -51,6 +52,9 @@ __all__ = [
 SELFTEST_STATUS_ENV: Final = "LAB_SELFTEST_STATUS_FILE"
 DEFAULT_SELFTEST_STATUS_FILE: Final = Path("/srv/lab/state/selftest.json")
 MAX_SUMMARY_CHARS: Final = 1000
+#: Every self-test registers a fresh experiment ``exp_selftest_<ULID>``; study metrics
+#: (``lab_runs_total``, ``lab_invalid_runs_total``) leave these experiments out.
+SELFTEST_EXPERIMENT_PREFIX: Final = "exp_selftest_"
 
 
 class SelftestStatusError(ValueError):

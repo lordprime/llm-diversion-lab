@@ -323,6 +323,8 @@ def test_teardown_removes_cell_guard_containers_before_compose_down(
     down = next(i for i, a in enumerate(argvs) if "down" in a)
     assert first_rm < down  # otherwise down fails with the network still in use
     assert not cell.compose_file.exists()  # it held the probe secret
+    assert not cell.compose_file.parent.exists()  # the cell's work directory too
+    assert tmp_path.is_dir()  # never the shared work directory
 
 
 def test_teardown_is_judged_by_listing_again_not_by_downs_exit_code(
