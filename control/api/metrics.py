@@ -10,9 +10,10 @@ self-test) loses nothing and two Collector processes report the same values:
   ``arm``): finished runs, i.e. rows of ``runs`` with ``status`` ``valid`` or
   ``invalid``. ``agent`` / ``target`` are the run's ``agent_id`` / ``target_id``;
   ``end_status`` is ``none`` when the run has none.
-* ``lab_invalid_runs_total`` (counter; ``reason``): runs with ``status = 'invalid'``.
-  The runs table does not record *why* a run was invalid yet, so ``reason`` is
-  :data:`UNRECORDED_REASON` until a reason column exists (a later schema change).
+* ``lab_invalid_runs_total`` (counter; ``reason``): runs with ``status = 'invalid'``,
+  by ``runs.invalid_reason`` (the bounded :class:`~control.core.models.InvalidReason`
+  set the runner records). A database CHECK makes every invalid run carry one;
+  :data:`UNRECORDED_REASON` would only label a row that somehow had none.
 * ``lab_runs_in_flight`` (gauge; ``agent``): runs with ``status = 'running'``; ``0``
   for every registered agent with none.
 * ``lab_selftest_last_success_timestamp`` (gauge): Unix time of the last passing
@@ -94,7 +95,7 @@ METRIC_NAMES: tuple[str, ...] = (
 
 #: Label value used for an absent ``end_status``.
 NONE_LABEL: Final = "none"
-#: ``reason`` label of ``lab_invalid_runs_total`` while runs carry no invalidity reason.
+#: ``reason`` label of ``lab_invalid_runs_total`` for an invalid run without a reason.
 UNRECORDED_REASON: Final = "unrecorded"
 #: Statement timeout of the scrape queries.
 QUERY_TIMEOUT_MS: Final = 5_000
@@ -156,8 +157,8 @@ class _RunTableCollector(Collector):
         if db is not None:
             for labels, count in db.finished:
                 runs.add_metric(list(labels), count)
-            if db.invalid:
-                invalid.add_metric([UNRECORDED_REASON], db.invalid)
+            for reason, count in db.invalid:
+                invalid.add_metric([reason], count)
             for agent, count in db.in_flight:
                 in_flight.add_metric([agent], count)
         yield runs
@@ -192,7 +193,7 @@ class _RunCounts:
     def __init__(
         self,
         finished: list[tuple[tuple[str, str, str, str, str], int]],
-        invalid: int,
+        invalid: list[tuple[str, int]],
         in_flight: list[tuple[str, int]],
     ) -> None:
         self.finished = finished
@@ -205,6 +206,11 @@ def _query(engine: Engine) -> _RunCounts:
         select(Run.status, Run.end_status, Run.agent_id, Run.target_id, Run.arm, func.count())
         .where(Run.status.in_([RunStatus.VALID, RunStatus.INVALID]))
         .group_by(Run.status, Run.end_status, Run.agent_id, Run.target_id, Run.arm)
+    )
+    invalid_q = (
+        select(Run.invalid_reason, func.count())
+        .where(Run.status == RunStatus.INVALID)
+        .group_by(Run.invalid_reason)
     )
     in_flight_q = (
         select(Agent.agent_id, func.count(Run.run_id))
@@ -228,8 +234,11 @@ def _query(engine: Engine) -> _RunCounts:
             )
             for status, end_status, agent, target, arm, count in conn.execute(finished_q)
         ]
+        invalid = [
+            (UNRECORDED_REASON if reason is None else _label(reason), int(count))
+            for reason, count in conn.execute(invalid_q)
+        ]
         in_flight = [(agent, int(count)) for agent, count in conn.execute(in_flight_q)]
-    invalid = sum(count for labels, count in finished if labels[0] == RunStatus.INVALID.value)
     return _RunCounts(finished, invalid, in_flight)
 
 

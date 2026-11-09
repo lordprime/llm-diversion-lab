@@ -176,7 +176,9 @@ def test_run_metrics_derive_from_the_runs_table(engine: Engine, status_file: Pat
     assert samples[("lab_runs_total", frozenset(invalid.items()))] == 1.0
     # queued and running runs are not finished: not counted
     assert sum(v for (n, _), v in samples.items() if n == "lab_runs_total") == 3.0
-    assert samples[("lab_invalid_runs_total", frozenset({("reason", UNRECORDED_REASON)}))] == 1.0
+    # by the run's recorded runs.invalid_reason (the seeded run is 'internal')
+    assert samples[("lab_invalid_runs_total", frozenset({("reason", "internal")}))] == 1.0
+    assert ("lab_invalid_runs_total", frozenset({("reason", UNRECORDED_REASON)})) not in samples
     assert samples[("lab_runs_in_flight", frozenset({("agent", ids["agent_id"])}))] == 1.0
     assert samples[("lab_metrics_database_up", frozenset())] == 1.0
 
@@ -237,7 +239,7 @@ def test_concurrent_scrapes_run_one_query_at_a_time(
         calls += 1
         entered.set()
         assert release.wait(5), "the test never released the query"
-        return metrics_mod._RunCounts([], 0, [("agt_x", in_flight)])
+        return metrics_mod._RunCounts([], [], [("agt_x", in_flight)])
 
     monkeypatch.setattr(metrics_mod, "_query", blocking_query)
     lab = LabMetrics(object(), selftest_status_file=status_file)  # type: ignore[arg-type]
