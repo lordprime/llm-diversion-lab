@@ -281,6 +281,45 @@ def test_build_context_sends_only_what_the_image_copies() -> None:
     assert all(r == "*" or r.startswith("!") or r.startswith("**/") for r in rules)
 
 
+ROOT_DOCKERIGNORE = ROOT / ".dockerignore"
+
+
+def _ignore_rules(path: Path) -> list[str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+
+
+def _copied_sources() -> set[str]:
+    """Context paths control.Dockerfile COPYs (not COPY --from=...)."""
+    sources: set[str] = set()
+    for line in DOCKERFILE.read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if parts[:1] == ["COPY"] and not any(p.startswith("--from") for p in parts):
+            sources.update(p.rstrip("/") for p in parts[1:-1] if not p.startswith("--"))
+    return sources
+
+
+def test_root_dockerignore_is_an_allow_list() -> None:
+    """The root context's fallback ignore file (builders that do not read
+    <Dockerfile>.dockerignore): nothing but what the root-context images copy."""
+    rules = _ignore_rules(ROOT_DOCKERIGNORE)
+    assert rules[0] == "*"
+    assert all(r == "*" or r.startswith("!") or r.startswith("**/") for r in rules)
+    allowed = {r[1:].rstrip("/") for r in rules if r.startswith("!")}
+    for private in (".venv", ".git", "tests", ".superpowers", "docs", "forks", "deploy"):
+        assert not any(a == private or a.startswith(private + "/") for a in allowed), private
+
+
+@pytest.mark.parametrize(
+    "ignore", [ROOT_DOCKERIGNORE, DOCKERFILE.with_name(DOCKERFILE.name + ".dockerignore")]
+)
+def test_ignore_files_keep_what_the_control_image_copies(ignore: Path) -> None:
+    allowed = {r[1:].rstrip("/") for r in _ignore_rules(ignore) if r.startswith("!")}
+    sources = _copied_sources()
+    assert sources == {"pyproject.toml", "uv.lock", "control"}
+    assert sources <= allowed, f"{ignore.name} drops {sources - allowed}"
+
+
 # --------------------------------------------------------------------- lab.env
 
 

@@ -1,0 +1,17 @@
+# Build context of every image built from the repository root: an allow-list of
+# what those images COPY. Everything else (.venv, .git, tests, docs, .superpowers,
+# forks, deploy/ with its inventories) stays out of the context.
+#
+# * control-plane image (deploy/compose/control.Dockerfile): pyproject.toml,
+#   uv.lock, control/. Its own control.Dockerfile.dockerignore is narrower and
+#   wins under BuildKit; this file is the fallback for builders that ignore it.
+# * lab-cell image (cell/Dockerfile, Task 14b): also cell/ and agents/.
+# Add a path here only together with the COPY that needs it.
+*
+!pyproject.toml
+!uv.lock
+!control/
+!cell/
+!agents/
+**/__pycache__
+**/*.pyc
