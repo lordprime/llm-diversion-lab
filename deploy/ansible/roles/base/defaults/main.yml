@@ -43,3 +43,6 @@ base_lab_dirs:
   - { path: db, mode: "0700" }
   - { path: ops, mode: "0750" }
   - { path: backups, mode: "0700" }
+  # The self-test status (control/core/selftest_status.py): written by labctl as
+  # root, read through a read-only mount by the Collector (uid 10001).
+  - { path: state, mode: "0755" }

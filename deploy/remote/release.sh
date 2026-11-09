@@ -23,17 +23,42 @@ STATE=$REL/.state
 ENV_FILE=$LAB/secrets/lab.env
 COMPOSE_REL=deploy/compose/control-plane.yml
 WAIT=(--wait --wait-timeout 300)
+TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
 
 die() {
 	printf 'ERROR: %s\n' "$*" >&2
 	exit 1
 }
 
+# release_tag_of TREE: the release tag a tree (or the `current` link) belongs to.
+release_tag_of() {
+	local real
+	real=$(readlink -f -- "$1") && real=${real##*/} && [[ $real =~ $TAG_RE ]] || {
+		printf 'ERROR: %s is not a release tree (releases/vX.Y.Z)\n' "$1" >&2
+		return 1
+	}
+	printf '%s\n' "$real"
+}
+
 # compose TREE ARG...: docker compose for the control plane of one release tree.
+# LAB_RELEASE_TAG is that tree's tag: the control-plane image is lab/control:<tag>,
+# so every release (and every rollback) runs its own image, never another's.
 compose() {
-	local tree=$1
+	local tree=$1 tag
 	shift
-	docker compose --project-name lab --env-file "$ENV_FILE" -f "$tree/$COMPOSE_REL" "$@"
+	tag=$(release_tag_of "$tree") || return 1
+	LAB_RELEASE_TAG=$tag docker compose --project-name lab --env-file "$ENV_FILE" \
+		-f "$tree/$COMPOSE_REL" "$@"
+}
+
+# ensure_pgdata: the Postgres data directory, mounted as the db container's data
+# directory. Created 0700 when missing (the entrypoint then chowns it to postgres);
+# an existing one is never touched. /srv/lab/db itself comes from the base role.
+ensure_pgdata() {
+	[[ -d $LAB/db ]] || die "$LAB/db is missing: run bootstrap.sh first"
+	[[ -d $LAB/db/pgdata ]] && return 0
+	mkdir -m 0700 "$LAB/db/pgdata"
+	echo "created $LAB/db/pgdata"
 }
 
 swap_current() {
@@ -52,6 +77,8 @@ cmd_preflight() {
 	local cells
 	[[ -d $REL ]] || die "$REL is missing: run bootstrap.sh first"
 	[[ -f $ENV_FILE ]] || die "$ENV_FILE is missing: run secrets.sh first"
+	grep -Eq '^LAB_DB_PASSWORD=.+' "$ENV_FILE" ||
+		die "LAB_DB_PASSWORD is missing from $ENV_FILE: run bootstrap.sh (it generates it once)"
 	docker info >/dev/null 2>&1 || die "Docker is not running"
 	cells=$(docker ps --quiet --filter label=lab.run_id | wc -l)
 	if ((cells > 0)); then
@@ -182,6 +209,7 @@ cmd_migrate() {
 	trap 'migrate_fail $LINENO' ERR
 	tree=$(release_tree "$1")
 	mkdir -p "$STATE"
+	ensure_pgdata
 	services=$(compose "$tree" config --services)
 	if ! grep -qx migrate <<<"$services"; then
 		echo "this release has no 'migrate' service: no migrations to run"
@@ -221,6 +249,7 @@ cmd_activate() {
 	local tree build=(--no-build)
 	tree=$(release_tree "$1")
 	[[ ${2:-} == allow-build ]] && build=()
+	ensure_pgdata
 	swap_current "$tree"
 	compose "$LAB/current" up -d --remove-orphans "${WAIT[@]}" "${build[@]}"
 }

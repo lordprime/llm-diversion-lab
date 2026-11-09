@@ -30,6 +30,9 @@ COMPOSE = ROOT / "deploy" / "compose" / "control-plane.yml"
 DOCKERFILE = ROOT / "deploy" / "compose" / "control.Dockerfile"
 LOCK = ROOT / "deploy" / "images.lock"
 ENV_EXAMPLE = ROOT / ".env.example"
+RELEASE_SH = ROOT / "deploy" / "remote" / "release.sh"
+BASE_DEFAULTS = ROOT / "deploy" / "ansible" / "roles" / "base" / "defaults" / "main.yml"
+RELEASE_IMAGE = "lab/control:${LAB_RELEASE_TAG:?LAB_RELEASE_TAG is not set (release.sh sets it)}"
 
 DIGEST_REF = re.compile(r"^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$")
 CELL_RANGE = ipaddress.ip_network("10.231.0.0/16")
@@ -99,11 +102,44 @@ def test_db_names_user_and_database_explicitly() -> None:
     assert re.fullmatch(rf"\$\{{{DB_PASSWORD_VAR}:\?[^}}]+\}}", env["POSTGRES_PASSWORD"])
 
 
-def test_db_data_lives_under_srv_lab_db() -> None:
+def _base_dirs() -> dict[str, str]:
+    base = yaml.safe_load(BASE_DEFAULTS.read_text(encoding="utf-8"))
+    return {d["path"]: d["mode"] for d in base["base_lab_dirs"]}
+
+
+def test_db_data_is_its_own_mount() -> None:
+    """The data directory itself is the mount, at the image's default PGDATA.
+
+    /srv/lab/db is lab:lab 0700. Mounting it as PGDATA's parent fails on a real host:
+    the entrypoint chowns only $PGDATA, then runs initdb as uid 999, which cannot enter
+    the 0700 parent. Mounting /srv/lab/db/pgdata *as* the data directory lets the
+    entrypoint chown the mount point itself.
+    """
     db = _services()["db"]
-    assert "/srv/lab/db:/var/lib/postgresql/data" in db["volumes"]
-    # a subdirectory, so the entrypoint's chown never touches /srv/lab/db itself
-    assert _env(db)["PGDATA"] == "/var/lib/postgresql/data/pgdata"
+    assert db["volumes"] == ["/srv/lab/db/pgdata:/var/lib/postgresql/data"]
+    assert "PGDATA" not in _env(db), "the image's default PGDATA is the mount point"
+
+
+def test_db_data_directory_is_not_managed_by_ansible() -> None:
+    """The base role owns /srv/lab/db (lab, 0700); it must never re-own pgdata (uid 999)."""
+    dirs = _base_dirs()
+    assert dirs["db"] == "0700"
+    assert not [p for p in dirs if p.startswith("db/")], "pgdata belongs to postgres (uid 999)"
+
+
+def test_every_host_bind_mount_has_a_creator() -> None:
+    """Each host path is created by the base role, or (pgdata) by release.sh."""
+    dirs = _base_dirs()
+    for name, service in _services().items():
+        for volume in service.get("volumes", []):
+            source = str(volume).split(":", 1)[0]
+            assert source.startswith("/srv/lab/"), f"{name}: {source}"
+            rel = source.removeprefix("/srv/lab/")
+            if rel == "db/pgdata":
+                assert "db/pgdata" in RELEASE_SH.read_text(encoding="utf-8")
+            else:
+                assert rel in dirs, f"{name}: the base role does not create {source}"
+    assert dirs["state"] == "0755", "the collector (uid 10001) reads the self-test status"
 
 
 def test_migrate_is_a_one_shot_alembic_upgrade() -> None:
@@ -208,6 +244,16 @@ def test_every_image_is_pinned_or_built_from_the_release() -> None:
             assert DIGEST_REF.match(service["image"]), f"{name}: {service['image']} not pinned"
 
 
+def test_built_image_is_tagged_per_release() -> None:
+    """A rollback must start the previous release's own image, never the new one's.
+
+    With one shared tag, `up --no-build` after a rollback would start the failed
+    release's migrate on the restored database and re-apply the failed migration.
+    """
+    for name in ("migrate", "collector"):
+        assert _services()[name]["image"] == RELEASE_IMAGE, name
+
+
 def test_dockerfile_base_images_are_pinned() -> None:
     text = DOCKERFILE.read_text(encoding="utf-8")
     froms = re.findall(r"^FROM\s+(\S+)", text, re.M)
@@ -238,11 +284,13 @@ def test_build_context_sends_only_what_the_image_copies() -> None:
 # --------------------------------------------------------------------- lab.env
 
 
-def test_db_password_is_a_lab_env_secret() -> None:
+def test_db_password_is_host_generated_not_operator_supplied() -> None:
     text = ENV_EXAMPLE.read_text(encoding="utf-8")
-    match = re.search(rf"^(#[^\n]*)\n{DB_PASSWORD_VAR}=$", text, re.M)
-    assert match, f"{DB_PASSWORD_VAR} missing from .env.example"
-    assert "[secret]" in match.group(1)
+    # not a NAME= line: secrets.sh never prompts for it nor sends it
+    assert not re.search(rf"^{DB_PASSWORD_VAR}=", text, re.M)
+    header = text.split("\n\n# ---", 1)[0]
+    assert DB_PASSWORD_VAR in header
+    assert "bootstrap.sh" in header
 
 
 # --------------------------------------------------------------------- docker compose config
@@ -267,7 +315,7 @@ def compose_cmd() -> list[str]:
 
 
 def _config(
-    compose_cmd: list[str], env_file: Path, *extra: str
+    compose_cmd: list[str], env_file: Path, *extra: str, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(  # noqa: S603 -- fixed argv
         [
@@ -284,18 +332,45 @@ def _config(
         capture_output=True,
         text=True,
         check=False,
-        env={"PATH": "/usr/bin:/bin"},
+        env={"PATH": "/usr/bin:/bin", **(env or {})},
     )
+
+
+TAG = {"LAB_RELEASE_TAG": "v0.1.0"}
 
 
 def test_compose_config_is_valid(compose_cmd: list[str], tmp_path: Path) -> None:
     env_file = tmp_path / "lab.env"
     env_file.write_text(f"{DB_PASSWORD_VAR}=correct-horse-battery\n", encoding="utf-8")
-    result = _config(compose_cmd, env_file, "--services")
+    result = _config(compose_cmd, env_file, "--services", env=TAG)
     assert result.returncode == 0, result.stderr
     # release.sh's migrate step looks for exactly these names
     assert {"db", "migrate", "collector"} <= set(result.stdout.split())
-    assert "correct-horse-battery" not in _config(compose_cmd, env_file, "--images").stdout
+    images = _config(compose_cmd, env_file, "--images", env=TAG).stdout
+    assert "correct-horse-battery" not in images
+
+
+def test_rendered_image_follows_the_release_tag(compose_cmd: list[str], tmp_path: Path) -> None:
+    env_file = tmp_path / "lab.env"
+    env_file.write_text(f"{DB_PASSWORD_VAR}=correct-horse-battery\n", encoding="utf-8")
+    images = {}
+    for tag in ("v0.1.0", "v0.0.9"):
+        result = _config(compose_cmd, env_file, "--images", env={"LAB_RELEASE_TAG": tag})
+        assert result.returncode == 0, result.stderr
+        images[tag] = set(result.stdout.split())
+    assert "lab/control:v0.1.0" in images["v0.1.0"]
+    assert "lab/control:v0.0.9" in images["v0.0.9"]
+    assert "lab/control:v0.1.0" not in images["v0.0.9"]
+
+
+def test_compose_refuses_to_run_without_the_release_tag(
+    compose_cmd: list[str], tmp_path: Path
+) -> None:
+    env_file = tmp_path / "lab.env"
+    env_file.write_text(f"{DB_PASSWORD_VAR}=correct-horse-battery\n", encoding="utf-8")
+    result = _config(compose_cmd, env_file)
+    assert result.returncode != 0
+    assert "LAB_RELEASE_TAG" in result.stderr
 
 
 def test_compose_refuses_to_run_without_the_db_password(
@@ -303,6 +378,6 @@ def test_compose_refuses_to_run_without_the_db_password(
 ) -> None:
     env_file = tmp_path / "lab.env"
     env_file.write_text("LAB_BUDGET_USD=10\n", encoding="utf-8")
-    result = _config(compose_cmd, env_file)
+    result = _config(compose_cmd, env_file, env=TAG)
     assert result.returncode != 0
     assert DB_PASSWORD_VAR in result.stderr

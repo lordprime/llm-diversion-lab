@@ -21,3 +21,27 @@
       chown {{ lab_user | quote }}:{{ lab_user | quote }} {{ (lab_root ~ '/secrets/hmac.key') | quote }}
     executable: /bin/bash
     creates: "{{ lab_root }}/secrets/hmac.key"
+
+# The control-plane Postgres password (deploy/compose/control-plane.yml), generated
+# once like the HMAC key and never regenerated: Postgres keeps the password it was
+# initialised with. It goes into lab.env, which secrets.sh rewrites but always
+# carries it over (and refuses to set it). 256 bits as hex: no character that
+# secrets.sh or compose would treat specially. The value is never printed.
+- name: Generate the control-plane database password once
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      umask 077
+      env_file={{ (lab_root ~ '/secrets/lab.env') | quote }}
+      if [[ -f $env_file ]] && grep -Eq '^LAB_DB_PASSWORD=.+' "$env_file"; then
+        echo kept
+        exit 0
+      fi
+      [[ ! -s $env_file || -z $(tail -c1 "$env_file") ]] || echo >>"$env_file"
+      printf 'LAB_DB_PASSWORD=%s\n' "$(openssl rand -hex 32)" >>"$env_file"
+      chown {{ lab_user | quote }}:{{ lab_user | quote }} "$env_file"
+      chmod 0600 "$env_file"
+      echo generated
+    executable: /bin/bash
+  register: base_db_password
+  changed_when: base_db_password.stdout == 'generated'

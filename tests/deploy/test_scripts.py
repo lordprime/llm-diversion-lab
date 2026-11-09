@@ -922,7 +922,7 @@ def test_backup_repo_is_accepted_with_a_warning(tmp_path: Path) -> None:
 
 FAKE_DOCKER = """\
 #!/usr/bin/env bash
-printf '%s\\n' "$*" >>"$FAKE_DOCKER_LOG"
+printf '%s [tag=%s]\\n' "$*" "${LAB_RELEASE_TAG-unset}" >>"$FAKE_DOCKER_LOG"
 case "$*" in
 *"config --services"*)
     [[ ${FAKE_CONFIG_FAIL:-0} == 1 ]] && exit 1
@@ -958,6 +958,7 @@ def lab_root(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     (root / "secrets").mkdir(mode=0o700)
     (root / "secrets" / "lab.env").write_text("A=b\n", encoding="utf-8")
     (root / "backups").mkdir()
+    (root / "db").mkdir(mode=0o700)  # the base role's /srv/lab/db
     (root / "current").symlink_to(root / "releases" / "v0.0.9")
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -1610,3 +1611,249 @@ def test_ansible_lint_clean() -> None:
     env = dict(os.environ, ANSIBLE_CONFIG=str(ANSIBLE / "ansible.cfg"))
     result = _run([*lint, "--offline", "-c", str(ANSIBLE / ".ansible-lint"), str(ANSIBLE)], env=env)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# ------------------------------------- control plane: per-release image, data dir, labctl
+
+
+def _tags(log: list[str], *needles: str) -> set[str]:
+    """The LAB_RELEASE_TAG of every logged docker call containing all needles."""
+    found = set()
+    for line in log:
+        if all(n in line for n in needles):
+            match = re.search(r" \[tag=([^\]]*)\]$", line)
+            assert match, line
+            found.add(match.group(1))
+    return found
+
+
+def test_every_compose_call_carries_its_trees_release_tag(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    """The control-plane image is lab/control:<tag>; each call names its own tree's tag."""
+    root, env = lab_root
+    result = _run(["bash", str(DEPLOY / "remote" / "release.sh"), "migrate", "v0.1.0"], env=env)
+    assert result.returncode == 0, result.stderr
+    log = [line for line in _docker_log(env) if line.startswith("compose ")]
+    assert log
+    assert _tags(log, f"{root}/current/", " stop ") == {"v0.0.9"}, "the running release"
+    assert _tags(log, "releases/v0.1.0/", "run --rm --no-deps migrate") == {"v0.1.0"}
+    assert "unset" not in _tags(log)
+
+
+def test_activate_starts_the_new_releases_image(lab_root: tuple[Path, dict[str, str]]) -> None:
+    _root, env = lab_root
+    result = _run(["bash", str(DEPLOY / "remote" / "release.sh"), "activate", "v0.1.0"], env=env)
+    assert result.returncode == 0, result.stderr
+    assert _tags(_docker_log(env), " up -d") == {"v0.1.0"}
+
+
+def test_rollback_starts_the_previous_releases_image(
+    failed_release: tuple[Path, dict[str, str], Path],
+) -> None:
+    """Never the failed release's migrate on the restored database."""
+    _, env, _ = failed_release
+    result = _rollback(env)
+    assert result.returncode == 0, result.stderr
+    log = _docker_log(env)
+    assert _tags(log, " stop api worker") == {"v0.1.0"}, "stop the failed release"
+    assert _tags(log, " up -d") == {"v0.0.9"}, "start the previous release's own image"
+
+
+def test_compose_refuses_a_tree_that_is_not_a_release(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    root, env = lab_root
+    (root / "current").unlink()
+    (root / "current").symlink_to(root / "backups")
+    result = _run(["bash", str(DEPLOY / "remote" / "release.sh"), "migrate", "v0.1.0"], env=env)
+    assert result.returncode != 0
+    assert "not a release tree" in result.stderr
+    assert not any("run --rm --no-deps migrate" in line for line in _docker_log(env))
+
+
+def test_migrate_creates_the_postgres_data_directory(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    root, env = lab_root
+    result = _run(["bash", str(DEPLOY / "remote" / "release.sh"), "migrate", "v0.1.0"], env=env)
+    assert result.returncode == 0, result.stderr
+    pgdata = root / "db" / "pgdata"
+    assert pgdata.is_dir()
+    assert oct(pgdata.stat().st_mode & 0o777) == "0o700"
+
+
+def test_an_existing_postgres_data_directory_is_left_alone(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    """The entrypoint chowned it to postgres (uid 999); release.sh never touches it again."""
+    root, env = lab_root
+    pgdata = root / "db" / "pgdata"
+    pgdata.mkdir(parents=True)
+    pgdata.chmod(0o750)
+    (pgdata / "PG_VERSION").write_text("17\n", encoding="utf-8")
+    result = _run(["bash", str(DEPLOY / "remote" / "release.sh"), "activate", "v0.1.0"], env=env)
+    assert result.returncode == 0, result.stderr
+    assert oct(pgdata.stat().st_mode & 0o777) == "0o750"
+    assert (pgdata / "PG_VERSION").read_text(encoding="utf-8") == "17\n"
+
+
+def _preflight(env: Mapping[str, str]) -> subprocess.CompletedProcess[str]:
+    return _run(["bash", str(DEPLOY / "remote" / "release.sh"), "preflight"], env=env)
+
+
+def test_preflight_requires_the_host_generated_db_password(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    root, env = lab_root
+    result = _preflight(env)
+    assert result.returncode != 0
+    assert "LAB_DB_PASSWORD" in result.stderr
+    assert "bootstrap.sh" in result.stderr
+    (root / "secrets" / "lab.env").write_text("A=b\nLAB_DB_PASSWORD=" + "f" * 64 + "\n")
+    result = _preflight(env)
+    assert result.returncode == 0, result.stderr
+    assert "f" * 16 not in result.stdout + result.stderr
+
+
+# --- secrets.sh keeps the host-generated database password
+
+
+def test_secrets_write_carries_the_host_generated_password_over(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    root, env = lab_root
+    env_file = root / "secrets" / "lab.env"
+    password = "feedface" * 8  # synthetic, low entropy (gitleaks)
+    env_file.write_text(f"A=b\nLAB_DB_PASSWORD={password}\n", encoding="utf-8")
+    result = _run(
+        ["bash", str(DEPLOY / "remote" / "secrets.sh"), "write"],
+        env=env,
+        stdin="SET ANTHROPIC_API_KEY=sk-ant-x-12345678\nEND 1\n",
+    )
+    assert result.returncode == 0, result.stderr
+    content = env_file.read_text(encoding="utf-8")
+    assert f"\nLAB_DB_PASSWORD={password}\n" in content
+    assert "ANTHROPIC_API_KEY=sk-ant-x-12345678" in content
+    assert "\nA=b\n" not in content, "only listed variables are written (A was not kept)"
+    assert password not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "stdin",
+    [
+        "SET LAB_DB_PASSWORD=" + "a" * 64 + "\nEND 1\n",
+        "KEEP LAB_DB_PASSWORD\nEND 1\n",
+    ],
+)
+def test_secrets_write_never_sets_the_host_generated_password(
+    lab_root: tuple[Path, dict[str, str]], stdin: str
+) -> None:
+    root, env = lab_root
+    env_file = root / "secrets" / "lab.env"
+    env_file.write_text("LAB_DB_PASSWORD=" + "b" * 64 + "\n", encoding="utf-8")
+    result = _run(["bash", str(DEPLOY / "remote" / "secrets.sh"), "write"], env=env, stdin=stdin)
+    assert result.returncode != 0
+    assert "generated on the host" in result.stderr
+    assert env_file.read_text(encoding="utf-8") == "LAB_DB_PASSWORD=" + "b" * 64 + "\n"
+
+
+def test_secrets_reload_uses_the_current_release_tag(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    _, env = lab_root
+    result = _run(["bash", str(DEPLOY / "remote" / "secrets.sh"), "reload"], env=env)
+    assert result.returncode == 0, result.stderr
+    assert _tags(_docker_log(env), " up -d") == {"v0.0.9"}
+
+
+def test_local_secrets_refuses_the_host_generated_password(tmp_path: Path) -> None:
+    values = tmp_path / "values.env"
+    values.write_text(
+        f"ANTHROPIC_API_KEY={PLACEHOLDER_KEY}\nLAB_BUDGET_USD={PLACEHOLDER_BUDGET}\n"
+        "LAB_DB_PASSWORD=" + "c" * 64 + "\n",
+        encoding="utf-8",
+    )
+    result = _run(
+        ["bash", str(DEPLOY / "secrets.sh"), "lab1", "--from-file", str(values), "--validate-only"],
+        env=_script_env(),
+    )
+    assert result.returncode != 0
+    assert "LAB_DB_PASSWORD" in result.stderr
+    assert "c" * 16 not in result.stdout + result.stderr
+
+
+# --- the base role generates the password once
+
+
+def _db_password_task() -> dict[str, Any]:
+    tasks = _load_yaml(ANSIBLE / "roles" / "base" / "tasks" / "tree.yml")
+    matches = [t for t in tasks if "database password" in t.get("name", "")]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _run_db_password_task(root: Path) -> subprocess.CompletedProcess[str]:
+    import shlex
+
+    cmd = _db_password_task()["ansible.builtin.shell"]["cmd"]
+    cmd = cmd.replace(
+        "{{ (lab_root ~ '/secrets/lab.env') | quote }}",
+        shlex.quote(str(root / "secrets" / "lab.env")),
+    )
+    owner = f"{os.getuid()}:{os.getgid()}"  # the test user stands in for lab:lab
+    cmd = cmd.replace("{{ lab_user | quote }}:{{ lab_user | quote }}", owner)
+    assert "{{" not in cmd, cmd
+    return _run(["bash", "-c", cmd])
+
+
+def test_bootstrap_generates_the_db_password_once(tmp_path: Path) -> None:
+    root = tmp_path / "lab"
+    (root / "secrets").mkdir(parents=True, mode=0o700)
+    env_file = root / "secrets" / "lab.env"
+    env_file.write_text("ANTHROPIC_API_KEY=x", encoding="utf-8")  # no trailing newline
+
+    first = _run_db_password_task(root)
+    assert first.returncode == 0, first.stderr
+    assert first.stdout.strip() == "generated"
+    lines = env_file.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "ANTHROPIC_API_KEY=x"
+    (pw_line,) = [line for line in lines if line.startswith("LAB_DB_PASSWORD=")]
+    password = pw_line.removeprefix("LAB_DB_PASSWORD=")
+    assert re.fullmatch(r"[0-9a-f]{64}", password), "256 bits, secrets.sh-safe characters"
+    assert oct(env_file.stat().st_mode & 0o777) == "0o600"
+    assert password not in first.stdout + first.stderr
+
+    second = _run_db_password_task(root)
+    assert second.returncode == 0, second.stderr
+    assert second.stdout.strip() == "kept"
+    assert env_file.read_text(encoding="utf-8").count("LAB_DB_PASSWORD=") == 1
+    assert pw_line in env_file.read_text(encoding="utf-8").splitlines()
+
+
+def test_bootstrap_creates_lab_env_when_absent(tmp_path: Path) -> None:
+    root = tmp_path / "lab"
+    (root / "secrets").mkdir(parents=True, mode=0o700)
+    result = _run_db_password_task(root)
+    assert result.returncode == 0, result.stderr
+    content = (root / "secrets" / "lab.env").read_text(encoding="utf-8")
+    assert re.fullmatch(r"LAB_DB_PASSWORD=[0-9a-f]{64}\n", content)
+
+
+def test_db_password_task_reports_changes_only_when_it_generates() -> None:
+    task = _db_password_task()
+    assert task["changed_when"] == "base_db_password.stdout == 'generated'"
+    assert task["register"] == "base_db_password"
+
+
+def test_base_role_creates_the_selftest_state_directory() -> None:
+    dirs = {
+        d["path"]: d["mode"]
+        for d in _load_yaml(ANSIBLE / "roles" / "base" / "defaults" / "main.yml")["base_lab_dirs"]
+    }
+    assert dirs["state"] == "0755"
+
+
+def test_status_names_the_current_release_tag_for_compose() -> None:
+    text = (DEPLOY / "remote" / "status.sh").read_text(encoding="utf-8")
+    assert re.search(r'LAB_RELEASE_TAG="\$tag" docker compose', text)

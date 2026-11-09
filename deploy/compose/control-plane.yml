@@ -8,9 +8,9 @@
 # * `db` is the official postgres image pinned by the digest in deploy/images.lock
 #   (PostgreSQL >= 13). POSTGRES_DB and POSTGRES_USER are set explicitly: release.sh
 #   runs pg_dump / pg_restore inside this container with them. The password is
-#   LAB_DB_PASSWORD from lab.env; the stack refuses to start without it. Postgres
-#   reads it only when the data directory is first initialised: changing it in
-#   lab.env later does NOT change the database's password.
+#   LAB_DB_PASSWORD from lab.env, generated once on the host by bootstrap.sh (base
+#   role) and carried over by secrets.sh; the stack refuses to start without it.
+#   Postgres reads it only when the data directory is first initialised.
 # * `migrate` is a one-shot `alembic upgrade head` (python -m control.cli.migrate,
 #   which configures the redacted JSON logging first). release.sh runs it with
 #   `run --rm --no-deps migrate` after a pg_dump; `up` runs it again before the
@@ -28,11 +28,21 @@
 #   release tree (deploy/compose/control.Dockerfile, base images pinned by digest),
 #   which needs `release.sh --allow-build` until CI publishes a pinned
 #   control-plane image; without it release.sh refuses the unpinned local tag.
+#   The built image is tagged per release, lab/control:$LAB_RELEASE_TAG, which
+#   deploy/remote/release.sh sets on every compose call to the tag of the tree it
+#   runs (status.sh and secrets.sh do the same for `current`). A rollback therefore
+#   starts the previous release's own image: never the failed release's migrate on
+#   the restored database. Compose refuses to run without it.
+# * Postgres data: /srv/lab/db/pgdata is mounted AS the data directory (the image's
+#   default PGDATA). /srv/lab/db is lab:lab 0700 (base role); the entrypoint chowns
+#   the mount point itself to postgres (uid 999), so initdb never has to enter the
+#   0700 parent. release.sh creates pgdata (0700) if it is missing and never touches
+#   it again; Ansible does not manage it.
 
 name: lab
 
 x-control-image: &control-image
-  image: lab/control:release
+  image: lab/control:${LAB_RELEASE_TAG:?LAB_RELEASE_TAG is not set (release.sh sets it)}
   build:
     context: ../..
     dockerfile: deploy/compose/control.Dockerfile
@@ -51,14 +61,11 @@ services:
     environment:
       POSTGRES_DB: lab
       POSTGRES_USER: lab
-      POSTGRES_PASSWORD: ${LAB_DB_PASSWORD:?LAB_DB_PASSWORD is not set (deploy/secrets.sh)}
+      POSTGRES_PASSWORD: ${LAB_DB_PASSWORD:?LAB_DB_PASSWORD is not set (deploy/bootstrap.sh generates it)}
       # The image's default auth: scram-sha-256 over TCP (the app services, labctl);
       # trust only on the container's own Unix socket (release.sh's pg_dump/psql).
-      # A subdirectory, so the entrypoint's chown never touches /srv/lab/db itself
-      # (owned by lab:lab, mode 0700, by the base role).
-      PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      - /srv/lab/db:/var/lib/postgresql/data
+      - /srv/lab/db/pgdata:/var/lib/postgresql/data
     ports:
       - 127.0.0.1:5432:5432
     networks: [control]

@@ -38,7 +38,8 @@ fi
 section "control plane"
 compose=$LAB/current/deploy/compose/control-plane.yml
 if [[ -f $compose ]] && docker info >/dev/null 2>&1; then
-	docker compose --project-name lab --env-file "$ENV_FILE" -f "$compose" \
+	# The control-plane image is lab/control:<tag> (deploy/compose/control-plane.yml).
+	LAB_RELEASE_TAG="$tag" docker compose --project-name lab --env-file "$ENV_FILE" -f "$compose" \
 		ps --format '  {{.Service}}: {{.State}} {{.Health}}' || problems+=("compose ps failed")
 else
 	echo "  not deployed"
