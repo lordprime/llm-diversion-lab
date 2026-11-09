@@ -4,7 +4,8 @@ Every connection carries exactly one request (the proxy answers with
 ``Connection: close``; Docker clients reconnect per request). For each request it:
 
 1. parses the request strictly (one ``Content-Length`` or ``chunked``, never both;
-   no obs-fold; bounded head and body) and answers ``400``/``413`` otherwise;
+   no obs-fold; bounded head and body; a request target of printable ASCII only; no
+   control characters in header values) and answers ``400``/``413`` otherwise;
 2. if the path names an existing object (a container, exec, network or volume),
    inspects that object on the real socket to learn its id and labels, which become
    :attr:`~cell.cellguard.policy.DockerRequest.target` (the forwarded path is then
@@ -15,7 +16,9 @@ Every connection carries exactly one request (the proxy answers with
 5. answers a denial with ``403`` and a JSON ``message`` (the daemon never sees it), or
    forwards the decided path and body with ``Connection: close`` and relays the
    response byte-for-byte until the daemon closes. The body forwarded is the one the
-   policy rebuilt (never the client's bytes); body-less operations forward none.
+   policy rebuilt (never the client's bytes); body-less operations forward none. Of
+   the client's headers only :data:`FORWARDED_HEADERS` are forwarded (plus the
+   ``Upgrade`` of an upgrade operation); ``Host`` is always ``docker``.
 
 Names: container and volume names the agent chooses get the cell's prefix at create
 time, so a lookup of an unprefixed name tries the prefixed name first.
@@ -101,6 +104,7 @@ __all__ = [
     "DECISIONS_FILE",
     "DEFAULT_EVIDENCE_DIR",
     "DEFAULT_MAX_CONNECTIONS",
+    "FORWARDED_HEADERS",
     "MAX_BODY",
     "MAX_HEAD",
     "CellGuard",
@@ -131,19 +135,25 @@ _RUN_ID_RE = re.compile(RUN_ID_PATTERN)
 _DECIMAL_RE = re.compile(r"[0-9]{1,12}")
 _METHOD_RE = re.compile(r"^[A-Z]{1,16}$")
 _TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
-_HOP_BY_HOP: Final = frozenset(
+#: A request target: printable ASCII, no spaces (what the policy also requires).
+_TARGET_RE = re.compile(r"^/[\x21-\x7e]*$")
+#: Control characters never allowed in a header value (horizontal tab is).
+_CTL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+#: The only client headers forwarded to the daemon (lowercase); framing, connection
+#: and ``Upgrade`` headers are set by the proxy itself. Docker clients send nothing
+#: else the API needs; registry credentials (``X-Registry-Auth``) only matter to the
+#: denied pull and push.
+FORWARDED_HEADERS: Final = frozenset(
     {
-        "connection",
-        "keep-alive",
-        "proxy-connection",
-        "proxy-authorization",
-        "transfer-encoding",
-        "content-length",
-        "expect",
-        "te",
-        "trailer",
-        "upgrade",
-        "host",
+        "accept",
+        "accept-encoding",
+        "content-type",
+        "origin",
+        "sec-websocket-extensions",
+        "sec-websocket-key",
+        "sec-websocket-protocol",
+        "sec-websocket-version",
+        "user-agent",
     }
 )
 _HIJACK_TYPES: Final = (
@@ -330,6 +340,8 @@ def _parse_head(raw: bytes) -> _Head:
     parts = lines[0].split(" ")
     if len(parts) != 3 or not _METHOD_RE.fullmatch(parts[0]) or not parts[1].startswith("/"):
         raise _BadRequest(400, "malformed request line")
+    if not _TARGET_RE.fullmatch(parts[1]):
+        raise _BadRequest(400, "request target is not printable ASCII")
     if parts[2] not in ("HTTP/1.1", "HTTP/1.0"):
         raise _BadRequest(400, "unsupported HTTP version")
     headers: list[tuple[str, str]] = []
@@ -337,7 +349,7 @@ def _parse_head(raw: bytes) -> _Head:
         name, colon, value = line.partition(":")
         if not colon or not _TOKEN_RE.fullmatch(name):
             raise _BadRequest(400, "malformed header line")
-        if "\n" in value or "\r" in value:
+        if _CTL_RE.search(value):
             raise _BadRequest(400, "malformed header value")
         headers.append((name, value.strip()))
     return _Head(parts[0], parts[1], headers)
@@ -603,8 +615,8 @@ class CellGuard:
             return
         try:
             lines = [f"{head.method} {decision.path} HTTP/1.1", "Host: docker"]
-            dropped = _HOP_BY_HOP | {"content-type"} if decision.body else _HOP_BY_HOP
-            lines += [f"{n}: {v}" for n, v in head.headers if n.lower() not in dropped]
+            kept = FORWARDED_HEADERS - {"content-type"} if decision.body else FORWARDED_HEADERS
+            lines += [f"{n}: {v}" for n, v in head.headers if n.lower() in kept]
             if decision.body:
                 # The body is the policy's own JSON, whatever the client declared.
                 lines.append("Content-Type: application/json")

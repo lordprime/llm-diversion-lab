@@ -61,6 +61,16 @@ What is allowed (everything else is denied):
   volume carrying both ownership labels;
 * volume create: local driver without options or query parameters; both ownership
   labels and the cell's name prefix are forced.
+
+**Query strings are allow-listed per operation** (:data:`_QUERY_KEYS`): a key the
+operation does not list is denied (``query.param``), whatever its value, because the
+daemon acts on keys the policy never looks at (``start?checkpoint=..&checkpoint-dir=..``
+hands a host directory to the runtime). The forwarded query is rebuilt from the
+checked pairs, never passed through. A request target with a control, space or
+non-ASCII character is malformed.
+
+Denial reasons echo at most :data:`MAX_REASON_CHARS` characters (they quote the
+agent's own text and go to the evidence and the 403 body).
 """
 
 from __future__ import annotations
@@ -69,7 +79,7 @@ import ipaddress
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Final
 from urllib.parse import parse_qsl, urlencode
@@ -84,6 +94,7 @@ __all__ = [
     "DEFAULT_PIDS_LIMIT",
     "DIGEST_PATTERN",
     "IMAGE_ROLES",
+    "MAX_REASON_CHARS",
     "MIN_API_VERSION",
     "ORIGIN",
     "ORIGIN_LABEL",
@@ -155,6 +166,11 @@ _IMAGE = r"[A-Za-z0-9][A-Za-z0-9_.:@/-]*"
 _PATH_RE = re.compile(r"^/[A-Za-z0-9_.:@/-]*$")
 _VERSION_RE = re.compile(r"^/v(?P<v>[0-9]{1,3}\.[0-9]{1,3})(?P<rest>/.*)$")
 _PORT_RE = re.compile(r"^[0-9]{1,5}(?:-[0-9]{1,5})?(?:/(?:tcp|udp|sctp))?$")
+
+#: A request target is printable ASCII without spaces (``!`` to ``~``) and nothing else.
+_TARGET_RE = re.compile(r"^[\x21-\x7e]*$")
+#: Longest denial reason recorded or answered: reasons quote agent text, which is cut.
+MAX_REASON_CHARS: Final = 240
 
 MALFORMED: Final = "malformed"
 UNKNOWN: Final = "unknown"
@@ -477,6 +493,8 @@ def _path_ok(base: str) -> bool:
 def route(method: str, path: str) -> Route:
     """Classify a request; ``op`` is ``"malformed"`` or ``"unknown"`` if it matches none."""
     raw, _, query = path.partition("?")
+    if not _TARGET_RE.fullmatch(path):
+        return Route(MALFORMED, None, raw, query)
     version: str | None = None
     base = raw
     if match := _VERSION_RE.fullmatch(raw):
@@ -1385,7 +1403,7 @@ def _volume_create(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
 
 
 def _plain(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
-    return _allow(r, req, r.op)
+    return _allow(r, req, r.op, path=r.rebuild(r.base, r.query))
 
 
 def _allow(
@@ -1438,6 +1456,63 @@ _HANDLERS: Final[Mapping[str, _Handler]] = {
 }
 
 
+#: Query keys each allowed operation accepts (case-sensitive, as the daemon reads them);
+#: anything else is denied. Plain reads accept only what common clients (the Docker
+#: CLI, docker-py) send; ``checkpoint``/``checkpoint-dir`` on start are never allowed.
+_QUERY_KEYS: Final[Mapping[str, frozenset[str]]] = {
+    "system.ping": frozenset(),
+    "system.version": frozenset(),
+    "container.create": frozenset({"name", "platform"}),
+    "container.list": frozenset({"all", "limit", "size", "trunc_cmd", "filters"}),
+    "container.inspect": frozenset({"size"}),
+    "container.start": frozenset({"detachKeys"}),
+    "container.stop": frozenset({"t", "signal"}),
+    "container.kill": frozenset({"signal"}),
+    "container.wait": frozenset({"condition"}),
+    "container.resize": frozenset({"h", "w"}),
+    "container.remove": frozenset({"v", "force", "link"}),
+    "container.logs": frozenset(
+        {"follow", "stdout", "stderr", "since", "until", "timestamps", "tail"}
+    ),
+    "container.attach": frozenset({"stream", "stdin", "stdout", "stderr", "logs", "detachKeys"}),
+    "exec.create": frozenset(),
+    "exec.start": frozenset(),
+    "exec.resize": frozenset({"h", "w"}),
+    "exec.inspect": frozenset(),
+    "image.list": frozenset(
+        {"all", "filters", "digests", "shared-size", "manifests", "only_ids", "filter"}
+    ),
+    "image.inspect": frozenset(),
+    "network.list": frozenset({"filters"}),
+    "network.inspect": frozenset({"verbose", "scope"}),
+    "volume.list": frozenset({"filters"}),
+    "volume.inspect": frozenset(),
+    "volume.create": frozenset(),
+}
+#: Operations whose handler denies a query key with its own rule.
+_QUERY_RULES: Final[Mapping[str, str]] = {
+    "container.create": "create.query",
+    "volume.create": "volume.query",
+}
+
+
+def _checked_query(r: Route) -> Route:
+    """``r`` with its query rebuilt from pairs whose keys the operation allows."""
+    allowed = _QUERY_KEYS.get(r.op, frozenset())
+    pairs = parse_qsl(r.query, keep_blank_values=True)
+    for key, _ in pairs:
+        if key not in allowed:
+            rule = _QUERY_RULES.get(r.op, "query.param")
+            raise _Denied(rule, f"query parameter {key!r} is not allowed on {r.op}")
+    return replace(r, query=urlencode(pairs))
+
+
+def _cap_reason(reason: str) -> str:
+    if len(reason) <= MAX_REASON_CHARS:
+        return reason
+    return reason[: MAX_REASON_CHARS - 13] + " [truncated]"
+
+
 # --------------------------------------------------------------------------- evaluate
 
 
@@ -1446,7 +1521,7 @@ def evaluate(request: DockerRequest, ctx: CellContext) -> Decision:
     r = route(request.method, request.path)
 
     def deny(rule: str, reason: str) -> Decision:
-        return Decision(False, r.op, rule, reason, request.path, request.body)
+        return Decision(False, r.op, rule, _cap_reason(reason), request.path, request.body)
 
     if r.op == MALFORMED:
         return deny("path.malformed", f"malformed path {request.path!r}")
@@ -1462,6 +1537,6 @@ def evaluate(request: DockerRequest, ctx: CellContext) -> Decision:
     if r.op not in _BODY_OPS and request.body:
         return deny("body.unexpected", f"{r.op} takes no request body")
     try:
-        return handler(r, request, ctx)
+        return handler(_checked_query(r), request, ctx)
     except _Denied as denied:
         return deny(denied.rule, denied.reason)

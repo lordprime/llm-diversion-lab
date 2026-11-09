@@ -1250,6 +1250,149 @@ def test_volume_create_query_params_are_denied() -> None:
     assert decision.rule == "volume.query"
 
 
+# --------------------------------------------------------------------------- query allow-lists
+
+
+def test_start_with_checkpoint_dir_is_denied() -> None:
+    """The final review's repro: a host directory handed to runc restore."""
+    path = f"/v1.44/containers/{CID}/start?checkpoint=c1&checkpoint-dir=/var/lib/docker"
+    decision = evaluate(DockerRequest("POST", path, target=own()), CTX)
+    assert not decision.allowed
+    assert decision.rule == "query.param"
+    for query in ("checkpoint=c1", "checkpoint-dir=/x", "check%70oint=c1", "Checkpoint=c1"):
+        path = f"/v1.44/containers/{CID}/start?{query}"
+        assert not evaluate(DockerRequest("POST", path, target=own()), CTX).allowed, query
+
+
+#: (method, path template, target kind, every query key the operation accepts)
+QUERY_OPS = [
+    ("GET", "/v1.44/_ping", None, ""),
+    ("GET", "/v1.44/version", None, ""),
+    ("POST", "/v1.44/containers/{c}/start", "container", "detachKeys=ctrl-x"),
+    ("POST", "/v1.44/containers/{c}/stop", "container", "t=1&signal=TERM"),
+    ("POST", "/v1.44/containers/{c}/kill", "container", "signal=KILL"),
+    ("POST", "/v1.44/containers/{c}/wait", "container", "condition=next-exit"),
+    (
+        "GET",
+        "/v1.44/containers/{c}/logs",
+        "container",
+        "follow=0&stdout=1&stderr=1&since=0&until=0&timestamps=0&tail=all",
+    ),
+    (
+        "POST",
+        "/v1.44/containers/{c}/attach",
+        "container",
+        "stream=1&stdin=1&stdout=1&stderr=1&logs=1&detachKeys=ctrl-x",
+    ),
+    ("GET", "/v1.44/containers/{c}/attach/ws", "container", "stream=1&stdout=1&logs=0"),
+    ("POST", "/v1.44/containers/{c}/resize", "container", "h=10&w=80"),
+    ("GET", "/v1.44/containers/{c}/json", "container", "size=1"),
+    ("DELETE", "/v1.44/containers/{c}", "container", "force=1&link=0&v=1"),
+    ("POST", "/v1.44/exec/{e}/resize", "exec", "h=10&w=80"),
+    ("GET", "/v1.44/exec/{e}/json", "exec", ""),
+    ("GET", "/v1.44/containers/json", None, "all=1&limit=-1&size=0&trunc_cmd=0"),
+    ("GET", "/v1.44/images/json", None, "all=0&only_ids=0&digests=1&shared-size=1&manifests=1"),
+    ("GET", "/v1.44/images/docker.io/library/alpine:3/json", None, ""),
+    ("GET", "/v1.44/networks", None, ""),
+    ("GET", f"/v1.44/networks/{NETWORK}", "network", "verbose=true&scope=local"),
+    ("GET", "/v1.44/volumes", None, ""),
+    ("GET", "/v1.44/volumes/v1", "volume", ""),
+]
+
+
+def _query_target(kind: str | None) -> Target | None:
+    if kind == "network":
+        return Target(kind="network", id="n" * 64, name=NETWORK, labels={})
+    if kind == "volume":
+        return Target(kind="volume", id="v1", name="v1", labels=MINE)
+    if kind == "exec":
+        return Target(kind="exec", id="e" * 64, name=None, labels=MINE)
+    return own() if kind == "container" else None
+
+
+@pytest.mark.parametrize(("method", "template", "kind", "keys"), QUERY_OPS)
+def test_each_operation_accepts_its_own_query_keys(
+    method: str, template: str, kind: str | None, keys: str
+) -> None:
+    path = template.format(c=CID, e="e" * 64) + (f"?{keys}" if keys else "")
+    decision = evaluate(DockerRequest(method, path, target=_query_target(kind)), CTX)
+    assert decision.allowed, decision.reason
+    forwarded = parse_qs(urlsplit(decision.path).query, keep_blank_values=True)
+    sent = parse_qs(keys, keep_blank_values=True)
+    assert {k: v for k, v in forwarded.items() if k in sent} == sent
+
+
+@pytest.mark.parametrize(("method", "template", "kind", "keys"), QUERY_OPS)
+@pytest.mark.parametrize("extra", ["bogus=1", "checkpoint-dir=/var/lib/docker", "=x", "Size=1"])
+def test_each_operation_denies_any_other_query_key(
+    method: str, template: str, kind: str | None, keys: str, extra: str
+) -> None:
+    query = f"{keys}&{extra}" if keys else extra
+    path = template.format(c=CID, e="e" * 64) + f"?{query}"
+    decision = evaluate(DockerRequest(method, path, target=_query_target(kind)), CTX)
+    assert not decision.allowed, path
+    assert decision.rule == "query.param"
+
+
+def test_exec_start_and_create_take_no_query() -> None:
+    exec_target = Target(kind="exec", id="e" * 64, name=None, labels=MINE)
+    body = b'{"Detach":false,"Tty":false}'
+    path = "/v1.44/exec/" + "e" * 64 + "/start"
+    assert evaluate(DockerRequest("POST", path, body, target=exec_target), CTX).allowed
+    denied = evaluate(DockerRequest("POST", path + "?detachKeys=x", body, target=exec_target), CTX)
+    assert (denied.allowed, denied.rule) == (False, "query.param")
+    create_body = json.dumps({"Cmd": ["id"]}).encode()
+    path = f"/v1.44/containers/{CID}/exec?privileged=1"
+    denied = evaluate(DockerRequest("POST", path, create_body, target=own()), CTX)
+    assert (denied.allowed, denied.rule) == (False, "query.param")
+
+
+def test_create_and_volume_create_keep_their_own_query_rules() -> None:
+    bad = create({"Image": IMG}, path="/v1.44/containers/create?name=x&bogus=1")
+    assert (bad.allowed, bad.rule) == (False, "create.query")
+    ok = create({"Image": IMG}, path="/v1.44/containers/create?name=x&platform=linux/amd64")
+    assert ok.allowed
+
+
+def test_forwarded_query_is_rebuilt_from_what_was_checked() -> None:
+    path = f"/v1.44/containers/{CID}/logs?stdout=1&tail=a%20b&follow"
+    decision = evaluate(DockerRequest("GET", path, target=own()), CTX)
+    assert decision.allowed
+    assert decision.path == f"/v1.44/containers/{CID}/logs?stdout=1&tail=a+b&follow="
+    plain = evaluate(DockerRequest("GET", "/v1.44/images/json?all=1&filters=%7B%7D"), CTX)
+    assert plain.path == "/v1.44/images/json?all=1&filters=%7B%7D"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1.44/version?x=\n",
+        "/v1.44/containers/json?all=1\nHost:x",
+        "/v1.44/containers/json?all=\x00",
+        "/v1.44/containers/json?all=1 x",
+        "/v1.44/containers/json?all=\u00e9",
+        "/v1.44/containers/json?all=1\x7f",
+    ],
+)
+def test_request_targets_with_control_or_non_ascii_characters_are_malformed(path: str) -> None:
+    decision = evaluate(DockerRequest("GET", path), CTX)
+    assert not decision.allowed
+    assert decision.rule == "path.malformed"
+
+
+def test_denial_reasons_cap_echoed_agent_text() -> None:
+    long_image = "docker.io/library/" + "a" * 5000
+    decision = create({"Image": long_image})
+    assert not decision.allowed
+    assert decision.rule == "image.not_allowed"
+    assert len(decision.reason) <= policy.MAX_REASON_CHARS
+    assert decision.reason.startswith("image 'docker.io/library/aaa")
+    huge = evaluate(DockerRequest("GET", "/v1.44/" + "x" * 5000), CTX)
+    assert len(huge.reason) <= policy.MAX_REASON_CHARS
+    short = create({"Image": "docker.io/library/ubuntu:24.04"})
+    assert short.reason == "image 'docker.io/library/ubuntu:24.04' is not in images.lock"
+
+
 # --------------------------------------------------------------------------- review 3: names
 
 
@@ -1928,12 +2071,12 @@ async def test_proxy_resolves_agent_names_with_the_cell_prefix(tmp_path: Path) -
 async def test_proxy_forces_json_content_type_on_bodies(tmp_path: Path) -> None:
     async with running_guard(tmp_path) as (_guard, daemon, sock):
         body = json.dumps({"Image": IMG}).encode()
-        extra = "Content-Type: text/plain\r\nX-Other: kept\r\n"
+        extra = "Content-Type: text/plain\r\nUser-Agent: docker-test\r\n"
         resp = await call(sock, req("POST", "/v1.44/containers/create", body, extra))
         assert resp.startswith(b"HTTP/1.1 201")
         _m, _t, headers, _b = daemon.requests[-1]
         assert headers["content-type"] == "application/json"
-        assert headers["x-other"] == "kept"
+        assert headers["user-agent"] == "docker-test"
         raw_head = daemon.raw_heads[-1].lower()
         assert raw_head.count(b"content-type:") == 1
 
@@ -1954,6 +2097,79 @@ async def test_proxy_failure_records_carry_the_method(
         "http.500",
         "container.remove",
     )
+
+
+async def test_proxy_forwards_only_allow_listed_headers(tmp_path: Path) -> None:
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        extra = (
+            "User-Agent: Docker-Client/27\r\nAccept: */*\r\nAccept-Encoding: gzip\r\n"
+            "X-Registry-Auth: e30=\r\nX-Forwarded-For: 10.0.0.1\r\nCookie: a=b\r\n"
+            "Authorization: Basic eDp5\r\nX-Other: dropped\r\n"
+        )
+        resp = await call(sock, req("POST", "/v1.44/containers/mine/start", b"", extra))
+        assert resp.startswith(b"HTTP/1.1 200")
+        _m, _t, headers, _b = daemon.requests[-1]
+        assert {"user-agent", "accept", "accept-encoding"} <= set(headers)
+        for name in ("x-registry-auth", "x-forwarded-for", "cookie", "authorization", "x-other"):
+            assert name not in headers, name
+
+
+async def test_proxy_forwards_websocket_handshake_headers(tmp_path: Path) -> None:
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        extra = (
+            "Connection: Upgrade\r\nUpgrade: websocket\r\n"
+            "Sec-WebSocket-Key: a2V5a2V5a2V5a2V5\r\n"
+            "Sec-WebSocket-Version: 13\r\nOrigin: http://docker\r\n"
+        )
+        await call(sock, req("GET", "/v1.44/containers/mine/attach/ws?stream=1", b"", extra))
+        _m, _t, headers, _b = daemon.requests[-1]
+        assert headers["sec-websocket-key"] == "a2V5a2V5a2V5a2V5"
+        assert headers["sec-websocket-version"] == "13"
+        assert headers["origin"] == "http://docker"
+        assert headers["upgrade"] == "websocket"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        b"/v1.44/containers/mine/start\n?checkpoint=c1",
+        b"/v1.44/containers/mine/json?size=\x00",
+        b"/v1.44/containers/m\xefne/json",
+        b"/v1.44/version\x7f",
+        b"/v1.44/version?a=\tb",
+    ],
+)
+async def test_proxy_rejects_request_targets_with_control_or_non_ascii_bytes(
+    tmp_path: Path, target: bytes
+) -> None:
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        raw = b"POST " + target + b" HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
+        resp = await call(sock, raw)
+        assert resp.startswith(b"HTTP/1.1 400")
+        assert daemon.requests == []
+    assert [(r["allowed"], r["rule"]) for r in records_of(tmp_path)] == [(False, "http.400")]
+
+
+@pytest.mark.parametrize("value", [b"a\x00b", b"a\x01", b"\x1b[31m", b"a\x7fb"])
+async def test_proxy_rejects_control_characters_in_header_values(
+    tmp_path: Path, value: bytes
+) -> None:
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        raw = b"GET /v1.44/version HTTP/1.1\r\nUser-Agent: " + value + b"\r\n\r\n"
+        resp = await call(sock, raw)
+        assert resp.startswith(b"HTTP/1.1 400")
+        assert daemon.requests == []
+
+
+async def test_proxy_403_body_caps_echoed_agent_text(tmp_path: Path) -> None:
+    async with running_guard(tmp_path) as (_guard, _daemon, sock):
+        body = json.dumps({"Image": "docker.io/library/" + "a" * 20000}).encode()
+        resp = await call(sock, req("POST", "/v1.44/containers/create", body))
+        assert resp.startswith(b"HTTP/1.1 403")
+        message = json.loads(resp.split(b"\r\n\r\n", 1)[1])["message"]
+        assert len(message) < 400
+    [record] = records_of(tmp_path)
+    assert len(record["reason"]) <= policy.MAX_REASON_CHARS
 
 
 # --------------------------------------------------------------------------- podman integration
