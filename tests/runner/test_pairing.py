@@ -13,7 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 from control.core.models import Arm, Surface
-from control.core.tokens import TAG_PATTERN
+from control.core.tokens import TAG_PATTERN, new_tag
 from control.runner.experiment import (
     Experiment,
     load_experiment,
@@ -266,6 +266,32 @@ def test_yaml_with_a_duplicate_key_is_refused() -> None:
 def test_yaml_that_is_not_a_mapping_is_refused() -> None:
     with pytest.raises(ValueError, match="mapping"):
         parse_experiment("- a\n- b\n")
+
+
+@pytest.mark.parametrize("experiment_id", ["exp_selftest_x", "exp_selftest_01JABCDEF"])
+def test_the_self_test_prefix_is_reserved(tmp_path: Path, experiment_id: str) -> None:
+    """Study metrics and the self-test's sweep treat exp_selftest_* as self-tests, so a
+    study experiment may never take such an id (only derive_experiment does)."""
+    text = SELFTEST.read_text().replace(
+        "experiment_id: exp_selftest\n", f"experiment_id: {experiment_id}\n"
+    )
+    with pytest.raises(ValueError, match="reserved"):
+        parse_experiment(text)
+    path = tmp_path / "study.yaml"
+    path.write_text(text)
+    with pytest.raises(ValueError, match="reserved"):
+        read_experiment(path)
+    assert parse_experiment(text, selftest=True).experiment_id == experiment_id
+    assert parse_experiment(SELFTEST.read_text()).experiment_id == "exp_selftest"  # no prefix
+
+
+def test_run_tags_are_lowercase_hex() -> None:
+    """Tags are drawn from [0-9a-f]; the pattern accepts nothing else (the labeller's
+    Visible check is case-sensitive, its contamination scan case-insensitive)."""
+    assert re.fullmatch(TAG_PATTERN, new_tag())
+    assert re.fullmatch(TAG_PATTERN, "0123456789abcdef")
+    for bad in ("0123456789ABCDEF", "0123456789abcdeg", "0123456789abcde", "z" * 16):
+        assert not re.fullmatch(TAG_PATTERN, bad), bad
 
 
 def _payload(doc: dict[str, Any]) -> dict[str, Any]:

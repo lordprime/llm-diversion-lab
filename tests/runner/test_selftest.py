@@ -785,7 +785,9 @@ def test_derive_experiment_gives_a_fresh_definition_each_time(tmp_path: Path) ->
     assert a.experiment.experiment_id.startswith("exp_selftest_")
     assert a.definition_sha256 != original.definition_sha256
     assert a.definition_sha256 == hashlib.sha256(a.definition_yaml.encode()).hexdigest()
-    assert parse_experiment(a.definition_yaml) == a.experiment
+    assert parse_experiment(a.definition_yaml, selftest=True) == a.experiment
+    with pytest.raises(ValueError, match="reserved"):  # never as a study experiment
+        parse_experiment(a.definition_yaml)
     assert original.definition_sha256 in a.definition_yaml  # provenance
     # everything but the id is the file's
     assert a.experiment.model_copy(update={"experiment_id": "x"}) == (

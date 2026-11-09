@@ -52,7 +52,7 @@
       "$ref": "#/$defs/Surface"
     },
     "tag": {
-      "pattern": "^[A-Za-z0-9]{16}$",
+      "pattern": "^[0-9a-f]{16}$",
       "title": "Tag",
       "type": "string"
     },

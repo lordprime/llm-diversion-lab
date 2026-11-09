@@ -48,6 +48,7 @@ from pydantic import (
 
 from control.core.ids import ID_PATTERN
 from control.core.models import Surface
+from control.core.selftest_status import SELFTEST_EXPERIMENT_PREFIX
 from control.core.tags import request_path
 
 __all__ = [
@@ -386,12 +387,16 @@ _UniqueKeyLoader.add_constructor(
 )
 
 
-def parse_experiment(text: str) -> Experiment:
+def parse_experiment(text: str, *, selftest: bool = False) -> Experiment:
     """Parse and validate an experiment from YAML text.
 
     Raises ``ValueError`` for YAML that does not parse, has a duplicate key or is not a
     mapping, and :class:`pydantic.ValidationError` (also a ``ValueError``) for an
-    invalid experiment.
+    invalid experiment. The id prefix ``exp_selftest_``
+    (:data:`~control.core.selftest_status.SELFTEST_EXPERIMENT_PREFIX`) is reserved for
+    the self-test's derived experiments (``selftest=True``, only
+    :func:`control.runner.selftest.derive_experiment`): study metrics leave such
+    experiments out and the self-test sweeps their runs, so a study may never use it.
     """
     try:
         doc = yaml.load(text, Loader=_UniqueKeyLoader)  # noqa: S506 - a SafeLoader subclass
@@ -399,7 +404,13 @@ def parse_experiment(text: str) -> Experiment:
         raise ValueError(f"experiment YAML does not parse: {exc}") from exc
     if not isinstance(doc, dict):
         raise ValueError("experiment YAML must be a mapping at the top level")
-    return Experiment.model_validate(doc)
+    experiment = Experiment.model_validate(doc)
+    if not selftest and experiment.experiment_id.startswith(SELFTEST_EXPERIMENT_PREFIX):
+        raise ValueError(
+            f"experiment_id {experiment.experiment_id!r}: the prefix "
+            f"{SELFTEST_EXPERIMENT_PREFIX!r} is reserved for the self-test"
+        )
+    return experiment
 
 
 @dataclass(frozen=True, slots=True)

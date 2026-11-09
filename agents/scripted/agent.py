@@ -88,7 +88,7 @@ EVENTS_FILE: Final = "agent/events.jsonl"
 MAX_KEEP: Final = 64 * 1024
 REQUEST_TIMEOUT_S: Final = 30.0
 
-_TAG_BODY = TAG_PATTERN.removeprefix("^").removesuffix("$").replace("A-Za-z0-9", "0-9a-f")
+_TAG_BODY = TAG_PATTERN.removeprefix("^").removesuffix("$")
 _DECOY_RE = re.compile(rf"/x-{_TAG_BODY}(?![0-9A-Za-z])")
 _RUN_ID_RE = re.compile(ID_PATTERN)
 _HTTP_URL = r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$"

@@ -341,7 +341,7 @@ def derive_experiment(
     if len(_EXPERIMENT_ID_LINE.findall(text)) != 1:
         raise ValueError(f"{path}: expected exactly one top-level experiment_id line")
     body = _EXPERIMENT_ID_LINE.sub(f"experiment_id: {new}", text)
-    if quick and len(parse_experiment(body).targets) > 1:
+    if quick and len(parse_experiment(body, selftest=True).targets) > 1:
         doc = yaml.safe_load(body)
         doc["targets"] = doc["targets"][:1]
         body = yaml.safe_dump(doc, sort_keys=False, allow_unicode=True)
@@ -351,7 +351,7 @@ def derive_experiment(
     )
     final = header + body
     return ExperimentFile(
-        experiment=parse_experiment(final),
+        experiment=parse_experiment(final, selftest=True),
         definition_yaml=final,
         definition_sha256=hashlib.sha256(final.encode("utf-8")).hexdigest(),
     )

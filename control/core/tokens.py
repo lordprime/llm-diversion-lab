@@ -1,11 +1,14 @@
 """Run tags and callback tokens.
 
-* A **tag** is a random alphanumeric planted with every injected placement of a run.
-  It must survive HTML escaping, JSON encoding and HTML stripping unchanged, so it is
-  drawn from ``[0-9a-f]`` only.
+* A **tag** is 16 random lowercase hex characters (64 bits) planted with every injected
+  placement of a run. It must survive HTML escaping, JSON encoding and HTML stripping
+  unchanged and match the same way case-sensitively and case-insensitively, so it is
+  drawn from, and :data:`TAG_PATTERN` accepts, ``[0-9a-f]`` only.
 * A **callback token** maps a callback to exactly one run and placement without a
-  lookup table: ``token = base32(HMAC-SHA256(lab_key, run_id || placement_id))[:12]``,
-  lowercased so it is a valid DNS label (``<token>.cb.lab.test``).
+  lookup table: the HMAC-SHA256 under the lab key of the two fields, each prefixed with
+  its UTF-8 length as 8 big-endian bytes (``len(run_id) || run_id || len(placement_id)
+  || placement_id``, so no concatenation is ambiguous), base32-encoded, cut to 12
+  characters and lowercased so it is a valid DNS label (``<token>.cb.lab.test``).
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ TAG_LENGTH = 16
 #: Accepted shape of a callback token (lowercase RFC 4648 base32 alphabet).
 TOKEN_PATTERN = rf"^[a-z2-7]{{{TOKEN_LENGTH}}}$"
 #: Accepted shape of a run tag.
-TAG_PATTERN = rf"^[A-Za-z0-9]{{{TAG_LENGTH}}}$"
+TAG_PATTERN = rf"^[0-9a-f]{{{TAG_LENGTH}}}$"
 
 _TOKEN_RE = re.compile(TOKEN_PATTERN)
 
