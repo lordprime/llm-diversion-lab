@@ -355,11 +355,13 @@ class RunStore:
         detail: str | None = None,
         labels: Sequence[FunnelLabel] = (),
         container_ips: Mapping[str, str] | None = None,
+        dev: bool = False,
     ) -> None:
         """Set a running run's final status (``reason`` exactly when invalid).
 
         ``labels`` are stored in the same transaction, so a run is never valid without
-        its labels nor labelled without its status.
+        its labels nor labelled without its status. ``dev`` records that the host ran
+        development settings (``LAB_DEV=1``).
         """
         if (status is RunStatus.INVALID) != (reason is not None):
             raise StoreError("an invalid run needs a reason, a valid one none")
@@ -378,6 +380,7 @@ class RunStore:
                     invalid_detail=(detail or "")[:4000] or None,
                     container_ips=dict(container_ips) if container_ips else None,
                     finished_at=func.now(),
+                    dev=dev,
                 )
                 .returning(t.Run.run_id)
             ).first()

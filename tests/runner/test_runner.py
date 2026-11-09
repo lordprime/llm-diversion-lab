@@ -31,6 +31,7 @@ from control.core.models import (
     Callback,
     CallbackChannel,
     EndStatus,
+    FunnelLabel,
     FunnelStage,
     InvalidReason,
     LlmCall,
@@ -38,6 +39,7 @@ from control.core.models import (
     RunManifest,
     RunStatus,
     TargetAccessEvent,
+    Verdict,
 )
 from control.db import tables as t
 from control.db.engine import session_scope
@@ -47,7 +49,15 @@ from control.runner.cell_spec import CellError, CellSettings, ComposeProject
 from control.runner.compose_backend import CellHandle, CollectReport, CommandResult, ContainerState
 from control.runner.experiment import read_experiment
 from control.runner.oracle import OUTBOUND_SUCCESS, PREVIOUSLY_SUCCESSFUL, OracleScore, parse_done
-from control.runner.runner import HostLockError, Runner, RunResult
+from control.runner.runner import (
+    DEFAULT_RUNNER_LOCK,
+    CellLeftBehindError,
+    HostLockError,
+    Runner,
+    RunResult,
+    host_lock,
+    runner_lock_path,
+)
 from control.runner.ship import CollectorClient
 from control.runner.store import RunStore, StoreError
 
@@ -84,6 +94,7 @@ def write_cell_evidence(
     leak: str | None = None,
     llm_calls: bool = True,
     probe_serves: bool = True,
+    probe_prefix: str | None = "",
 ) -> None:
     """What a cell running the scripted agent leaves behind, for its own manifest."""
     manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
@@ -91,7 +102,7 @@ def write_cell_evidence(
     run_id, tag = manifest.run_id, manifest.tag
     access: list[Any] = []
     seq = 0
-    for path, status in project.probe_paths:  # the pre-flight probe
+    for path, status in project.probe_paths if probe_prefix is not None else ():
         access.append(
             TargetAccessEvent(
                 run_id=run_id,
@@ -100,7 +111,7 @@ def write_cell_evidence(
                 ts=TS,
                 flow_id=f"p{seq}",
                 method="GET",
-                url=f"http://goat:9090{path}",
+                url=f"http://goat:9090{probe_prefix}{path}",
                 status=status,
                 probe=True,
             )
@@ -244,7 +255,10 @@ class FakeBackend:
     agent_states: list[ContainerState] = field(
         default_factory=lambda: [ContainerState("running"), ContainerState("exited", 0)]
     )
-    injector_state: ContainerState = field(default_factory=lambda: ContainerState("running"))
+    dead_before_start: dict[str, ContainerState] = field(default_factory=dict)
+    dead_after_start: dict[str, ContainerState] = field(default_factory=dict)
+    logs_fail: frozenset[str] = frozenset()
+    probe_prefix: str | None = ""
     logs_text: dict[str, str] = field(default_factory=dict)
     refuse: list[str] = field(default_factory=list)
     teardown_error: str | None = None
@@ -269,6 +283,7 @@ class FakeBackend:
 
     def up(self, cell: CellHandle) -> None:
         self.calls.append(("up", cell.project.run_id))
+        self._started = False
         if self.up_error:
             raise CellError(self.up_error)
 
@@ -293,12 +308,15 @@ class FakeBackend:
     def start_agent(self, cell: CellHandle) -> None:
         self.calls.append(("start_agent", cell.project.run_id))
         self._states = list(self.agent_states)  # each run's agent starts afresh
+        self._started = True
 
     def state(self, cell: CellHandle, service: str) -> ContainerState:
-        if service == "injector":
-            return self.injector_state
-        states = getattr(self, "_states", [ContainerState("missing")])
-        return states.pop(0) if len(states) > 1 else states[0]
+        if service == "agent":
+            states = getattr(self, "_states", [ContainerState("missing")])
+            return states.pop(0) if len(states) > 1 else states[0]
+        if getattr(self, "_started", False) and service in self.dead_after_start:
+            return self.dead_after_start[service]
+        return self.dead_before_start.get(service, ContainerState("running"))
 
     def kill_agent(self, cell: CellHandle) -> None:
         self.calls.append(("kill_agent", cell.project.run_id))
@@ -308,6 +326,8 @@ class FakeBackend:
         self.calls.append(("stop", ",".join(services)))
 
     def logs(self, cell: CellHandle, service: str) -> str:
+        if service in self.logs_fail:
+            raise CellError(f"compose logs {service}: exit 1")
         return self.logs_text.get(service, "")
 
     def collect(
@@ -321,6 +341,7 @@ class FakeBackend:
             leak=self.leak(cell.project),
             llm_calls=self.llm_calls,
             probe_serves=self.probe_serves,
+            probe_prefix=self.probe_prefix,
         )
         return CollectReport(files=["..."], refused=list(self.refuse))
 
@@ -331,6 +352,13 @@ class FakeBackend:
 
 
 # --------------------------------------------------------------------------- fixtures
+
+
+@pytest.fixture(autouse=True)
+def runner_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    lock = tmp_path / "state" / "runner.lock"
+    monkeypatch.setenv("LAB_RUNNER_LOCK", str(lock))
+    return lock
 
 
 @pytest.fixture
@@ -550,7 +578,6 @@ def test_a_leaked_tag_in_the_control_run_is_contamination(
             InvalidReason.RECORDING_FAILED,
         ),
         (FakeBackend(refuse=["agent/link (special, 0 bytes)"]), InvalidReason.EVIDENCE_INCOMPLETE),
-        (FakeBackend(teardown_error="containers left"), InvalidReason.TEARDOWN_FAILED),
         (FakeBackend(up_error="no free subnets"), InvalidReason.CELL_FAILED),
     ],
 )
@@ -651,7 +678,10 @@ def test_an_agent_that_crashes_after_its_llm_calls_is_a_valid_crashed_run(
 
 @pytest.mark.parametrize(
     "backend",
-    [FakeBackend(probe_serves=False), FakeBackend(injector_state=ContainerState("exited", 1))],
+    [
+        FakeBackend(probe_serves=False),
+        FakeBackend(dead_after_start={"injector": ContainerState("exited", 1)}),
+    ],
     ids=["missing-probe-serves", "injector-died"],
 )
 def test_injector_failures_invalidate_the_run(
@@ -705,7 +735,10 @@ def test_every_problem_is_kept_and_a_failed_teardown_is_the_reason(
     engine: Engine, collector: CollectorClient, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     backend = FakeBackend(probe_override={"/.env": 200}, teardown_error="volumes left: v1")
-    results = _single(engine, collector, backend, tmp_path)
+    with pytest.raises(CellLeftBehindError) as err:  # the experiment stops there
+        _single(engine, collector, backend, tmp_path)
+    results = err.value.results
+    assert len(results) == 1
     for result in results:
         assert result.reason is InvalidReason.TEARDOWN_FAILED  # an operator must clean up
         assert "ProbeFailedError" in result.detail and "volumes left: v1" in result.detail
@@ -734,8 +767,10 @@ def test_resuming_with_other_image_builds_is_refused(
         rebuilt.register(ef)
 
 
-def test_one_runner_per_host(engine: Engine, collector: CollectorClient, tmp_path: Path) -> None:
-    lock = tmp_path / "work" / "runner.lock"
+def test_one_runner_per_host(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, runner_lock: Path
+) -> None:
+    lock = runner_lock
     lock.parent.mkdir(parents=True)
     fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(fd, fcntl.LOCK_EX)
@@ -788,3 +823,177 @@ def test_an_outbound_success_stays_latched_after_a_later_unsuccessful_poll() -> 
     score.add((True, OUTBOUND_SUCCESS))
     score.add((False, "Attack unsuccessful."))
     assert score.success and score.message == OUTBOUND_SUCCESS and not score.unexpected
+
+
+# --------------------------------------------------------------------------- fix round 2
+
+
+def test_a_failed_teardown_stops_the_experiment_and_leaves_the_rest_queued(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    ef = read_experiment(SELFTEST)
+    backend = FakeBackend(teardown_error="network labcabc left")
+    with pytest.raises(CellLeftBehindError) as err:
+        _runner(engine, collector, backend, tmp_path).run_experiment(ef)
+    (first,) = err.value.results
+    assert first.reason is InvalidReason.TEARDOWN_FAILED
+    assert [c for c, _ in backend.calls].count("prepare") == 1  # the next run never began
+    statuses = {
+        r.run_id: RunStore(engine).status(r.run_id)[0]
+        for r in RunStore(engine).load_schedule(ef.experiment.experiment_id)
+    }
+    assert sorted(statuses.values()) == [RunStatus.INVALID, RunStatus.QUEUED]
+    assert "stopping" in caplog.text
+
+
+@pytest.mark.parametrize("service", ["injector", "tap", "catcher", "stub-llm", "goat"])
+def test_dead_infrastructure_before_the_agent_is_a_cell_failure(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, service: str
+) -> None:
+    backend = FakeBackend(dead_before_start={service: ContainerState("exited", 1)})
+    results = _single(engine, collector, backend, tmp_path)
+    assert {r.reason for r in results} == {InvalidReason.CELL_FAILED}
+    assert all(service in r.detail for r in results)
+    assert not any(c == "start_agent" for c, _ in backend.calls)
+
+
+@pytest.mark.parametrize(
+    ("service", "reason"),
+    [
+        ("tap", InvalidReason.RECORDING_FAILED),
+        ("catcher", InvalidReason.RECORDING_FAILED),
+        ("injector", InvalidReason.INJECTOR_FAILED),
+    ],
+)
+def test_infrastructure_dying_during_the_run_comes_before_no_llm_calls(
+    engine: Engine,
+    collector: CollectorClient,
+    tmp_path: Path,
+    service: str,
+    reason: InvalidReason,
+) -> None:
+    # the tap died, so no LLM call was recorded: that is a recording failure, not the agent's
+    backend = FakeBackend(
+        llm_calls=False, dead_after_start={service: ContainerState("exited", 137)}
+    )
+    results = _single(engine, collector, backend, tmp_path)
+    assert {r.reason for r in results} == {reason}
+
+
+def test_an_unreadable_log_is_a_recording_failure(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    results = _single(engine, collector, FakeBackend(logs_fail=frozenset({"tap"})), tmp_path)
+    assert {r.reason for r in results} == {InvalidReason.RECORDING_FAILED}
+    assert all("cannot read tap logs" in r.detail for r in results)
+
+
+@pytest.mark.parametrize("prefix", [None, "/elsewhere"], ids=["no-access", "other-path"])
+def test_the_pre_flight_accesses_must_be_in_the_injector_evidence_at_their_exact_paths(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, prefix: str | None
+) -> None:
+    results = _single(engine, collector, FakeBackend(probe_prefix=prefix), tmp_path)
+    assert {r.reason for r in results} == {InvalidReason.INJECTOR_FAILED}
+
+
+def test_an_invalid_run_never_gets_a_verdict(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    posted: list[str] = []
+    real = CollectorClient.post_verdict
+
+    def spy(self: CollectorClient, verdict: Any) -> None:
+        posted.append(verdict.run_id)
+        real(self, verdict)
+
+    monkeypatch.setattr(CollectorClient, "post_verdict", spy)
+    ef = read_experiment(SELFTEST)
+
+    def leak(project: ComposeProject) -> str | None:
+        manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
+        if manifest.arm is Arm.INJECTED:
+            return None
+        schedule = RunStore(engine).load_schedule(ef.experiment.experiment_id)
+        return next(r.tag for r in schedule if r.pair_id == manifest.pair_id and r.tag)
+
+    results = _single(engine, collector, FakeBackend(leak=leak), tmp_path)
+    control = _by_arm(results, Arm.CONTROL)
+    assert control.reason is InvalidReason.CONTAMINATED
+    assert control.run_id not in posted  # labelling failed after the verdict was decided
+    assert _run_row(engine, control.run_id).outcome is None
+    assert _by_arm(results, Arm.INJECTED).run_id in posted
+
+
+def test_a_failed_verdict_post_leaves_a_valid_run_with_its_verdict_on_disk(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(self: CollectorClient, verdict: Any) -> None:
+        raise RuntimeError("collector restarting")
+
+    monkeypatch.setattr(CollectorClient, "post_verdict", refuse)
+    results = _single(engine, collector, FakeBackend(), tmp_path)
+    for result in results:
+        assert result.status is RunStatus.VALID
+        saved = tmp_path / "runs" / f"{result.run_id}.verdict.json"
+        assert Verdict.model_validate_json(saved.read_bytes()).run_id == result.run_id
+
+
+def test_a_development_run_is_recorded_as_such(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    runner = Runner(
+        store=RunStore(engine),
+        collector=collector,
+        backend=FakeBackend(),
+        settings=CellSettings(images=IMAGES, dev=True),
+        lab_key=KEY,
+        runs_dir=tmp_path / "runs",
+        work_dir=tmp_path / "work",
+        oracle_interval_s=0,
+        tick_s=0,
+        sleep=lambda _s: None,
+    )
+    results = runner.run_experiment(read_experiment(SELFTEST))
+    assert all(_run_row(engine, r.run_id).dev for r in results)
+    plain = _single(engine, collector, FakeBackend(), tmp_path / "plain")
+    assert plain == [] or not any(_run_row(engine, r.run_id).dev for r in plain)
+
+
+def test_finish_is_atomic_labels_roll_back_with_the_status(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    ef = read_experiment(SELFTEST)
+    schedule = _runner(engine, collector, FakeBackend(), tmp_path).register(ef)
+    queued = schedule[0]  # never claimed: the status UPDATE matches no running row
+    label = FunnelLabel(
+        run_id=queued.run_id,
+        stage=FunnelStage.ACCESS,
+        value=False,
+        labeler="funnel-deterministic",
+        labeler_version="test",
+    )
+    with pytest.raises(StoreError, match="not running"):
+        RunStore(engine).finish(queued.run_id, RunStatus.VALID, labels=[label])
+    assert _labels(engine, queued.run_id) == {}
+
+
+def test_the_runner_lock_is_host_wide_reentrant_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LAB_RUNNER_LOCK")
+    assert runner_lock_path({}, dev=False, work_dir=tmp_path) == DEFAULT_RUNNER_LOCK
+    assert runner_lock_path({}, dev=True, work_dir=tmp_path) == tmp_path / "runner.lock"
+    custom = {"LAB_RUNNER_LOCK": str(tmp_path / "x.lock")}
+    assert runner_lock_path(custom, dev=False, work_dir=tmp_path) == tmp_path / "x.lock"
+    lock = tmp_path / "state" / "runner.lock"
+    with host_lock(lock), host_lock(lock):  # the self-test holds it around the runner
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # another process would block
+        finally:
+            os.close(fd)
+    blocked = tmp_path / "file"
+    blocked.write_text("")
+    with pytest.raises(HostLockError), host_lock(blocked / "runner.lock"):
+        pass  # a path that cannot be created is an error, never "run unlocked"

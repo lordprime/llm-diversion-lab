@@ -15,7 +15,7 @@ from enum import StrEnum
 from typing import Any, Final
 
 from pydantic import BaseModel, JsonValue
-from sqlalchemy import BigInteger, String, column, func, select, update, values
+from sqlalchemy import BigInteger, Connection, String, column, func, select, update, values
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -40,6 +40,7 @@ from control.db.tables import (
 
 __all__ = [
     "BULK_CHUNK_ROWS",
+    "UNRECORDED_REASON",
     "ArtifactResult",
     "EventKey",
     "InsertResult",
@@ -71,14 +72,20 @@ def _chunks[T](items: Sequence[T], size: int = BULK_CHUNK_ROWS) -> Iterator[Sequ
         yield items[start : start + size]
 
 
-def invalid_runs_by_reason(session: Session) -> dict[str, int]:
-    """Invalid runs counted by ``runs.invalid_reason`` (for ``lab_invalid_runs_total``)."""
-    rows = session.execute(
+#: ``reason`` of an invalid run without a recorded one (a CHECK makes that impossible).
+UNRECORDED_REASON: Final = "unrecorded"
+
+
+def invalid_runs_by_reason(conn: Session | Connection) -> dict[str, int]:
+    """Invalid runs counted by ``runs.invalid_reason`` (``lab_invalid_runs_total``)."""
+    rows = conn.execute(
         select(Run.invalid_reason, func.count())
         .where(Run.status == RunStatus.INVALID)
         .group_by(Run.invalid_reason)
     )
-    return {(reason.value if reason is not None else "unrecorded"): n for reason, n in rows}
+    return {
+        (reason.value if reason is not None else UNRECORDED_REASON): int(n) for reason, n in rows
+    }
 
 
 def claim_next_run(session: Session, *, experiment_id: str | None = None) -> Run | None:

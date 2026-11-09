@@ -332,6 +332,8 @@ class Run(Base):
         _enum(InvalidReason, "invalid_reason")
     )
     invalid_detail: Mapped[str | None] = mapped_column(Text)
+    #: the run ran on a development host (LAB_DEV=1: Podman, unpinned images)
+    dev: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
 
 
 class Placement(Base):

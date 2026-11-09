@@ -1,12 +1,14 @@
 """The runner: one experiment's runs, each in a fresh cell, from claim to label.
 
-:meth:`Runner.run_experiment` takes the host lock (one runner per host: cell subnets
-are allocated first-free), registers the experiment and its matched-pair schedule
-(:class:`~control.runner.store.RunStore`; a resumed queue must have the same
-definition hash and the same image builds), checks the whole stored schedule with
-:func:`~control.runner.schedule.check_schedule` (``experiment=``, all attempts) and
-then claims and runs queued runs one at a time. :meth:`Runner.run_one` walks a run
-through:
+:meth:`Runner.run_experiment` takes the host-wide lock (:func:`host_lock`, default
+:data:`DEFAULT_RUNNER_LOCK`; the self-test takes the same one), registers the
+experiment and its matched-pair schedule (:class:`~control.runner.store.RunStore`; a
+resumed queue must have the same definition hash and the same image builds), checks
+the whole stored schedule with :func:`~control.runner.schedule.check_schedule`
+(``experiment=``, all attempts) and then claims and runs queued runs one at a time. If
+a run's teardown fails it stops (:class:`CellLeftBehindError`), leaving the rest
+queued: a leaked cell may still hold a Docker socket, an agent or a gateway route.
+:meth:`Runner.run_one` walks a run through:
 
 1. **claim** -- render the manifest with the lab key and verify every token
    (:func:`~control.runner.render.verify_manifest_tokens`) before anything sees it; post
@@ -16,32 +18,38 @@ through:
    file, no lab key), keep its handle, then bring up its infrastructure;
 3. **probe** -- the target's own health script, then the injector's pre-flight probe:
    every probed path must answer its expected status (the P7 path its 404, robots.txt
-   200). A failure stops here: the agent never starts, no token is spent;
+   200); then every infrastructure service must be running. A failure stops here: the
+   agent never starts, no token is spent;
 4. **run** -- start the agent; poll the oracle (``/opt/support/done.sh`` only) every
    15 s while it runs, stop it at the run's ``timeout_s``, poll once more after. An
    agent that never leaves ``created`` is a cell failure, not a timeout;
-5. **collect** -- note whether the injector is still running, stop the agent, then the
+5. **collect** -- note which infrastructure died while the agent ran (the injector:
+   ``injector_failed``; the tap, catcher or cell-guard: ``recording_failed``; so do an
+   unreadable log or a recording-failure line in one), stop the agent, then the
    infrastructure with SIGTERM (the tap drains in-flight calls), copy each producer's
    evidence out of its stopped container;
 6. **teardown** -- always, once the handle exists (a failed provision included):
    remove the cell and everything labelled with the run, verified by listing again;
 7. **ship evidence** -- for every run that reached collection, valid or not: every
    stored event line verbatim and every artifact with its sha256 (no verdict);
-8. **decide** -- the run is invalid if anything above failed, if the injector died or
-   its events lack the pre-flight probe's accesses and serves (``injector_failed``),
-   if the oracle never answered or reported an unexpected success, or if the agent
-   made no LLM call at all (``no_llm_calls``, DEVELOPMENT_PLAN 5.4). Only then is the
-   verdict posted (``decided_at`` = the final poll's time);
+8. **decide** -- the run is invalid if anything above failed, if the injector's events
+   lack the pre-flight probe's accesses and serves (``injector_failed``), if the oracle
+   never answered or reported an unexpected success, or if the agent made no LLM call
+   at all (``no_llm_calls``, DEVELOPMENT_PLAN 5.4). The verdict is built here
+   (``decided_at`` = the final poll's time) but not yet posted;
 9. **label** -- re-check the full schedule, load the evidence of the torn-down cell
    with the run's forbidden tags and the verdict, label the funnel; the labels and the
-   final status are stored in one transaction.
+   final status (and whether the host ran development settings) are stored in one
+   transaction. Only a run finished valid then posts its verdict, so an invalid run
+   never has one; a failed post leaves it valid with the verdict file to re-send.
 
 Every failure maps to an invalid reason in exactly one place (:func:`_reason`); all of
 a run's problems are logged and kept in ``invalid_detail``, and a failed teardown (an
 operator must clean up) is the reason whenever it happened. :meth:`run_one` never
 raises for a run-level failure, a database error included. The lab key is only ever
 an argument here; it never reaches a cell, a file or a log line. Retrying an invalid
-run (a new attempt) is not done here: that is 15b's queue policy.
+run (a new attempt), a SIGTERM handler, a start-up sweep of orphaned ``lab.run_id``
+resources and a reaper for runs stuck ``running`` are not done here (15b-2 / final).
 """
 
 from __future__ import annotations
@@ -52,12 +60,14 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
+from urllib.parse import urlsplit
 
 from control.core.models import (
     Arm,
@@ -109,13 +119,18 @@ from control.runner.store import (
 
 __all__ = [
     "AGENT_START_GRACE_S",
+    "DEFAULT_RUNNER_LOCK",
     "PREFLIGHT_COMMAND",
     "RECORDING_FAILURE_MARKERS",
+    "RECORDING_SERVICES",
+    "CellLeftBehindError",
     "HostLockError",
     "ProbeFailedError",
     "RunResult",
     "Runner",
     "catalog_for",
+    "host_lock",
+    "runner_lock_path",
 ]
 
 log = logging.getLogger(__name__)
@@ -124,6 +139,8 @@ PREFLIGHT_COMMAND: Final = ("python", "-m", "cell.injector.preflight", "--port",
 #: Log lines of cell components that mean evidence could not be recorded (the
 #: component then withheld the response, so the agent's path changed: invalid run).
 #: mitmdump runs with ``flow_detail=0``, so no agent-chosen text is logged per flow.
+#: Infrastructure whose death during a run means its evidence is incomplete.
+RECORDING_SERVICES: Final = frozenset({"tap", "catcher", "cellguard"})
 RECORDING_FAILURE_MARKERS: Final = {
     "injector": ("injector: cannot",),
     "tap": ("tap: cannot",),
@@ -140,7 +157,20 @@ class ProbeFailedError(RuntimeError):
 
 
 class HostLockError(RuntimeError):
-    """Another runner holds this host's runner lock."""
+    """Another runner holds this host's runner lock (or it could not be taken)."""
+
+
+class CellLeftBehindError(RuntimeError):
+    """A run's teardown failed: :meth:`Runner.run_experiment` stopped, the rest is queued.
+
+    ``results`` holds the results of the runs that ran (the last one's ``detail`` says
+    what was left). An operator must clean up before the experiment is resumed.
+    """
+
+    def __init__(self, results: Sequence[RunResult]) -> None:
+        self.results = list(results)
+        last = self.results[-1]
+        super().__init__(f"run {last.run_id}: teardown failed, experiment stopped: {last.detail}")
 
 
 class _OracleUnexpectedError(RuntimeError):
@@ -250,17 +280,58 @@ def catalog_for(
     return RunCatalog(targets=targets, agents=agents)
 
 
+#: The host-wide runner lock; the self-test takes the same one.
+DEFAULT_RUNNER_LOCK: Final = Path("/srv/lab/state/runner.lock")
+_held: dict[Path, int] = {}
+_held_guard = threading.Lock()
+
+
+def runner_lock_path(env: Mapping[str, str], *, dev: bool, work_dir: Path) -> Path:
+    """``LAB_RUNNER_LOCK``, else :data:`DEFAULT_RUNNER_LOCK` (``work_dir`` only with dev)."""
+    if env.get("LAB_RUNNER_LOCK"):
+        return Path(env["LAB_RUNNER_LOCK"])
+    return work_dir / "runner.lock" if dev else DEFAULT_RUNNER_LOCK
+
+
 @contextlib.contextmanager
-def _host_lock(path: Path) -> Iterator[None]:
-    """Hold an exclusive, non-blocking flock on ``path`` (one runner per host)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+def host_lock(path: Path) -> Iterator[None]:
+    """Hold the host-wide runner lock (exclusive, non-blocking ``flock`` on ``path``).
+
+    One runner (or self-test) per host: cell subnets are allocated first-free. The lock
+    is re-entrant within this process, so a self-test holding it can call
+    :meth:`Runner.run_experiment`. Any failure to take it is a :class:`HostLockError`.
+    """
+    key = path.resolve()
+    with _held_guard:
+        reentered = key in _held
+        if reentered:
+            _held[key] += 1
+    if reentered:
+        try:
+            yield
+        finally:
+            with _held_guard:
+                _held[key] -= 1
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise HostLockError(f"cannot open the runner lock {path}: {exc}") from exc
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise HostLockError(f"another runner holds {path}") from exc
-        yield
+        except OSError as exc:  # ENOLCK and friends: never run unlocked
+            raise HostLockError(f"cannot lock {path}: {exc}") from exc
+        with _held_guard:
+            _held[key] = 1
+        try:
+            yield
+        finally:
+            with _held_guard:
+                _held.pop(key, None)
     finally:
         os.close(fd)  # closing releases the lock
 
@@ -273,7 +344,6 @@ class _RunState:
     manifest: RunManifest | None = None
     cell: CellHandle | None = None
     up_done: bool = False
-    injector_alive: bool = True
     agent_started: bool = False
     collected: bool = False
     event_lines: list[bytes] = field(default_factory=list)
@@ -316,7 +386,9 @@ class Runner:
         self._lab_key = lab_key
         self._runs_dir = runs_dir
         self._work_dir = work_dir
-        self._lock_path = lock_path or work_dir / "runner.lock"
+        self._lock_path = lock_path or runner_lock_path(
+            os.environ, dev=settings.dev, work_dir=work_dir
+        )
         self._oracle_interval_s = oracle_interval_s
         self._tick_s = tick_s
         self._health_timeout_s = health_timeout_s
@@ -344,7 +416,7 @@ class Runner:
 
     def run_experiment(self, ef: ExperimentFile) -> list[RunResult]:
         """Register, then run every queued run of the experiment in schedule order."""
-        with _host_lock(self._lock_path):
+        with host_lock(self._lock_path):
             self.register(ef)
             results: list[RunResult] = []
             while True:
@@ -353,7 +425,16 @@ class Runner:
                 run = self._store.claim_next(ef.experiment.experiment_id, schedule)
                 if run is None:
                     return results
-                results.append(self.run_one(run))
+                result = self.run_one(run)
+                results.append(result)
+                if result.reason is InvalidReason.TEARDOWN_FAILED:
+                    log.error(
+                        "run %s left cell resources behind; stopping, the remaining runs "
+                        "stay queued until an operator has cleaned up: %s",
+                        result.run_id,
+                        result.detail,
+                    )
+                    raise CellLeftBehindError(results)
 
     # one run
 
@@ -380,9 +461,10 @@ class Runner:
                 raise _RunFailed(state.problems)
             self._decide(state)
             labels = self._label(state)
-            self._store.finish(run.run_id, RunStatus.VALID, labels=labels)
+            self._store.finish(run.run_id, RunStatus.VALID, labels=labels, dev=self._settings.dev)
         except Exception as exc:  # every failure, a database error included
             return self._finish_invalid(state, exc)
+        self._post_verdict(state)
         self._heartbeat(state, RunPhase.FINISHED, "valid", best_effort=True)
         return RunResult(
             run_id=run.run_id,
@@ -402,7 +484,13 @@ class Runner:
             log.warning("run %s problem: %s", state.run.run_id, _describe(problem))
         log.warning("run %s invalid (%s)", state.run.run_id, reason.value)
         try:
-            self._store.finish(state.run.run_id, RunStatus.INVALID, reason=reason, detail=detail)
+            self._store.finish(
+                state.run.run_id,
+                RunStatus.INVALID,
+                reason=reason,
+                detail=detail,
+                dev=self._settings.dev,
+            )
         except Exception:
             log.exception("run %s: cannot record its invalid status", state.run.run_id)
         self._heartbeat(state, RunPhase.FINISHED, f"invalid: {reason.value}", best_effort=True)
@@ -470,6 +558,14 @@ class Runner:
 
         self._heartbeat(state, RunPhase.PROBING)
         self._probe(state.cell, project)
+
+        not_running: dict[str, str] = {}
+        for service in project.infra_services:
+            status = self._backend.state(state.cell, service)
+            if not status.running:
+                not_running[service] = status.status
+        if not_running:
+            raise CellError(f"infrastructure not running before the agent: {not_running}")
 
         self._heartbeat(state, RunPhase.AGENT_RUNNING)
         oracle_log = OracleLog(state.run.run_id, state.evidence_dir)
@@ -544,19 +640,37 @@ class Runner:
         try:
             if state.up_done:
                 self._heartbeat(state, RunPhase.COLLECTING, best_effort=True)
-                injector = self._backend.state(cell, project.injector_service)
-                state.injector_alive = injector.running
+                # infrastructure that died while the agent ran: its evidence is partial
+                for service in project.infra_services:
+                    status = self._backend.state(cell, service)
+                    if status.running:
+                        continue
+                    if service == project.injector_service:
+                        state.problems.append(
+                            _InjectorFailedError(f"the injector was {status.status}")
+                        )
+                    elif service in RECORDING_SERVICES:
+                        state.problems.append(
+                            _RecordingFailedError(f"{service} was {status.status}")
+                        )
                 if self._backend.state(cell, project.agent_service).running:
                     self._backend.kill_agent(cell)
                 self._backend.stop(cell, [project.agent_service], timeout_s=STOP_TIMEOUT_S)
                 self._backend.stop(cell, list(project.infra_services), timeout_s=STOP_TIMEOUT_S)
                 for service, markers in RECORDING_FAILURE_MARKERS.items():
-                    if service in project.document["services"]:
+                    if service not in project.document["services"]:
+                        continue
+                    try:
                         text = self._backend.logs(cell, service)
-                        if any(m in text for m in markers):
-                            state.problems.append(
-                                _RecordingFailedError(f"{service} could not record evidence")
-                            )
+                    except Exception as exc:  # unread logs never pass silently
+                        state.problems.append(
+                            _RecordingFailedError(f"cannot read {service} logs: {exc}")
+                        )
+                        continue
+                    if any(m in text for m in markers):
+                        state.problems.append(
+                            _RecordingFailedError(f"{service} could not record evidence")
+                        )
                 producers = [
                     s for s in project.evidence if s != project.agent_service or state.agent_started
                 ]
@@ -586,8 +700,7 @@ class Runner:
         self._collector.post_artifacts(state.run.run_id, scan_artifacts(state.evidence_dir))
 
     def _check_injector(self, state: _RunState) -> None:
-        if not state.injector_alive:
-            raise _InjectorFailedError("the injector was not running when the agent stopped")
+        """The injector's evidence must hold the pre-flight probe it served."""
         manifest, cell = state.manifest, state.cell
         if manifest is None or cell is None:  # pragma: no cover - set before collection
             raise RuntimeError("no manifest or cell")
@@ -598,10 +711,10 @@ class Runner:
             if doc.get("stream") != "injector" or not doc.get("probe"):
                 continue
             if doc.get("kind") == "target_access":
-                probed.add(str(doc.get("url", "")).split("?")[0])
+                probed.add(urlsplit(str(doc.get("url", ""))).path)
             elif doc.get("kind") == "placement_serve" and doc.get("insert_ok"):
                 served.add(str(doc.get("placement_id")))
-        missing = [p for p, _ in cell.project.probe_paths if not any(u.endswith(p) for u in probed)]
+        missing = [p for p, _ in cell.project.probe_paths if p not in probed]
         missing += [p.placement_id for p in manifest.placements if p.placement_id not in served]
         if missing:
             raise _InjectorFailedError(f"injector evidence lacks the pre-flight probe: {missing}")
@@ -624,7 +737,26 @@ class Runner:
             oracle_message=state.score.message,
             decided_at=state.final_poll_at,
         )
-        self._collector.post_verdict(state.verdict)
+
+    def _post_verdict(self, state: _RunState) -> None:
+        """Post a finished-valid run's verdict (kept on disk first, so it can be re-sent).
+
+        Only a run already stored valid gets here, so an invalid run never has a verdict.
+        A failed post leaves the run valid; the verdict file re-posts identically.
+        """
+        verdict = state.verdict
+        if verdict is None:  # pragma: no cover - set by _decide
+            raise RuntimeError("no verdict")
+        path = state.evidence_dir.parent / f"{state.run.run_id}.verdict.json"
+        try:
+            path.write_bytes(verdict.model_dump_json().encode())
+            self._collector.post_verdict(verdict)
+        except Exception:
+            log.exception(
+                "run %s is valid but its verdict was not stored; re-post %s",
+                state.run.run_id,
+                path,
+            )
 
     def _label(self, state: _RunState) -> tuple[FunnelLabel, ...]:
         experiment = self._experiment_file().experiment

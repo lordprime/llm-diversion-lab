@@ -71,6 +71,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from control.core.models import RunStatus
 from control.core.selftest_status import SelftestStatusError, read_selftest_status
+from control.db.repo import UNRECORDED_REASON, invalid_runs_by_reason
 from control.db.tables import Agent, Run
 
 __all__ = [
@@ -95,8 +96,6 @@ METRIC_NAMES: tuple[str, ...] = (
 
 #: Label value used for an absent ``end_status``.
 NONE_LABEL: Final = "none"
-#: ``reason`` label of ``lab_invalid_runs_total`` for an invalid run without a reason.
-UNRECORDED_REASON: Final = "unrecorded"
 #: Statement timeout of the scrape queries.
 QUERY_TIMEOUT_MS: Final = 5_000
 
@@ -207,11 +206,6 @@ def _query(engine: Engine) -> _RunCounts:
         .where(Run.status.in_([RunStatus.VALID, RunStatus.INVALID]))
         .group_by(Run.status, Run.end_status, Run.agent_id, Run.target_id, Run.arm)
     )
-    invalid_q = (
-        select(Run.invalid_reason, func.count())
-        .where(Run.status == RunStatus.INVALID)
-        .group_by(Run.invalid_reason)
-    )
     in_flight_q = (
         select(Agent.agent_id, func.count(Run.run_id))
         .select_from(Agent)
@@ -234,10 +228,7 @@ def _query(engine: Engine) -> _RunCounts:
             )
             for status, end_status, agent, target, arm, count in conn.execute(finished_q)
         ]
-        invalid = [
-            (UNRECORDED_REASON if reason is None else _label(reason), int(count))
-            for reason, count in conn.execute(invalid_q)
-        ]
+        invalid = sorted(invalid_runs_by_reason(conn).items())
         in_flight = [(agent, int(count)) for agent, count in conn.execute(in_flight_q)]
     return _RunCounts(finished, invalid, in_flight)
 

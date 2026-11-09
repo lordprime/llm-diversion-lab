@@ -1,4 +1,5 @@
-"""Runs: why a run is invalid (``invalid_reason``, a bounded set) and free detail.
+"""Runs: why a run is invalid (``invalid_reason``, a bounded set), free detail, and
+whether the host ran development settings (``dev``).
 
 Revision ID: 0005
 Revises: 0004
@@ -47,6 +48,10 @@ def upgrade() -> None:
         ),
     )
     op.add_column("runs", sa.Column("invalid_detail", sa.Text(), nullable=True))
+    op.add_column(
+        "runs",
+        sa.Column("dev", sa.Boolean(), server_default=sa.text("false"), nullable=False),
+    )
     # rows already invalid (none before the runner existed) get the catch-all reason
     op.execute("UPDATE runs SET invalid_reason = 'internal' WHERE status = 'invalid'")
     op.create_check_constraint(
@@ -58,5 +63,6 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_constraint(op.f("ck_runs_invalid_has_reason"), "runs", type_="check")
+    op.drop_column("runs", "dev")
     op.drop_column("runs", "invalid_detail")
     op.drop_column("runs", "invalid_reason")

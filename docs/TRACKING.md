@@ -102,7 +102,7 @@ Prometheus scrapes **node-exporter** (host), **cAdvisor** (containers) and the *
 | `lab_runs_in_flight` | gauge | `agent` |
 | `lab_queue_depth` | gauge | `provider` |
 | `lab_run_stage_seconds` | histogram | `stage` |
-| `lab_invalid_runs_total` | counter | `reason` (`unrecorded` until runs record why they were invalid) |
+| `lab_invalid_runs_total` | counter | `reason`: the run's `runs.invalid_reason` (the bounded `InvalidReason` set) |
 | `lab_llm_requests_total` | counter | `provider`, `model`, `http_status` |
 | `lab_llm_refusals_total` | counter | `model`, `category` |
 | `lab_llm_spend_usd_total` | counter | `provider`, `model` |
