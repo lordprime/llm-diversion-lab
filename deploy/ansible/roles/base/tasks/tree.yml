@@ -27,6 +27,36 @@
 # initialised with. It goes into lab.env, which secrets.sh rewrites but always
 # carries it over (and refuses to set it). 256 bits as hex: no character that
 # secrets.sh or compose would treat specially. The value is never printed.
+#
+# If the database is already initialised (pgdata/PG_VERSION) but lab.env has lost
+# the password, a new one would lock the Collector out: stop and say how to recover.
+# These checks read no secret, so they stay visible; the generating task is no_log.
+- name: Look for an initialised control-plane Postgres data directory
+  ansible.builtin.stat:
+    path: "{{ lab_root }}/db/pgdata/PG_VERSION"
+  register: base_pgdata_version
+
+- name: Look for LAB_DB_PASSWORD in lab.env (presence only, never the value)
+  ansible.builtin.command:
+    argv: [grep, -Eq, "^LAB_DB_PASSWORD=.+", "{{ lab_root }}/secrets/lab.env"]
+  register: base_db_password_present
+  changed_when: false
+  failed_when: base_db_password_present.rc not in [0, 1, 2]
+  check_mode: false
+
+- name: Refuse to generate a second password for an initialised database
+  ansible.builtin.fail:
+    msg: >-
+      {{ lab_root }}/db/pgdata is an initialised Postgres data directory, but
+      LAB_DB_PASSWORD is missing from {{ lab_root }}/secrets/lab.env. Postgres keeps
+      the password it was initialised with, so a new one would lock the Collector
+      out. Restore the old line (LAB_DB_PASSWORD=<old value>, e.g. from a backup of
+      lab.env) into lab.env (0600, owner lab) and run bootstrap.sh again. If the old
+      password is lost: set a new one in Postgres first (psql -U lab inside the db
+      container, then \password lab, which prompts and keeps it out of argv), then
+      put the same value in lab.env.
+  when: base_pgdata_version.stat.exists and base_db_password_present.rc != 0
+
 - name: Generate the control-plane database password once
   ansible.builtin.shell:
     cmd: |
@@ -37,6 +67,11 @@
         echo kept
         exit 0
       fi
+      # defence in depth (the fail task above already stops this case)
+      if [[ -e {{ (lab_root ~ '/db/pgdata/PG_VERSION') | quote }} ]]; then
+        echo "LAB_DB_PASSWORD is missing but the database is initialised: restore the old password into lab.env" >&2
+        exit 1
+      fi
       [[ ! -s $env_file || -z $(tail -c1 "$env_file") ]] || echo >>"$env_file"
       printf 'LAB_DB_PASSWORD=%s\n' "$(openssl rand -hex 32)" >>"$env_file"
       chown {{ lab_user | quote }}:{{ lab_user | quote }} "$env_file"
@@ -45,3 +80,4 @@
     executable: /bin/bash
   register: base_db_password
   changed_when: base_db_password.stdout == 'generated'
+  no_log: true

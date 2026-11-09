@@ -433,7 +433,7 @@ The scripts validate every host entry: an unknown key, a bad type or a bad value
 - Updates and packages: git, jq, curl, tcpdump, nftables, iptables, restic, openssl, rsync. chrony only on a VM. fail2ban only when not behind Twingate (all clients share the connector's IP).
 - Locale `C.UTF-8`.
 - Creates the `lab` user and the `/srv/lab` tree with ownership.
-- Generates the HMAC key once, and `LAB_DB_PASSWORD` in `secrets/lab.env` once (256 bits, never regenerated).
+- Generates the HMAC key once, and `LAB_DB_PASSWORD` in `secrets/lab.env` once (256 bits, never regenerated). If `db/pgdata` is already initialised but `lab.env` has lost the password, it stops with recovery steps instead of generating one Postgres would reject.
 - Creates `state/` (the self-test status) with the rest of the tree; never `db/pgdata`.
 - Installs a pinned `uv` (release tarball checked against its SHA-256) on root's PATH and, with it, labctl's pinned Python 3.12 under `/opt/lab/python`.
 - **SSH hardening.** Key-only login, turned on only after a key-only login is proven. `PermitRootLogin` depends on the profile: `prohibit-password` for the LXC (§0.1 exception), `no` on a VM.

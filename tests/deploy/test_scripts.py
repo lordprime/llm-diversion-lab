@@ -1788,7 +1788,7 @@ def test_local_secrets_refuses_the_host_generated_password(tmp_path: Path) -> No
 
 def _db_password_task() -> dict[str, Any]:
     tasks = _load_yaml(ANSIBLE / "roles" / "base" / "tasks" / "tree.yml")
-    matches = [t for t in tasks if "database password" in t.get("name", "")]
+    matches = [t for t in tasks if t.get("name", "").startswith("Generate the control-plane")]
     assert len(matches) == 1
     return matches[0]
 
@@ -1800,6 +1800,10 @@ def _run_db_password_task(root: Path) -> subprocess.CompletedProcess[str]:
     cmd = cmd.replace(
         "{{ (lab_root ~ '/secrets/lab.env') | quote }}",
         shlex.quote(str(root / "secrets" / "lab.env")),
+    )
+    cmd = cmd.replace(
+        "{{ (lab_root ~ '/db/pgdata/PG_VERSION') | quote }}",
+        shlex.quote(str(root / "db" / "pgdata" / "PG_VERSION")),
     )
     owner = f"{os.getuid()}:{os.getgid()}"  # the test user stands in for lab:lab
     cmd = cmd.replace("{{ lab_user | quote }}:{{ lab_user | quote }}", owner)
@@ -1844,6 +1848,50 @@ def test_db_password_task_reports_changes_only_when_it_generates() -> None:
     task = _db_password_task()
     assert task["changed_when"] == "base_db_password.stdout == 'generated'"
     assert task["register"] == "base_db_password"
+    assert task["no_log"] is True, "the task handles the password: never log it"
+
+
+def test_no_new_db_password_for_an_initialised_database(tmp_path: Path) -> None:
+    """Postgres keeps the password it was initialised with: a new one would lock it out."""
+    root = tmp_path / "lab"
+    (root / "secrets").mkdir(parents=True, mode=0o700)
+    (root / "db" / "pgdata").mkdir(parents=True)
+    (root / "db" / "pgdata" / "PG_VERSION").write_text("17\n", encoding="utf-8")
+    env_file = root / "secrets" / "lab.env"
+    env_file.write_text("ANTHROPIC_API_KEY=x\n", encoding="utf-8")
+
+    result = _run_db_password_task(root)
+    assert result.returncode != 0
+    assert "LAB_DB_PASSWORD" in result.stderr
+    assert "restore" in result.stderr
+    assert env_file.read_text(encoding="utf-8") == "ANTHROPIC_API_KEY=x\n"
+
+    # with the old password restored, the task keeps it
+    env_file.write_text("LAB_DB_PASSWORD=" + "c" * 64 + "\n", encoding="utf-8")
+    result = _run_db_password_task(root)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "kept"
+
+
+def test_base_role_fails_visibly_before_regenerating_for_an_initialised_database() -> None:
+    """no_log hides the generating task's own error, so a visible check runs first."""
+    tasks = _load_yaml(ANSIBLE / "roles" / "base" / "tasks" / "tree.yml")
+    names = [t.get("name", "") for t in tasks]
+    generate = names.index(_db_password_task()["name"])
+    (stat,) = [t for t in tasks if "ansible.builtin.stat" in t]
+    assert stat["ansible.builtin.stat"]["path"] == "{{ lab_root }}/db/pgdata/PG_VERSION"
+    (grep,) = [t for t in tasks if "LAB_DB_PASSWORD" in str(t.get("ansible.builtin.command"))]
+    assert grep["changed_when"] is False
+    assert grep["check_mode"] is False
+    (fail,) = [t for t in tasks if "ansible.builtin.fail" in t]
+    when = " ".join(fail["when"]) if isinstance(fail["when"], list) else fail["when"]
+    assert f"{stat['register']}.stat.exists" in when
+    assert f"{grep['register']}.rc" in when
+    msg = fail["ansible.builtin.fail"]["msg"]
+    assert "LAB_DB_PASSWORD" in msg and "restore" in msg.lower()
+    for task in (stat, grep, fail):
+        assert names.index(task["name"]) < generate
+        assert "no_log" not in task, "the check must stay visible; it reads no secret"
 
 
 def test_base_role_creates_the_selftest_state_directory() -> None:
