@@ -46,3 +46,18 @@ base_lab_dirs:
   # The self-test status (control/core/selftest_status.py): written by labctl as
   # root, read through a read-only mount by the Collector (uid 10001).
   - { path: state, mode: "0755" }
+
+# A pinned uv on the host: release.sh installs labctl per release with it, from the
+# release's uv.lock, into releases/<tag>/.venv (DEPLOYMENT §4.2). The tarball is
+# checked against its published SHA-256 before it is unpacked; change all three
+# together in a reviewed commit.
+base_uv_version: "0.11.21"
+base_uv_sha256:
+  x86_64: 8c88519b0ef0af9801fcdee419bbb12116bd9e6b18e162ae093c932d8b264050
+  aarch64: 88e800834007cc5efd4675f166eb2a51e7e3ad19876d85fa8805a6fb5c922397
+base_uv_arch: "{{ ansible_facts['architecture'] }}"
+# labctl's interpreter, installed by uv: the control-plane image's Python minor (3.12),
+# at the newest patch release the pinned uv can install (uv 0.11.21 knows up to
+# 3.12.13; the image is 3.12.16). Raise it together with base_uv_version.
+base_uv_python: "3.12.13"
+base_uv_python_dir: /opt/lab/python

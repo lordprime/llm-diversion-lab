@@ -12,7 +12,8 @@ Deploys the git tag to /srv/lab/releases/<tag> on <host> and makes it current:
  3. `git archive` the tag and copy it over SSH, verified by SHA-256;
  4. pull every image in the tag's deploy/images.lock by digest, and the
     control-plane images (deploy/compose/control-plane.yml), which must all be
-    pinned by digest (unless --allow-build);
+    pinned by digest (unless --allow-build); install labctl for the tag into
+    its own venv (/usr/local/bin/labctl follows `current`);
  5. if the release has a `migrate` service: stop the app services (the database
     keeps running), pg_dump, then `compose run --rm --no-deps migrate`;
  6. swap the `current` symlink and restart the control plane (compose up --wait);
@@ -134,6 +135,10 @@ lab_remote release.sh pull "${image_refs[@]}"
 build_arg=()
 ((allow_build)) && build_arg=(allow-build)
 lab_remote release.sh compose-pull "$tag" "${build_arg[@]}"
+
+# Before anything changes: a release whose labctl cannot be installed is refused.
+lab_step "Install labctl for $tag on $host"
+lab_remote release.sh labctl "$tag"
 
 rollback() {
 	lab_warn "$1: rolling back $host"

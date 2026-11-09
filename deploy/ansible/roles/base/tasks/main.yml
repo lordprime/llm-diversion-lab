@@ -54,3 +54,6 @@
 
 - name: Create the /srv/lab tree and keys
   ansible.builtin.import_tasks: tree.yml
+
+- name: Install the pinned uv and labctl's Python
+  ansible.builtin.import_tasks: uv.yml

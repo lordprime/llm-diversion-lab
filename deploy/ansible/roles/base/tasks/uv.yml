@@ -1,0 +1,56 @@
+---
+# A pinned uv (and, through it, labctl's pinned Python) on the host. release.sh
+# installs labctl per release with them (deploy/remote/release.sh `labctl`):
+# releases/<tag>/.venv from the release's uv.lock, /usr/local/bin/labctl ->
+# /srv/lab/current/.venv/bin/labctl. Nothing here is used by the containers.
+
+- name: Download the pinned uv release (checked against its SHA-256)
+  ansible.builtin.get_url:
+    url: "https://github.com/astral-sh/uv/releases/download/{{ base_uv_version }}/uv-{{ base_uv_arch }}-unknown-linux-gnu.tar.gz"
+    dest: "/var/cache/lab-uv-{{ base_uv_version }}-{{ base_uv_arch }}.tar.gz"
+    checksum: "sha256:{{ base_uv_sha256[base_uv_arch] }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Create the directory for this uv version
+  ansible.builtin.file:
+    path: "/usr/local/lib/lab-uv-{{ base_uv_version }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Unpack uv
+  ansible.builtin.unarchive:
+    src: "/var/cache/lab-uv-{{ base_uv_version }}-{{ base_uv_arch }}.tar.gz"
+    dest: "/usr/local/lib/lab-uv-{{ base_uv_version }}"
+    remote_src: true
+    extra_opts: [--strip-components=1]
+    owner: root
+    group: root
+    creates: "/usr/local/lib/lab-uv-{{ base_uv_version }}/uv"
+
+- name: Put uv and uvx on root's PATH
+  ansible.builtin.file:
+    src: "/usr/local/lib/lab-uv-{{ base_uv_version }}/{{ item }}"
+    dest: "/usr/local/bin/{{ item }}"
+    state: link
+    owner: root
+    group: root
+    force: true
+  loop: [uv, uvx]
+
+- name: Install labctl's pinned Python
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/uv
+      - python
+      - install
+      - --no-bin
+      - "{{ base_uv_python }}"
+  environment:
+    UV_PYTHON_INSTALL_DIR: "{{ base_uv_python_dir }}"
+    UV_NO_CONFIG: "1"
+  register: base_uv_python_install
+  changed_when: "'Installed' in base_uv_python_install.stderr"

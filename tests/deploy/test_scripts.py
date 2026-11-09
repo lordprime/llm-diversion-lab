@@ -1854,6 +1854,188 @@ def test_base_role_creates_the_selftest_state_directory() -> None:
     assert dirs["state"] == "0755"
 
 
+# --- a pinned uv on the host, labctl per release
+
+
+def test_base_role_installs_a_pinned_uv_and_python() -> None:
+    defaults = _load_yaml(ANSIBLE / "roles" / "base" / "defaults" / "main.yml")
+    assert re.fullmatch(r"\d+\.\d+\.\d+", defaults["base_uv_version"])
+    assert set(defaults["base_uv_sha256"]) == {"x86_64", "aarch64"}
+    for digest in defaults["base_uv_sha256"].values():
+        assert re.fullmatch(r"[0-9a-f]{64}", digest)
+    assert re.fullmatch(r"3\.12\.\d+", defaults["base_uv_python"])
+    assert defaults["base_uv_python_dir"] == "/opt/lab/python"
+
+    tasks = _load_yaml(ANSIBLE / "roles" / "base" / "tasks" / "uv.yml")
+    (download,) = [t for t in tasks if "ansible.builtin.get_url" in t]
+    get_url = download["ansible.builtin.get_url"]
+    assert "{{ base_uv_version }}" in get_url["url"]
+    assert get_url["url"].startswith("https://github.com/astral-sh/uv/releases/download/")
+    assert get_url["checksum"] == "sha256:{{ base_uv_sha256[base_uv_arch] }}"
+    (python,) = [t for t in tasks if "ansible.builtin.command" in t]
+    assert python["ansible.builtin.command"]["argv"] == [
+        "/usr/local/bin/uv",
+        "python",
+        "install",
+        "--no-bin",  # nothing on root's PATH but uv itself
+        "{{ base_uv_python }}",
+    ]
+    assert python["environment"]["UV_PYTHON_INSTALL_DIR"] == "{{ base_uv_python_dir }}"
+    main = _load_yaml(ANSIBLE / "roles" / "base" / "tasks" / "main.yml")
+    assert any(t.get("ansible.builtin.import_tasks") == "uv.yml" for t in main)
+
+
+def test_labctl_python_matches_the_base_role_and_the_image() -> None:
+    defaults = _load_yaml(ANSIBLE / "roles" / "base" / "defaults" / "main.yml")
+    release = (DEPLOY / "remote" / "release.sh").read_text(encoding="utf-8")
+    assert f"LABCTL_PYTHON={defaults['base_uv_python']}\n" in release
+    assert f"LABCTL_PYTHON_DIR={defaults['base_uv_python_dir']}\n" in release
+    # The same Python minor as the control-plane image (the patch level is whatever
+    # the pinned host uv can install; see the next test).
+    dockerfile = (DEPLOY / "compose" / "control.Dockerfile").read_text(encoding="utf-8")
+    image = re.search(r"python:(3\.\d+)\.\d+-slim", dockerfile)
+    assert image, "control.Dockerfile has no python:X.Y.Z-slim base"
+    assert defaults["base_uv_python"].rsplit(".", 1)[0] == image.group(1)
+
+
+def test_the_pinned_host_uv_can_install_labctls_python() -> None:
+    """`uv python install` only knows the Pythons its release shipped metadata for.
+
+    Checked offline with a local uv of the same version (its embedded download list);
+    skipped when the local uv is a different version.
+    """
+    defaults = _load_yaml(ANSIBLE / "roles" / "base" / "defaults" / "main.yml")
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("no local uv")
+    local = _run([uv, "--version"]).stdout.split()
+    if local[1:2] != [defaults["base_uv_version"]]:
+        pytest.skip(f"local uv is {' '.join(local[1:2])}, the host's is pinned elsewhere")
+    version = defaults["base_uv_python"]
+    result = _run(
+        [
+            uv,
+            "python",
+            "list",
+            version,
+            "--all-versions",
+            "--all-platforms",
+            "--only-downloads",
+            "--offline",
+        ],
+        env={**os.environ, "UV_NO_CONFIG": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+    known = set(re.findall(r"^cpython-(\S+?)-linux-x86_64-gnu\s", result.stdout, re.M))
+    assert version in known, f"uv {defaults['base_uv_version']} cannot install Python {version}"
+
+
+FAKE_UV = """\
+#!/usr/bin/env bash
+printf '%s | env=%s %s %s %s\\n' "$*" "$UV_PROJECT_ENVIRONMENT" \\
+    "${UV_PYTHON_DOWNLOADS-}" "${UV_PYTHON_INSTALL_DIR-}" "${UV_NO_CONFIG-}" >>"$FAKE_UV_LOG"
+[[ ${FAKE_UV_FAIL:-0} == 1 ]] && exit 1
+mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
+printf '#!/bin/sh\\necho labctl "$@"\\n' >"$UV_PROJECT_ENVIRONMENT/bin/labctl"
+chmod +x "$UV_PROJECT_ENVIRONMENT/bin/labctl"
+"""
+
+
+@pytest.fixture
+def labctl_env(
+    lab_root: tuple[Path, dict[str, str]], tmp_path: Path
+) -> tuple[Path, dict[str, str]]:
+    root, env = lab_root
+    uv = Path(env["PATH"].split(":", 1)[0]) / "uv"
+    uv.write_text(FAKE_UV, encoding="utf-8")
+    uv.chmod(0o755)
+    bindir = tmp_path / "usr-local-bin"
+    bindir.mkdir()
+    return root, {**env, "FAKE_UV_LOG": str(tmp_path / "uv.log"), "LAB_BIN_DIR": str(bindir)}
+
+
+def _install_labctl(
+    env: Mapping[str, str], tag: str = "v0.1.0"
+) -> subprocess.CompletedProcess[str]:
+    return _run(["bash", str(DEPLOY / "remote" / "release.sh"), "labctl", tag], env=env)
+
+
+def test_labctl_is_installed_per_release_from_the_lock(
+    labctl_env: tuple[Path, dict[str, str]],
+) -> None:
+    root, env = labctl_env
+    result = _install_labctl(env)
+    assert result.returncode == 0, result.stderr
+    (call,) = Path(env["FAKE_UV_LOG"]).read_text(encoding="utf-8").splitlines()
+    args, _, envs = call.partition(" | env=")
+    tree = f"{root}/releases/v0.1.0"
+    assert args.split() == [
+        "sync",
+        "--project",
+        tree,
+        "--frozen",
+        "--no-dev",
+        "--no-editable",
+        "--compile-bytecode",
+        "--python",
+        "3.12.13",
+    ]
+    assert envs.split() == [f"{tree}/.venv", "never", "/opt/lab/python", "1"]
+    assert (root / "releases" / "v0.1.0" / ".venv" / "bin" / "labctl").is_file()
+
+
+def test_labctl_on_path_follows_current(labctl_env: tuple[Path, dict[str, str]]) -> None:
+    """/usr/local/bin/labctl -> /srv/lab/current/.venv/bin/labctl: a rollback switches it."""
+    root, env = labctl_env
+    assert _install_labctl(env, "v0.1.0").returncode == 0
+    assert _install_labctl(env, "v0.0.9").returncode == 0
+    link = Path(env["LAB_BIN_DIR"]) / "labctl"
+    assert link.is_symlink()
+    assert os.readlink(link) == f"{root}/current/.venv/bin/labctl"
+    # current is v0.0.9 in the fixture; swapping it moves labctl with it
+    assert _run([str(link), "x"]).stdout.strip() == "labctl x"
+    (root / "current").unlink()
+    (root / "current").symlink_to(root / "releases" / "v0.1.0")
+    assert _run([str(link), "y"]).returncode == 0
+
+
+def test_labctl_install_failure_stops_the_release(
+    labctl_env: tuple[Path, dict[str, str]],
+) -> None:
+    _root, env = labctl_env
+    result = _install_labctl({**env, "FAKE_UV_FAIL": "1"})
+    assert result.returncode != 0
+    assert "labctl" in result.stderr
+    assert not (Path(env["LAB_BIN_DIR"]) / "labctl").exists()
+
+
+def test_labctl_install_needs_the_hosts_uv(
+    lab_root: tuple[Path, dict[str, str]], tmp_path: Path
+) -> None:
+    _, env = lab_root
+    bindir = tmp_path / "empty-bin"
+    bindir.mkdir()
+    docker = Path(env["PATH"].split(":", 1)[0]) / "docker"
+    (bindir / "docker").symlink_to(docker)
+    env = {**env, "PATH": f"{bindir}:/usr/bin:/bin", "LAB_BIN_DIR": str(tmp_path)}
+    if shutil.which("uv", path="/usr/bin:/bin"):
+        pytest.skip("a system uv on /usr/bin would be found")
+    result = _install_labctl(env)
+    assert result.returncode != 0
+    assert "bootstrap.sh" in result.stderr
+
+
+def test_release_installs_labctl_before_anything_changes() -> None:
+    text = (DEPLOY / "release.sh").read_text(encoding="utf-8")
+    install = text.index('lab_remote release.sh labctl "$tag"')
+    assert text.index("release.sh compose-pull") < install < text.index("release.sh begin")
+
+
 def test_status_names_the_current_release_tag_for_compose() -> None:
     text = (DEPLOY / "remote" / "status.sh").read_text(encoding="utf-8")
     assert re.search(r'LAB_RELEASE_TAG="\$tag" docker compose', text)
+
+
+def test_no_control_container_gets_the_docker_socket() -> None:
+    compose = (DEPLOY / "compose" / "control-plane.yml").read_text(encoding="utf-8")
+    assert "docker.sock" not in compose

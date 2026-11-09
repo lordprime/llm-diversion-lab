@@ -4,6 +4,9 @@
 #   preflight                       bootstrap + secrets done, Docker up, no cells running (exit 4)
 #   receive TAG SHA256 COMMIT WHO   read a `git archive` tar on stdin into releases/TAG
 #   begin TAG                       remember the current release as the rollback target
+#   labctl TAG                      install labctl for TAG into releases/TAG/.venv (host
+#                                   uv, the release's uv.lock); /usr/local/bin/labctl
+#                                   -> current/.venv/bin/labctl, so it follows `current`
 #   pull REF...                     docker pull each image@sha256:digest
 #   compose-pull TAG [allow-build]  check every image is pinned by digest, then pull
 #                                   (or, as a fallback, build) the control-plane images
@@ -16,13 +19,18 @@
 #   record TAG COMMIT WHO RESULT    append the deployment to deployments.jsonl
 set -Eeuo pipefail
 
-# LAB_ROOT is for the test suite only; on a host it is never set.
+# LAB_ROOT and LAB_BIN_DIR are for the test suite only; on a host they are never set.
 LAB=${LAB_ROOT:-/srv/lab}
+BIN=${LAB_BIN_DIR:-/usr/local/bin}
 REL=$LAB/releases
 STATE=$REL/.state
 ENV_FILE=$LAB/secrets/lab.env
 COMPOSE_REL=deploy/compose/control-plane.yml
 WAIT=(--wait --wait-timeout 300)
+# labctl's interpreter: installed by the base role with the host's pinned uv, the
+# control-plane image's Python minor (tests check the role, this and the image agree).
+LABCTL_PYTHON=3.12.13
+LABCTL_PYTHON_DIR=/opt/lab/python
 TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
 
 die() {
@@ -113,6 +121,27 @@ cmd_receive() {
 	chown -R lab:lab "$tmpd/tree"
 	mv -T "$tmpd/tree" "$dest"
 	echo "received $tag (commit $commit) into $dest"
+}
+
+# labctl TAG: labctl from TAG's tree, into TAG's own venv, with the host's pinned
+# uv and Python; only the locked packages (and the pinned build backend) are
+# downloaded, never an interpreter. The PATH entry is a link through `current`, so
+# activating or rolling back a release switches labctl.
+cmd_labctl() {
+	local tree venv
+	tree=$(release_tree "$1")
+	command -v uv >/dev/null 2>&1 ||
+		die "uv is not installed on this host: run bootstrap.sh (base role) first"
+	venv=$tree/.venv
+	echo "installing labctl for $1 into $venv"
+	UV_PROJECT_ENVIRONMENT=$venv UV_PYTHON_DOWNLOADS=never \
+		UV_PYTHON_INSTALL_DIR=$LABCTL_PYTHON_DIR UV_NO_CONFIG=1 \
+		uv sync --project "$tree" --frozen --no-dev --no-editable --compile-bytecode \
+		--python "$LABCTL_PYTHON" || die "could not install labctl for $1 (uv sync failed)"
+	"$venv/bin/labctl" --help >/dev/null || die "labctl for $1 does not run"
+	ln -sfn "$LAB/current/.venv/bin/labctl" "$BIN/labctl.new"
+	mv -T "$BIN/labctl.new" "$BIN/labctl"
+	echo "labctl: $BIN/labctl -> $LAB/current/.venv/bin/labctl"
 }
 
 cmd_pull() {
@@ -390,6 +419,7 @@ case $sub in
 preflight) cmd_preflight ;;
 begin) cmd_begin "$@" ;;
 receive) cmd_receive "$@" ;;
+labctl) cmd_labctl "$@" ;;
 pull) cmd_pull "$@" ;;
 compose-pull) cmd_compose_pull "$@" ;;
 migrate) cmd_migrate "$@" ;;
@@ -397,5 +427,5 @@ activate) cmd_activate "$@" ;;
 selftest) cmd_selftest ;;
 rollback) cmd_rollback ;;
 record) cmd_record "$@" ;;
-*) die "usage: release.sh preflight|begin|receive|pull|compose-pull|migrate|activate|selftest|rollback|record" ;;
+*) die "usage: release.sh preflight|begin|receive|labctl|pull|compose-pull|migrate|activate|selftest|rollback|record" ;;
 esac
