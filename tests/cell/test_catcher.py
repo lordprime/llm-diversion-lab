@@ -11,6 +11,8 @@ import hashlib
 import json
 import socket
 import struct
+import threading
+import time
 from dataclasses import fields
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,11 +25,13 @@ from dnslib.server import DNSLogger, DNSServer  # type: ignore[import-untyped]
 from fastapi.testclient import TestClient
 from pydantic import TypeAdapter
 
+from cell.catcher import dns_server
 from cell.catcher.callback_log import (
     CATCHER_DNS_STREAM,
     CATCHER_HTTP_STREAM,
     DNS_EVENTS_FILE,
     HTTP_EVENTS_FILE,
+    RECORD_FAILURE_PREFIX,
     CallbackLog,
     CatcherConfig,
 )
@@ -564,6 +568,41 @@ def test_http_storage_failure_is_loud(tmp_path: Path) -> None:
         client.get("/r/x")
 
 
+def _failure_lines(err: str) -> list[str]:
+    """Lines the runner's recording-failure scan matches (exact prefix ``catcher: cannot``)."""
+    return [line for line in err.splitlines() if line.startswith("catcher: cannot")]
+
+
+def test_record_failure_prefix_is_what_the_runner_scans_for() -> None:
+    assert RECORD_FAILURE_PREFIX.startswith("catcher: cannot")
+
+
+def test_http_storage_failure_is_logged_for_the_runner(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = _config(tmp_path)
+    app = CatcherApp(config)
+    (tmp_path / HTTP_EVENTS_FILE).unlink(missing_ok=True)
+    (tmp_path / HTTP_EVENTS_FILE).mkdir()  # appending to a directory fails
+    with TestClient(app, raise_server_exceptions=True) as client, pytest.raises(OSError):
+        client.get("/r/x")
+    [line] = _failure_lines(capsys.readouterr().err)
+    assert line.startswith(f"{RECORD_FAILURE_PREFIX} HTTP request")
+    assert "IsADirectoryError" in line
+
+
+def test_http_storage_failure_answers_500_not_the_fixed_response(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    app = CatcherApp(_config(tmp_path))
+    (tmp_path / HTTP_EVENTS_FILE).mkdir()
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post("/r/x", content=b"dump")
+    assert resp.status_code == 500
+    assert resp.content != FIXED_BODY
+    assert len(_failure_lines(capsys.readouterr().err)) == 1
+
+
 def test_body_bounds_constants() -> None:
     assert MAX_INLINE_BODY == 64 * 1024
     assert LIMIT_CONCURRENCY == 64
@@ -741,6 +780,45 @@ def test_parse_catcher_ip_rejects_bad_values(value: str) -> None:
         parse_catcher_ip(value)
 
 
+def test_dns_storage_failure_is_logged_and_raises(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    resolver = _resolver(tmp_path)
+    (tmp_path / DNS_EVENTS_FILE).unlink(missing_ok=True)
+    (tmp_path / DNS_EVENTS_FILE).mkdir()  # appending to a directory fails
+    with pytest.raises(OSError):
+        resolver.resolve(_query("x.cb.lab.test"), _handler())
+    pkt = _raw_query(0x4242, [b"\xff", b"cb", b"lab", b"test"])
+    with pytest.raises(OSError):
+        resolver.reply_unparsable(pkt, _handler())
+    lines = _failure_lines(capsys.readouterr().err)
+    assert len(lines) == 2
+    assert all(line.startswith(f"{RECORD_FAILURE_PREFIX} DNS question") for line in lines)
+
+
+def test_dns_storage_failure_over_a_real_socket_sends_no_answer(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    resolver = _resolver(tmp_path)
+    (tmp_path / DNS_EVENTS_FILE).unlink(missing_ok=True)
+    (tmp_path / DNS_EVENTS_FILE).mkdir()
+    server = DNSServer(
+        resolver,
+        port=0,
+        address="127.0.0.1",
+        logger=DNSLogger("-request,-reply"),
+        handler=LenientDNSHandler,
+    )
+    server.start_thread()
+    try:
+        port = server.server.server_address[1]
+        with pytest.raises(TimeoutError):
+            DNSRecord.question("lost.test", "A").send("127.0.0.1", port, timeout=1)
+    finally:
+        server.stop()
+    assert len(_failure_lines(capfd.readouterr().err)) == 1
+
+
 def test_dns_real_socket_smoke(tmp_path: Path) -> None:
     resolver = _resolver(tmp_path)
     server = DNSServer(
@@ -855,6 +933,67 @@ def test_dns_real_socket_non_utf8_label_udp_and_tcp(tmp_path: Path) -> None:
     assert cbs[0].token == tok
     assert all(cb.source_ip == "127.0.0.1" for cb in cbs)
     assert all(cb.body_size is None and cb.body_sha256 is None for cb in cbs)
+
+
+def _tcp_server(resolver: CatcherResolver) -> Any:
+    server = DNSServer(
+        resolver,
+        port=0,
+        address="127.0.0.1",
+        logger=DNSLogger("-request,-reply"),
+        tcp=True,
+        handler=LenientDNSHandler,
+    )
+    server.start_thread()
+    return server
+
+
+def test_dns_tcp_limits_are_bounded() -> None:
+    assert 0 < dns_server.TCP_TIMEOUT_S <= 10
+    assert 0 < dns_server.MAX_TCP_CONNECTIONS <= 64
+
+
+def test_dns_tcp_idle_connection_is_dropped_after_the_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dns_server, "TCP_TIMEOUT_S", 0.5)
+    server = _tcp_server(_resolver(tmp_path))
+    try:
+        port = server.server.server_address[1]
+        with socket.create_connection(("127.0.0.1", port), 5) as conn:
+            conn.sendall(b"\x00")  # half a length prefix, then nothing
+            started = time.monotonic()
+            assert conn.recv(16) == b""  # the server closed it
+            assert time.monotonic() - started < 4
+        # the server still answers afterwards
+        pkt = _raw_query(0x3333, [b"ok", b"test"])
+        with socket.create_connection(("127.0.0.1", port), 5) as conn:
+            conn.sendall(struct.pack("!H", len(pkt)) + pkt)
+            length = struct.unpack("!H", conn.recv(2))[0]
+            assert DNSRecord.parse(conn.recv(length)).header.id == 0x3333
+    finally:
+        server.stop()
+
+
+def test_dns_tcp_connections_beyond_the_cap_are_closed_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dns_server, "TCP_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(dns_server, "MAX_TCP_CONNECTIONS", 2)
+    monkeypatch.setattr(LenientDNSHandler, "_tcp_slots", threading.BoundedSemaphore(2))
+    server = _tcp_server(_resolver(tmp_path))
+    port = server.server.server_address[1]
+    idle = [socket.create_connection(("127.0.0.1", port), 5) for _ in range(2)]
+    try:
+        time.sleep(0.3)  # both idle handlers hold a slot
+        with socket.create_connection(("127.0.0.1", port), 5) as extra:
+            started = time.monotonic()
+            assert extra.recv(16) == b""
+            assert time.monotonic() - started < 2
+    finally:
+        for conn in idle:
+            conn.close()
+        server.stop()
 
 
 # --------------------------------------------------------------------------- CallbackLog

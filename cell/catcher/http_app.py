@@ -24,8 +24,10 @@ this order and the first verified token wins: the path (``/r/<token>``), the Hos
 ``None`` and the request is still recorded. The catcher holds no secrets and never
 classifies leaks; the labeller does that later from the raw evidence.
 
-If the event cannot be stored the request fails (500) instead of being answered, so
-evidence loss is loud. HTTPS is not served in M0.
+If the event cannot be stored the request fails (500) instead of being answered and
+``catcher: cannot record HTTP request ...`` is printed to stderr
+(:func:`~cell.catcher.callback_log.report_record_failure`), which makes the runner
+mark the run ``RECORDING_FAILED``: evidence loss is loud. HTTPS is not served in M0.
 
 Run (one process per cell; it serves every port itself so one ``seq`` counter is
 used)::
@@ -57,6 +59,7 @@ from cell.catcher.callback_log import (
     CallbackLog,
     CatcherConfig,
     parse_port,
+    report_record_failure,
 )
 from cell.catcher.classify import TokenIndex
 from control.core.models import Callback, CallbackChannel
@@ -269,7 +272,11 @@ class CatcherApp:
         build = partial(
             http_callback, contact, run_id=self._config.run_id, tokens=self._config.tokens
         )
-        await run_in_threadpool(self._log.record, build)
+        try:
+            await run_in_threadpool(self._log.record, build)
+        except Exception as exc:
+            report_record_failure("HTTP request", exc)
+            raise
 
     @staticmethod
     async def _lifespan(receive: Receive, send: Send) -> None:

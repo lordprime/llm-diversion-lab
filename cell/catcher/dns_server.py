@@ -20,8 +20,15 @@ qname exactly as received (case kept, trailing dot), the qtype name (``A``,
 
 The token is extracted from any label after lowercasing the qname, because resolvers
 may randomise case (0x20 encoding); it is set only if it verifies against the run's
-manifest. If the event cannot be stored the resolver raises and no answer is sent
-(dnslib logs the error), so evidence loss is loud.
+manifest. If the event cannot be stored the resolver prints
+``catcher: cannot record DNS question ...`` to stderr
+(:func:`~cell.catcher.callback_log.report_record_failure`) and raises, and no answer
+is sent; the runner marks the run ``RECORDING_FAILED``, so evidence loss is loud.
+
+DNS over TCP is bounded: a connection must deliver its query within
+:data:`TCP_TIMEOUT_S` or it is dropped, and at most :data:`MAX_TCP_CONNECTIONS` are
+served at once (more are closed at once), so idle connections cannot pile up threads
+until the container's ``pids_limit`` stops every new lookup.
 
 Run (one process per cell; UDP and TCP share one resolver and one ``seq`` counter)::
 
@@ -36,7 +43,9 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import socket
 import struct
+import threading
 from datetime import UTC, datetime
 from functools import partial
 from typing import Any, Final
@@ -61,12 +70,15 @@ from cell.catcher.callback_log import (
     CallbackLog,
     CatcherConfig,
     parse_port,
+    report_record_failure,
 )
 from cell.catcher.classify import TokenIndex
 from control.core.models import Callback, CallbackChannel
 
 __all__ = [
     "DNS_TTL",
+    "MAX_TCP_CONNECTIONS",
+    "TCP_TIMEOUT_S",
     "CatcherIp",
     "CatcherResolver",
     "LenientDNSHandler",
@@ -79,6 +91,10 @@ __all__ = [
 
 #: TTL of every answer: 0, so each lookup reaches the catcher again.
 DNS_TTL: Final = 0
+#: Seconds a DNS-over-TCP client has for each read and write before it is dropped.
+TCP_TIMEOUT_S: float = 5.0
+#: DNS-over-TCP connections served at once; more are closed without an answer.
+MAX_TCP_CONNECTIONS: int = 32
 
 CatcherIp = ipaddress.IPv4Address | ipaddress.IPv6Address
 
@@ -201,18 +217,24 @@ class CatcherResolver:
     def record_question(
         self, qname: str, qtype: str, source_ip: str | None, ts: datetime
     ) -> Callback:
-        """Record one question on the ``catcher-dns`` stream (raises if it cannot)."""
-        return self._log.record(
-            partial(
-                dns_callback,
-                run_id=self._config.run_id,
-                ts=ts,
-                qname=qname,
-                qtype=qtype,
-                source_ip=source_ip,
-                tokens=self._config.tokens,
-            )
+        """Record one question on the ``catcher-dns`` stream.
+
+        If it cannot, prints the recording-failure marker and raises.
+        """
+        build = partial(
+            dns_callback,
+            run_id=self._config.run_id,
+            ts=ts,
+            qname=qname,
+            qtype=qtype,
+            source_ip=source_ip,
+            tokens=self._config.tokens,
         )
+        try:
+            return self._log.record(build)
+        except Exception as exc:
+            report_record_failure("DNS question", exc)
+            raise
 
     def resolve(self, request: Any, handler: Any) -> Any:
         ts = datetime.now(UTC)
@@ -242,7 +264,28 @@ class LenientDNSHandler(DNSHandler):  # type: ignore[misc]
     dnslib rejects any label that is not valid UTF-8 before the resolver runs; this
     handler catches that, records the question via
     :meth:`CatcherResolver.reply_unparsable` and answers ``FORMERR``.
+
+    TCP connections get a socket timeout (:data:`TCP_TIMEOUT_S`) and one of
+    :data:`MAX_TCP_CONNECTIONS` slots; without a free slot a connection is closed at
+    once. A timed-out connection is dropped quietly.
     """
+
+    _tcp_slots: threading.BoundedSemaphore = threading.BoundedSemaphore(MAX_TCP_CONNECTIONS)
+
+    def handle(self) -> None:
+        if self.server.socket_type != socket.SOCK_STREAM:
+            super().handle()
+            return
+        slots = type(self)._tcp_slots
+        if not slots.acquire(blocking=False):
+            return  # over the cap: the connection is closed without an answer
+        try:
+            self.request.settimeout(TCP_TIMEOUT_S)
+            super().handle()
+        except TimeoutError:
+            return  # a client that did not send (or read) in time: drop it
+        finally:
+            slots.release()
 
     def get_reply(self, data: bytes) -> bytes:
         try:

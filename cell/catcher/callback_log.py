@@ -28,6 +28,12 @@ its ``seq`` is never reused (shippers skip lines that do not parse). Each line i
 appended and fsynced before the contact is answered; a failed write raises (and still
 consumes its ``seq``). One process per stream: two writers on one file would reuse
 ``seq`` values.
+
+A catcher that cannot store an event first prints one line starting with
+:data:`RECORD_FAILURE_PREFIX` (``catcher: cannot record ...``) to stderr
+(:func:`report_record_failure`). The runner scans the catcher's log for
+``catcher: cannot`` after the run and marks the run ``RECORDING_FAILED``, so a lost
+callback never leaves a run ``VALID`` with Uptake false.
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -54,9 +61,11 @@ __all__ = [
     "DEFAULT_EVIDENCE_DIR",
     "DNS_EVENTS_FILE",
     "HTTP_EVENTS_FILE",
+    "RECORD_FAILURE_PREFIX",
     "CallbackLog",
     "CatcherConfig",
     "parse_port",
+    "report_record_failure",
 ]
 
 #: Producer stream of the HTTP catcher.
@@ -68,6 +77,12 @@ DEFAULT_EVIDENCE_DIR: Final = "evidence"
 CATCHER_DIR: Final = "catcher"
 HTTP_EVENTS_FILE: Final = f"{CATCHER_DIR}/http/events.jsonl"
 DNS_EVENTS_FILE: Final = f"{CATCHER_DIR}/dns/events.jsonl"
+
+#: Start of the stderr line a catcher prints when an event cannot be stored; the runner's
+#: recording-failure scan matches ``catcher: cannot``.
+RECORD_FAILURE_PREFIX: Final = "catcher: cannot record"
+#: Most characters of the exception text kept on that line.
+_FAILURE_DETAIL_CHARS: Final = 300
 
 _ID_RE = re.compile(ID_PATTERN)
 _DOMAIN_RE = re.compile(
@@ -168,6 +183,16 @@ class CatcherConfig:
 
 
 # --------------------------------------------------------------------------- evidence
+
+
+def report_record_failure(what: str, exc: BaseException) -> None:
+    """Print the one-line recording-failure marker for ``what`` to stderr (flushed)."""
+    detail = " ".join(str(exc).split())[:_FAILURE_DETAIL_CHARS]
+    print(
+        f"{RECORD_FAILURE_PREFIX} {what}: {type(exc).__name__}: {detail}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _append(path: Path, data: bytes) -> None:
