@@ -161,12 +161,14 @@ jobs:
           tag="sha-${GITHUB_SHA::12}"
           if [[ "$REF_TYPE" == tag ]]; then tag="$REF_NAME"; fi
           docker tag goat-dvga:ci "$IMAGE:$tag"
-          docker push "$IMAGE:$tag"
-          # the registry digest of what was just pushed, as recorded by the daemon
-          repo_digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$tag")
-          [[ "$repo_digest" == "$IMAGE@"* ]] || { echo "unexpected RepoDigest: $repo_digest" >&2; exit 1; }
-          digest=${repo_digest#*@}
+          docker push "$IMAGE:$tag" | tee push.log
+          # the digest the registry reported for this push (the daemon's RepoDigests
+          # can list the local build name first, so it is not used)
+          digest=$(sed -n 's/^.*digest: \(sha256:[0-9a-f]*\) size: [0-9]*$/\1/p' push.log | tail -n1)
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad digest: $digest" >&2; exit 1; }
+          # and the registry must now serve exactly that digest at the tag
+          served=$(docker buildx imagetools inspect "$IMAGE:$tag" --format '{{json .Manifest}}' | jq -r .digest)
+          [[ "$served" == "$digest" ]] || { echo "registry serves $served at $IMAGE:$tag, push said $digest" >&2; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
@@ -281,12 +283,14 @@ jobs:
           tag="sha-${GITHUB_SHA::12}"
           if [[ "$REF_TYPE" == tag ]]; then tag="$REF_NAME"; fi
           docker tag lab-cell:ci "$IMAGE:$tag"
-          docker push "$IMAGE:$tag"
-          # the registry digest of what was just pushed, as recorded by the daemon
-          repo_digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$tag")
-          [[ "$repo_digest" == "$IMAGE@"* ]] || { echo "unexpected RepoDigest: $repo_digest" >&2; exit 1; }
-          digest=${repo_digest#*@}
+          docker push "$IMAGE:$tag" | tee push.log
+          # the digest the registry reported for this push (the daemon's RepoDigests
+          # can list the local build name first, so it is not used)
+          digest=$(sed -n 's/^.*digest: \(sha256:[0-9a-f]*\) size: [0-9]*$/\1/p' push.log | tail -n1)
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad digest: $digest" >&2; exit 1; }
+          # and the registry must now serve exactly that digest at the tag
+          served=$(docker buildx imagetools inspect "$IMAGE:$tag" --format '{{json .Manifest}}' | jq -r .digest)
+          [[ "$served" == "$digest" ]] || { echo "registry serves $served at $IMAGE:$tag, push said $digest" >&2; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
@@ -392,12 +396,14 @@ jobs:
           tag="sha-${GITHUB_SHA::12}"
           if [[ "$REF_TYPE" == tag ]]; then tag="$REF_NAME"; fi
           docker tag control:ci "$IMAGE:$tag"
-          docker push "$IMAGE:$tag"
-          # the registry digest of what was just pushed, as recorded by the daemon
-          repo_digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$tag")
-          [[ "$repo_digest" == "$IMAGE@"* ]] || { echo "unexpected RepoDigest: $repo_digest" >&2; exit 1; }
-          digest=${repo_digest#*@}
+          docker push "$IMAGE:$tag" | tee push.log
+          # the digest the registry reported for this push (the daemon's RepoDigests
+          # can list the local build name first, so it is not used)
+          digest=$(sed -n 's/^.*digest: \(sha256:[0-9a-f]*\) size: [0-9]*$/\1/p' push.log | tail -n1)
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad digest: $digest" >&2; exit 1; }
+          # and the registry must now serve exactly that digest at the tag
+          served=$(docker buildx imagetools inspect "$IMAGE:$tag" --format '{{json .Manifest}}' | jq -r .digest)
+          [[ "$served" == "$digest" ]] || { echo "registry serves $served at $IMAGE:$tag, push said $digest" >&2; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 

@@ -219,7 +219,7 @@ The runner sets `LAB_MAX_PARALLEL` and a per-agent concurrency cap from these nu
 
    **Building and pinning a digest:**
    1. Trigger the workflow: push a `lab-vN` tag (e.g. `git tag lab-v1 && git push origin lab-v1`; the image tag is then `lab-v1`), or run it by hand (`gh workflow run build-images.yml --ref main`, or *Actions → build-images → Run workflow*; the image tag is then `sha-<12 hex>`).
-   2. Each job reads the pushed digest from `docker image inspect` (`RepoDigests`), checks it is `sha256:` + 64 hex, and writes a ready `images.lock` entry to its job summary and to the `<name>-digest` artifact (`gh run download <run-id> -n lab-cell-digest`).
+   2. Each job takes the digest from the `docker push` output, checks it is `sha256:` + 64 hex and that the registry serves that same digest at the tag (`docker buildx imagetools inspect`), and writes a ready `images.lock` entry to its job summary and to the `<name>-digest` artifact (`gh run download <run-id> -n lab-cell-digest`).
    3. Paste the entry into `deploy/images.lock` (replacing an older entry of the same name) with its `name`, `image` (the repository, no tag), `digest`, `expect_tools` and `role`: `goat-dvga` → `target`, `lab-cell` → `infra`, `control` → `control`. cell-guard lets an agent start only `role: agent` images, so none of these three can be started from inside a cell.
    4. Commit it for review, then tag the release: `release.sh` pulls every `images.lock` entry by digest.
 

@@ -1,8 +1,8 @@
 """Shape of ``.github/workflows/build-images.yml``: the jobs that push the lab's images.
 
 Every job must pin its actions by full commit SHA, check out without persisting the
-token, hold only ``contents: read`` and ``packages: write``, read the pushed digest from
-``docker image inspect`` RepoDigests and check it, and hand over a ready
+token, hold only ``contents: read`` and ``packages: write``, take the pushed digest from
+the push output and check the registry serves it at the tag, and hand over a ready
 ``deploy/images.lock`` entry with the image's ``role``.
 """
 
@@ -94,7 +94,12 @@ def test_checkout_does_not_persist_credentials(job: str) -> None:
 def test_job_pushes_to_its_ghcr_name_and_checks_the_digest(job: str) -> None:
     assert _jobs()[job].get("env", {}).get("IMAGE") == f"ghcr.io/lordprime/{job}"
     run = _run_text(job)
-    assert "{{index .RepoDigests 0}}" in run, f"{job}: digest not read from RepoDigests"
+    assert ".RepoDigests" not in run, f"{job}: RepoDigests can name the local build first"
+    assert "tee push.log" in run, f"{job}: digest not taken from the push output"
+    assert 'docker buildx imagetools inspect "$IMAGE:$tag"' in run, (
+        f"{job}: the registry's digest at the tag is not checked"
+    )
+    assert '[[ "$served" == "$digest" ]]' in run, f"{job}: pushed and served digests not compared"
     assert "^sha256:[0-9a-f]{64}$" in run, f"{job}: digest format not checked"
     uploads = [s for s in _steps(job) if str(s.get("uses", "")).startswith("actions/upload-")]
     assert [u["with"]["name"] for u in uploads] == [f"{job}-digest"]
