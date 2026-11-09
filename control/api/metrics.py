@@ -14,12 +14,14 @@ self-test) loses nothing and two Collector processes report the same values:
   by ``runs.invalid_reason`` (the bounded :class:`~control.core.models.InvalidReason`
   set the runner records). A database CHECK makes every invalid run carry one;
   :data:`UNRECORDED_REASON` would only label a row that somehow had none.
-* ``lab_runs_in_flight`` (gauge; ``agent``): runs with ``status = 'running'``; ``0``
-  for every registered agent with none. Self-test runs count here (a cell is busy).
+* ``lab_runs_in_flight`` (gauge; ``agent``): study runs with ``status = 'running'``;
+  ``0`` for every registered agent with none.
 
-The two counters leave the self-test's own experiments out (``exp_selftest_*``,
+All three leave the self-test's own experiments out (``exp_selftest_*``,
 :data:`~control.core.selftest_status.SELFTEST_EXPERIMENT_PREFIX`): a deliberately
-failing self-test must not move the study's invalid-run rate. The self-test reports
+failing self-test must not move the study's invalid-run rate, and a killed self-test's
+run left ``running`` (until the next self-test marks it abandoned) must not read as a
+stuck study run. The self-test reports
 through ``lab_selftest_last_success_timestamp`` instead.
 * ``lab_selftest_last_success_timestamp`` (gauge): Unix time of the last passing
   self-test, from the self-test status file (:mod:`control.core.selftest_status`);
@@ -214,7 +216,10 @@ def _query(engine: Engine) -> _RunCounts:
     in_flight_q = (
         select(Agent.agent_id, func.count(Run.run_id))
         .select_from(Agent)
-        .outerjoin(Run, (Run.agent_id == Agent.agent_id) & (Run.status == RunStatus.RUNNING))
+        .outerjoin(
+            Run,
+            (Run.agent_id == Agent.agent_id) & (Run.status == RunStatus.RUNNING) & not_selftest(),
+        )
         .group_by(Agent.agent_id)
     )
     with engine.connect() as conn, conn.begin():

@@ -12,26 +12,39 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import inspect
 import io
 import ipaddress
 import json
+import signal
 import socket
+import threading
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+from dnslib import DNSRecord
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 
 from cell.probe import containment
 from control.api.app import create_app
 from control.cli import main as cli
-from control.core.models import Arm, Callback, CallbackChannel, RunManifest
+from control.core.models import (
+    Arm,
+    Callback,
+    CallbackChannel,
+    InvalidReason,
+    RunManifest,
+    RunStatus,
+)
 from control.core.selftest_status import read_selftest_status
+from control.db import tables as t
+from control.db.engine import session_scope
 from control.runner import selftest
-from control.runner.cell_spec import CellSettings, ComposeProject
+from control.runner.cell_spec import CellError, CellSettings, ComposeProject
 from control.runner.compose_backend import CellHandle, CollectReport, CommandResult, ContainerState
 from control.runner.experiment import parse_experiment, read_experiment
 from control.runner.runner import Runner
@@ -46,7 +59,16 @@ from control.runner.selftest import (
 )
 from control.runner.ship import CollectorClient
 from control.runner.store import RunStore
-from tests.runner.test_runner import IMAGES, KEY, TS, FakeBackend, _file, _write_events
+from tests.runner.test_runner import (
+    IMAGES,
+    KEY,
+    SUCCESS,
+    TS,
+    UNSUCCESSFUL,
+    FakeBackend,
+    _file,
+    _write_events,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SELFTEST_YAML = REPO_ROOT / "experiments" / "selftest.yaml"
@@ -1075,3 +1097,229 @@ def test_the_host_profile_carries_the_probe_lan() -> None:
     assert "LAB_PROBE_LAN={{ lab_probe_lan | join(',') }}" in template
     group_vars = yaml.safe_load((ansible / "group_vars" / "all.yml").read_text())
     assert group_vars["lab_probe_lan"] == "{{ lab_upstream_dns }}"
+
+
+# --------------------------------------------------------------------------- final fix pass
+
+
+def test_the_control_must_score_outcome_true(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    """The scripted agent runs importPaste in both arms, so the control's Outcome is true
+    too; a stored verdict alone (any outcome) would let a dead oracle pass."""
+    backend = SelftestBackend(done=[(0, UNSUCCESSFUL)])
+    report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=True)
+    failed = _failed(report)
+    assert "outcome False" in failed["control: oracle"]
+    assert "injected: oracle" in failed
+
+
+def test_an_oracle_reporting_success_before_the_agent_fails_the_self_test(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    backend = SelftestBackend(done=[(0, SUCCESS)])
+    report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=True)
+    failed = _failed(report)
+    assert "probe_failed" in failed["injected: valid"]
+    assert "success before the agent" in failed["control: valid"]
+    assert not any(c == "start_agent" for c, _ in backend.calls)
+
+
+def test_after_a_breach_no_later_cell_starts_its_agent(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    """Quick mode probes only the first cell; once that one is not contained, the gate
+    stays shut, so the second cell's agent never starts unprobed."""
+    backend = SelftestBackend()
+    probe_engine = ProbeEngine(reachable=lambda host, port: host == "1.1.1.1")
+    report = run_selftest(_deps(engine, collector, tmp_path, backend, probe_engine), quick=True)
+    assert report.critical and len(report.probes) == 1
+    assert not any(c == "start_agent" for c, _ in backend.calls)
+    assert {r["status"] for r in report.runs} == {"invalid"}
+    unprobed = next(r for r in report.runs if r["run_id"] != report.probes[0].run_id)
+    assert unprobed["reason"] == "cell_failed"
+
+
+def test_the_gate_latches_after_any_cell_not_proven_contained() -> None:
+    record = selftest.ProbeRecord("run_a", False, None, ("probe not run",))
+    calls: list[str] = []
+
+    class Inner:
+        def start_agent(self, cell: Any) -> None:
+            calls.append(cell.project.run_id)
+
+    class Cell:
+        def __init__(self, run_id: str) -> None:
+            self.project = type("P", (), {"run_id": run_id})()
+
+    gate = ContainmentGate(Inner(), lambda _cell: record, limit=1)  # type: ignore[arg-type]
+    for run_id in ("run_a", "run_b", "run_c"):
+        with pytest.raises(CellError):
+            gate.start_agent(Cell(run_id))  # type: ignore[arg-type]
+    assert calls == [] and len(gate.records) == 1
+
+
+def test_stale_running_selftest_runs_are_marked_abandoned_and_study_runs_never(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    def claimed(ef: Any, where: Path) -> str:
+        runner = Runner(
+            store=RunStore(engine),
+            collector=collector,
+            backend=SelftestBackend(),
+            settings=CellSettings(images=IMAGES),
+            lab_key=KEY,
+            runs_dir=where / "runs",
+            work_dir=where / "work",
+        )
+        schedule = runner.register(ef)
+        run = RunStore(engine).claim_next(ef.experiment.experiment_id, schedule)
+        assert run is not None
+        return run.run_id
+
+    killed = claimed(derive_experiment(SELFTEST_YAML, quick=True), tmp_path / "k")
+    study = claimed(read_experiment(SELFTEST_YAML), tmp_path / "s")
+    report = run_selftest(_deps(engine, collector, tmp_path / "b"), quick=True)
+    assert report.passed, _failed(report)
+    with session_scope(engine) as s:
+        old = s.get(t.Run, killed)
+        assert old is not None
+        assert (old.status, old.invalid_reason) == (RunStatus.INVALID, InvalidReason.INTERNAL)
+        assert "abandoned" in (old.invalid_detail or "") and old.finished_at is not None
+        other = s.get(t.Run, study)
+        assert other is not None and other.status is RunStatus.RUNNING
+    swept = next(c for c in report.checks if c.name == "earlier self-tests swept")
+    assert "1 abandoned" in swept.detail
+
+
+def test_selftest_runs_are_left_out_of_the_in_flight_gauge(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    from control.api.metrics import _query
+
+    ef = derive_experiment(SELFTEST_YAML, quick=True)
+    runner = Runner(
+        store=RunStore(engine),
+        collector=collector,
+        backend=SelftestBackend(),
+        settings=CellSettings(images=IMAGES),
+        lab_key=KEY,
+        runs_dir=tmp_path / "runs",
+        work_dir=tmp_path / "work",
+    )
+    schedule = runner.register(ef)
+    assert RunStore(engine).claim_next(ef.experiment.experiment_id, schedule) is not None
+    in_flight = _query(engine).in_flight
+    assert in_flight and all(count == 0 for _, count in in_flight)
+
+
+def test_a_host_with_nonlocal_bind_checks_its_own_addresses() -> None:
+    """With ip_nonlocal_bind=1 any address binds, so bind() would call a foreign gateway
+    this host's; the address must then be one the host actually has."""
+    own = {"10.0.0.5"}
+    assert selftest.is_local_address(
+        "10.0.0.5", nonlocal_bind=lambda _v: True, host_addresses=lambda: own
+    )
+    assert not selftest.is_local_address(
+        "192.0.2.1", nonlocal_bind=lambda _v: True, host_addresses=lambda: own
+    )
+    assert not selftest.is_local_address(  # addresses unknown: nothing is proven
+        "10.0.0.5", nonlocal_bind=lambda _v: True, host_addresses=lambda: None
+    )
+    assert selftest.is_local_address("127.0.0.1", nonlocal_bind=lambda _v: False)
+    assert not selftest.is_local_address("192.0.2.1", nonlocal_bind=lambda _v: False)
+    assert selftest._nonlocal_bind(4) in (True, False)  # reads this host's sysctl
+
+
+def test_host_addresses_come_from_ip_json() -> None:
+    doc = [
+        {"ifname": "lo", "addr_info": [{"family": "inet", "local": "127.0.0.1"}]},
+        {"ifname": "eth0", "addr_info": [{"family": "inet6", "local": "fe80::1"}]},
+    ]
+
+    def run(argv: Sequence[str], **_kw: Any) -> CommandResult:
+        assert list(argv[1:]) == ["-j", "address", "show"]
+        return CommandResult(tuple(argv), 0, json.dumps(doc).encode())
+
+    def failed(argv: Sequence[str], **_kw: Any) -> CommandResult:
+        return CommandResult(tuple(argv), 1, b"")
+
+    assert selftest._host_addresses(run) == {"127.0.0.1", "fe80::1"}
+    assert selftest._host_addresses(failed) is None
+
+
+def _dns_responder(answer: bool) -> tuple[socket.socket, int]:
+    """A UDP socket on 127.0.0.1 that answers one query (a DNS reply, or garbage)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+
+    def serve() -> None:
+        with contextlib.suppress(OSError):
+            data, peer = sock.recvfrom(4096)
+            reply = DNSRecord.parse(data).reply().pack() if answer else b"garbage"
+            sock.sendto(reply, peer)
+
+    threading.Thread(target=serve, daemon=True).start()
+    return sock, sock.getsockname()[1]
+
+
+@pytest.mark.parametrize(("answer", "expected"), [(True, True), (False, False)])
+def test_a_lan_resolver_that_answers_dns_answers(answer: bool, expected: bool) -> None:
+    """The host firewall may let only DNS to the LAN resolver through: a DNS reply over
+    UDP/53 proves the address answers (a non-DNS reply does not)."""
+    sock, port = _dns_responder(answer)
+    try:
+        got = selftest.lan_answers(
+            "127.0.0.1", timeout_s=1.0, tcp_ports=(), dns_port=port, use_ping=False
+        )
+        assert got is expected
+    finally:
+        sock.close()
+
+
+def test_lan_answers_probes_every_containment_lan_port() -> None:
+    default = inspect.signature(selftest.lan_answers).parameters["tcp_ports"].default
+    assert default is containment.LAN_PORTS
+
+
+def test_labctl_records_an_in_progress_marker_before_the_self_test(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A self-test killed mid-way leaves "aborted", never the previous pass, as its last
+    run; the last success stays."""
+    status = tmp_path / "state" / "selftest.json"
+    monkeypatch.setenv("LAB_ROOT", str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL", "postgresql://lab:x@127.0.0.1:9/lab")
+    monkeypatch.setattr(cli.selftest, "run_lab_selftest", lambda _c, *, quick: _report(True))
+    assert cli.main(["selftest", "--quick"]) == 0
+    seen: list[Any] = []
+
+    def killed(_context: selftest.LabContext, *, quick: bool) -> SelftestReport:
+        seen.append(read_selftest_status(status))
+        raise SystemExit(143)  # SIGTERM, as labctl maps it
+
+    monkeypatch.setattr(cli.selftest, "run_lab_selftest", killed)
+    with pytest.raises(SystemExit):
+        cli.main(["selftest", "--quick"])
+    during = seen[0]
+    assert during.last_run is not None and not during.last_run.passed
+    assert "in progress" in during.last_run.summary
+    after = read_selftest_status(status)
+    assert after.last_run is not None and not after.last_run.passed
+    assert "aborted" in after.last_run.summary
+    assert after.last_success is not None and after.last_success.passed
+
+
+def test_labctl_turns_sigterm_and_sighup_into_system_exit() -> None:
+    previous = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        cli._exit_on_signals()
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            handler = signal.getsignal(sig)
+            assert callable(handler)
+            with pytest.raises(SystemExit) as err:
+                handler(sig, None)
+            assert err.value.code == 128 + sig
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)

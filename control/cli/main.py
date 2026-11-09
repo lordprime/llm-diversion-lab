@@ -9,7 +9,9 @@ Commands (each takes ``--json`` for scripting):
 * ``labctl selftest [--quick] [--json]``: the instrumentation self-test
   (:mod:`control.runner.selftest`): one injected and one control DVGA cell with the
   scripted agent and the stub LLM, a containment probe, and the checks; the result is
-  recorded in the self-test status file (``labctl status``, ``/metrics``).
+  recorded in the self-test status file (``labctl status``, ``/metrics``), after an
+  "in progress" marker recorded before it starts. SIGTERM and SIGHUP end it through
+  ``SystemExit`` (exit 128 + signal), so its cell is still torn down.
 
 Exit status: 0 success (the self-test passed); 1 a check failed, the self-test failed
 (an unusable ``DATABASE_URL`` included: it is recorded), the database is unreachable or
@@ -26,9 +28,12 @@ and never mixes with the command's output on stdout. The database is only read (
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import shutil
+import signal
 import sys
+import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from ipaddress import IPv4Network
@@ -274,20 +279,71 @@ def _cmd_run_show(args: argparse.Namespace, settings: LabSettings) -> int:
 # --------------------------------------------------------------------- selftest
 
 
+def _exit_on_signals() -> dict[int, Any]:
+    """Make SIGTERM and SIGHUP (a stopped service, a dropped SSH session) raise
+    ``SystemExit(128 + signal)``, so ``finally`` blocks run: the runner tears the cell
+    down. Returns the previous handlers."""
+
+    def _exit(signum: int, _frame: Any) -> None:
+        raise SystemExit(128 + signum)
+
+    return {sig: signal.signal(sig, _exit) for sig in (signal.SIGTERM, signal.SIGHUP)}
+
+
+def _record(settings: LabSettings, result: SelftestResult) -> None:
+    try:
+        record_selftest_result(result, settings.selftest_status_file)
+    except OSError as exc:
+        raise _Failure(
+            f"the result could not be recorded in {settings.selftest_status_file}: {exc}"
+        ) from None
+
+
 def _cmd_selftest(args: argparse.Namespace, settings: LabSettings) -> int:
     """Run the self-test, record its result once, print it; 0 passed, 1 failed.
 
     Every failure past argument parsing is recorded, a bad ``DATABASE_URL`` and an
-    internal error included (exit 1; exit 2 is only for argparse usage errors).
+    internal error included (exit 1; exit 2 is only for argparse usage errors). Before
+    it runs, an "in progress" result (failed) is recorded, so a self-test that is
+    killed never leaves an earlier pass as the last run; SIGTERM and SIGHUP end it
+    through ``SystemExit`` (the cell is torn down) and record it as aborted.
     """
     # progress (runs, phases, problems) goes to stderr; the result to stdout
     configure_logging(level="INFO", stream=sys.stderr)
+    started = time.time()
+    _record(
+        settings,
+        SelftestResult(
+            False,
+            started,
+            args.quick,
+            f"in progress since {_when(started)} (if this stays, the self-test was aborted)",
+        ),
+    )
+    previous = _exit_on_signals()
     try:
         report = _selftest_report(args, settings)
     except Exception as exc:  # never unrecorded
         report = selftest.failed_report(
             args.quick, "internal", redact_text(f"{type(exc).__name__}: {exc}")[:300]
         )
+    except BaseException as exc:  # SystemExit (a signal), KeyboardInterrupt
+        code = exc.code if isinstance(exc, SystemExit) else type(exc).__name__
+        # if this cannot be written, the in-progress marker stays: it reads as aborted too
+        with contextlib.suppress(OSError):
+            record_selftest_result(
+                SelftestResult(
+                    False,
+                    time.time(),
+                    args.quick,
+                    f"aborted ({code}) after starting at {_when(started)}",
+                ),
+                settings.selftest_status_file,
+            )
+        raise
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
     try:
         _out(
             json.dumps(report.to_json(), indent=2, default=str)
@@ -295,15 +351,10 @@ def _cmd_selftest(args: argparse.Namespace, settings: LabSettings) -> int:
             else report.render_text()
         )
     finally:
-        try:
-            record_selftest_result(
-                SelftestResult(report.passed, report.finished_at, args.quick, report.summary),
-                settings.selftest_status_file,
-            )
-        except OSError as exc:
-            raise _Failure(
-                f"the result could not be recorded in {settings.selftest_status_file}: {exc}"
-            ) from None
+        _record(
+            settings,
+            SelftestResult(report.passed, report.finished_at, args.quick, report.summary),
+        )
     return EXIT_OK if report.passed else EXIT_FAIL
 
 

@@ -12,10 +12,12 @@ container engine. It **passes** only if all of these hold:
   (``runs.outcome``, ``runs.decided_at``) is true; the catcher recorded a callback on
   **both** channels (HTTP and DNS) whose token is the one the lab key derives for one
   of the run's own placements;
-* control run: Access, Visible and Uptake are false, its verdict is stored, no token
-  callback reached it, and no file of its evidence holds any injected run's tag or
-  token, base64 fields (``body_b64``) decoded (the labeller's forbidden-tag check
-  already made a leaking control ``contaminated``; the scan repeats it independently);
+* control run: Access, Visible and Uptake are false, its stored verdict is true (the
+  scripted agent runs the exploit in both arms; the runner's probe already required
+  the oracle to answer "not yet" before each agent), no token callback reached it,
+  and no file of its evidence holds any injected run's tag or token, base64 fields
+  (``body_b64``) decoded (the labeller's forbidden-tag check already made a leaking
+  control ``contaminated``; the scan repeats it independently);
 * **containment** (critical): before a cell is trusted, i.e. after the runner's health
   check, pre-flight probe and liveness check and before its agent starts,
   ``cell/probe/containment.py`` runs in a sibling container on the cell's agent network
@@ -28,18 +30,23 @@ container engine. It **passes** only if all of these hold:
   ``deploy/compose/control-plane.yml``) and the host's own LAN address on the host
   ports. IP literals only. Anything reachable, a must-reach that failed, or a probe
   without a complete report fails the self-test as CRITICAL and that cell's agent never
-  starts (:class:`ContainmentGate` raises: the run is invalid ``cell_failed``);
+  starts (:class:`ContainmentGate` raises: the run is invalid ``cell_failed``), nor does
+  any later cell's;
 * a "blocked" result proves something only about real addresses: the host gateway must
-  be one of this host's own addresses (checked with ``bind``) before each probe, and
-  each LAN address must answer from the host (TCP on 80/443, else ICMP) before the
-  self-test starts. Otherwise the self-test fails (not critical: nothing was reached,
+  be one of this host's own addresses (checked with ``bind``, or against the
+  interfaces' addresses where ``ip_nonlocal_bind`` lets any address bind) before each
+  probe, and each LAN address must answer from the host (TCP on the probe's
+  :data:`LAN_PORTS`, else a DNS query over UDP/53, else ICMP) before the self-test
+  starts. Otherwise the self-test fails (not critical: nothing was reached,
   but nothing was proven);
 * after teardown nothing (container, volume, network) is labelled with either run id,
   and the runs' cell work directories are gone.
 
 Before the pair runs, resources left by **earlier self-tests** are swept: those
 labelled ``lab.run_id`` with a run of an ``exp_selftest_*`` experiment (none can be
-running: the self-test holds the runner lock). Study runs' resources are never touched.
+running: the self-test holds the runner lock), and such runs still ``running`` (a
+killed self-test's) are marked invalid (``internal``, abandoned). Study runs and their
+resources are never touched.
 
 A cell that fails before its agent would start (so before the probe) is reported as a
 cell failure, not as a containment failure.
@@ -98,11 +105,19 @@ from typing import Any, Final, Protocol
 
 import httpx
 import yaml
-from sqlalchemy import Engine, func, select
+from dnslib import DNSRecord  # type: ignore[import-untyped]
+from sqlalchemy import Engine, func, select, update
 
 from cell.probe.containment import HOST_PORTS, LAN_PORTS
 from control.core.ids import new_id
-from control.core.models import Arm, CallbackChannel, EndStatus, FunnelStage, RunStatus
+from control.core.models import (
+    Arm,
+    CallbackChannel,
+    EndStatus,
+    FunnelStage,
+    InvalidReason,
+    RunStatus,
+)
 from control.core.selftest_status import MAX_SUMMARY_CHARS, SELFTEST_EXPERIMENT_PREFIX
 from control.core.tokens import derive_token
 from control.db import tables as t
@@ -360,12 +375,60 @@ def derive_experiment(
 # --------------------------------------------------------------------------- addresses
 
 
-def is_local_address(addr: str) -> bool:
-    """True if ``addr`` is one of this host's own addresses (it can be bound here)."""
+def _nonlocal_bind(version: int) -> bool:
+    """Whether this host lets a socket bind an address it does not have
+    (``net.ipv4.ip_nonlocal_bind`` / ``net.ipv6.ip_nonlocal_bind``); unknown counts as yes."""
+    path = Path(f"/proc/sys/net/ipv{version}/ip_nonlocal_bind")
+    try:
+        return path.read_text(encoding="ascii").strip() != "0"
+    except (OSError, UnicodeDecodeError):
+        return True
+
+
+def _host_addresses(run: CommandRunner | None = None) -> set[str] | None:
+    """Every address of this host's interfaces (``ip -j address show``), or ``None``."""
+    run = run or SubprocessRunner()
+    result = run([shutil.which("ip") or "ip", "-j", "address", "show"], timeout=10)
+    if result.returncode != 0:
+        return None
+    try:
+        links = json.loads(result.stdout)
+        return {
+            str(info["local"])
+            for link in links
+            for info in link.get("addr_info") or []
+            if info.get("local")
+        }
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def is_local_address(
+    addr: str,
+    *,
+    nonlocal_bind: Callable[[int], bool] = _nonlocal_bind,
+    host_addresses: Callable[[], set[str] | None] = _host_addresses,
+) -> bool:
+    """True if ``addr`` is one of this host's own addresses.
+
+    Normally: it can be bound here. On a host that allows binding foreign addresses
+    (``ip_nonlocal_bind=1``) a bind proves nothing, so ``addr`` must then be listed on
+    one of the host's interfaces (``ip -j address show``); if that list cannot be read
+    the answer is no.
+    """
     try:
         ip = ipaddress.ip_address(addr)
     except ValueError:
         return False
+    if nonlocal_bind(ip.version):
+        listed = host_addresses()
+        if listed is None:
+            return False
+        own: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+        for value in listed:
+            with contextlib.suppress(ValueError):
+                own.add(ipaddress.ip_address(value.partition("%")[0]))
+        return ip in own
     family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
     try:
         with socket.socket(family, socket.SOCK_STREAM) as sock:
@@ -375,10 +438,44 @@ def is_local_address(addr: str) -> bool:
     return True
 
 
-def lan_answers(addr: str, *, timeout_s: float = 2.0) -> bool:
+#: The DNS port a LAN resolver answers on (the host firewall may let only that through).
+DNS_PORT: Final = 53
+
+
+def dns_answers(addr: str, *, port: int = DNS_PORT, timeout_s: float = 2.0) -> bool:
+    """True if ``addr`` answers a DNS query over UDP from this host: a DNS reply to our
+    query (any rcode, REFUSED included) or an ICMP port-unreachable."""
+    query = DNSRecord.question(".", "NS")
+    family = socket.AF_INET6 if ipaddress.ip_address(addr).version == 6 else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout_s)
+            sock.connect((addr, port))
+            sock.send(query.pack())
+            data = sock.recv(4096)
+    except ConnectionRefusedError:
+        return True
+    except OSError:
+        return False
+    try:
+        reply = DNSRecord.parse(data)
+    except Exception:  # dnslib raises its own errors on garbage
+        return False
+    return bool(reply.header.qr) and reply.header.id == query.header.id
+
+
+def lan_answers(
+    addr: str,
+    *,
+    timeout_s: float = 2.0,
+    tcp_ports: Sequence[int] = LAN_PORTS,
+    dns_port: int = DNS_PORT,
+    use_ping: bool = True,
+) -> bool:
     """True if ``addr`` answers from this host: TCP on a probed LAN port (a connection or
-    a refusal both answer), else one ICMP echo (``ping``)."""
-    for port in LAN_PORTS:
+    a refusal both answer; the containment probe's :data:`LAN_PORTS`), else a DNS query
+    over UDP (:func:`dns_answers`), else one ICMP echo (``ping``)."""
+    for port in tcp_ports:
         try:
             with socket.create_connection((addr, port), timeout=timeout_s):
                 return True
@@ -386,6 +483,10 @@ def lan_answers(addr: str, *, timeout_s: float = 2.0) -> bool:
             return True
         except OSError:
             continue
+    if dns_answers(addr, port=dns_port, timeout_s=timeout_s):
+        return True
+    if not use_ping:
+        return False
     ping = shutil.which("ping")
     if ping is None:
         return False
@@ -642,7 +743,8 @@ class ContainmentGate:
     Everything is delegated to ``inner``; :meth:`start_agent` first runs ``probe`` (for
     the first ``limit`` cells, all if ``None``) and raises :class:`CellError` if the cell
     is not proven contained, so the agent never starts there and the runner tears it
-    down.
+    down. The gate then stays shut: no later cell's agent starts, probed or not (the
+    cells differ only by subnet, so one breach speaks for all).
     """
 
     def __init__(
@@ -651,13 +753,17 @@ class ContainmentGate:
         self._inner = inner
         self._probe = probe
         self._limit = limit
+        self._shut: str | None = None
         self.records: list[ProbeRecord] = []
 
     def start_agent(self, cell: CellHandle) -> None:
+        if self._shut is not None:
+            raise CellError(f"not started: the cell of run {self._shut} was not proven contained")
         if self._limit is None or len(self.records) < self._limit:
             record = self._probe(cell)
             self.records.append(record)
             if not record.contained:
+                self._shut = record.run_id
                 log.error(
                     "selftest: cell of run %s is NOT proven contained: %s",
                     record.run_id,
@@ -932,12 +1038,43 @@ def run_selftest(
     return report
 
 
+#: ``invalid_detail`` of a self-test run found still ``running`` by a later self-test.
+ABANDONED_DETAIL: Final = (
+    "abandoned: still running when a later self-test took the runner lock (the self-test "
+    "that ran it was killed)"
+)
+
+
 def _sweep_earlier(deps: SelftestDeps) -> Check:
-    """Remove what earlier self-tests left (never a study run's resources)."""
+    """Remove what earlier self-tests left (never a study run's resources).
+
+    Called holding the runner lock, so no self-test run can be running: any still
+    ``running`` belongs to a killed self-test and is marked invalid (``internal``,
+    :data:`ABANDONED_DETAIL`). Study runs are never touched.
+    """
     try:
         labelled = deps.resources.labelled_run_ids()
     except Exception as exc:
         return Check("earlier self-tests swept", False, f"cannot list: {exc}"[:300])
+    selftest_experiment = t.Run.experiment_id.startswith(
+        SELFTEST_EXPERIMENT_PREFIX, autoescape=True
+    )
+    with session_scope(deps.engine) as s:
+        abandoned = list(
+            s.scalars(
+                update(t.Run)
+                .where(selftest_experiment, t.Run.status == RunStatus.RUNNING)
+                .values(
+                    status=RunStatus.INVALID,
+                    invalid_reason=InvalidReason.INTERNAL,
+                    invalid_detail=ABANDONED_DETAIL,
+                    finished_at=func.now(),
+                )
+                .returning(t.Run.run_id)
+            )
+        )
+    if abandoned:
+        log.warning("selftest: earlier self-test runs left running, now invalid: %s", abandoned)
     with session_scope(deps.engine) as s:
         selftest_runs = set(
             s.scalars(
@@ -982,7 +1119,12 @@ def _sweep_earlier(deps: SelftestDeps) -> Check:
                 removed.append(by_dir[directory.name])
     if removed:
         log.warning("selftest: swept what earlier self-tests left: %s", removed)
-    detail = f"removed resources of {len(removed)} earlier self-test runs" if removed else ""
+    notes = []
+    if removed:
+        notes.append(f"removed resources of {len(removed)} earlier self-test runs")
+    if abandoned:
+        notes.append(f"marked {len(abandoned)} abandoned running self-test runs invalid")
+    detail = "; ".join(notes)
     if left:
         return Check("earlier self-tests swept", False, f"still there: {json.dumps(left)[:300]}")
     return Check("earlier self-tests swept", True, detail)
@@ -1057,12 +1199,7 @@ def _check_results(
         outcome, decided_at = _stored_verdict(deps.engine, result.run_id)
         if result.arm is Arm.INJECTED:
             checks.append(_funnel_check(name, labels, want_true=tuple(FunnelStage)))
-            ok = outcome is True and decided_at is not None
-            checks.append(
-                Check(
-                    f"{name}: oracle", ok, "" if ok else f"stored verdict {outcome}, {decided_at}"
-                )
-            )
+            checks.append(_oracle_check(name, outcome, decided_at))
             checks.append(_callback_check(deps, result.run_id))
         else:
             checks.append(
@@ -1072,8 +1209,8 @@ def _check_results(
                     want_false=(FunnelStage.ACCESS, FunnelStage.VISIBLE, FunnelStage.UPTAKE),
                 )
             )
-            ok = outcome is not None and decided_at is not None
-            checks.append(Check(f"{name}: oracle", ok, "" if ok else "no stored verdict"))
+            # the scripted agent runs importPaste in both arms: the control succeeds too
+            checks.append(_oracle_check(name, outcome, decided_at))
             checks.append(_control_clean(deps, result.run_id, needles))
         record = probed.get(result.run_id)
         if record is not None:
@@ -1105,6 +1242,14 @@ def _check_results(
             Check("contained", False, "not probed: the first cell failed before its agent")
         )
     return checks
+
+
+def _oracle_check(arm: str, outcome: bool | None, decided_at: Any) -> Check:
+    """The stored verdict is Outcome true (the oracle answered "not yet" before the agent,
+    which the runner's probe requires, and saw the scripted exploit after it)."""
+    ok = outcome is True and decided_at is not None
+    detail = "" if ok else f"stored verdict: outcome {outcome}, decided at {decided_at}"
+    return Check(f"{arm}: oracle", ok, detail)
 
 
 def _funnel_check(
