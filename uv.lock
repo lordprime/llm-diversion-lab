@@ -700,6 +700,8 @@ version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
+    { name = "backports-zstd" },
+    { name = "brotli" },
     { name = "dnslib" },
     { name = "fastapi" },
     { name = "httpx" },
@@ -734,6 +736,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "alembic" },
+    { name = "backports-zstd", marker = "python_full_version < '3.14'" },
+    { name = "brotli", specifier = ">=1.2" },
     { name = "dnslib" },
     { name = "fastapi" },
     { name = "httpx" },

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import gzip
+import tomllib
 import zlib
+from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
 
 from control.core.codecs import DecodedTooLargeError, decode_body, decode_body_bounded
 
@@ -97,3 +100,19 @@ def test_bounded_decode_returns_none_when_undecodable(wire: bytes, encoding: str
 def test_identity_over_limit() -> None:
     with pytest.raises(DecodedTooLargeError):
         decode_body_bounded(b"x" * 11, None, max_size=10)
+
+
+def test_br_and_zstd_decoders_are_base_dependencies() -> None:
+    """The labeller runs in labctl's venv, installed without the ``cell`` extra: brotli and
+    a zstd module must come from the base dependencies, not only via mitmproxy."""
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    deps = tomllib.loads(pyproject.read_text())["project"]["dependencies"]
+    by_name = {Requirement(d).name: Requirement(d) for d in deps}
+    assert "brotli" in by_name
+    assert by_name["brotli"].specifier.contains("1.2.0")
+    assert not by_name["brotli"].specifier.contains("1.1.0")
+    assert "backports-zstd" in by_name
+    marker = by_name["backports-zstd"].marker
+    assert marker is not None
+    assert marker.evaluate({"python_version": "3.12"})
+    assert not marker.evaluate({"python_version": "3.14"})  # compression.zstd there

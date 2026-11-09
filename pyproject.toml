@@ -17,6 +17,10 @@ dependencies = [
     "pyyaml",
     "psycopg[binary]>=3",
     "prometheus-client>=0.26.0",
+    # Content-Encoding br/zstd for the labeller (control.core.codecs), which runs in
+    # labctl's venv without the `cell` extra; Python 3.14 has compression.zstd.
+    "brotli>=1.2",
+    "backports-zstd; python_version < '3.14'",
 ]
 
 [project.scripts]
