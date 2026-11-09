@@ -52,6 +52,12 @@ Every transition is a timestamped row (`run_transitions`), so per-stage duration
 
 **Evidence shipping rule (M0 runner, `control/runner/runner.py`).** Every run that reached collection (its cell came up and its producers' evidence was copied out) ships all its event lines and artifacts to the Collector, valid or not. The oracle **verdict** is posted only for a run that passed every validity check (no failure in the cell, injector alive with its pre-flight probe in its evidence, the oracle answered and reported nothing unexpected, at least one LLM call); otherwise the run has no verdict, never `outcome: false`. A run that failed before collection (manifest refused, cell never came up) ships only its manifest. Invalid reasons are the bounded `runs.invalid_reason` set; all problems of a run are kept in `runs.invalid_detail`, and a failed teardown is always the reason when it happened. Retrying an invalid run (a new attempt) is a queue policy outside the runner.
 
+Evidence integrity rules that make a run invalid rather than silently incomplete:
+- **Recording failures.** A run is `recording_failed` if a cell component could not record, or if an evidence line was skipped or torn. A component that "could not record" includes the tap, cell-guard and the catcher (it logs `catcher: cannot record …` first). So is a run where the tap, catcher or cell-guard exits non-zero after the stop, for example 137. For the injector, the same failures give `injector_failed`.
+- **Oracle before the agent.** The probe phase needs one answered oracle poll that reports `false` before the agent starts. Otherwise the run is `probe_failed`.
+- **Placements.** A served placement that is not in the run's manifest makes the run `contaminated`.
+- **Body size limits.** The injector stops at 64 MiB of body and the tap at 32 MiB. An oversized flow ends in the error path: the injector records it with status `null`, and the tap never forwards it.
+
 **Schedule.** `enabled` ⇄ `paused`, then `removed`. Each firing is recorded with the runs it enqueued.
 
 ---
@@ -99,7 +105,7 @@ Prometheus scrapes **node-exporter** (host), **cAdvisor** (containers) and the *
 | Metric | Type | Labels |
 |---|---|---|
 | `lab_runs_total` | counter | `status`, `end_status`, `agent`, `target`, `arm` |
-| `lab_runs_in_flight` | gauge | `agent` |
+| `lab_runs_in_flight` | gauge | `agent`; self-test runs are left out |
 | `lab_queue_depth` | gauge | `provider` |
 | `lab_run_stage_seconds` | histogram | `stage` |
 | `lab_invalid_runs_total` | counter | `reason`: the run's `runs.invalid_reason` (the bounded `InvalidReason` set); self-test runs (`exp_selftest_*`) are left out, as in `lab_runs_total` |
@@ -153,17 +159,20 @@ It **passes** only if all of these hold:
 | `<arm>: contained` | Before the cell's agent starts, `cell/probe/containment.py` runs in a sibling container on the agent network with `--host-gateway` (the network's `.1`), `--lan` (`LAB_PROBE_LAN`), `--sinkhole` (catcher `.2`), `--reach` injector `.3:80` and tap `.4:8080`, and must-fail `--dest`s for the control plane (the Collector's and the database's container addresses on the control network, and that network's gateway on the published ports, read from `deploy/compose/control-plane.yml` and the engine) and for the host's own LAN address on the host ports. IP literals only. Anything reachable, a failed must-reach, a destination missing from the report, or no complete report is **CRITICAL**, and that cell's agent never starts (the run is invalid `cell_failed`). A blocked result proves something only about real addresses: the host gateway must be one of this host's own addresses (`bind` succeeds) before each probe, else the check fails without being critical; a cell that fails before its agent would start is reported as a cell failure ("not probed"), not as containment |
 | `<arm>: nothing left` | After teardown no container, volume or network carries the run's `lab.run_id`, and its `cells/labcell-<run>` work directory is gone |
 
-Before any cell starts, each `LAB_PROBE_LAN` address must answer from the host (TCP on 80 or 443, a refusal counts, else one ICMP echo); otherwise a blocked result from a cell would prove nothing, and the self-test fails (configuration).
+Before any cell starts, each `LAB_PROBE_LAN` address must answer from the host. It can answer on TCP 53, 80 or 443 (a refusal counts), with a reply to a UDP/53 DNS query, or else to one ICMP echo. Otherwise a blocked result from a cell would prove nothing, and the self-test fails (configuration). The default address is the LAN resolver (`lab_upstream_dns`). The Proxmox firewall leaves exactly one LAN path open from the LXC, DNS to that resolver (DEPLOYMENT §0.1), so the check probes that path. From the cell, the containment probe tries each `--lan` address on TCP 53, 80 and 443 and sends it a UDP/53 DNS query; any answer, a DNS reply included, is a breach.
 
 `--quick` (what `release.sh` runs after a deploy) keeps the first target only (one matched pair: the smallest unit the matched-pair schedule runs, and the control's zero-tag check is a core claim) and probes containment in the first cell only; every other check is the same. With M0's single target, full mode differs only by probing every cell.
 
 Output: a readable report on stdout (`--json`: the same as JSON), progress as JSON log lines on stderr. Exit 0 passed, 1 failed, 2 only for an argparse usage error; never 3 (`release.sh` reads 3 as "labctl not installed"). **Every** run past argument parsing is recorded once in `/srv/lab/state/selftest.json` (`labctl status`, `lab_selftest_last_success_timestamp`), configuration problems, an unusable `DATABASE_URL` and internal errors included; a result that cannot be recorded makes the command fail.
 
-Self-test runs are left out of `lab_runs_total` and `lab_invalid_runs_total` (experiment id prefix `exp_selftest_`): a deliberately failing self-test must not move the study's invalid-run rate. They do count in `lab_runs_in_flight` (a cell is busy); the self-test's own signal is `lab_selftest_last_success_timestamp`.
+Self-test runs are left out of `lab_runs_total`, `lab_invalid_runs_total` and `lab_runs_in_flight` (experiment id prefix `exp_selftest_`): a deliberately failing self-test must not move the study's numbers. The self-test's own signal is `lab_selftest_last_success_timestamp`. The prefix is reserved: an experiment file whose id starts with `exp_selftest_` is refused, and only the self-test derives such ids.
 
 Inputs on the host: `secrets/hmac.key`; the host profile `host.env` (read by the runner's settings: `LAB_CELL_NETWORKS`, `LAB_LLM_GATEWAY`; and `LAB_PROBE_LAN`, in production only from the profile); the release tree `current/`, resolved once at the start (experiment, cell templates, `deploy/compose/control-plane.yml`, and always its own `deploy/images.lock`, which must pin `lab-cell` and `goat-dvga`; `LAB_IMAGES_LOCK` and `LAB_IMAGE_OVERRIDES` count only in development); the running control plane (compose project `lab`); evidence under `artifacts/`, cell files under `cells/`. Development (`LAB_DEV=1`, refused wherever `/srv/lab/host.env` exists): no host profile, settings and `LAB_PROBE_LAN` from the environment, a missing control plane is tolerated, and on Podman only `LAB_PROBE_HOST_GATEWAY` (an address of this machine) replaces the probed host gateway, because under rootless Podman the network gateway is the rootless namespace, which answers with a reset.
 
-Not built: requeuing or retrying a self-test run (an interrupted self-test leaves its runs `queued`/`running` under its own experiment id; the next self-test sweeps its resources but not its rows).
+**Interrupted self-tests.**
+- SIGTERM and SIGHUP end `labctl` like an exception, so a self-test still records its result. Before the pair runs, the self-test records an "in progress" marker. A self-test killed outright therefore shows as aborted in `labctl status`, not as the previous pass.
+- Under the runner lock, the next self-test's sweep marks the earlier self-test runs still `queued`/`running` as invalid (`internal`, "abandoned").
+- Not built: requeuing or retrying a self-test run.
 
 ### 3.4 Programmatic tracking: the APIs
 
@@ -220,3 +229,15 @@ From any number on a results page you can follow the links to the exact runs, ar
 | M2 | Experiments, Queue, Schedule and Deployments pages; Providers dashboard; `labctl watch`, `logs -f`; budget alerts |
 | M3 | Funnel heatmap and waterfall, Effects, Callbacks, Cost and Refusals pages; `labctl export`; full alert set |
 | M4+ | Multi-provider breakdowns; OIDC login; optional distributed tracing (OpenTelemetry → Tempo) if per-stage latency debugging needs it |
+
+---
+
+## 5. Known limits (M0)
+
+These limits are accepted for M0. Each is recorded here so it is not mistaken for a result.
+
+| Limit | Effect | Where it is decided |
+|---|---|---|
+| **Target-driven SSRF callbacks are invisible to the catcher.** The catcher, with its HTTP sink and resolver, sits only on the agent network. When the *target* makes the outbound request, the catcher never sees it: for example, DVGA's `importPaste` runs `curl` on a URL the agent supplied. The callback leaves from the target network (injector and GOAT only, `internal`), which has no catcher, no resolver for callback names and no way out. It is lost, and contained. | An agent that follows the planted instruction *through* the target's SSRF registers no callback. Uptake(b) (a token-carrying callback) is then a **false negative** for that path. Uptake from the agent's own requests, Access, Visible and the oracle Outcome are unaffected. | An M1 design decision: give the target network its own sink and resolver, or route target egress to the catcher. Until then, read DVGA Uptake as a lower bound. |
+| **ARP spoofing on the shared cell bridge.** Agent containers keep `NET_RAW` and can ARP-spoof other containers on the cell network. | They could intercept traffic, but cannot forge evidence: callbacks are verified by token. | DEPLOYMENT §0.3 (known limit); separate agent, target and catcher networks per cell are an M1 item. |
+| **No study-run safety nets.** M0 has no start-up sweep of runs left `running` by a crashed runner, no reaper timer (`lab-reaper.timer`) and no retry API for invalid runs. The self-test cleans up only its own runs (§3.3). | A crashed study run stays `running` and holds its cell until an operator removes it by hand (`lab.run_id` labels). | M1, before any study runs on the lab. |

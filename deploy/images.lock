@@ -10,6 +10,9 @@
 #      tag), keeping its role: goat-dvga -> target, lab-cell -> infra,
 #      control -> control;
 #   3. commit it for review; release.sh pulls exactly these image@digest refs.
+# After a package's first build, make it public on GHCR (no secrets are in the
+# images; the host pulls anonymously and never logs in), then check an anonymous
+# `docker pull <image>@<digest>` works (docs/DEPLOYMENT.md §0.5).
 #
 # expect_tools: commands a smoke check expects on PATH inside the image.
 # role: agent | target | infra | control. cell-guard lets an agent start only

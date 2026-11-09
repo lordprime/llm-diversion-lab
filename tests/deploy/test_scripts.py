@@ -1330,6 +1330,37 @@ def test_deployment_doc_states_the_postgres_version_rollback_needs() -> None:
     )
 
 
+def test_deployment_quickstarts_use_the_release_flags_the_images_need() -> None:
+    """§0.7 and §4.4 match §4.2: --allow-build while the control image is built on the
+    host, --skip-selftest named while lab-cell or goat-dvga is not pinned yet."""
+    text = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    compose = _load_yaml(DEPLOY / "compose" / "control-plane.yml")
+    builds = "build" in compose["x-control-image"]
+    pinned = {e["name"] for e in _load_yaml(DEPLOY / "images.lock")["images"]}
+    unpinned = {"lab-cell", "goat-dvga"} - pinned
+    fenced: list[str] = []
+    current: list[str] | None = None
+    for line in text.splitlines():
+        if line.startswith("```"):
+            if current is None:
+                current = []
+            else:
+                fenced.append("\n".join(current))
+                current = None
+        elif current is not None:
+            current.append(line)
+    blocks = [b for b in fenced if "./deploy/release.sh" in b]
+    assert len(blocks) == 2, "expected the two quickstarts (§0.7, §4.4)"
+    for block in blocks:
+        (release,) = [line for line in block.splitlines() if "./deploy/release.sh" in line]
+        if builds:
+            assert "--allow-build" in release, release
+        if unpinned:
+            assert "--skip-selftest" in block, block
+    if unpinned:
+        assert "Make the three GHCR packages public" in text
+
+
 def test_rollback_reports_when_the_old_release_cannot_start(
     lab_root: tuple[Path, dict[str, str]],
 ) -> None:
