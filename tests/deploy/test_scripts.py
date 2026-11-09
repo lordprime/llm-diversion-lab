@@ -1666,6 +1666,69 @@ def test_ansible_syntax_check(rendered_inventory: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+MADISON = [
+    " docker-ce | 5:29.9.3-1~ubuntu.24.04~noble | https://download.docker.com/linux/ubuntu"
+    " noble/stable amd64 Packages",
+    " docker-ce | 5:29.8.2-1~ubuntu.24.04~noble | https://download.docker.com/linux/ubuntu"
+    " noble/stable amd64 Packages",
+    " docker-ce | 5:29.8.1-1~ubuntu.24.04~noble | https://download.docker.com/linux/ubuntu"
+    " noble/stable amd64 Packages",
+    " docker-ce | 5:29.1.0-1~ubuntu.24.04~noble | https://download.docker.com/linux/ubuntu"
+    " noble/stable amd64 Packages",
+]
+
+
+@pytest.mark.parametrize(
+    ("minor", "installed", "chosen"),
+    [
+        ("29.8", "", "5:29.8.2-1~ubuntu.24.04~noble"),  # the newest patch of the minor
+        ("29.9", "", "5:29.9.3-1~ubuntu.24.04~noble"),
+        ("29.1", "", ""),  # 29.1.0 is the only candidate, and it is excluded
+        ("29.8", "5:29.8.1-1~ubuntu.24.04~noble", "5:29.8.1-1~ubuntu.24.04~noble"),  # kept
+        ("29.8", "5:29.1.0-1~ubuntu.24.04~noble", "5:29.8.2-1~ubuntu.24.04~noble"),
+        ("29.5", "", ""),
+    ],
+)
+def test_docker_version_choice_runs_through_ansible(
+    tmp_path: Path, minor: str, installed: str, chosen: str
+) -> None:
+    """The role's own "Choose the docker-ce version" task, run by ansible-playbook on
+    apt-cache madison lines (a regex that never matched made every bootstrap fail)."""
+    playbook_cmd = _require_tool("ansible-playbook", ANSIBLE_CORE)
+    tasks = _load_yaml(ANSIBLE / "roles" / "docker" / "tasks" / "main.yml")
+    (choose,) = [t for t in tasks if t.get("name") == "Choose the docker-ce version"]
+    play = [
+        {
+            "hosts": "localhost",
+            "connection": "local",
+            "gather_facts": False,
+            "vars": {
+                "docker_ce_minor": minor,
+                "docker_ce_forbidden_versions": ["29.1.0"],
+                "docker_madison": {"stdout_lines": MADISON},
+                "docker_installed": {"rc": 0 if installed else 1, "stdout": installed},
+            },
+            "tasks": [
+                choose,
+                {"ansible.builtin.debug": {"msg": "CHOSEN=[{{ docker_ce_version }}]"}},
+            ],
+        }
+    ]
+    path = tmp_path / "choose.yml"
+    path.write_text(yaml.safe_dump(play, sort_keys=False), encoding="utf-8")
+    env = dict(
+        os.environ,
+        ANSIBLE_LOCALHOST_WARNING="False",
+        ANSIBLE_INVENTORY_UNPARSED_WARNING="False",
+        ANSIBLE_NOCOLOR="1",
+    )
+    result = _run([*playbook_cmd, "-i", "localhost,", str(path)], env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    match = re.search(r"CHOSEN=\[([^\]]*)\]", result.stdout)
+    assert match, result.stdout
+    assert match.group(1) == chosen
+
+
 def test_ansible_lint_clean() -> None:
     lint = _require_tool("ansible-lint", ANSIBLE_LINT)
     env = dict(os.environ, ANSIBLE_CONFIG=str(ANSIBLE / "ansible.cfg"))
