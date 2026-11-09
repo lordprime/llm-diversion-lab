@@ -7,11 +7,14 @@ real-connector tests, which aim the socket at a listener (or a closed port) on
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import socket
+import struct
 import subprocess
 import sys
+import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -21,6 +24,7 @@ from cell.probe import containment
 from cell.probe.containment import (
     ALL_CATEGORIES,
     DEFAULT_INTERNET,
+    LAN_PORTS,
     MAX_TIMEOUT_S,
     MIN_TIMEOUT_S,
     Category,
@@ -35,7 +39,9 @@ from cell.probe.containment import (
     main,
     parse_destination,
     probe,
+    probe_addresses,
     tcp_connect,
+    udp_dns_query,
 )
 
 TAP_IP = "10.88.0.10"
@@ -105,6 +111,17 @@ def _outcomes(report: ContainmentReport) -> dict[str, Outcome]:
 
 def _contained_probe(dests: list[Destination]) -> ContainmentReport:
     return probe(dests, connect=_only_reach, resolve=_resolve_tap)
+
+
+def _silent_query(host: str, port: int, timeout: float) -> bytes:
+    """Nothing answers a UDP DNS query (the expected result under DROP)."""
+    raise TimeoutError("timed out")
+
+
+@pytest.fixture(autouse=True)
+def no_real_udp_queries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default set queries every LAN address over UDP: never from a test machine."""
+    monkeypatch.setattr(containment, "udp_dns_query", _silent_query)
 
 
 @pytest.fixture
@@ -233,6 +250,182 @@ def test_dns_resolving_to_a_real_address_is_reachable() -> None:
     (result,) = report.results
     assert result.outcome is Outcome.REACHABLE
     assert not result.ok
+
+
+# --------------------------------------------------------------------- DNS over UDP to the LAN
+
+LAN_DNS = Destination(Category.LAN, Kind.UDP_DNS, "192.168.1.1", 53)
+
+
+def test_lan_ports_include_the_resolver() -> None:
+    """The documented firewall's one open LAN path (DNS to the resolver) is probed."""
+    assert set(LAN_PORTS) >= {53, 80, 443}
+
+
+def test_default_set_queries_every_lan_address_over_udp_and_tcp_53(
+    route_file: Callable[[str], str],
+) -> None:
+    dests = default_destinations(
+        host_gateway="172.30.0.1", lan=["192.168.1.1", "10.0.0.1"],
+        route_file=route_file(ROUTE_INTERNAL),
+    )  # fmt: skip
+    lan = {(d.kind, d.target, d.port) for d in dests if d.category is Category.LAN}
+    for addr in ("192.168.1.1", "10.0.0.1"):
+        assert (Kind.UDP_DNS, addr, 53) in lan
+        assert {(Kind.TCP, addr, port) for port in LAN_PORTS} <= lan
+
+
+def test_any_udp_dns_answer_from_the_lan_is_a_breach() -> None:
+    report = probe([LAN_DNS], query=lambda host, port, timeout: b"\x12\x34\x81\x80")
+    (result,) = report.results
+    assert result.outcome is Outcome.REACHABLE
+    assert not result.ok
+    assert report.breaches == (result,)
+
+
+@pytest.mark.parametrize(
+    ("exc", "outcome", "ok"),
+    [
+        (TimeoutError("timed out"), Outcome.TIMEOUT, True),
+        (OSError(errno.EHOSTUNREACH, "No route to host"), Outcome.UNREACHABLE, True),
+        (OSError(errno.EPERM, "Operation not permitted"), Outcome.UNREACHABLE, True),
+        (ConnectionRefusedError(errno.ECONNREFUSED, "refused"), Outcome.REFUSED, False),
+        (RuntimeError("probe bug"), Outcome.ERROR, False),
+    ],
+)
+def test_udp_dns_outcomes(exc: BaseException, outcome: Outcome, ok: bool) -> None:
+    def query(host: str, port: int, timeout: float) -> bytes:
+        raise exc
+
+    (result,) = probe([LAN_DNS], query=query).results
+    assert (result.outcome, result.ok) == (outcome, ok)
+
+
+def test_udp_dns_alone_does_not_cover_the_lan() -> None:
+    dests = [d for d in ALL if d.category is not Category.LAN] + [LAN_DNS]
+    report = probe(dests, connect=_only_reach, resolve=_resolve_tap, query=_silent_query)
+    assert all(r.ok for r in report.results)
+    assert report.missing_categories == {Category.LAN}
+
+
+def test_default_set_with_an_answering_lan_resolver_is_not_contained(
+    route_file: Callable[[str], str],
+) -> None:
+    dests = default_destinations(
+        host_gateway="172.30.0.1", lan=["192.168.1.1"], reach=[("tap", 8080)],
+        route_file=route_file(ROUTE_INTERNAL),
+    )  # fmt: skip
+    answered = probe(
+        dests, connect=_only_reach, resolve=_resolve_tap, query=lambda h, p, t: b"answer"
+    )
+    assert not is_contained(answered)
+    assert [r.destination for r in answered.breaches] == [LAN_DNS]
+
+
+def test_an_injected_connector_also_answers_udp_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A faked network is faked entirely: no real datagram leaves a test."""
+
+    def real_udp(host: str, port: int, timeout: float) -> bytes:
+        raise AssertionError("a real UDP query was sent")
+
+    monkeypatch.setattr(containment, "udp_dns_query", real_udp)
+    tried: list[tuple[str, int]] = []
+
+    def connect(host: str, port: int, timeout: float) -> None:
+        tried.append((host, port))
+        if host != "192.168.1.1":
+            raise TimeoutError("timed out")
+
+    report = probe([LAN_DNS, Destination(Category.LAN, Kind.UDP_DNS, "10.0.0.1", 53)], connect)
+    assert [r.outcome for r in report.results] == [Outcome.REACHABLE, Outcome.TIMEOUT]
+    assert tried == [("192.168.1.1", 53), ("10.0.0.1", 53)]
+    (real,) = probe([LAN_DNS]).results  # the real connector: the real UDP query
+    assert "a real UDP query was sent" in real.detail
+
+
+def test_udp_dns_targets_follow_the_must_fail_rules() -> None:
+    for target in ("127.0.0.1", "192.0.2.1", "resolver.lan"):
+        dest = Destination(Category.LAN, Kind.UDP_DNS, target, 53)
+        (result,) = probe([dest], query=lambda h, p, t: b"answer").results
+        assert result.outcome is Outcome.ERROR, target
+    reach = Destination(Category.REACH, Kind.UDP_DNS, "10.88.0.10", 53)
+    assert probe([reach], query=lambda h, p, t: b"x").results[0].outcome is Outcome.ERROR
+
+
+@contextlib.contextmanager
+def _udp_server(reply: bool) -> Iterator[tuple[int, list[bytes]]]:
+    """A loopback UDP responder: echoes each query's id in a minimal DNS reply."""
+    received: list[bytes] = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.settimeout(0.2)
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                data, peer = sock.recvfrom(4096)
+            except TimeoutError:
+                continue
+            received.append(data)
+            if reply:
+                sock.sendto(data[:2] + b"\x81\x80" + data[4:], peer)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield sock.getsockname()[1], received
+    finally:
+        stop.set()
+        thread.join(2)
+        sock.close()
+
+
+def test_real_udp_dns_query_returns_the_answer() -> None:
+    with _udp_server(reply=True) as (port, received):
+        data = udp_dns_query("127.0.0.1", port, 2.0)
+    (query,) = received
+    _qid, flags, qdcount = struct.unpack("!HHH", query[:6])
+    assert (flags, qdcount) == (0x0100, 1)  # one recursive question
+    assert b"\x07example\x03com\x00" in query
+    assert data[:2] == query[:2]
+
+
+def test_real_udp_dns_query_times_out_on_silence() -> None:
+    with _udp_server(reply=False) as (port, received), pytest.raises(TimeoutError):
+        udp_dns_query("127.0.0.1", port, 1.0)
+    assert len(received) == 1
+
+
+def test_real_udp_dns_query_to_a_closed_port_is_refused() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    with pytest.raises(ConnectionRefusedError):
+        udp_dns_query("127.0.0.1", port, 2.0)
+
+
+# --------------------------------------------------------------------- the probe's own address
+
+
+def test_probe_addresses_are_the_source_towards_each_sinkhole() -> None:
+    assert probe_addresses(["127.0.0.1", "127.0.0.1"]) == ("127.0.0.1",)
+    assert probe_addresses([]) == ()
+    assert probe_addresses(["not-an-ip"]) == ()
+
+
+def test_report_carries_the_probe_addresses() -> None:
+    report = ContainmentReport(results=(), probe_addresses=("10.88.0.7",))
+    assert json.loads(report.to_json())["probe_addresses"] == ["10.88.0.7"]
+
+
+def test_main_reports_its_own_address_towards_the_catcher(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main([*FULL_CLI, "--sinkhole", "127.0.0.1"], connect=_only_reach, resolve=_resolve_tap)
+    doc = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert doc["probe_addresses"] == ["127.0.0.1"]
 
 
 # --------------------------------------------------------------------- is_contained
@@ -779,6 +972,11 @@ def test_full_default_set_with_reach_is_contained(route_file: Callable[[str], st
         ("lan:tcp:[fd00::1]:443", Destination(Category.LAN, Kind.TCP, "fd00::1", 443)),
         ("reach:tcp:tap:8080", REACH),
         ("reach:tcp:10.88.0.10:8080", Destination(Category.REACH, Kind.TCP, TAP_IP, 8080)),
+        ("lan:udp-dns:192.168.1.1:53", LAN_DNS),
+        (
+            "internet:udp-dns:[2606:4700:4700::1111]:53",
+            Destination(Category.INTERNET, Kind.UDP_DNS, "2606:4700:4700::1111", 53),
+        ),
     ],
 )
 def test_parse_destination(spec: str, expected: Destination) -> None:
@@ -806,6 +1004,10 @@ def test_parse_destination(spec: str, expected: Destination) -> None:
         "reach:tcp:0.0.0.0:8080",
         "reach:tcp:localhost:8080",
         "reach:tcp:tap.localhost:8080",
+        "lan:udp-dns:192.168.1.1",  # no port
+        "lan:udp-dns:resolver.lan:53",  # an IP literal, as for tcp
+        "lan:udp-dns:127.0.0.1:53",
+        "reach:udp-dns:10.88.0.10:53",  # reach must be tcp
     ],
 )
 def test_parse_destination_rejects_bad_specs(spec: str) -> None:
@@ -903,6 +1105,10 @@ def test_main_defaults_without_a_gateway_report_an_error(
     assert code == 1
     lan = {r["target"] for r in doc["results"] if r["category"] == "lan"}
     assert lan == {"192.168.1.1"}
+    lan_dns = [r for r in doc["results"] if r["kind"] == "udp-dns"]
+    assert [(r["target"], r["port"], r["outcome"]) for r in lan_dns] == [
+        ("192.168.1.1", 53, "timeout")  # the autouse fixture: nothing answers
+    ]
 
 
 @pytest.mark.parametrize(
