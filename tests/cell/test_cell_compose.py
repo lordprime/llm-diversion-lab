@@ -104,6 +104,12 @@ def test_rendered_cell_bounds_mitmproxy_bodies(rendered: dict[str, Any], service
     assert "stream_large_bodies" not in options
 
 
+def test_cell_image_pulls_no_dockerfile_frontend() -> None:
+    """``# syntax=`` makes BuildKit pull a frontend image; cell/Dockerfile needs none."""
+    lines = (REPO_ROOT / "cell" / "Dockerfile").read_text().splitlines()
+    assert not any(line.lower().replace(" ", "").startswith("#syntax=") for line in lines)
+
+
 # --------------------------------------------------------------------------- end to end
 
 _SMALL_LIMIT = "2k"

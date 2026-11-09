@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # lab-cell: the harness's in-cell components in one image -- the surface injector
 # and the LLM tap (mitmproxy addons), the callback catcher, the stub LLM, cell-guard,
 # the containment probe and the scripted (non-LLM) self-test agent. Each cell
