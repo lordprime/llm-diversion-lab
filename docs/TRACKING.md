@@ -134,6 +134,30 @@ Built in M0 (`control/api/metrics.py`, served by the Collector at `/metrics`): `
 | `labctl export <exp> --format parquet\|csv` | Tidy tables (runs, labels, llm_calls, callbacks) for notebooks and the paper |
 | `labctl doctor` / `labctl selftest` | Environment and pipeline verification |
 
+#### The self-test: `labctl selftest [--quick] [--json]` (built in M0)
+
+`control/runner/selftest.py`. It runs `experiments/selftest.yaml` through the real runner: one injected and one matched control DVGA cell, the scripted agent and the stub LLM (no model is called, no tokens are spent). Each invocation registers a fresh experiment `exp_selftest_<ULID>` (the file's text with that id), so it can be repeated and survives new image builds. It takes the host's runner lock (`/srv/lab/state/runner.lock`), so it never runs beside another runner.
+
+It **passes** only if all of these hold:
+
+| Check | Requirement |
+|---|---|
+| `<arm>: valid`, `<arm>: completed` | Both runs `valid` **and** the agent ended `completed` (a crashed agent gives a valid run; that is not enough) |
+| `injected: funnel`, `injected: oracle` | Access, Visible, Uptake and Outcome all true; the oracle verdict is true |
+| `injected: callbacks` | A callback on **both** channels (HTTP and DNS) whose token is the one the lab key derives for one of the run's own placements |
+| `control: funnel`, `control: oracle` | Access, Visible and Uptake false (all four stages labelled); a verdict was decided |
+| `control: no tags` | No token callback reached it and no file of its evidence holds any injected run's tag (the labeller's forbidden-tag check already makes a leaking control `contaminated`) |
+| `<arm>: contained` (**critical**) | Before the cell's agent starts, `cell/probe/containment.py` runs in a sibling container on the agent network with `--host-gateway` (the network's `.1`), `--lan` (`LAB_PROBE_LAN` from `host.env`), `--sinkhole` (catcher `.2`), `--reach` injector `.3:80` and tap `.4:8080`, IP literals only. Anything reachable on the internet, the host or the LAN, a failed must-reach, or a probe without a complete report fails the self-test as CRITICAL, and that cell's agent never starts (the run is invalid `cell_failed`) |
+| `<arm>: nothing left` | After teardown no container, volume or network carries the run's `lab.run_id` |
+
+`--quick` (what `release.sh` runs after a deploy) keeps the first target only (one matched pair: the smallest unit the matched-pair schedule runs, and the control's zero-tag check is a core claim) and probes containment in the first cell only; every other check is the same. With M0's single target, full mode differs only by probing every cell.
+
+Output: a readable report on stdout (`--json`: the same as JSON), progress as JSON log lines on stderr. Exit 0 passed, 1 failed (a configuration problem included), 2 usage; never 3 (`release.sh` reads 3 as "labctl not installed"). Every run that gets past argument parsing is recorded once in `/srv/lab/state/selftest.json` (`labctl status`, `lab_selftest_last_success_timestamp`); a result that cannot be recorded makes the command fail.
+
+Inputs on the host: `secrets/hmac.key`, `host.env` (`LAB_CELL_NETWORKS`, `LAB_LLM_GATEWAY`, `LAB_PROBE_LAN`), the release tree `current/` (experiment, cell templates, `deploy/images.lock`, which must pin `lab-cell`), evidence under `artifacts/`, cell files under `cells/`. Development overrides: `LAB_ROOT`, `LAB_HOST_ENV`, `LAB_RELEASE_TREE`, `LAB_RUNNER_LOCK`, `LAB_PROBE_LAN`, and, with `LAB_DEV=1` only, a missing `host.env` and `LAB_PROBE_HOST_GATEWAY` (under rootless Podman the network gateway is the rootless namespace, which answers with a reset).
+
+Not built: requeuing or retrying a self-test run (an interrupted self-test leaves its runs `queued`/`running` under its own experiment id until a reaper exists).
+
 ### 3.4 Programmatic tracking: the APIs
 
 | API | Use |
