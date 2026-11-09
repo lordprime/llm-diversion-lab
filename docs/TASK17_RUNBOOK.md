@@ -21,6 +21,7 @@ Task 17 is **complete** only when every step passes and the self-test runs for r
    - **Record:** `lsmod | grep br_netfilter` and `sysctl net.netfilter.nf_log_all_netns`.
 3. **Proxmox firewall** for the container, as in DEPLOYMENT §0.1: inbound 22 and 443 from the Twingate connector only; outbound DNS to the resolver and nothing else on the LAN; the IPv6 rules.
    - The DNS exception is the one LAN path left open, so the self-test's LAN check probes `192.168.1.1:53`: from the host it must answer (TCP 53 or a UDP/53 DNS reply), from a cell it must not.
+   - **State on 9 Nov 2026:** this Proxmox firewall is **not configured** on CT 111. Ruling: Task 17 goes ahead without it, because cell containment rests on the in-LXC layers (nftables and `DOCKER-USER`), and those are what P5 checks. Enabling it is recommended before any study run: it is defence in depth, and it limits the container's LAN egress to DNS. Until it is on, the LXC itself can reach the LAN; cells still cannot.
 4. **Access.**
    - Add Twingate resources for `192.168.1.145`, ports 22 and 443.
    - Put the workstation's public key in the container's `/root/.ssh/authorized_keys`.
@@ -30,7 +31,8 @@ Task 17 is **complete** only when every step passes and the self-test runs for r
 
 5. **Clean tree and green CI.**
    - Merge the final fixes to `main`; `git status --porcelain` prints nothing.
-   - `cp deploy/hosts.example.yml deploy/hosts.yml`, then `LAB_REQUIRE_TOOLS=1 uv run pytest -q`, then push.
+   - `deploy/hosts.yml` exists (git-ignored; created from `hosts.example.yml` on 9 Nov 2026). Its `lab1` vars carry `docker_ce_minor: "29.8"`. That is now also the role default, so the override can stay or go.
+   - `LAB_REQUIRE_TOOLS=1 uv run pytest -q`, then push.
    - **Pass:** CI is green on the pushed commit.
 6. **Build and pin the images** (DEPLOYMENT §0.5).
    - Run the build-images workflow on `main` (*Actions → build-images → Run workflow*, or push a `lab-vN` tag). **Pass:** all three jobs (`goat-dvga`, `lab-cell`, `control`) are green.
@@ -56,7 +58,7 @@ Task 17 is **complete** only when every step passes and the self-test runs for r
    - `secrets/hmac.key`, `secrets/lab.env` and `secrets/web-basic-auth` are mode 600.
    - `sysctl net.ipv6.conf.all.disable_ipv6 net.ipv4.ip_forward`: both 1.
    - From the workstation: `curl -sk -o /dev/null -w '%{http_code}' https://192.168.1.145/` prints `401`.
-   - From the LXC: `curl -m5 http://192.168.1.1/` fails; `curl -sI https://api.anthropic.com` answers; `getent hosts example.com` resolves.
+   - From the LXC: `curl -m5 http://192.168.1.1/` fails (only once the Proxmox firewall of step 3 is on; record the result either way); `curl -sI https://api.anthropic.com` answers; `getent hosts example.com` resolves.
    - **Record:** `cat /proc/sys/net/bridge/bridge-nf-call-iptables` (if present) and `dpkg-query -W containerd.io` (the exact revision).
 
 ## P3 Secrets (stub LLM only, no real keys)
