@@ -536,7 +536,8 @@ def test_g_app_user_cannot_write_latch(goat: Goat) -> None:
     code, digest_before = goat.sh(f"sha256sum {LATCH_FILE}")
     assert code == 0, digest_before
     code, out = goat.sh(f"stat -c %u:%g:%a:%F {LATCH_DIR} {LATCH_FILE}")
-    assert (code, out.split()) == (0, ["0:0:700:directory", "0:0:600:regular"]), out
+    # %F is "regular file", with a space: one line per path
+    assert (code, out.splitlines()) == (0, ["0:0:700:directory", "0:0:600:regular file"]), out
 
     attempts = {
         "list": f"ls {LATCH_DIR}",
