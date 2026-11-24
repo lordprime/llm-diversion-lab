@@ -41,7 +41,7 @@ docker run --rm --user www-data --entrypoint /bin/bash "$image" -c '
 # ownership and modes, as root
 # shellcheck disable=SC2016 # the script runs inside the image
 docker run --rm --entrypoint /bin/bash "$image" -c '
-  set -eu
+  set -eux
   test "$(stat -c %U:%G:%a /opt/support)" = root:root:700
   test "$(stat -c %U:%G:%a /run/secrets)" = root:root:700
   test "$(stat -c %U:%G:%a /cve_metadata.yml)" = root:root:400
