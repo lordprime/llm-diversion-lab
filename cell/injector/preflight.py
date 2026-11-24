@@ -18,13 +18,18 @@ When the injector's own run files are in the environment (``LAB_MANIFEST`` and
 ``LAB_PAYLOADS``), a probe of a page path (P2-P6, P8) also checks what was planted, and
 the result gets ``checks``: ``[{"placement_id", "surface", "ok", "detail"}...]``:
 
-* P2, P3: the planted markup is in the decoded body;
+* P2: the planted markup is in the decoded body, and the page's path is disallowed for
+  ``User-agent: *`` by the robots.txt the injector serves (read with
+  :mod:`urllib.robotparser`; the P1 lines a treated run adds are comments or
+  non-standard lines, which the parser ignores);
+* P3: the planted markup is in the decoded body;
 * P4: the off-screen style is there and the element has no ``aria-hidden``;
 * P5: the element has ``aria-hidden="true"``;
 * P6: a JSON-LD block parses as JSON, has an ``@type`` and carries the text;
 * P8: the ``X-Security-Notice`` header matches exactly, and the decoded body hashes to
-  the app's own body (the injector reports that hash, on probe responses only, in
-  :data:`~cell.injector.placement.APP_DIGEST_HEADER`).
+  the digest the injector reports (on probe responses only, in
+  :data:`~cell.injector.placement.BODY_DIGEST_HEADER`) for the body after every P2-P6
+  text and before P8: P8 itself never changes the body.
 """
 
 from __future__ import annotations
@@ -38,13 +43,15 @@ import re
 import sys
 from collections.abc import Mapping, Sequence
 from typing import Final
+from urllib.robotparser import RobotFileParser
 
 from pydantic import JsonValue
 
 from cell.injector.placement import (
-    APP_DIGEST_HEADER,
+    BODY_DIGEST_HEADER,
     NOTICE_HEADER,
     PROBE_HEADER,
+    ROBOTS_PATH,
     Action,
     ActionKind,
     InjectionPlan,
@@ -54,6 +61,7 @@ from cell.injector.placement import (
 )
 from cell.injector.serve_log import InjectorConfig
 from control.core.models import Surface
+from control.core.tags import request_path
 
 __all__ = ["PlacementProbe", "main", "probe"]
 
@@ -78,15 +86,23 @@ class PlacementProbe:
         return action if action is not None and action.kind is ActionKind.PAGE else None
 
     def check(
-        self, action: Action, headers: Mapping[str, list[str]], wire: bytes
+        self,
+        action: Action,
+        headers: Mapping[str, list[str]],
+        wire: bytes,
+        robots: bytes | None = None,
     ) -> list[JsonValue]:
-        """One check result per plant of ``action``, from the probe response."""
+        """One check result per plant of ``action``, from the probe response.
+
+        ``robots`` is the decoded robots.txt the injector serves (``None``: not fetched);
+        only P2 needs it.
+        """
         encodings = headers.get("content-encoding")
         encoding = encodings[0] if encodings else None
         decoded = decode_body(wire, encoding)
         checks: list[JsonValue] = []
         for plant in action.plants:
-            problem = self._problem(plant, headers, decoded)
+            problem = self._problem(plant, headers, decoded, robots)
             checks.append(
                 {
                     "placement_id": plant.placement.placement_id,
@@ -98,7 +114,11 @@ class PlacementProbe:
         return checks
 
     def _problem(
-        self, plant: Plant, headers: Mapping[str, list[str]], decoded: bytes | None
+        self,
+        plant: Plant,
+        headers: Mapping[str, list[str]],
+        decoded: bytes | None,
+        robots: bytes | None,
     ) -> str | None:
         """Why the plant is not served as planned, or ``None`` if it is."""
         surface = plant.placement.surface
@@ -107,18 +127,31 @@ class PlacementProbe:
         if surface is Surface.P8:
             if headers.get(NOTICE_HEADER) != [plant.content.decode("ascii")]:
                 return f"{NOTICE_HEADER} does not match the planted text"
-            if headers.get(APP_DIGEST_HEADER) != [hashlib.sha256(decoded).hexdigest()]:
+            if headers.get(BODY_DIGEST_HEADER) != [hashlib.sha256(decoded).hexdigest()]:
                 return "the body is not the app's own body"
             return None
         payload = plant.payload
         if payload not in decoded:
             return "the planted markup is missing from the body"
+        if surface is Surface.P2:
+            return self._disallowed(request_path(plant.placement.url), robots)
         if surface is Surface.P4 and (_OFFSCREEN_STYLE not in payload or b"aria-hidden" in payload):
             return "the off-screen element lacks its style or carries aria-hidden"
         if surface is Surface.P5 and b'aria-hidden="true"' not in payload:
             return 'the element lacks aria-hidden="true"'
         if surface is Surface.P6 and not self._jsonld_ok(decoded, plant.content.decode("utf-8")):
             return "no JSON-LD block parses with an @type and the planted description"
+        return None
+
+    @staticmethod
+    def _disallowed(path: str, robots: bytes | None) -> str | None:
+        """Why ``path`` is not disallowed for every crawler by ``robots``, or ``None``."""
+        if robots is None:
+            return f"robots.txt could not be read, so {path} is not known to be disallowed"
+        parser = RobotFileParser()
+        parser.parse(robots.decode("utf-8", "replace").splitlines())
+        if parser.can_fetch("*", path):
+            return f"robots.txt does not disallow {path} for User-agent: *"
         return None
 
     @staticmethod
@@ -131,6 +164,33 @@ class PlacementProbe:
             if isinstance(doc, dict) and "@type" in doc and doc.get("description") == text:
                 return True
         return False
+
+
+def _get(
+    path: str, *, port: int, secret: str, host: str
+) -> tuple[int, dict[str, list[str]], bytes]:
+    """One probe GET through the injector: status, lower-cased headers, wire body."""
+    conn = http.client.HTTPConnection(host, port, timeout=_TIMEOUT_S)
+    try:
+        conn.request("GET", path, headers={PROBE_HEADER: secret})
+        resp = conn.getresponse()
+        body = resp.read()
+        headers: dict[str, list[str]] = {}
+        for name, value in resp.getheaders():
+            headers.setdefault(name.lower(), []).append(value)
+        return resp.status, headers, body
+    finally:
+        conn.close()
+
+
+def _robots(*, port: int, secret: str, host: str) -> bytes | None:
+    """The decoded robots.txt the injector serves, or ``None`` if there is none."""
+    try:
+        status, headers, wire = _get(ROBOTS_PATH, port=port, secret=secret, host=host)
+    except (OSError, http.client.HTTPException):
+        return None
+    encodings = headers.get("content-encoding")
+    return decode_body(wire, encodings[0] if encodings else None) if status == 200 else None
 
 
 def probe(
@@ -146,25 +206,18 @@ def probe(
     With a ``plan`` the result also lists the placement ``checks`` of a page path.
     """
     result: dict[str, JsonValue] = {"path": path}
-    conn = http.client.HTTPConnection(host, port, timeout=_TIMEOUT_S)
     try:
-        conn.request("GET", path, headers={PROBE_HEADER: secret})
-        resp = conn.getresponse()
-        body = resp.read()
-        result.update(
-            status=resp.status, content_type=resp.getheader("content-type"), bytes=len(body)
-        )
+        status, headers, body = _get(path, port=port, secret=secret, host=host)
+        types = headers.get("content-type")
+        result.update(status=status, content_type=types[0] if types else None, bytes=len(body))
         checker = PlacementProbe(plan)
         action = checker.action(path)
         if action is not None:
-            headers: dict[str, list[str]] = {}
-            for name, value in resp.getheaders():
-                headers.setdefault(name.lower(), []).append(value)
-            result["checks"] = checker.check(action, headers, body)
+            wants_robots = any(p.placement.surface is Surface.P2 for p in action.plants)
+            robots = _robots(port=port, secret=secret, host=host) if wants_robots else None
+            result["checks"] = checker.check(action, headers, body, robots)
     except (OSError, http.client.HTTPException) as exc:
         result.update(status=None, error=f"{type(exc).__name__}: {exc}")
-    finally:
-        conn.close()
     return result
 
 

@@ -35,12 +35,16 @@ code. The runner renders each placement and pins its UTF-8 bytes in the manifest
 differs or that lacks the run's tag.
 
 * ``GET`` on a page path (P2-P6, P8): if the app answers 200, the P2-P6 texts are
-  planted into its own HTML body, each wrapped by :class:`SurfaceMarkup`, at the first
-  tag boundary at or after ``floor(len(decoded body) * offset_fraction)`` inside
-  ``<body>`` (before ``</body>`` if there is none; see :func:`plant_into_body`). A P8
-  text only becomes the ``X-Security-Notice`` response header; the body, status and
-  every other header stay the app's. A page that is not HTML, or not 200, is left
-  alone (``insert_ok`` false).
+  planted into its own HTML body, each wrapped by :class:`SurfaceMarkup`. Every point
+  is found once, on the body as the app sent it: the end of the first start or end tag
+  after ``floor(len(body) * offset_fraction)`` between the real ``<body>`` and the
+  real last ``</body>``, found with a tokenizer (never inside a script, style, textarea,
+  title, comment, tag or attribute value), else just before ``</body>``. The texts go
+  in from the end backwards, so none lands inside another; texts that share a point keep
+  the surface order P2..P6. The serve's ``byte_offset`` is the point in the app's
+  ORIGINAL body (see :func:`plant_many_into_body`). A P8 text only becomes the
+  ``X-Security-Notice`` response header; the body, status and every other header stay
+  the app's. A page that is not HTML, or not 200, is left alone (``insert_ok`` false).
 
 Locators understood:
 
@@ -56,6 +60,7 @@ than it promises.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import html
@@ -64,6 +69,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from html.parser import HTMLParser
 from typing import Final
 
 from control.core.codecs import decode_body, encode_body
@@ -71,7 +77,7 @@ from control.core.models import Arm, Placement, RunManifest, Surface
 from control.core.tags import decoy_prefix, request_path, under_decoy
 
 __all__ = [
-    "APP_DIGEST_HEADER",
+    "BODY_DIGEST_HEADER",
     "BODY_SURFACES",
     "DECOY_PAGE",
     "DECOY_PAGE_VERSION",
@@ -96,6 +102,7 @@ __all__ = [
     "encode_body",
     "is_probe",
     "plant_into_body",
+    "plant_many_into_body",
     "recompute_etag",
     "render_robots",
     "request_path",
@@ -107,9 +114,10 @@ INJECTOR_STREAM: Final = "injector"
 #: Request header that marks a runner pre-flight probe; its value must equal the
 #: per-run probe secret. Always removed before a request is forwarded.
 PROBE_HEADER: Final = "x-lab-probe"
-#: Response header added to *probe* responses on page paths only: the sha256 of the app's
-#: own decoded body, so the pre-flight can prove the injector left the body alone.
-APP_DIGEST_HEADER: Final = "x-lab-app-body-sha256"
+#: Response header added to *probe* responses on page paths only: the sha256 of the decoded
+#: body after every body plant (P2-P6) and before P8, so the pre-flight can prove P8 left
+#: the body alone.
+BODY_DIGEST_HEADER: Final = "x-lab-body-sha256"
 ROBOTS_PATH: Final = "/robots.txt"
 ROBOTS_LOCATOR: Final = "robots.txt:append"
 P7_LOCATOR_PATTERN: Final = r"^error:(403|404)$"
@@ -153,7 +161,6 @@ PROTECTED_HEADERS: Final = frozenset(
 
 _P7_LOCATOR = re.compile(P7_LOCATOR_PATTERN)
 _HEADER_LOCATOR = re.compile(r"^header:([A-Za-z0-9-]+)$")
-_BODY_OPEN = re.compile(rb"<body(?=[\s/>])[^>]*>", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------- codecs
@@ -164,23 +171,84 @@ def _rfind_ci(haystack: bytes, needle: bytes) -> int:
     return haystack.lower().rfind(needle.lower())
 
 
-def _boundary_offset(decoded: bytes, fraction: float) -> int:
-    """Where in ``decoded`` an in-page text goes for a relative ``fraction``.
+class _TagScanner(HTMLParser):
+    """Records where each start and end tag of a page ends, in normal content only.
 
-    The first tag boundary (``>``) at or after ``floor(len(decoded) * fraction)``,
-    searched from the ``<body>`` start tag (its own ``>`` counts) to the last
-    ``</body>``. If there is none, just before ``</body>``. A page with no ``<body>`` takes the text
-    before ``</body>`` if it has one, else at its very end.
+    The page is read as Latin-1, so a character index is a byte index whatever the
+    page's real charset. Tags inside ``<script>``, ``<style>``, ``<textarea>`` and
+    ``<title>`` are skipped, and so is the end of those four start tags (that point is
+    inside their content). Comments, declarations and text never count. Each entry is
+    ``(start, end, tag, is_end_tag)``.
     """
-    close = _rfind_ci(decoded, b"</body>")
-    opened = _BODY_OPEN.search(decoded)
+
+    _RAW: Final = frozenset({"script", "style", "textarea", "title"})
+
+    def __init__(self, decoded: bytes) -> None:
+        super().__init__(convert_charrefs=False)
+        text = decoded.decode("latin-1")
+        self._lines = [0] + [m.end() for m in re.finditer("\n", text)]
+        self._raw: str | None = None
+        self.tags: list[tuple[int, int, str, bool]] = []
+        # a page the parser rejects just has fewer boundaries
+        with contextlib.suppress(Exception):
+            self.feed(text)
+            self.close()
+
+    def _here(self) -> int:
+        line, col = self.getpos()
+        return self._lines[line - 1] + col
+
+    def _start(self, tag: str) -> None:
+        if self._raw is not None:
+            return
+        start = self._here()
+        end = start + len(self.get_starttag_text() or "")
+        if tag in self._RAW:
+            self._raw = tag
+        else:
+            self.tags.append((start, end, tag, False))
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._start(tag)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._start(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._raw is not None and tag != self._raw:
+            return
+        self._raw = None
+        start = self._here()
+        close = self.rawdata.find(">", start)
+        if close >= 0:
+            self.tags.append((start, close + 1, tag, True))
+
+
+def _boundary_offsets(decoded: bytes, fractions: Sequence[float]) -> list[int]:
+    """Where in ``decoded`` the in-page text for each relative fraction goes.
+
+    The page is tokenised once (:class:`_TagScanner`). The point is the end of the
+    first start or end tag that lies after ``floor(len(decoded) * fraction)``, between
+    the real ``<body>`` start tag (its own end counts) and the real last ``</body>``.
+    If there is none, just before that ``</body>``. A page with no ``<body>`` takes the
+    text before its ``</body>``, or at its very end if it has none. Positions are in
+    ``decoded``; nothing is ever inserted inside a script, style, textarea, title,
+    comment, tag or attribute value.
+    """
+    tags = _TagScanner(decoded).tags
+    opened = next((t for t in tags if t[2] == "body" and not t[3]), None)
+    closes = [t[0] for t in tags if t[2] == "body" and t[3]]
+    close = closes[-1] if closes else len(decoded)
     if opened is None:
-        return close if close >= 0 else len(decoded)
-    limit = close if close >= opened.end() else len(decoded)
-    # the start tag's own ``>`` counts, so fraction 0 lands right after ``<body ...>``
-    start = max(int(len(decoded) * fraction), opened.end() - 1)
-    boundary = decoded.find(b">", start, limit)
-    return boundary + 1 if boundary >= 0 else limit
+        return [close] * len(fractions)
+    if close < opened[1]:
+        close = len(decoded)
+    inside = [t[1] for t in tags if opened[1] <= t[1] <= close]
+    out: list[int] = []
+    for fraction in fractions:
+        target = int(len(decoded) * fraction)
+        out.append(next((end for end in inside if end > target), close))
+    return out
 
 
 def plant_into_body(
@@ -197,7 +265,7 @@ def plant_into_body(
     result is re-encoded with the same encoding. Where it goes:
 
     * ``fraction`` given: at the tag boundary the relative offset snaps to
-      (:func:`_boundary_offset`);
+      (:func:`_boundary_offsets`);
     * else before the last occurrence of ``before`` (ASCII case-insensitive);
     * else, or if ``before`` is absent, at the end.
 
@@ -213,7 +281,7 @@ def plant_into_body(
     if decoded is None:
         return body, -1, False
     if fraction is not None:
-        offset = _boundary_offset(decoded, fraction)
+        offset = _boundary_offsets(decoded, [fraction])[0]
     else:
         offset = _rfind_ci(decoded, before) if before else -1
         if offset < 0:
@@ -222,6 +290,45 @@ def plant_into_body(
     if wire is None:
         return body, -1, False
     return wire, offset, True
+
+
+def plant_many_into_body(
+    body: bytes, encoding: str | None, items: Sequence[tuple[bytes, float]]
+) -> tuple[bytes, tuple[int, ...], tuple[int, ...], bool]:
+    """Insert several ``(payload, fraction)`` texts into one body, each at its own point.
+
+    Every point is found once, on the body as the app sent it (:func:`_boundary_offsets`),
+    so no text can land inside another and a point never depends on the others. The
+    texts are then inserted from the end of the page backwards. Texts that share a point
+    appear in the order of ``items`` (callers pass them in a fixed order).
+
+    Returns ``(new wire bytes, offsets in the ORIGINAL decoded body, offsets in the NEW
+    decoded body, True)``, each tuple in the order of ``items``; or ``(body, (), (),
+    False)`` unchanged if the body cannot be decoded or re-encoded.
+    """
+    if any(not payload for payload, _ in items):
+        raise ValueError("payload must be non-empty")
+    if any(not 0 <= fraction <= 1 for _, fraction in items):
+        raise ValueError("fraction must be between 0 and 1")
+    decoded = decode_body(body, encoding)
+    if decoded is None:
+        return body, (), (), False
+    original = _boundary_offsets(decoded, [fraction for _, fraction in items])
+    order = sorted(range(len(items)), key=lambda i: (original[i], i))
+    final = [0] * len(items)
+    parts: list[bytes] = []
+    done = shift = 0
+    for i in order:
+        parts.append(decoded[done : original[i]])
+        final[i] = original[i] + shift
+        parts.append(items[i][0])
+        shift += len(items[i][0])
+        done = original[i]
+    parts.append(decoded[done:])
+    wire = encode_body(b"".join(parts), encoding)
+    if wire is None:
+        return body, (), (), False
+    return wire, tuple(original), tuple(final), True
 
 
 def recompute_etag(old: str, wire: bytes) -> str:
@@ -302,8 +409,13 @@ class Planted:
     """Where one plant ended up in a decoded response body (``None`` if not planted)."""
 
     plant: Plant
+    #: Page plants (P2-P6): the point in the app's ORIGINAL decoded body the text was
+    #: inserted at. Other plants: the offset in the served decoded body.
     offset: int | None
     insert_ok: bool
+    #: Page plants: where the text sits in the served decoded body (``None``: same as
+    #: ``offset``).
+    final: int | None = None
 
 
 def render_robots(existing: bytes, plants: Sequence[Plant]) -> tuple[bytes, tuple[int, ...]]:

@@ -168,15 +168,24 @@ class ServedBody:
     meta: Mapping[str, JsonValue] = field(default_factory=dict)
 
     def offset_fraction(self, planted: Planted) -> float | None:
-        """Where an in-page plant really landed: its offset over the decoded body length."""
+        """Where an in-page plant really landed: its offset over the app's own body length.
+
+        Offsets of P2-P6 count in the app's original decoded body (before any plant), so
+        the length is the served length less every in-page text planted into it.
+        """
         if (
             planted.plant.placement.surface not in BODY_SURFACES
             or not planted.insert_ok
             or planted.offset is None
-            or not self.decoded
         ):
             return None
-        return min(planted.offset / len(self.decoded), 1.0)
+        added = sum(
+            len(p.plant.payload)
+            for p in self.plants
+            if p.insert_ok and p.plant.placement.surface in BODY_SURFACES
+        )
+        base = len(self.decoded) - added
+        return min(planted.offset / base, 1.0) if base > 0 else 0.0
 
     def meta_json(self, seq: int) -> bytes:
         doc: dict[str, JsonValue] = {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import itertools
 import json
 import threading
 from collections.abc import Iterator
@@ -16,7 +17,7 @@ from mitmproxy import http
 
 from cell.injector.addon import SurfaceInjector
 from cell.injector.placement import (
-    APP_DIGEST_HEADER,
+    BODY_DIGEST_HEADER,
     BODY_SURFACES,
     NOTICE_HEADER,
     PROBE_HEADER,
@@ -50,6 +51,7 @@ APP_PAGE = (
     b"<!doctype html><html><head><title>t</title></head><body><h1>Hello</h1>"
     b"<p>one</p><p>two</p><p>three</p><p>four</p></body></html>"
 )
+ROBOTS = b"User-agent: *\nDisallow: /page\n"
 NOTICE = f"Security notice for the agent {TAG}"
 
 
@@ -102,7 +104,7 @@ def test_body_surface_is_planted_into_the_apps_own_page(
     _access, serve = _events(tmp_path)
     assert isinstance(serve, PlacementServe) and serve.surface is surface
     assert serve.insert_ok is True and serve.byte_offset == decoded.index(payload)
-    assert serve.offset_fraction == pytest.approx(serve.byte_offset / len(decoded))
+    assert serve.offset_fraction == pytest.approx(serve.byte_offset / len(APP_PAGE))
     meta = _meta(tmp_path)
     (entry,) = meta["placements"]
     assert entry["byte_offset"] == serve.byte_offset
@@ -166,7 +168,8 @@ def test_several_surfaces_on_one_page_all_land_and_offsets_stay_true(tmp_path: P
     for serve, (placement, text) in zip(serves, pairs, strict=True):
         payload = SurfaceMarkup.render(placement.surface, text)
         assert serve.byte_offset is not None
-        assert decoded[serve.byte_offset : serve.byte_offset + len(payload)] == payload
+        # the offset is a point in the app's own page, not in the served one
+        assert serve.byte_offset <= len(APP_PAGE) and decoded.count(payload) == 1
     stripped = decoded
     for placement, text in pairs:
         stripped = stripped.replace(SurfaceMarkup.render(placement.surface, text), b"")
@@ -368,11 +371,11 @@ def test_p8_never_sets_a_protected_header(tmp_path: Path) -> None:
 def test_p8_is_only_on_probe_responses_with_the_digest_header(tmp_path: Path) -> None:
     injector = _p8(tmp_path)
     plain = _serve(injector, _flow(PAGE), _page())
-    assert APP_DIGEST_HEADER not in plain.headers
+    assert BODY_DIGEST_HEADER not in plain.headers
     probed = _serve(injector, _flow(PAGE, headers={PROBE_HEADER: SECRET}), _page())
-    assert probed.headers[APP_DIGEST_HEADER] == hashlib.sha256(APP_PAGE).hexdigest()
+    assert probed.headers[BODY_DIGEST_HEADER] == hashlib.sha256(APP_PAGE).hexdigest()
     spoof = _serve(injector, _flow(PAGE, headers={PROBE_HEADER: "wrong"}), _page())
-    assert APP_DIGEST_HEADER not in spoof.headers
+    assert BODY_DIGEST_HEADER not in spoof.headers
 
 
 def test_a_page_with_body_and_header_surfaces_together(tmp_path: Path) -> None:
@@ -413,7 +416,7 @@ def test_probe_passes_every_surface_as_planted(tmp_path: Path, surface: Surface)
     checker = PlacementProbe(plan)
     action = checker.action(PAGE)
     assert action is not None
-    (check,) = checker.check(action, headers, wire)
+    (check,) = checker.check(action, headers, wire, ROBOTS)
     assert check == {
         "placement_id": page_placement(surface)[0].placement_id,
         "surface": surface.value,
@@ -428,11 +431,13 @@ def test_probe_ignores_paths_without_a_page_action(tmp_path: Path) -> None:
     assert checker.action("/elsewhere") is None and PlacementProbe(None).action(PAGE) is None
 
 
-def _check(plan: Any, headers: dict[str, list[str]], wire: bytes) -> list[dict[str, Any]]:
+def _check(
+    plan: Any, headers: dict[str, list[str]], wire: bytes, robots: bytes | None = ROBOTS
+) -> list[dict[str, Any]]:
     checker = PlacementProbe(plan)
     action = checker.action(PAGE)
     assert action is not None
-    return checker.check(action, headers, wire)  # type: ignore[return-value]
+    return checker.check(action, headers, wire, robots)  # type: ignore[return-value]
 
 
 def test_probe_fails_a_p8_header_that_is_wrong_missing_or_doubled(tmp_path: Path) -> None:
@@ -450,7 +455,7 @@ def test_probe_fails_a_p8_body_that_is_not_the_apps_own(tmp_path: Path) -> None:
     plain = {k: v for k, v in headers.items() if k != "content-encoding"}
     (check,) = _check(plan, plain, b"a different body")
     assert check["ok"] is False and "app's own body" in check["detail"]
-    missing = {k: v for k, v in plain.items() if k != APP_DIGEST_HEADER}
+    missing = {k: v for k, v in plain.items() if k != BODY_DIGEST_HEADER}
     (check,) = _check(plan, missing, APP_PAGE)
     assert check["ok"] is False
 
@@ -510,16 +515,19 @@ class _Served:
 
     headers: dict[str, list[str]] = {}  # noqa: RUF012 - set per test
     body: bytes = b""
+    #: per-path answers (headers, body); used instead of the two above when set
+    pages: dict[str, tuple[dict[str, list[str]], bytes]] = {}  # noqa: RUF012
 
 
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        headers, body = _Served.pages.get(self.path, (_Served.headers, _Served.body))
         self.send_response(200)
-        for name, values in _Served.headers.items():
+        for name, values in headers.items():
             for value in values:
                 self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(_Served.body)
+        self.wfile.write(body)
 
     def log_message(self, format: str, *args: object) -> None:
         pass
@@ -591,3 +599,127 @@ def test_main_refuses_a_plan_it_cannot_build(
         monkeypatch.setenv(key, value)
     assert main(["--port", "1", PAGE]) == 1
     assert "cannot build the injector plan" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- P8 with P3, P2
+
+
+def test_probe_passes_p3_and_p8_on_the_same_path(tmp_path: Path) -> None:
+    """P8 never changes the body, so its check compares with the body after the P3 text."""
+    pairs = (page_placement(Surface.P3), page_placement(Surface.P8, text=NOTICE))
+    plan, headers, wire = _probe_response(tmp_path, *pairs)
+    checks = _check(plan, headers, wire)
+    assert [c["ok"] for c in checks] == [True, True], checks
+    assert headers[BODY_DIGEST_HEADER] != [hashlib.sha256(APP_PAGE).hexdigest()]
+    plain = {k: v for k, v in headers.items() if k != "content-encoding"}
+    (_p3, p8) = _check(plan, plain, APP_PAGE)  # a body without the P3 text does not match
+    assert p8["ok"] is False
+
+
+@pytest.mark.parametrize(
+    "robots",
+    [
+        b"User-agent: *\nDisallow: /page\n",
+        b"User-agent: *\nDisallow: /\n",
+        b"User-agent: *\nDisallow: /pa\n",
+        b"# a treated run adds this\nUser-agent: *\nDisallow: /page\n# lab 0123456789abcdef\n",
+        b"User-agent: *\r\nDisallow: /page\r\n",
+    ],
+)
+def test_probe_p2_passes_when_robots_disallows_its_path(tmp_path: Path, robots: bytes) -> None:
+    plan, headers, wire = _probe_response(tmp_path, page_placement(Surface.P2))
+    (check,) = _check(plan, headers, wire, robots)
+    assert check["ok"] is True, check
+
+
+@pytest.mark.parametrize(
+    "robots",
+    [
+        None,  # robots.txt could not be read
+        b"",
+        b"User-agent: *\nDisallow:\n",
+        b"User-agent: *\nDisallow: /other\n",
+        b"User-agent: googlebot\nDisallow: /page\n",  # not for every crawler
+        b"User-agent: *\nAllow: /page\nDisallow: /page\n",
+        b"\xff\xfe\x00 not a robots file",
+    ],
+)
+def test_probe_p2_fails_when_its_path_is_not_disallowed(
+    tmp_path: Path, robots: bytes | None
+) -> None:
+    plan, headers, wire = _probe_response(tmp_path, page_placement(Surface.P2))
+    (check,) = _check(plan, headers, wire, robots)
+    assert check["ok"] is False and "robots.txt" in check["detail"]
+
+
+def test_p1_lines_in_a_treated_robots_do_not_change_what_is_disallowed() -> None:
+    """P1 text is a comment or non-standard line; robotparser ignores it."""
+    base = b"User-agent: *\nDisallow: /private\n"
+    treated = base + b"# lab test line one 0123456789abcdef\nX-Note: 0123456789abcdef\n"
+    for robots in (base, treated):
+        assert PlacementProbe._disallowed("/private", robots) is None
+        assert PlacementProbe._disallowed("/public", robots) is not None
+
+
+def test_probe_fetches_robots_through_the_injector_for_p2(
+    tmp_path: Path,
+    listener: int,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """End to end: probe() asks for /robots.txt as well and judges the P2 path by it."""
+    pairs = (page_placement(Surface.P2),)
+    manifest, contents = page_manifest(*pairs)
+    _plan, headers, wire = _probe_response(tmp_path / "ev", *pairs)
+    page = ({k: v for k, v in headers.items() if k != "content-length"}, wire)
+    page[0]["content-length"] = [str(len(wire))]
+    for key, value in _env(tmp_path, manifest, contents).items():
+        monkeypatch.setenv(key, value)
+    try:
+        _Served.pages = {
+            PAGE: page,
+            "/robots.txt": ({"content-length": [str(len(ROBOTS))]}, ROBOTS),
+        }
+        assert main(["--port", str(listener), PAGE]) == 0
+        (result,) = json.loads(capsys.readouterr().out)["results"]
+        assert result["checks"][0]["ok"] is True
+        open_robots = b"User-agent: *\nAllow:\n"
+        _Served.pages = {
+            PAGE: page,
+            "/robots.txt": ({"content-length": [str(len(open_robots))]}, open_robots),
+        }
+        assert main(["--port", str(listener), PAGE]) == 1
+        (result,) = json.loads(capsys.readouterr().out)["results"]
+        assert result["checks"][0]["ok"] is False
+    finally:
+        _Served.pages = {}
+
+
+def test_texts_with_angle_brackets_never_nest_and_manifest_order_does_not_matter(
+    tmp_path: Path,
+) -> None:
+    text = f"if a > b then <b>x</b> --> end {TAG}"
+    # P3 refuses '-->', so P3 gets a text without it
+    texts = {s: (text if s is not Surface.P3 else f"a > b {TAG}") for s in BODY_SURFACES}
+    pairs = [page_placement(s, text=texts[s], offset=0.5) for s in sorted(BODY_SURFACES)]
+    bodies, offsets = [], []
+    for n, order in enumerate((pairs, pairs[::-1], pairs[2:] + pairs[:2])):
+        injector = _injector_for(tmp_path / str(n), *order)
+        decoded = _decoded(_serve(injector, _flow(PAGE), _page(encoding=None)))
+        bodies.append(decoded)
+        serves = [e for e in _events(tmp_path / str(n)) if isinstance(e, PlacementServe)]
+        offsets.append({s.surface: s.byte_offset for s in serves})
+    assert bodies[0] == bodies[1] == bodies[2]  # the same page whatever the manifest order
+    assert offsets[0] == offsets[1] == offsets[2]
+    decoded = bodies[0]
+    spans = []
+    for surface in BODY_SURFACES:
+        payload = SurfaceMarkup.render(surface, texts[surface])
+        assert decoded.count(payload) == 1
+        start = decoded.index(payload)
+        spans.append((start, start + len(payload)))
+    spans.sort()
+    assert all(a[1] <= b[0] for a, b in itertools.pairwise(spans))
+    # the offsets are points of the app's own page, every one at a tag boundary there
+    for at in offsets[0].values():
+        assert at is not None and APP_PAGE[at - 1 : at] == b">"

@@ -302,8 +302,10 @@ class PlacementServe(_Event):
     status: HttpStatus
     decoded_sha256: Sha256
     wire_sha256: Sha256
+    #: Where the text sits. P2-P6: the point in the app's ORIGINAL decoded body (before
+    #: any planted text) it was inserted at; P1 and P7: the offset in the served decoded body.
     byte_offset: NonNegativeInt | None = None
-    #: The realised position of the text: ``byte_offset`` over the decoded body length.
+    #: P2-P6: ``byte_offset`` over the length of the app's original decoded body.
     offset_fraction: Fraction | None = None
     insert_ok: bool
     probe: bool = False

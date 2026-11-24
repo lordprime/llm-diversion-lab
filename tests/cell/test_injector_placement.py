@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import re
 from typing import Any
 
 import pytest
@@ -22,6 +23,7 @@ from cell.injector.placement import (
     SurfaceMarkup,
     build_plan,
     plant_into_body,
+    plant_many_into_body,
 )
 from control.core.models import Arm, Placement, RunManifest, Surface
 from tests.cell.test_injector import (
@@ -186,17 +188,22 @@ def _at(decoded: bytes, offset: int, payload: bytes) -> bytes:
     return decoded[:offset] + payload + decoded[offset:]
 
 
+def _tag_ends(page: bytes) -> list[int]:
+    """End offsets of every plain tag of a page without raw text, comments or odd quoting."""
+    return [m.end() for m in re.finditer(rb"</?[a-zA-Z][^<>]*>", page)]
+
+
 def test_offset_fraction_snaps_to_tag_boundary() -> None:
     payload = b"<!-- X -->"
-    body_open = HTML.index(b"<body>") + len(b"<body>") - 1  # the start tag's own '>'
+    body_open = HTML.index(b"<body>") + len(b"<body>")
     close = HTML.index(b"</body>")
-    for fraction in (0.0, 0.25, 0.5, 0.75, 0.9, 0.99):
+    ends = [e for e in _tag_ends(HTML) if body_open <= e <= close]
+    for fraction in (0.0, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0):
         wire, offset, ok = plant_into_body(HTML, None, payload, fraction=fraction)
         assert ok is True
-        target = max(int(len(HTML) * fraction), body_open)
-        assert HTML[offset - 1 : offset] == b">"  # a tag boundary
-        boundary = HTML.find(b">", target, close)
-        assert offset == (boundary + 1 if boundary >= 0 else close)  # the first one at/after
+        target = int(len(HTML) * fraction)
+        expected = next((e for e in ends if e > target), close)  # first tag end after target
+        assert offset == expected
         assert wire == _at(HTML, offset, payload)
 
 
@@ -218,12 +225,12 @@ def test_boundary_inside_the_closing_body_tag_is_not_used() -> None:
     assert plant_into_body(page, None, b"X", fraction=0.6)[1] == page.index(b"</body>")
 
 
-def test_body_tag_matching_ignores_case_and_attributes() -> None:
+def test_body_tag_matching_ignores_case_and_a_greater_than_in_its_attributes() -> None:
     page = b'<HTML><BODY class="a>b" id=x><p>one</p><p>two</p></BoDy></HTML>'
-    start = page.index(b"<BODY")
+    after_body = page.index(b" id=x>") + len(b" id=x>")  # the real end of the start tag
     _w, offset, ok = plant_into_body(page, None, b"X", fraction=0.0)
-    assert ok is True and offset > start
-    assert page[offset - 1 : offset] == b">"
+    assert ok is True and offset == after_body
+    assert plant_into_body(page, None, b"X", fraction=1.0)[1] == page.index(b"</BoDy>")
 
 
 def test_look_alike_tags_are_not_the_body_tag() -> None:
@@ -492,3 +499,195 @@ def test_plant_payload_wraps_page_text_and_leaves_p1_and_p7_alone() -> None:
     assert Plant(placement, text.encode()).payload == f"<!-- {text} -->".encode()
     p7 = _placement(P7_ID, Surface.P7, "/.env", "error:404", P7_TEXT)
     assert Plant(p7, P7_TEXT.encode()).payload == P7_TEXT.encode()
+
+
+# --------------------------------------------------------------------------- forbidden contexts
+
+# A page with one forbidden context ahead of the body text. The text planted must never
+# land inside it, whatever the fraction: it goes at a real tag end or before </body>.
+CONTEXTS = {
+    "script": b"<script>if (a > b) { x = '<p>' } // >>> </p> ></script>",
+    "script-in-head": b"<head><script>var s = '<body>'; if (a > b) {}</script></head>",
+    "style": b"<style>p > a { color: red } /* > <b> */</style>",
+    "textarea": b"<textarea>a > b <p>not a tag</p> ></textarea>",
+    "title": b"<title>x > y <i>no</i> ></title>",
+    "comment": b"<!-- a > b <p>nope</p> -->",
+    "comment-with-fake-body": b"<!-- <body> <p>x</p> </body> -->",
+    "attribute": b'<a href="/x" title="x>y" data-z=\'>>\'>link</a>',
+    "unquoted-then-quoted": b'<img alt="a > b" src=x>',
+}
+
+
+def _forbidden_spans(page: bytes) -> list[tuple[int, int]]:
+    """Byte spans a plant must stay out of: raw-text elements, comments, attribute values."""
+    spans = []
+    for pattern in (
+        rb"<script\b[^>]*>(.*?)</script>",
+        rb"<style\b[^>]*>(.*?)</style>",
+        rb"<textarea\b[^>]*>(.*?)</textarea>",
+        rb"<title\b[^>]*>(.*?)</title>",
+        rb"<!--(.*?)-->",
+    ):
+        spans += [m.span(1) for m in re.finditer(pattern, page, re.DOTALL)]
+    spans += [m.span() for m in re.finditer(rb'="[^"]*"|=\'[^\']*\'', page)]
+    return spans
+
+
+def _inside(offset: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start < offset < end for start, end in spans)
+
+
+@pytest.mark.parametrize("name", sorted(CONTEXTS))
+def test_text_never_lands_inside_a_forbidden_context(name: str) -> None:
+    context = CONTEXTS[name]
+    page = b"<html><body>" + context + b"<p>one</p><p>two</p></body></html>"
+    if name == "script-in-head":
+        page = b"<html>" + context + b"<body><p>one</p><p>two</p></body></html>"
+    spans = _forbidden_spans(page)
+    body_open = page.index(b"<body>") + len(b"<body>")
+    for tenth in range(11):
+        _wire, offset, ok = plant_into_body(page, None, b"X", fraction=tenth / 10)
+        assert ok is True
+        assert not _inside(offset, spans), (name, tenth, page[:offset])
+        assert body_open <= offset <= page.rindex(b"</body>")
+
+
+def test_a_greater_than_in_a_script_is_not_a_boundary() -> None:
+    page = b"<html><body><script>if (a > b) { go() }</script><p>x</p></body></html>"
+    script_start = page.index(b"<script>") + len(b"<script>")
+    script_end = page.index(b"</script>")
+    for fraction in (0.0, 0.2, 0.3, 0.4):
+        offset = plant_into_body(page, None, b"X", fraction=fraction)[1]
+        assert not script_start <= offset <= script_end - 1 or offset == script_end
+
+
+def test_an_open_script_swallows_the_rest_so_the_text_goes_before_the_close() -> None:
+    page = b"<html><body><p>a</p><script>never closed <p>b</p> > </body></html>"
+    # the browser would treat everything after <script> as script text, </body> included
+    # no real </body> is left, so the text is appended at the very end
+    assert plant_into_body(page, None, b"X", fraction=1.0)[1] == len(page)
+    offset = plant_into_body(page, None, b"X", fraction=0.0)[1]
+    assert offset == page.index(b"<p>a</p>")
+
+
+def test_the_body_tag_inside_a_comment_or_script_is_not_the_body() -> None:
+    page = (
+        b"<html><head><!-- <body> --><script>document.write('<body>')</script></head>"
+        b"<body><p>real</p></body></html>"
+    )
+    real = page.index(b"<body><p>real") + len(b"<body>")
+    assert plant_into_body(page, None, b"X", fraction=0.0)[1] == real
+    assert plant_into_body(page, None, b"X", fraction=1.0)[1] == page.rindex(b"</body>")
+
+
+def test_a_closing_body_tag_inside_a_comment_or_script_is_not_the_close() -> None:
+    page = (
+        b"<html><body><p>a</p><script>x = '</body>'</script><!-- </body> --><p>b</p></body></html>"
+    )
+    assert plant_into_body(page, None, b"X", fraction=1.0)[1] == page.rindex(b"</body>")
+
+
+def test_offsets_count_bytes_not_characters_in_a_non_ascii_page() -> None:
+    page = "<html><body><p>caf\u00e9 \u4e2d\u6587 \U0001f600</p><p>two</p></body></html>".encode()
+    wire, offset, ok = plant_into_body(page, None, b"X", fraction=0.4)
+    assert ok is True and wire == _at(page, offset, b"X")
+    assert page[offset - 1 : offset] == b">"
+    assert offset == page.index(b"</p>") + len(b"</p>")  # the first tag end after 40% of the bytes
+    assert plant_into_body(page, None, b"X", fraction=1.0)[1] == page.index(b"</body>")
+
+
+def test_multi_line_pages_map_their_positions_to_bytes() -> None:
+    page = b"<html>\n<body>\r\n<p>a</p>\n\n<p>b</p>\n<p>c</p>\n</body>\n</html>\n"
+    body_open = page.index(b"<body>") + len(b"<body>")
+    ends = [e for e in _tag_ends(page) if body_open <= e <= page.index(b"</body>")]
+    for fraction in (0.0, 0.3, 0.5, 0.7, 1.0):
+        offset = plant_into_body(page, None, b"X", fraction=fraction)[1]
+        target = int(len(page) * fraction)
+        assert offset == next((e for e in ends if e > target), page.index(b"</body>"))
+
+
+@pytest.mark.parametrize(
+    "junk", [b"<", b"<<<", b"<a", b'<a b="', b"<!--", b"<![CDATA[", b"</", b"<?x"]
+)
+def test_unterminated_markup_never_breaks_planting(junk: bytes) -> None:
+    for page in (b"<html><body><p>a</p>" + junk, junk + b"<body><p>a</p></body>", junk):
+        wire, offset, ok = plant_into_body(page, None, b"X", fraction=0.5)
+        assert ok is True and wire == _at(page, offset, b"X")
+        assert 0 <= offset <= len(page)
+
+
+# --------------------------------------------------------------------------- several texts at once
+
+PAGE_FOR_MANY = (
+    b"<html><body><h1>t</h1><p>one</p><p>two</p><p>three</p><p>four</p><p>five</p>"
+    b"<p>six</p></body></html>"
+)
+
+
+def test_several_texts_are_placed_on_the_original_page_and_never_nest() -> None:
+    # every text holds '>' and '<', the characters that used to confuse the next boundary
+    items = [
+        (f"<p>a > b {i} </p><!-- > -->".encode(), f)
+        for i, f in enumerate((0.5, 0.5, 0.5, 0.0, 1.0))
+    ]
+    wire, original, final, ok = plant_many_into_body(PAGE_FOR_MANY, None, items)
+    assert ok is True
+    assert wire.count(b"<!-- > -->") == 5
+    for (payload, _f), at, now in zip(items, original, final, strict=True):
+        assert wire[now : now + len(payload)] == payload  # each text whole, in one piece
+        assert PAGE_FOR_MANY[at - 1 : at] in (b">", b"")
+    removed = wire
+    for payload, _f in items:
+        removed = removed.replace(payload, b"", 1)
+    assert removed == PAGE_FOR_MANY  # nothing else changed
+    for i in range(len(items)):  # none sits inside another
+        for j, (other, _g) in enumerate(items):
+            if i != j:
+                assert not final[j] < final[i] < final[j] + len(other)
+
+
+def test_offsets_are_on_the_original_body_and_do_not_depend_on_the_order_given() -> None:
+    items = [(b"<!--A-->", 0.2), (b"<!--B-->", 0.6), (b"<!--C-->", 1.0), (b"<!--D-->", 0.0)]
+    _w, original, _f, _ok = plant_many_into_body(PAGE_FOR_MANY, None, items)
+    for order in ([3, 2, 1, 0], [1, 3, 0, 2], [2, 0, 3, 1]):
+        shuffled = [items[i] for i in order]
+        _w2, original2, _f2, _ok2 = plant_many_into_body(PAGE_FOR_MANY, None, shuffled)
+        assert [original2[order.index(i)] for i in range(4)] == list(original)
+    # each offset is what the single-text rule gives on the untouched page
+    for (payload, fraction), at in zip(items, original, strict=True):
+        assert plant_into_body(PAGE_FOR_MANY, None, payload, fraction=fraction)[1] == at
+
+
+def test_texts_sharing_a_point_keep_the_order_given() -> None:
+    items = [(b"<!--1-->", 0.5), (b"<!--2-->", 0.5), (b"<!--3-->", 0.5)]
+    wire, original, final, _ok = plant_many_into_body(PAGE_FOR_MANY, None, items)
+    assert len(set(original)) == 1
+    assert wire[final[0] : final[0] + 24] == b"<!--1--><!--2--><!--3-->"
+    assert list(final) == [original[0], original[0] + 8, original[0] + 16]
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "br", "zstd"])
+def test_several_texts_into_compressed_pages(encoding: str) -> None:
+    codec = {
+        "gzip": gzip,
+        "br": pytest.importorskip("brotli"),
+        "zstd": pytest.importorskip("backports.zstd"),
+    }[encoding]
+    items = [(b"<!--A-->", 0.3), (b"<!--B-->", 0.9)]
+    wire, original, final, ok = plant_many_into_body(codec.compress(PAGE_FOR_MANY), encoding, items)
+    assert ok is True
+    decoded = codec.decompress(wire)
+    for (payload, _f), now in zip(items, final, strict=True):
+        assert decoded[now : now + len(payload)] == payload
+    assert len(original) == 2
+
+
+def test_several_texts_refuse_bad_input_and_leave_bad_bodies_alone() -> None:
+    assert plant_many_into_body(b"junk", "gzip", [(b"X", 0.5)]) == (b"junk", (), (), False)
+    assert plant_many_into_body(b"junk", "gzip, br", [(b"X", 0.5)]) == (b"junk", (), (), False)
+    with pytest.raises(ValueError, match="payload"):
+        plant_many_into_body(PAGE_FOR_MANY, None, [(b"", 0.5)])
+    with pytest.raises(ValueError, match="fraction"):
+        plant_many_into_body(PAGE_FOR_MANY, None, [(b"X", 1.5)])
+    wire, original, final, ok = plant_many_into_body(PAGE_FOR_MANY, None, [])
+    assert (wire, original, final, ok) == (PAGE_FOR_MANY, (), (), True)

@@ -48,7 +48,7 @@ from mitmproxy import http
 from pydantic import JsonValue
 
 from cell.injector.placement import (
-    APP_DIGEST_HEADER,
+    BODY_DIGEST_HEADER,
     DECOY_PAGE,
     DEFAULT_ROBOTS_BASE,
     NOTICE_HEADER,
@@ -62,6 +62,7 @@ from cell.injector.placement import (
     encode_body,
     is_probe,
     plant_into_body,
+    plant_many_into_body,
     recompute_etag,
     render_robots,
 )
@@ -214,34 +215,42 @@ def _apply_page(
     if status != 200:
         meta["note"] = f"app answered {status}, not 200; nothing planted"
         return _not_planted(action), meta
-    app_body = decode_body(response.raw_content or b"", response.headers.get("content-encoding"))
+    encoding = response.headers.get("content-encoding")
+    app_body = decode_body(response.raw_content or b"", encoding)
     if app_body is not None:
         meta["app_decoded_sha256"] = hashlib.sha256(app_body).hexdigest()
-    results: list[Planted] = []
+    # fixed surface order, so a point shared by two texts never depends on the manifest
+    body_plants = sorted(
+        (p for p in action.plants if p.placement.surface is not Surface.P8),
+        key=lambda p: p.placement.surface.value,
+    )
+    results: dict[str, Planted] = {}
+    if body_plants:
+        items = [(p.payload, p.placement.offset_fraction or 0.0) for p in body_plants]
+        ok = _is_html(response) and plantable(response)
+        wire, original, final, ok = (
+            plant_many_into_body(response.raw_content or b"", encoding, items)
+            if ok
+            else (b"", (), (), False)
+        )
+        if ok:
+            _replace_body(response, wire)
+            for plant, at, now in zip(body_plants, original, final, strict=True):
+                results[plant.placement.placement_id] = Planted(plant, at, True, now)
+            meta["offset_reference"] = "original decoded body"
+        else:
+            meta["note"] = "app page is not HTML or cannot be planted into (encoding or range)"
+            for plant in body_plants:
+                results[plant.placement.placement_id] = Planted(plant, None, False)
+    served = decode_body(response.raw_content or b"", encoding)
+    if served is not None:
+        meta["body_sha256_before_p8"] = hashlib.sha256(served).hexdigest()
     for plant in action.plants:
         if plant.placement.surface is Surface.P8:
             meta["replaced_header"] = NOTICE_HEADER in response.headers
             response.headers[NOTICE_HEADER] = plant.content.decode("ascii")
-            results.append(Planted(plant, None, True))
-            continue
-        offset, ok = (
-            plant_into_response(response, plant.payload, fraction=plant.placement.offset_fraction)
-            if _is_html(response)
-            else (-1, False)
-        )
-        if not ok:
-            meta["note"] = "app page is not HTML or cannot be planted into (encoding or range)"
-            results.append(Planted(plant, None, False))
-            continue
-        # text planted earlier at or after this point has moved right
-        results = [
-            Planted(p.plant, p.offset + len(plant.payload), True)
-            if p.insert_ok and p.offset is not None and p.offset >= offset
-            else p
-            for p in results
-        ]
-        results.append(Planted(plant, offset, True))
-    return tuple(results), meta
+            results[plant.placement.placement_id] = Planted(plant, None, True)
+    return tuple(results[p.placement.placement_id] for p in action.plants), meta
 
 
 def _landed(response: http.Response, decoded: bytes, planted: Planted) -> bool:
@@ -251,9 +260,10 @@ def _landed(response: http.Response, decoded: bytes, planted: Planted) -> bool:
         return False
     if plant.placement.surface is Surface.P8:
         return response.headers.get_all(NOTICE_HEADER) == [plant.content.decode("ascii")]
-    if planted.offset is None:
+    at = planted.final if planted.final is not None else planted.offset
+    if at is None:
         return False
-    return decoded[planted.offset : planted.offset + len(plant.payload)] == plant.payload
+    return decoded[at : at + len(plant.payload)] == plant.payload
 
 
 def _apply_decoy(response: http.Response) -> None:
@@ -346,9 +356,9 @@ class SurfaceInjector:
             planted, meta = _apply_robots(response, action)
         elif action.kind is ActionKind.PAGE:
             planted, meta = _apply_page(response, action)
-            digest = meta.get("app_decoded_sha256")
+            digest = meta.get("body_sha256_before_p8")
             if probe and isinstance(digest, str):  # lets the pre-flight probe see the app's body
-                response.headers[APP_DIGEST_HEADER] = digest
+                response.headers[BODY_DIGEST_HEADER] = digest
         else:
             planted, meta = _apply_error(response, action)
         wire = response.raw_content or b""
