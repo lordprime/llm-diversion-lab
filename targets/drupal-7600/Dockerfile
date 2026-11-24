@@ -117,7 +117,7 @@ RUN set -eux; \
     find / -xdev -perm /6000 -type f -exec chmod ug-s {} +; \
     command -v curl && command -v bash && command -v setpriv; \
     test ! -e /var/www/html/scripts; \
-    if grep -rliI -e diversion -e lordprime /var/www/html/sites /var/www/data /usr/local/lib/portal \
+    if grep -rlia -e diversion -e lordprime /var/www/html/sites /var/www/data /usr/local/lib/portal \
         /cve_metadata.yml /entrypoint.sh /opt/support; then \
         echo 'runtime: a shipped file names the study or a fork' >&2; exit 1; \
     fi

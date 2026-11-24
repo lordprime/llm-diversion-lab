@@ -12,7 +12,7 @@ upstream:
 branches:
   upstream: upstream
   lab: lab
-build_commit: 708595229a7ec0574b2b468253a4afbe75dec6dc   # lab: scripted SQLite install, content pack, admin password script
+build_commit: 28b8a87bd9b3c4e8bba657abbbc9affda649fa08   # lab: scripted SQLite install, content pack, admin password script
 lab_changes:
   # Core, vendor and every module are untouched; the commits only add files under scripts/.
   - scripts/install.php: scripted SQLite install, update module off

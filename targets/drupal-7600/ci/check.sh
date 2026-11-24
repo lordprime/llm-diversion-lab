@@ -38,7 +38,7 @@ docker run --rm --entrypoint /bin/bash "$image" -c '
   test "$(stat -c %U:%G:%a /var/www/html/sites/default/settings.php)" = root:root:444
   test ! -e /var/www/html/scripts
   test ! -e /var/www/html/.git
-  ! grep -rliI -e diversion -e lordprime /var/www/html/sites /var/www/data /usr/local/lib/portal /cve_metadata.yml /entrypoint.sh /opt/support'
+  ! grep -rlia -e diversion -e lordprime /var/www/html/sites /var/www/data /usr/local/lib/portal /cve_metadata.yml /entrypoint.sh /opt/support'
 
 # the image's behaviour tests
 uv sync --frozen
