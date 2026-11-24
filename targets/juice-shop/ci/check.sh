@@ -54,8 +54,7 @@ docker run --rm --entrypoint /bin/bash "$image" -c '
   test "$(stat -c %U:%G:%a $app/data)" = root:juice:1775
   for p in README.md test build/test rsn scripts swagger.yml data/static/challenges.yml \
            data/static/codefixes routes build/routes/b2bOrder.js build/routes/vulnCodeSnippet.js \
-           build/routes/continueCode.js build/routes/chat.js build/lib/challengeUtils.js \
-           node_modules/sequelize/lib/dialects/oracle; do
+           build/routes/continueCode.js build/routes/chat.js build/lib/challengeUtils.js; do
     if [ -e "$app/$p" ]; then echo "unexpected in the image: $app/$p"; exit 1; fi
   done
   # no source map and no upstream marker comment in the compiled server

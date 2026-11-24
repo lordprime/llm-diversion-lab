@@ -64,7 +64,6 @@ RUN install -d -m 0755 /opt/run-skeleton && install -d -m 0700 /opt/run-skeleton
 # ---------------------------------------------------------------------------
 # Stage 2: production dependencies only, from the same lockfile. sqlite3 is the one
 # native module; its rebuild fetches the prebuilt binding for this platform.
-# Sequelize's unused Oracle dialect and the packages' CI folders are dropped.
 # ---------------------------------------------------------------------------
 FROM ${NODE_IMAGE} AS deps
 
@@ -77,8 +76,6 @@ COPY --from=juice-shop package.json package-lock.json /src/
 RUN npm ci --omit=dev --ignore-scripts \
  && npm rebuild sqlite3 \
  && node -e "require('sqlite3')" \
- && rm -rf node_modules/sequelize/lib/dialects/oracle \
- && find node_modules -name .github -type d -prune -exec rm -rf {} + \
  && rm -rf /root/.npm /root/.cache \
  && if grep -rli diversion node_modules; then \
         echo 'deps: node_modules names the fork' >&2; exit 1; \
