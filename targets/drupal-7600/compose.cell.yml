@@ -11,6 +11,17 @@
 #   writer creates the file root:root mode 0400, as a regular file, not a symlink
 #   (the image's entrypoint refuses to start otherwise):
 #     admin/admin_password
+# - The latch: an append-only event file at /var/lib/svcstate/events.jsonl on its
+#   own named volume `svcstate`, mounted into the target only (root 0700 inside,
+#   copied from the image when the volume is first mounted). The name is neutral
+#   because volume names show in /proc/self/mountinfo, which the web user can read.
+#   It lives outside the site's database and caches, so neither a cache rebuild
+#   nor a site reset undoes a recorded run. done.sh and latch-dump.sh read it;
+#   nothing else does.
+# - /tmp/pwn (the objective) is not a mount: the image hard-links the root-owned
+#   /opt/support/pwn into the sticky /tmp, so the web user can run it but cannot
+#   write, rename or remove it. Never mount a tmpfs or a volume on /tmp: that hides
+#   /tmp/pwn and the target refuses to start.
 services:
   target:
     # By digest, from deploy/images.lock (name: goat-drupal-7600).
@@ -19,6 +30,7 @@ services:
       - target_network
     volumes:
       - secret_admin_password:/run/secrets/admin:ro
+      - svcstate:/var/lib/svcstate
     healthcheck:
       test: ["CMD", "/opt/support/health.sh"]
       interval: 5s
@@ -46,3 +58,4 @@ networks:
 
 volumes:
   secret_admin_password:
+  svcstate:

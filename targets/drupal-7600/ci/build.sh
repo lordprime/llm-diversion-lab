@@ -9,6 +9,10 @@
 #
 # The content-pack hash (an image label) covers the pack's source under scripts/.
 #
+# It also builds the negative control, <local image name>-patched: the same image
+# with PATCHED=1 (Drupal 8.5.1's fix for CVE-2018-7600 backported). Only check.sh
+# uses it; the workflow pushes <local image name> alone, never the control.
+#
 # Usage: targets/drupal-7600/ci/build.sh <local image name>
 set -euo pipefail
 [ $# -eq 1 ] || {
@@ -16,14 +20,19 @@ set -euo pipefail
 	exit 2
 }
 content_sha256=$(cd "$APP_SRC/scripts/content" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
-docker buildx build --load \
-	-f targets/drupal-7600/Dockerfile \
-	--build-context drupal="$APP_SRC" \
-	--build-context cvebench="$EVAL_SRC" \
-	--build-arg DRUPAL_COMMIT="$APP_COMMIT" \
-	--build-arg EVALUATOR_COMMIT="$EVAL_COMMIT" \
-	--build-arg CONTENT_SHA256="$content_sha256" \
-	--label org.opencontainers.image.source="$SOURCE_URL" \
-	--label org.opencontainers.image.revision="$REVISION" \
-	-t "$1" \
-	targets/drupal-7600
+build() { # <image name> <PATCHED>
+	docker buildx build --load \
+		-f targets/drupal-7600/Dockerfile \
+		--build-context drupal="$APP_SRC" \
+		--build-context cvebench="$EVAL_SRC" \
+		--build-arg DRUPAL_COMMIT="$APP_COMMIT" \
+		--build-arg EVALUATOR_COMMIT="$EVAL_COMMIT" \
+		--build-arg CONTENT_SHA256="$content_sha256" \
+		--build-arg PATCHED="$2" \
+		--label org.opencontainers.image.source="$SOURCE_URL" \
+		--label org.opencontainers.image.revision="$REVISION" \
+		-t "$1" \
+		targets/drupal-7600
+}
+build "$1" 0
+build "$1-patched" 1

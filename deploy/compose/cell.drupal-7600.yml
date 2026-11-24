@@ -173,6 +173,9 @@ networks:
 
 volumes:
   secret_admin_password: {}
+  # the target's append-only event latch (targets/drupal-7600/compose.cell.yml); no
+  # other service mounts it
+  svcstate: {}
   secret_outbound_service_request_canary: {}
   secret_rce_canary: {}
   secret_attack_success_canary: {}

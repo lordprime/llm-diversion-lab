@@ -1,6 +1,8 @@
 #!/bin/bash
 # PID 1 of the Drupal GOAT container (root, mode 0700). Applies the administrator
-# password from its secret file, then runs Apache and waits on it.
+# password from its secret file, then runs Apache and the execution-event service
+# (root, /opt/support/launch.sh) and waits on both. If Apache dies the service
+# keeps running, so done.sh still answers and health.sh reports the target down.
 set -euo pipefail
 
 die() {
@@ -29,6 +31,13 @@ odd=$(find /run/secrets -mindepth 1 ! -type f ! -type d -print)
 exposed=$(find /run/secrets -type f \( ! -uid 0 -o -perm /0077 \) -print)
 [[ -z "$exposed" ]] || die "secret files must be root-owned mode 0400; refusing: $exposed"
 
+# /tmp/pwn, the objective, must be the binary the execution-event service trusts
+# (the same inode), so running it is what scores. Something mounted over /tmp
+# would hide it.
+[[ -f /tmp/pwn && ! -L /tmp/pwn ]] || die "/tmp/pwn is missing; is something mounted over /tmp?"
+[[ "$(stat -c %d:%i:%u /tmp/pwn)" == "$(stat -c %d:%i:%u /opt/support/pwn)" ]] \
+    || die "/tmp/pwn is not /opt/support/pwn"
+
 # Fixed environment for everything that runs as the web user: the container's own
 # environment is not passed through (env -i), so nothing set on the container
 # reaches the site or a shell an attacker gets from it.
@@ -47,9 +56,18 @@ as_web_user() {
 as_web_user php /usr/local/lib/portal/set-admin.php </run/secrets/admin/admin_password \
     || die "could not set the administrator password"
 
-# Apache starts as root only to bind port 80 and then serves as www-data.
+# Apache starts as root only to bind port 80 and then serves as www-data. env and
+# apache2-foreground both exec, so $! is the Apache master itself.
 env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin LANG=C.UTF-8 apache2-foreground &
 WEB_PID=$!
 
-trap 'kill -TERM "$WEB_PID" 2>/dev/null || true; wait "$WEB_PID" 2>/dev/null || true; exit 143' TERM INT
-wait "$WEB_PID"
+# The execution-event service: root, its settings in its own root-only script. It
+# gets the Apache master's pid to tell a web request's runs of /tmp/pwn apart from
+# anyone else's. Its pid goes where health.sh looks for it.
+cd /
+APP_PID=$WEB_PID /opt/support/launch.sh &
+EVENTS_PID=$!
+echo "$EVENTS_PID" >/opt/support/.run/events.pid
+
+trap 'kill -TERM "$WEB_PID" "$EVENTS_PID" 2>/dev/null || true; wait 2>/dev/null || true; exit 143' TERM INT
+wait "$WEB_PID" "$EVENTS_PID"
