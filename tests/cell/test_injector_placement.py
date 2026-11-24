@@ -9,7 +9,6 @@ from __future__ import annotations
 import gzip
 import json
 import re
-from html.parser import HTMLParser
 from typing import Any
 
 import pytest
@@ -20,6 +19,7 @@ from cell.injector.placement import (
     BODY_SURFACES,
     MAX_NOTICE_BYTES,
     PROTECTED_HEADERS,
+    SCANNER_PROBE,
     SURFACE_LOCATORS,
     ActionKind,
     Plant,
@@ -27,6 +27,7 @@ from cell.injector.placement import (
     _boundary_offsets,
     _TagScanner,
     build_plan,
+    check_scanner,
     plant_into_body,
     plant_many_into_body,
 )
@@ -663,13 +664,39 @@ def _ends_a_tag(prefix: bytes) -> bool:
     )
 
 
+def _expected_end(page: bytes, fraction: float) -> int:
+    """The brief's rule, worked out with a plain regex on pages simple enough for one."""
+    ends = [m.end() for m in re.finditer(rb"<(?!style\b)/?[a-zA-Z][^<>]*>|</style>", page)]
+    body = page.find(b"<body>")
+    low = body + len(b"<body>") if body >= 0 else 0
+    inside = [e for e in ends if e >= low]
+    close = page.rfind(b"</body>")
+    if body < 0:  # a fragment: before its </body>, else after its last tag
+        return close if close >= 0 else inside[-1]
+    limit = close if close >= low else inside[-1]  # no real </body>: the last tag end
+    target = int(len(page) * fraction)
+    return next((e for e in inside if target < e <= limit), limit)
+
+
 @pytest.mark.parametrize("page", AMPERSAND_PAGES)
 def test_a_bad_character_reference_does_not_shift_later_tag_ends(page: bytes) -> None:
     for tenth in range(11):
         wire, offset, ok = plant_into_body(page, None, b"|PLANT|", fraction=tenth / 10)
         assert ok is True
-        assert _ends_a_tag(page[:offset]), (tenth, page[:offset])
+        assert offset == _expected_end(page, tenth / 10), (tenth, page[:offset])
         assert wire == _at(page, offset, b"|PLANT|")
+
+
+def test_bad_character_references_do_not_collapse_the_fraction() -> None:
+    """Every fraction used to land right after the first <h1> on 3.12 runtimes."""
+    page = (
+        b"<html><body><h1>R&#D</h1><div>" + b"<p>row &#x; and &#A; more</p>" * 6 + b"</div>"
+        b"<p>z</p></body></html>"
+    )
+    offsets = {plant_into_body(page, None, b"X", fraction=f / 10)[1] for f in range(11)}
+    assert len(offsets) > 5  # spread over the page, not one point
+    for f in (0.3, 0.7, 1.0):
+        assert plant_into_body(page, None, b"X", fraction=f)[1] == _expected_end(page, f)
 
 
 def test_the_style_in_the_first_probe_is_never_split() -> None:
@@ -718,28 +745,95 @@ def test_raw_text_and_non_rendered_elements_are_never_planted_into(page: bytes) 
         assert _ends_a_tag(page[:offset])
 
 
-def test_the_html_parser_behaviour_the_scanner_relies_on_has_not_drifted() -> None:
-    """The cell image's Python patch release may differ from this host's: fail loudly."""
-    assert {"script", "style"} <= set(HTMLParser.CDATA_CONTENT_ELEMENTS)
-    assert {"textarea", "title"} <= set(getattr(HTMLParser, "RCDATA_CONTENT_ELEMENTS", ()))
-    assert {"script", "style", "textarea", "title", "xmp", "iframe", "noscript"} <= _TagScanner._RAW
+def _tags(page: bytes) -> list[tuple[str, bool]]:
+    return [(t[2], t[3]) for t in _TagScanner(page).tags]
 
-    def tags(page: bytes) -> list[tuple[str, bool]]:
-        return [(t[2], t[3]) for t in _TagScanner(page).tags]
 
-    assert tags(b"<p>a</p>") == [("p", False), ("p", True)]
-    assert tags(b"<!-- x <p>y</p> --><b>") == [("b", False)]
-    assert tags(b"<script>if (a > b) {}</script><i>") == [("script", True), ("i", False)]
-    assert tags(b"<textarea><p>x</p></textarea>") == [("textarea", True)]
-    assert tags(b"<plaintext><p>x</p></plaintext>") == []
-    assert tags(b"<p>a</p><!-- never closed <p>b</p>") == [("p", False), ("p", True)]
-    assert tags(b"<p>a</p><script>never closed <p>b</p>") == [("p", False), ("p", True)]
-    # an end tag's end is the parser's own, even after an invalid character reference
-    page = b"<h1>R&#D</h1><div><span>x</span></div><style>a{b:c;}</style>"
-    for _start, end, tag, is_end in _TagScanner(page).tags:
-        assert page[:end].endswith(b">"), (tag, is_end, page[:end])
-        assert _ends_a_tag(page[:end])
-    assert [page[: t[1]][-8:] for t in _TagScanner(page).tags][-1] == b"</style>"
+def test_the_scanner_probe_page_reads_as_expected() -> None:
+    """The cell image build runs this same check, so a drift fails there too."""
+    check_scanner()
+    assert SCANNER_PROBE.startswith(b"<html>")
+
+
+def test_the_scanner_reads_the_basics() -> None:
+    assert _tags(b"<p>a</p>") == [("p", False), ("p", True)]
+    assert _tags(b"<!-- x <p>y</p> --><b>") == [("b", False)]
+    assert _tags(b"<script>if (a > b) {}</script><i>") == [("script", True), ("i", False)]
+    assert _tags(b"<textarea><p>x</p></textarea>") == [("textarea", True)]
+    assert _tags(b"<plaintext><p>x</p></plaintext>") == []
+    assert _tags(b"<p>a</p><!-- never closed <p>b</p>") == [("p", False), ("p", True)]
+    assert _tags(b"<p>a</p><script>never closed <p>b</p>") == [("p", False), ("p", True)]
+    assert _tags(b"<p>a</p><?php x > ?><b>") == [("p", False), ("p", True), ("b", False)]
+    assert _tags(b"<!DOCTYPE html><p>") == [("p", False)]
+    assert _tags(b"a </ b> c <p>") == [("p", False)]  # a junk end tag is a bogus comment
+    assert _tags(b"</>x<p>") == [("p", False)]
+    assert _tags(b"<P CLASS=A>") == [("p", False)]
+    assert _tags(b'<a b"c>') == [("a", False)]  # a quote inside a name is just a name
+
+
+def test_the_scanner_survives_the_standard_parser_quirks() -> None:
+    """Bad character references and quoted '>' never move or hide a tag end."""
+    page = b"<h1>R&#D</h1><div><span>x</span></div><style>a{b:c;}</style><p class='x>y'>q</p>"
+    tags = _TagScanner(page).tags
+    assert [(t[2], t[3]) for t in tags] == [
+        ("h1", False),
+        ("h1", True),
+        ("div", False),
+        ("span", False),
+        ("span", True),
+        ("div", True),
+        ("style", True),
+        ("p", False),
+        ("p", True),
+    ]
+    for _start, end, _tag, _is_end in tags:
+        assert _ends_a_tag(page[:end]) or page[:end].endswith(b"</style>")
+
+
+# --------------------------------------------------------------------------- script data states
+
+SCRIPT_PROBES = {
+    # CPython ends the script at the inner </script>; browsers keep it open (double escaped)
+    "double-escaped": (
+        b"<script><!--\ndocument.write('<script src=\"x.js\"></script>');\n//--></script>",
+        b"</script>",
+    ),
+    # '<!-->' closes the comment at once, so the script below is a real script
+    "abrupt-comment": (b"<!--><script>--><p>IN</p></script>", b"</script>"),
+    "abrupt-dash-comment": (b"<!---><script>--><p>IN</p></script>", b"</script>"),
+    # scripting on: noscript holds raw text, so '<!--' is not a comment and the script is real
+    "noscript": (b"<noscript><!--</noscript><script>--><p>IN</p></script>", b"</script>"),
+    "escaped-then-closed": (b"<script><!-- <p>IN</p> --></script>", b"</script>"),
+    "escaped-open-end": (b"<script><!-- <p>IN</p></script>", b"</script>"),
+    "abrupt-inside-script": (b"<script><!--> <p>IN</p></script>", b"</script>"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(SCRIPT_PROBES))
+def test_script_data_escape_states_decide_where_a_script_ends(name: str) -> None:
+    probe, end_tag = SCRIPT_PROBES[name]
+    page = b"<html><body><p>a</p>" + probe + b"<p>b</p><p>c</p></body></html>"
+    inner = page.index(b"document.write" if name == "double-escaped" else b"<p>IN</p>")
+    after = page.index(probe) + len(probe)
+    assert page[:after].endswith(end_tag)
+    for tenth in range(11):
+        offset = plant_into_body(page, None, b"X", fraction=tenth / 10)[1]
+        assert not inner <= offset < after, (name, tenth, page[:offset])
+    ends = {t[1] for t in _TagScanner(page).tags}
+    assert after in ends  # the real end tag of the script is a boundary
+    assert not any(inner <= e < after for e in ends)
+
+
+def test_a_script_left_double_escaped_swallows_the_rest_and_fails_closed() -> None:
+    page = b"<html><body><p>a</p><script><!--<script></script><p>b</p></body></html>"
+    # the inner </script> only returns to the escaped state; nothing closes the script
+    offsets = {plant_into_body(page, None, b"X", fraction=f / 10)[1] for f in range(11)}
+    assert max(offsets) <= page.index(b"<script>")  # never into or after the script
+
+
+def test_a_comment_hiding_a_script_start_is_not_a_script() -> None:
+    page = b"<body><!-- <script> --><p>a</p><p>b</p></body>"
+    assert ("p", False) in _tags(page) and ("body", True) in _tags(page)
 
 
 # --------------------------------------------------------------------------- property test
@@ -750,9 +844,27 @@ _TEXT = st.sampled_from(
 _TAGS = st.sampled_from(
     [b"<p>", b"</p>", b'<a href="x>y">', b"</a>", b'</p class="x>y">', b"<br/>", b"<b id='q>'>"]
 )
-_COMMENT = st.sampled_from([b"<!-- a > b <p> -->", b"<!---->", b"<!-- &#D; -->"])
+_COMMENT = st.sampled_from(
+    [b"<!-- a > b <p> -->", b"<!---->", b"<!-- &#D; -->", b"<!-->", b"<!--->", b"<!-- x --!>"]
+)
 _RAW_NAMES = st.sampled_from(
-    [b"script", b"style", b"textarea", b"title", b"xmp", b"iframe", b"noembed", b"noframes"]
+    [b"style", b"textarea", b"title", b"xmp", b"iframe", b"noembed", b"noframes", b"noscript"]
+)
+# contents that leave a script in plain script data, so the last </script> ends it
+_SCRIPT_CONTENT = st.sampled_from(
+    [
+        b"a > b",
+        b"if (x) { y = '<b>' }",
+        b"<!-- document.write('<script></script>'); //-->",
+        b"<!--<script>-->",
+        b"-->",
+        b"--><p>IN</p>",
+        b"<!-->",
+        b"<!--->",
+        b"<!-- <p>x</p> -->",
+        b"<!--<script></script>-->",
+        b"&#D; </scripty> <p>",
+    ]
 )
 _RAW_CONTENT = st.sampled_from(
     [b"a > b", b"<p>", b"if (x) { y = '<b>' }", b"&#D;", b"<!-- not a comment ->", b"x;"]
@@ -760,42 +872,45 @@ _RAW_CONTENT = st.sampled_from(
 
 
 @st.composite
-def _documents(draw: Any) -> tuple[bytes, set[int]]:
-    """A page and the offsets that are safe: right after a tag in normal content."""
+def _documents(draw: Any) -> tuple[bytes, list[int]]:
+    """A page and the offsets of every tag end in normal content (known by construction)."""
     page = b"<html><body>"
-    safe = {len(page)}  # the body start tag's own end
+    ends = [len(page)]  # the body start tag's own end
     for _ in range(draw(st.integers(0, 14))):
-        kind = draw(st.sampled_from(["text", "tag", "tag", "comment", "raw"]))
+        kind = draw(st.sampled_from(["text", "tag", "tag", "comment", "raw", "script"]))
         if kind == "text":
             page += draw(_TEXT)
         elif kind == "tag":
             page += draw(_TAGS)
-            safe.add(len(page))
+            ends.append(len(page))
         elif kind == "comment":
             page += draw(_COMMENT)
+        elif kind == "script":
+            page += b"<script>" + draw(_SCRIPT_CONTENT) + b"</script>"
+            ends.append(len(page))  # only the end of the closing tag is in normal content
         else:
             name = draw(_RAW_NAMES)
             page += b"<" + name + b">" + draw(_RAW_CONTENT) + b"</" + name + b">"
-            safe.add(len(page))  # only the end of the closing tag is in normal content
-    safe.add(len(page))  # just before </body>
-    return page + b"</body></html>", safe
+            ends.append(len(page))
+    return page + b"</body></html>", ends
 
 
-@settings(max_examples=300, deadline=None)
+@settings(max_examples=600, deadline=None)
 @given(doc=_documents(), fractions=st.lists(st.floats(0, 1), min_size=1, max_size=6))
-def test_every_recorded_boundary_is_the_end_of_a_real_tag_in_normal_content(
-    doc: tuple[bytes, set[int]], fractions: list[float]
+def test_every_boundary_is_the_first_tag_end_after_the_target(
+    doc: tuple[bytes, list[int]], fractions: list[float]
 ) -> None:
-    page, safe = doc
+    page, ends = doc
+    close = page.index(b"</body>")  # the one real </body>: nothing generated contains another
     offsets = _boundary_offsets(page, fractions)
     assert offsets is not None
     for fraction, offset in zip(fractions, offsets, strict=True):
-        assert offset in safe, (fraction, page[:offset], page[offset:])
-        assert offset >= page.index(b"<body>") + len(b"<body>")
-        assert offset <= page.index(b"</body>")
-    # and nothing the scanner records is ever inside a raw element or comment
-    for _start, end, _tag, _is_end in _TagScanner(page).tags:
-        assert end in safe or end > page.index(b"</body>") or page[:end].endswith(b"<html>")
+        target = int(len(page) * fraction)
+        expected = next((e for e in ends if target < e <= close), close)
+        assert offset == expected, (fraction, page[:offset], page[offset:])
+    # and the scanner records exactly the construction's tag ends, nothing hidden or extra
+    recorded = [t[1] for t in _TagScanner(page).tags]
+    assert recorded == [len(b"<html>"), *ends, close + len(b"</body>"), len(page)]
 
 
 # --------------------------------------------------------------------------- several texts at once

@@ -60,7 +60,6 @@ than it promises.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import hmac
 import html
@@ -69,7 +68,6 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from html.parser import HTMLParser
 from typing import Final
 
 from control.core.codecs import decode_body, encode_body
@@ -90,6 +88,7 @@ __all__ = [
     "PROTECTED_HEADERS",
     "ROBOTS_LOCATOR",
     "ROBOTS_PATH",
+    "SCANNER_PROBE",
     "SURFACE_LOCATORS",
     "Action",
     "ActionKind",
@@ -98,6 +97,7 @@ __all__ = [
     "Planted",
     "SurfaceMarkup",
     "build_plan",
+    "check_scanner",
     "decode_body",
     "encode_body",
     "is_probe",
@@ -171,80 +171,199 @@ def _rfind_ci(haystack: bytes, needle: bytes) -> int:
     return haystack.lower().rfind(needle.lower())
 
 
-class _TagScanner(HTMLParser):
+class _TagScanner:
     """Records where each start and end tag of a page ends, in normal content only.
 
-    The page is read as Latin-1, so a character index is a byte index whatever the
-    page's real charset. Tags inside raw-text or non-rendered elements (:data:`_RAW`:
-    script, style, textarea, title, xmp, iframe, noembed, noframes, noscript and
-    plaintext) are skipped, and so is the end of their start tags (that point is inside
-    their content). ``plaintext`` never ends. Comments, declarations and text never
-    count. Each entry is ``(start, end, tag, is_end_tag)``.
+    A small tokenizer that follows the HTML parsing rules a browser applies, so it gives
+    the same answer on every Python (the standard library parser changes between patch
+    releases and differs from browsers in several corners). The page is read as Latin-1,
+    so a character index is a byte index whatever the page's real charset. Each entry of
+    :attr:`tags` is ``(start, end, tag, is_end_tag)``.
 
-    The end of a tag is the index the parser itself returns for it (rebased to the
-    whole page, because the parser trims what it has already read), so a ``>`` inside a
-    quoted attribute value is never mistaken for it.
+    * Comments (including ``<!-->`` and ``<!--->``, which close at once), doctypes,
+      ``<?...>`` and ``</ ...>`` junk never count.
+    * ``style``, ``xmp``, ``iframe``, ``noembed``, ``noframes`` and ``noscript`` (scripting
+      on) hold raw text until their end tag; ``textarea`` and ``title`` likewise.
+      The end of those start tags lies inside their content and is not recorded;
+      ``plaintext`` swallows the rest of the page.
+    * ``script`` follows the script data escape states: after ``<!--`` a ``<script``
+      opens a double-escaped section that only a later ``</script>`` followed by ``-->``
+      and a final ``</script>`` can end.
+    * Tag ends honour quoted attribute values, so a ``>`` inside one is not a tag end.
+
+    Anything unterminated (a comment, a quote, a script, a raw element) swallows the rest
+    of the page: no later boundary is recorded, which fails closed.
     """
 
-    _RAW: Final = (
-        frozenset(HTMLParser.CDATA_CONTENT_ELEMENTS)
-        | frozenset(getattr(HTMLParser, "RCDATA_CONTENT_ELEMENTS", ()))
-        | {"script", "style", "textarea", "title"}
-        | {"xmp", "iframe", "noembed", "noframes", "noscript", "plaintext"}
+    _RAWTEXT: Final = frozenset({"style", "xmp", "iframe", "noembed", "noframes", "noscript"})
+    _RCDATA: Final = frozenset({"textarea", "title"})
+    _SPACE: Final = "\t\n\f\r "
+    _NAME_END: Final = re.compile(r"[^\t\n\f\r />]*")
+    _ATTR_NAME: Final = re.compile(r"=?[^\t\n\f\r />=]*")
+    _UNQUOTED: Final = re.compile(r"[^\t\n\f\r >]*")
+    _SPACES: Final = re.compile(r"[\t\n\f\r ]*")
+    _COMMENT_END: Final = re.compile(r"--!?>")
+    _SCRIPT_TOKEN: Final = re.compile(
+        r"<!--(-*>)?|-->|<script(?=[\t\n\f\r />])|</script(?=[\t\n\f\r />])", re.IGNORECASE
     )
 
     def __init__(self, decoded: bytes) -> None:
-        super().__init__(convert_charrefs=False)
         self._text = decoded.decode("latin-1")
-        self._lines = [0] + [m.end() for m in re.finditer("\n", self._text)]
-        self._raw: str | None = None
-        self._pending: tuple[int, str, bool] | None = None
         self.tags: list[tuple[int, int, str, bool]] = []
-        # a page the parser rejects just has fewer boundaries
-        with contextlib.suppress(Exception):
-            self.feed(self._text)
-            self.close()
+        self._scan()
 
-    def _here(self) -> int:
-        line, col = self.getpos()
-        return self._lines[line - 1] + col
+    def _tag_end(self, j: int) -> int:
+        """Index just after the ``>`` of the tag whose name ends at ``j``; -1 if unterminated."""
+        text, n = self._text, len(self._text)
+        while j < n:
+            c = text[j]
+            if c == ">":
+                return j + 1
+            if c in self._SPACE or c == "/":
+                j += 1
+                continue
+            j = self._ATTR_NAME.match(text, j).end()  # type: ignore[union-attr]
+            k = self._SPACES.match(text, j).end()  # type: ignore[union-attr]
+            if text[k : k + 1] != "=":
+                continue
+            k = self._SPACES.match(text, k + 1).end()  # type: ignore[union-attr]
+            quote = text[k : k + 1]
+            if quote in ('"', "'"):
+                close = text.find(quote, k + 1)
+                if close < 0:
+                    return -1
+                j = close + 1
+            else:
+                j = self._UNQUOTED.match(text, k).end()  # type: ignore[union-attr]
+        return -1
 
-    def _finish(self, end: int) -> None:
-        """Record the tag the handler just saw, now that the parser says where it ends."""
-        pending, self._pending = self._pending, None
-        if pending is not None and end > 0:
-            start, tag, is_end = pending
-            self.tags.append((start, len(self._text) - len(self.rawdata) + end, tag, is_end))
+    def _raw_end(self, name: str, start: int) -> tuple[int, int] | None:
+        """``(start, end)`` of the end tag that closes raw text from ``start``; ``None`` if none."""
+        pattern = re.compile(rf"</{name}(?=[\t\n\f\r />])", re.IGNORECASE)
+        found = pattern.search(self._text, start)
+        if found is None:
+            return None
+        end = self._tag_end(found.end())
+        return None if end < 0 else (found.start(), end)
 
-    def parse_starttag(self, i: int) -> int:
-        end = super().parse_starttag(i)
-        self._finish(end)
-        return end
+    def _script_end(self, start: int) -> tuple[int, int] | None:
+        """``(start, end)`` of the ``</script>`` that really ends the script from ``start``."""
+        text = self._text
+        state, pos = "data", start
+        while (m := self._SCRIPT_TOKEN.search(text, pos)) is not None:
+            piece = m.group(0).lower()
+            pos = m.end()
+            if piece.startswith("<!--"):
+                if m.group(1) is not None:  # "<!-->", "<!--->": back to plain script data
+                    state = "data"
+                elif state == "data":
+                    state = "escaped"
+            elif piece == "-->":
+                if state != "data":
+                    state = "data"
+            elif piece == "<script":
+                if state == "escaped":
+                    state = "double"
+            elif state == "double":  # "</script" inside a double-escaped section
+                state = "escaped"
+            else:
+                end = self._tag_end(m.end())
+                return None if end < 0 else (m.start(), end)
+        return None
 
-    def parse_endtag(self, i: int) -> int:
-        end = super().parse_endtag(i)
-        self._finish(end)
-        return end
+    def _scan(self) -> None:
+        text, i = self._text, 0
+        while (i := text.find("<", i)) >= 0:
+            nxt = text[i + 1 : i + 2]
+            if nxt == "!":
+                if text.startswith("<!--", i):
+                    if text.startswith(">", i + 4):
+                        i += 5
+                    elif text.startswith("->", i + 4):
+                        i += 6
+                    else:
+                        found = self._COMMENT_END.search(text, i + 4)
+                        if found is None:
+                            return
+                        i = found.end()
+                else:  # a doctype or a bogus comment, up to the next ">"
+                    close = text.find(">", i + 2)
+                    if close < 0:
+                        return
+                    i = close + 1
+            elif nxt == "?":
+                close = text.find(">", i + 2)
+                if close < 0:
+                    return
+                i = close + 1
+            elif nxt == "/":
+                after = text[i + 2 : i + 3]
+                if after.isascii() and after.isalpha():
+                    name_end = self._NAME_END.match(text, i + 2).end()  # type: ignore[union-attr]
+                    end = self._tag_end(name_end)
+                    if end < 0:
+                        return
+                    self.tags.append((i, end, text[i + 2 : name_end].lower(), True))
+                    i = end
+                else:  # "</>" is ignored; anything else is a bogus comment
+                    close = text.find(">", i + 2)
+                    if close < 0:
+                        return
+                    i = close + 1
+            elif nxt.isascii() and nxt.isalpha():
+                name_end = self._NAME_END.match(text, i + 1).end()  # type: ignore[union-attr]
+                name = text[i + 1 : name_end].lower()
+                end = self._tag_end(name_end)
+                if end < 0:
+                    return
+                if name == "plaintext":
+                    return
+                if name == "script" or name in self._RAWTEXT or name in self._RCDATA:
+                    closing = (
+                        self._script_end(end) if name == "script" else self._raw_end(name, end)
+                    )
+                    if closing is None:
+                        return
+                    self.tags.append((closing[0], closing[1], name, True))
+                    i = closing[1]
+                else:
+                    self.tags.append((i, end, name, False))
+                    i = end
+            else:
+                i += 1
 
-    def _start(self, tag: str) -> None:
-        if self._raw is not None:
-            return
-        if tag in self._RAW:
-            self._raw = tag
-        else:
-            self._pending = (self._here(), tag, False)
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self._start(tag)
+#: A page whose tag ends are known, for :func:`check_scanner`: an abrupt comment, a quoted
+#: ``>``, a bad character reference, a double-escaped script and a style holding ``>``.
+SCANNER_PROBE: Final = (
+    b'<html><body><!--> x --><p class="a>b">R&#D</p><script><!--\n'
+    b'document.write("<script></script>");\n//--></script><style>a>b{}</style>'
+    b"<p>z</p></body></html>"
+)
+SCANNER_PROBE_TAGS: Final = (
+    ("html", False),
+    ("body", False),
+    ("p", False),
+    ("p", True),
+    ("script", True),
+    ("style", True),
+    ("p", False),
+    ("p", True),
+    ("body", True),
+    ("html", True),
+)
 
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self._start(tag)
 
-    def handle_endtag(self, tag: str) -> None:
-        if self._raw is not None and (self._raw == "plaintext" or tag != self._raw):
-            return
-        self._raw = None
-        self._pending = (self._here(), tag, True)
+def check_scanner() -> None:
+    """Raise ``RuntimeError`` unless the scanner reads :data:`SCANNER_PROBE` as expected.
+
+    Run by the cell image build and by the tests, so a change of behaviour fails loudly.
+    """
+    tags = _TagScanner(SCANNER_PROBE).tags
+    if tuple((t[2], t[3]) for t in tags) != SCANNER_PROBE_TAGS or any(
+        not SCANNER_PROBE[: t[1]].endswith(b">") for t in tags
+    ):
+        raise RuntimeError(f"the tag scanner misreads its probe page: {tags}")
 
 
 def _boundary_offsets(decoded: bytes, fractions: Sequence[float]) -> list[int] | None:

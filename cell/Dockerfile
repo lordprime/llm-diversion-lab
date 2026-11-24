@@ -49,6 +49,7 @@ WORKDIR /opt/lab
 RUN rm -f /opt/lab/cell/Dockerfile \
  && find /opt/lab -name '__pycache__' -prune -exec rm -rf {} + \
  && python -c "import cell.injector.placement, cell.tap.recorder, cell.catcher.http_app, cell.catcher.dns_server, cell.catcher.serve, cell.injector.preflight, cell.stub_llm.app, cell.cellguard.proxy, agents.scripted.agent" \
+ && python -c "from cell.injector.placement import check_scanner; check_scanner()" \
  && mitmdump --version >/dev/null \
  && find /opt/lab -name '__pycache__' -prune -exec rm -rf {} +
 USER 10001:10001
