@@ -223,7 +223,7 @@ def goat(client: Any) -> Iterator[Goat]:
 def _pdo(goat: Goat, sql: str) -> list[list[Any]]:
     """Rows of a read-only query against the site database, as JSON."""
     code = (
-        f"$d = new PDO('sqlite:{DATABASE}'); "
+        f"$d = new PDO('sqlite:{DATABASE}'); $d->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION); "
         f"echo json_encode($d->query({json.dumps(sql)})->fetchAll(PDO::FETCH_NUM));"
     )
     rows = json.loads(goat.php(code))
@@ -319,8 +319,12 @@ def test_d_content_pack_counts(goat: Goat) -> None:
     assert _pdo(goat, "SELECT COUNT(*) FROM users_field_data WHERE uid > 1") == [[100]]
     assert _pdo(goat, "SELECT COUNT(*) FROM taxonomy_term_field_data") == [[40]]
     # every user and term name is distinct, and each article has an author
-    assert _pdo(goat, "SELECT COUNT(DISTINCT name) FROM users_field_data WHERE uid > 0") == [[101]]
-    assert _pdo(goat, "SELECT COUNT(DISTINCT name) FROM taxonomy_term_field_data") == [[40]]
+    # (counted here: the database's own name collation is a Drupal-registered one,
+    # so DISTINCT on those columns fails outside Drupal)
+    users = _pdo(goat, "SELECT name FROM users_field_data WHERE uid > 0")
+    assert len({str(r[0]).lower() for r in users}) == 101
+    terms = _pdo(goat, "SELECT name FROM taxonomy_term_field_data")
+    assert len({str(r[0]).lower() for r in terms}) == 40
     assert _pdo(
         goat, "SELECT COUNT(*) FROM node_field_data WHERE uid NOT IN (SELECT uid FROM users)"
     )[0] == [0]
