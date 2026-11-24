@@ -20,6 +20,7 @@ from control.core.models import (
     FunnelStage,
     LlmCall,
     OraclePoll,
+    OracleVerdictKind,
     Placement,
     PlacementServe,
     RunManifest,
@@ -361,11 +362,67 @@ def test_funnel_label_constructs() -> None:
     assert lbl.stage is FunnelStage.VISIBLE
 
 
+def _verdict_doc(**over: Any) -> dict[str, Any]:
+    doc: dict[str, Any] = {
+        "run_id": RUN,
+        "end_status": "completed",
+        "outcome": True,
+        "effect": True,
+        "decided_at": TS,
+    }
+    return doc | over
+
+
 def test_verdict_constructs() -> None:
-    v = Verdict.model_validate(
-        {"run_id": RUN, "end_status": "completed", "outcome": True, "decided_at": TS}
-    )
+    v = Verdict.model_validate(_verdict_doc())
     assert v.end_status is EndStatus.COMPLETED
+
+
+def test_verdict_model_fields() -> None:
+    """Both verdicts are kept; the mechanism may be unknown (None), the effect never."""
+    v = Verdict.model_validate(_verdict_doc(mechanism=False))
+    assert (v.effect, v.mechanism, v.outcome) == (True, False, True)
+    assert Verdict.model_validate(_verdict_doc()).mechanism is None
+    assert Verdict.model_validate_json(v.model_dump_json()) == v
+    required = Verdict.model_json_schema()["required"]
+    assert "effect" in required and "mechanism" not in required
+
+
+def test_oracle_poll_keeps_the_whole_done_answer() -> None:
+    base = EVENT_FIXTURES[OraclePoll]
+    poll = OraclePoll.model_validate(
+        base | {"objective": "outbound_service", "mechanism": None, "latch_events": 4}
+    )
+    assert (poll.objective, poll.mechanism, poll.latch_events) == ("outbound_service", None, 4)
+    assert OraclePoll.model_validate(base).latch_events is None  # an errored poll
+    with pytest.raises(ValidationError):
+        OraclePoll.model_validate(base | {"latch_events": -1})
+
+
+def test_oracle_verdict_kind_values() -> None:
+    assert [k.value for k in OracleVerdictKind] == ["effect", "mechanism"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"effect": None},
+        {"effect": "banana"},
+        {"mechanism": "maybe"},
+        {"outcome": False},  # neither verdict says false
+        {"outcome": True, "effect": False, "mechanism": None},
+        {"outcome": True, "effect": False, "mechanism": False},
+        {"outcome": None},
+    ],
+)
+def test_verdict_rejects_inconsistent_or_malformed_verdicts(bad: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        Verdict.model_validate(_verdict_doc(**bad))
+
+
+def test_verdict_outcome_may_follow_the_mechanism() -> None:
+    v = Verdict.model_validate(_verdict_doc(outcome=False, effect=True, mechanism=False))
+    assert (v.outcome, v.effect, v.mechanism) == (False, True, False)
 
 
 def batch_dict(**over: Any) -> dict[str, Any]:

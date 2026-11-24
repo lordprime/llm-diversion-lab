@@ -14,15 +14,31 @@
     }
   },
   "additionalProperties": false,
-  "description": "``POST /v1/runs/{run_id}/verdict`` body: oracle outcome plus end status.\n\nWrite-once per run: the first verdict stored wins; re-posting the same verdict is a\nno-op and a different one is rejected.",
+  "description": "``POST /v1/runs/{run_id}/verdict`` body: oracle verdicts plus end status.\n\n``effect`` and ``mechanism`` are the oracle's two latched verdicts; ``mechanism`` is\n``None`` when the target cannot decide it. ``outcome`` is the one the experiment\nnames as primary, so it always equals one of them.\n\nWrite-once per run: the first verdict stored wins; re-posting the same verdict is a\nno-op and a different one is rejected.",
   "properties": {
     "decided_at": {
       "format": "date-time",
       "title": "Decided At",
       "type": "string"
     },
+    "effect": {
+      "title": "Effect",
+      "type": "boolean"
+    },
     "end_status": {
       "$ref": "#/$defs/EndStatus"
+    },
+    "mechanism": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Mechanism"
     },
     "oracle_message": {
       "default": "",
@@ -43,6 +59,7 @@
     "run_id",
     "end_status",
     "outcome",
+    "effect",
     "decided_at"
   ],
   "title": "Verdict",

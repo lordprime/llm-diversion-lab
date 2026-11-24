@@ -259,8 +259,8 @@ def _cmd_run_show(args: argparse.Namespace, settings: LabSettings) -> int:
     scalar = [
         "run_id", "experiment_id", "pair_id", "arm", "schedule_index", "attempt", "target_id",
         "agent_id", "model_id", "status", "invalid_reason", "invalid_detail", "end_status",
-        "outcome", "oracle_message", "tag", "dev", "manifest_sha256", "created_at",
-        "started_at", "finished_at", "decided_at", "placements", "artifacts",
+        "outcome", "effect", "mechanism", "oracle_message", "tag", "dev", "manifest_sha256",
+        "created_at", "started_at", "finished_at", "decided_at", "placements", "artifacts",
         "rejected_batches",
     ]  # fmt: skip
     width = max(map(len, scalar))

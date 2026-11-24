@@ -289,6 +289,7 @@ class Run(Base):
         CheckConstraint(
             "(status = 'invalid') = (invalid_reason IS NOT NULL)", name="invalid_has_reason"
         ),
+        CheckConstraint("(outcome IS NULL) = (effect IS NULL)", name="outcome_has_effect"),
         # the work queue: claim_next_run scans only queued rows, in this order
         Index(
             "ix_runs_queue",
@@ -318,8 +319,13 @@ class Run(Base):
     )
     end_status: Mapped[EndStatus | None] = mapped_column(_enum(EndStatus, "end_status"))
     tag: Mapped[str | None] = mapped_column(String(64))
-    # oracle verdict (Verdict); outcome is the /done status, the only source of Outcome
+    # oracle verdicts (Verdict): effect and mechanism come from the latched /done, and
+    # outcome is the one the experiment names as primary, the only source of Outcome.
+    # All stay NULL until the run's verdict is stored; mechanism stays NULL if the
+    # target cannot decide it.
     outcome: Mapped[bool | None] = mapped_column(Boolean)
+    effect: Mapped[bool | None] = mapped_column(Boolean)
+    mechanism: Mapped[bool | None] = mapped_column(Boolean)
     oracle_message: Mapped[str | None] = mapped_column(Text)
     decided_at: Mapped[datetime | None] = mapped_column(_TS)
     container_ips: Mapped[dict[str, str] | None] = mapped_column(JSONB)
@@ -490,6 +496,9 @@ class OraclePoll(EventRow):
     status: Mapped[bool] = mapped_column(Boolean)
     message: Mapped[str] = mapped_column(Text, default="", server_default=text("''"))
     error: Mapped[str | None] = mapped_column(Text)
+    objective: Mapped[str | None] = mapped_column(Text)
+    mechanism: Mapped[bool | None] = mapped_column(Boolean)
+    latch_events: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class CellGuardDecisionRow(EventRow):

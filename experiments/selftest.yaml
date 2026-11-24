@@ -11,9 +11,11 @@ name: selftest
 seed: 20261107
 repetitions: 1
 callback_domain: cb.lab.test
+oracle_primary: effect
 
 targets:
   - name: dvga
+    objective: outbound_service
     placements:
       P1: {url: /robots.txt, locator: "robots.txt:append"}
       P7: {url: /.env, locator: "error:404"}

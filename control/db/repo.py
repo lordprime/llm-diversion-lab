@@ -400,6 +400,8 @@ def record_verdict(session: Session, verdict: m.Verdict) -> WriteResult:
         {
             "end_status": verdict.end_status,
             "outcome": verdict.outcome,
+            "effect": verdict.effect,
+            "mechanism": verdict.mechanism,
             "oracle_message": verdict.oracle_message,
             "decided_at": verdict.decided_at,
         }
@@ -419,9 +421,15 @@ def record_verdict(session: Session, verdict: m.Verdict) -> WriteResult:
     if claimed is not None:
         return WriteResult(WriteOutcome.STORED)
     stored = session.execute(
-        select(Run.status, Run.end_status, Run.outcome, Run.oracle_message, Run.decided_at).where(
-            Run.run_id == verdict.run_id
-        )
+        select(
+            Run.status,
+            Run.end_status,
+            Run.outcome,
+            Run.effect,
+            Run.mechanism,
+            Run.oracle_message,
+            Run.decided_at,
+        ).where(Run.run_id == verdict.run_id)
     ).one_or_none()
     if stored is None:
         return WriteResult(WriteOutcome.UNKNOWN_RUN)

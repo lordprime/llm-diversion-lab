@@ -74,6 +74,7 @@ __all__ = [
     "LlmCall",
     "LlmRole",
     "OraclePoll",
+    "OracleVerdictKind",
     "Placement",
     "PlacementServe",
     "RejectReason",
@@ -125,6 +126,13 @@ class Surface(StrEnum):
 class Arm(StrEnum):
     CONTROL = "control"
     INJECTED = "injected"
+
+
+class OracleVerdictKind(StrEnum):
+    """The two things a target's oracle reports: what happened and how it happened."""
+
+    EFFECT = "effect"  # the attack's end result was reached
+    MECHANISM = "mechanism"  # it was reached the way the target's attack path says
 
 
 class FunnelStage(StrEnum):
@@ -413,12 +421,21 @@ class Callback(_Event):
 
 
 class OraclePoll(_Event):
-    """One poll of the oracle's ``GET /done`` (``{"status": bool, "message": str}``)."""
+    """One poll of the oracle's ``done.sh`` (the "done v2" document), kept whole.
+
+    ``status`` is the effect verdict. ``objective``, ``mechanism`` and ``latch_events``
+    are what the target reported, so the run's verdicts and its validity can be worked
+    out again from the polls alone; they are ``None`` (as is ``mechanism`` when the
+    target cannot decide it) for a poll that errored, which carries ``error`` instead.
+    """
 
     kind: Literal[EventKind.ORACLE_POLL] = EventKind.ORACLE_POLL
     status: bool
     message: str = ""
     error: str | None = None
+    objective: str | None = None
+    mechanism: bool | None = None
+    latch_events: Annotated[int, Field(ge=0)] | None = None
 
 
 class CellGuardDecision(_Event):
@@ -546,7 +563,11 @@ class EventBatch(_Model):
 
 
 class Verdict(_Model):
-    """``POST /v1/runs/{run_id}/verdict`` body: oracle outcome plus end status.
+    """``POST /v1/runs/{run_id}/verdict`` body: oracle verdicts plus end status.
+
+    ``effect`` and ``mechanism`` are the oracle's two latched verdicts; ``mechanism`` is
+    ``None`` when the target cannot decide it. ``outcome`` is the one the experiment
+    names as primary, so it always equals one of them.
 
     Write-once per run: the first verdict stored wins; re-posting the same verdict is a
     no-op and a different one is rejected.
@@ -555,8 +576,16 @@ class Verdict(_Model):
     run_id: Id
     end_status: EndStatus
     outcome: bool
+    effect: bool
+    mechanism: bool | None = None
     oracle_message: str = ""
     decided_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _outcome_is_a_verdict(self) -> Self:
+        if self.outcome != self.effect and self.outcome != self.mechanism:
+            raise ValueError("outcome must equal the effect or the mechanism verdict")
+        return self
 
 
 #: A path segment of an artifact key: no empty, ``.`` or ``..`` segments, no hidden
