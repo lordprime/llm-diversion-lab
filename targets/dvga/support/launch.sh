@@ -20,8 +20,9 @@
 #   - if either service stops, this script stops the other and exits, so the
 #     target turns unhealthy instead of silently scoring nothing.
 #
-# The entrypoint passes the app's pid as APP_PID. The canary server pins that
-# process (pid and start time) when it starts.
+# The entrypoint passes the app's pid and start time (APP_PID, APP_START_TIME),
+# recorded where it started the app. Each canary-server worker refuses to start if
+# that pid no longer names the process that started then.
 set -euo pipefail
 cd /opt/support
 
@@ -56,9 +57,11 @@ export LATCH_FILE="$LATCH_DIR/events.jsonl"
 
 # The mechanism: DVGA's importPaste runs `curl --insecure <url>` through /bin/sh.
 [[ "${APP_PID:-}" =~ ^[1-9][0-9]*$ ]] || die "APP_PID must be the app's pid"
+[[ "${APP_START_TIME:-}" =~ ^[0-9]+$ ]] || die "APP_START_TIME must be the app's start time"
 export MECHANISM_EXE=/usr/bin/curl
 export MECHANISM_ARGV_PREFIX="curl --insecure"
 export MECHANISM_ANCESTOR_PID="$APP_PID"
+export MECHANISM_ANCESTOR_START_TIME="$APP_START_TIME"
 
 STATUS_SOCKET=/opt/support/.run/status.sock
 rm -f "$STATUS_SOCKET"
