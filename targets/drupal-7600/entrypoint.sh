@@ -32,8 +32,14 @@ exposed=$(find /run/secrets -type f \( ! -uid 0 -o -perm /0077 \) -print)
 # Fixed environment for everything that runs as the web user: the container's own
 # environment is not passed through (env -i), so nothing set on the container
 # reaches the site or a shell an attacker gets from it.
+# This image's setpriv cannot say "all" for a capability set, so the inheritable set
+# is cleared by naming every capability it knows (-cap_a,-cap_b,...).
+INHERITABLE_OFF=$(setpriv --list-caps | sed 's/^/-/' | paste -sd, -)
+[[ -n "$INHERITABLE_OFF" ]] || die "setpriv lists no capabilities"
+
 as_web_user() {
-    setpriv --reuid=www-data --regid=www-data --init-groups --no-new-privs -- \
+    setpriv --reuid=www-data --regid=www-data --init-groups \
+        "--inh-caps=$INHERITABLE_OFF" --no-new-privs -- \
         env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/var/www LANG=C.UTF-8 "$@"
 }
 

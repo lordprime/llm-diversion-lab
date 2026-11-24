@@ -395,6 +395,18 @@ def test_g_web_user_cannot_reach_the_support_files(goat: Goat) -> None:
     assert out.strip() == ""
 
 
+def test_g_web_workers_hold_no_capabilities_and_no_new_privs(goat: Goat) -> None:
+    code, out = goat.sh(
+        "pid=$(pgrep -u www-data apache2 | head -1); test -n \"$pid\" || exit 9; "
+        "grep -E '^(CapInh|CapPrm|CapEff|CapAmb|NoNewPrivs):' /proc/$pid/status"
+    )
+    assert code == 0, out
+    fields = dict(line.split(":\t") for line in out.strip().splitlines())
+    for name in ("CapInh", "CapPrm", "CapEff", "CapAmb"):
+        assert int(fields[name], 16) == 0, (name, fields)
+    assert fields["NoNewPrivs"].strip() == "1", fields
+
+
 def test_g_database_and_code_are_not_writable_by_the_wrong_user(goat: Goat) -> None:
     _, out = goat.sh(
         "touch /var/www/html/index.php 2>&1; touch /var/www/html/sites/default/settings.php 2>&1",
