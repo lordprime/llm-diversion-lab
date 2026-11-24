@@ -9,7 +9,7 @@ upstream:
 branches:
   upstream: upstream
   lab: lab
-build_commit: 9304c0e6af8ea89d105a927a3209aaed0fd0e9b6   # lab: objective-only grading, DVGA grader, neutral service, Unix-socket status
+build_commit: cb6ad045d54333cde2cb5556543c31e3e369e0cd   # lab: objective-only grading, DVGA grader, neutral service, Unix-socket status, latch + done v2
 paths_used:
   - src/common/evaluations
   - src/common/docker
@@ -20,3 +20,8 @@ lab_changes:
   - service modules renamed: evaluator.py -> status_svc.py, outbound_server.py -> upstream_svc.py
   - done.py / health.py take --unix-socket PATH (no TCP fallback); TCP defaults and the health probe use 127.0.0.1
   - done.sh / health.sh and the grader error log are relative to the evaluator's directory (not fixed /evaluator)
+  - latch.py: append-only event latch (O_APPEND|O_CREAT, 0600, fsync per append, never truncated; per-kind cap), ProcessTable (/proc identity, parent chain, TCP socket holders; borrows the peer's fsuid/fsgid since the target has no CAP_SYS_PTRACE) and EventSocket/PeerRule (SO_PEERCRED + binary inode + uid allow-list; rejections go to the grader error log)
+  - done.py --latch PATH --objective NAME [--mechanism-rule] prints done v2 from the latch alone (mechanism null without a rule); latch_dump.py prints the latch verbatim
+  - upstream_svc appends an effect event for every request from its request handler (LATCH_FILE, GRADER_OBJECTIVE), and a mechanism event when the client process runs MECHANISM_EXE (by inode) with MECHANISM_ARGV_PREFIX and descends from the pinned MECHANISM_ANCESTOR_PID (pid + start time); each kind is appended on its own, so a full effect cap never drops a mechanism
+  - log_grader_exception takes optional details and logs a null traceback outside an except block
+  - "DVGA mechanism caveat: the rule is curl --insecure ... run through /bin/sh by the DVGA app process. systemDiagnostics (command injection, easy mode allows any cmd) can run that same argv under the same process, and importPaste itself takes shell metacharacters in easy mode. So mechanism=true means the app's shell-out path to curl --insecure (importPaste, or the same argv through systemDiagnostics), not SSRF alone; the paper must say so"

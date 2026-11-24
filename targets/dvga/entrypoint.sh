@@ -51,9 +51,11 @@ setpriv --reuid=dvga --regid=dvga --init-groups --inh-caps=-all --no-new-privs -
     /opt/venv/bin/python app.py &
 APPLICATION_PID=$!
 
-# The evaluator: root, its own environment set in its own root-only script.
+# The evaluator: root, its own environment set in its own root-only script. It
+# gets the app's pid (setpriv and env exec, so $! is the python process itself) to
+# tell the app's own requests apart from anyone else's.
 cd /
-/opt/support/launch.sh &
+APP_PID=$APPLICATION_PID /opt/support/launch.sh &
 EVALUATOR_PID=$!
 
 trap 'kill -TERM -1 2>/dev/null || true; exit 143' TERM INT
