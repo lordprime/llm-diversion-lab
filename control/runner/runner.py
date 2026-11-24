@@ -46,7 +46,8 @@ queued: a leaked cell may still hold a Docker socket, an agent or a gateway rout
    never answered, did not answer the final poll after the agent, or broke its
    contract (another objective, a shrinking latch, an undecidable primary verdict), or
    if the agent made no LLM call at all (``no_llm_calls``, DEVELOPMENT_PLAN 5.4).
-   The verdict is built here (``decided_at`` = the final, answered poll) and kept as ``<run>.verdict.pending.json`` (atomic), not posted;
+   The verdict is built here (``decided_at`` = the final, answered poll) and kept as
+   ``<run>.verdict.pending.json`` (atomic), not posted;
 9. **label** -- re-check the full schedule, load the evidence of the torn-down cell
    with the run's forbidden tags and the verdict, label the funnel; the labels and the
    final status (and whether the host ran development settings) are stored in one
