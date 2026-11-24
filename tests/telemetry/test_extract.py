@@ -314,6 +314,7 @@ def _call(seq: int, **fields: object) -> CallTelemetry:
         "history_hashes": (),
         "reply_hash": None,
         "persona_sha256": None,
+        "last_assistant_index": None,
         "tool_calls": (),
         "reasoning": "",
         "text": "",
@@ -385,8 +386,8 @@ def test_summarise_counts_agents_tokens_and_tools() -> None:
     assert run.largest_thread_calls == 3  # main: calls 0, 4 and 5
 
 
-def test_telemetry_version_is_bumped_for_the_v3_rules() -> None:
-    assert TELEMETRY_VERSION == "3"
+def test_telemetry_version_is_bumped_for_the_v4_rules() -> None:
+    assert TELEMETRY_VERSION == "4"
 
 
 def test_peak_input_counts_cached_prompt_tokens_for_anthropic() -> None:
@@ -921,10 +922,12 @@ def test_same_reply_in_two_threads_goes_to_the_matching_persona(tmp_path: Path) 
 def test_branch_points_are_counted_once_per_parent_reply() -> None:
     calls = [
         _call(0, thread_key="p", reply_hash="r"),
-        _call(1, thread_key="p", history_hashes=("t", "r", "n1")),
-        _call(2, thread_key="p", history_hashes=("t", "r", "n2")),
-        _call(3, thread_key="p", history_hashes=("t", "r", "n3")),
-        _call(4, thread_key="p", history_hashes=("t", "r", "n2")),  # retry of call 2
+        _call(1, thread_key="p", history_hashes=("t", "r", "n1"), reply_hash="xn1"),
+        _call(2, thread_key="p", history_hashes=("t", "r", "n2"), reply_hash="xn2"),
+        _call(3, thread_key="p", history_hashes=("t", "r", "n3"), reply_hash="xn3"),
+        _call(
+            4, thread_key="p", history_hashes=("t", "r", "n2"), reply_hash="xn2b"
+        ),  # retry of call 2
     ]
     links = ThreadLinker().link(calls)
     assert links.branch_points == 1

@@ -29,7 +29,7 @@ import os
 import re
 import stat
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -38,8 +38,8 @@ from pydantic import JsonValue
 
 from control.core.codecs import DecodedTooLargeError, decode_body_bounded
 from control.core.tags import parse_json
-from control.telemetry.model import TELEMETRY_VERSION, CallTelemetry, RunTelemetry, ThreadLinker
-from control.telemetry.wire import MAX_BODY_BYTES, parse_call, unparsed_call
+from control.telemetry.model import TELEMETRY_VERSION, CallTelemetry, RunTelemetry, ThreadLinks
+from control.telemetry.wire import MAX_BODY_BYTES, MessageDigests, parse_call, unparsed_call
 
 __all__ = [
     "CALLS_FILE",
@@ -151,8 +151,12 @@ class TapEvidence:
         self._dir = evidence_dir / LLM_DIR
 
     def calls(self) -> list[CallTelemetry]:
-        """Every call the tap recorded, in ``seq`` order."""
-        return [self._call(seq) for seq in self.seqs()]
+        """Every call the tap recorded, in ``seq`` order.
+
+        The message-digest cache lives for this one load only and is dropped with it.
+        """
+        digests = MessageDigests()
+        return [self._call(seq, digests) for seq in self.seqs()]
 
     def seqs(self) -> list[int]:
         """The ``seq`` of every tap file present (any of the three kinds)."""
@@ -207,7 +211,7 @@ class TapEvidence:
             )
         return decoded, None
 
-    def _call(self, seq: int) -> CallTelemetry:
+    def _call(self, seq: int, digests: MessageDigests) -> CallTelemetry:
         request, request_problem = self._read_body(seq, _REQ_SUFFIX)
         response, response_problem = self._read_body(seq, _RESP_SUFFIX)
         try:
@@ -233,6 +237,7 @@ class TapEvidence:
             seq=seq,
             request_problem=request_problem,
             response_problem=response_problem,
+            digests=digests,
         )
 
 
@@ -245,9 +250,17 @@ def load_calls(evidence_dir: Path) -> list[CallTelemetry]:
     return TapEvidence(evidence_dir).calls()
 
 
-def summarise(run_id: str, calls: Sequence[CallTelemetry]) -> RunTelemetry:
-    """Add up one run's calls (pure; see :meth:`RunTelemetry.from_calls`)."""
-    return RunTelemetry.from_calls(run_id, calls)
+def summarise(
+    run_id: str,
+    calls: Sequence[CallTelemetry],
+    agent_ids: Mapping[int, str] | None = None,
+) -> RunTelemetry:
+    """Add up one run's calls (pure; see :meth:`RunTelemetry.from_calls`).
+
+    ``agent_ids`` (call ``seq`` to agent id, from a framework adapter that knows which
+    agent made each call) replaces the inferred agents; it must name every call.
+    """
+    return RunTelemetry.from_calls(run_id, calls, agent_ids)
 
 
 # --------------------------------------------------------------------------- writing
@@ -274,14 +287,24 @@ class DerivedWriter:
         self._out_dir = out_dir
         self._folder = out_dir / TELEMETRY_DIR
 
-    def write(self, run: RunTelemetry, calls: Sequence[CallTelemetry]) -> None:
+    def write(
+        self,
+        run: RunTelemetry,
+        calls: Sequence[CallTelemetry],
+        agent_ids: Mapping[int, str] | None = None,
+    ) -> None:
         ordered = sorted(calls, key=lambda c: c.seq)
         if run.calls != len(ordered):
             raise ValueError(f"summary counts {run.calls} calls but {len(ordered)} were given")
+        if (agent_ids is None) != (run.agents_source == "inferred"):
+            raise ValueError(
+                f"the summary's agents are {run.agents_source}; pass agent ids exactly when "
+                "the summary was built from them"
+            )
         self._check_destination()
         self._folder.mkdir(parents=True, exist_ok=True)
-        # the agent thread each call was linked to (None for an unreadable request)
-        agents = ThreadLinker().link(ordered).by_seq
+        # the agent each call belongs to (None for an unreadable request)
+        agents = ThreadLinks.resolve(ordered, agent_ids).by_seq
         # the history hashes only serve the linking, whose result is the agent column;
         # they grow with every message, so they are left out of the file
         row_fields = {"reasoning", "history_hashes"}
@@ -351,11 +374,18 @@ class DerivedWriter:
             raise
 
 
-def write_derived(out_dir: Path, run: RunTelemetry, calls: Sequence[CallTelemetry]) -> None:
+def write_derived(
+    out_dir: Path,
+    run: RunTelemetry,
+    calls: Sequence[CallTelemetry],
+    agent_ids: Mapping[int, str] | None = None,
+) -> None:
     """Write ``run`` and ``calls`` under ``<out_dir>/telemetry/`` (see :class:`DerivedWriter`).
 
-    Rerunning replaces the previous files. Raises :class:`TelemetryError` if
-    ``out_dir`` is, or lies inside, a run's evidence directory, or if the telemetry
-    folder or one of its files is a symlink or not a regular file.
+    Pass the same ``agent_ids`` the summary was built with (if any), so each row names
+    the same agent. Rerunning replaces the previous files. Raises
+    :class:`TelemetryError` if ``out_dir`` is, or lies inside, a run's evidence
+    directory, or if the telemetry folder or one of its files is a symlink or not a
+    regular file.
     """
-    DerivedWriter(out_dir).write(run, calls)
+    DerivedWriter(out_dir).write(run, calls, agent_ids)

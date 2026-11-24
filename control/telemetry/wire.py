@@ -25,47 +25,35 @@ a provider error, or a body over :data:`MAX_BODY_BYTES` all end up in
 
 Grouping calls into agents
 --------------------------
-This is a heuristic, and it counts *conversations*, not processes. Each call carries
-three keys, and :class:`control.telemetry.model.ThreadLinker` combines them (its
-docstring has the exact rules):
+The agent count is an *inference* from traffic (``RunTelemetry.agents_source`` is
+``"inferred"``), and it counts conversations, not processes; a framework adapter that
+knows each call's agent can replace it. Each call carries the keys
+:class:`control.telemetry.model.ThreadLinker` works from (its docstring has the exact
+rules and the known errors in each direction):
 
-* ``history_hashes`` and ``reply_hash``, rolling hashes over the non-system messages.
-  An agent that re-sends its growing history sends, as a prefix, the previous call's
-  messages followed by that call's reply, so the later call is linked to the earlier
-  one even when a timestamp in its system prompt changed. Messages are compared in a
-  canonical form (whitespace collapsed, reasoning and inline thinking dropped, JSON
-  arguments re-serialised), so the usual ways clients re-echo a reply still match.
+* ``history_hashes`` and ``reply_hash``, rolling hashes over the non-system messages,
+  and ``last_assistant_index``, where the latest assistant message sits. An agent that
+  re-sends its growing history sends, as a prefix, the previous call's messages
+  followed by that call's reply, so the later call is linked to the earlier one even
+  when a timestamp in its system prompt changed. Messages are compared in a canonical
+  form (whitespace collapsed, reasoning and inline thinking dropped, JSON arguments
+  re-serialised), so the usual ways clients re-echo a reply still match. When older
+  messages were rewritten, only an older ancestor still matches and its reply is not
+  the latest assistant message; the call then stays with that ancestor's agent.
 * ``persona_sha256``, the system prompt with digits and whitespace normalised away.
-  A continuation under a different persona is a handoff and becomes a new agent; two
-  different continuations of one reply are a fork (a branch point) and each extra
-  one becomes a new agent.
+  A continuation under a different persona is a handoff or a worker and becomes a new
+  agent (a persona split); different continuations of one reply are a fork (a branch
+  point) and each extra one becomes a new agent.
 * ``thread_key``, the fallback for a call that extends no earlier call: the SHA-256 of
   ``system_sha256`` plus the whitespace-normalised text of the first non-system
   message. A sub-agent starts with its own system prompt or its own first task, so it
   gets its own key.
 
-What makes ``agents`` too high (over-count):
-
-* a sliding window or history compaction that drops or rewrites earlier messages, so
-  the previous call's messages are no longer a prefix;
-* ``/api/generate``, or any framework that rebuilds one prompt from scratch each round:
-  there is no message history to link, and each new prompt looks like a new task;
-* a client that edits the echoed reply beyond the canonical form (for example
-  truncating long tool arguments), or one agent whose system prompt changes wording
-  (not just digits) between rounds.
-
-What makes ``agents`` too low (under-count):
-
-* two sub-agents given the same system prompt and the same first task;
-* forks that keep the parent's persona and whose branches send the same next message
-  (they only differ later);
-* a handoff to a persona whose system prompt differs only in digits.
-
 How to read the diagnostics: ``single_call_threads == calls`` (more than one call) is
 the clear over-count alarm, because no call linked to any other; below that, one-shot
-sub-agents legitimately add single-call threads. ``branch_points`` counts the forks the
-linker saw, which is the under-count signal: a framework known to fork that shows 0
-was not seen forking.
+sub-agents legitimately add single-call threads. ``branch_points`` and
+``persona_splits`` count the agents the linker added for forks and persona changes; a
+framework known to fork that shows 0 for both was not seen forking.
 """
 
 from __future__ import annotations
@@ -76,7 +64,6 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import ClassVar, Final
 
 from pydantic import JsonValue
@@ -87,6 +74,7 @@ from control.telemetry.model import CallTelemetry, ToolCallRecord, WireFormat
 __all__ = [
     "MAX_BODY_BYTES",
     "AnthropicMessagesParser",
+    "MessageDigests",
     "OllamaChatParser",
     "OpenAIChatParser",
     "WireFormat",
@@ -379,22 +367,34 @@ def _canonical_arguments(arguments: str) -> str:
 #: Length (hex digits) of the history hashes: 64 bits, plenty to tell one run's
 #: message prefixes apart, and short enough to store one per message.
 _HISTORY_HASH_CHARS: Final = 16
-#: How many distinct messages keep their digest in memory. An agent re-sends the same
-#: messages call after call, so each is canonicalised once rather than once per call.
-#: It must be larger than the longest history, or a sequential re-send evicts every
-#: entry before it is reused; the cost is holding that many messages in memory.
-_DIGEST_CACHE_SIZE: Final = 8192
 
 
-@lru_cache(maxsize=_DIGEST_CACHE_SIZE)
-def _message_digest(message: _Message) -> str:
-    """The hash of one message's canonical form (a pure function, so caching is safe)."""
-    return _sha256(message.canonical())[:_HISTORY_HASH_CHARS]
+class MessageDigests:
+    """Digests of canonical messages, shared by the calls of one load.
 
+    An agent re-sends the same messages on every call, so each distinct message is
+    canonicalised and hashed once per load instead of once per call. A digest is a
+    pure function of the message, so sharing one changes no result. Create one per
+    load and drop it afterwards: it holds every distinct message it has seen, so its
+    memory is about the size of the run's distinct messages, and it is freed with it.
+    """
 
-def _extend_history(previous: str, message: _Message) -> str:
-    """The rolling hash of a history extended by one message."""
-    return _sha256(f"{previous}\n{_message_digest(message)}")[:_HISTORY_HASH_CHARS]
+    def __init__(self) -> None:
+        self._known: dict[_Message, str] = {}
+
+    def __len__(self) -> int:
+        return len(self._known)
+
+    def digest(self, message: _Message) -> str:
+        """The hash of one message's canonical form."""
+        known = self._known.get(message)
+        if known is None:
+            known = self._known[message] = _sha256(message.canonical())[:_HISTORY_HASH_CHARS]
+        return known
+
+    def extend(self, previous: str, message: _Message) -> str:
+        """The rolling hash of a history extended by one message."""
+        return _sha256(f"{previous}\n{self.digest(message)}")[:_HISTORY_HASH_CHARS]
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,17 +420,21 @@ class _RequestShape:
     persona_sha256: str | None = None
     thread_key: str = ""
     history_hashes: tuple[str, ...] = ()
+    last_assistant_index: int | None = None
 
     @classmethod
-    def of(cls, model: str | None, parts: _RequestParts) -> _RequestShape:
+    def of(cls, model: str | None, parts: _RequestParts, digests: MessageDigests) -> _RequestShape:
         system = _normalise("\n".join(parts.system))
         system_sha = _sha256(system) if system else None
         persona_sha = _sha256(_persona(system)) if system else None
         first = _normalise(parts.turns[0].flat_text()) if parts.turns else ""
         hashes: list[str] = []
+        last_assistant: int | None = None
         for message in parts.turns:
             if not message.system:
-                hashes.append(_extend_history(hashes[-1] if hashes else "", message))
+                if message.role == "assistant":
+                    last_assistant = len(hashes)
+                hashes.append(digests.extend(hashes[-1] if hashes else "", message))
         return cls(
             requested_model=model,
             messages=parts.messages,
@@ -439,14 +443,17 @@ class _RequestShape:
             persona_sha256=persona_sha,
             thread_key=_sha256(f"{system_sha or ''}\n{first}"),
             history_hashes=tuple(hashes),
+            last_assistant_index=last_assistant,
         )
 
-    def reply_hash(self, text: str, tools: Sequence[ToolCallRecord]) -> str | None:
+    def reply_hash(
+        self, text: str, tools: Sequence[ToolCallRecord], digests: MessageDigests
+    ) -> str | None:
         """The history hash once the reply is appended (``None`` without a request)."""
         if not self.thread_key:
             return None
         reply = _Message("assistant", (text,), tuple((t.name, t.arguments) for t in tools))
-        return _extend_history(self.history_hashes[-1] if self.history_hashes else "", reply)
+        return digests.extend(self.history_hashes[-1] if self.history_hashes else "", reply)
 
 
 def _load_object(
@@ -485,6 +492,7 @@ def unparsed_call(
         persona_sha256=None,
         thread_key="",
         history_hashes=(),
+        last_assistant_index=None,
         reply_hash=None,
         tool_calls=(),
         reasoning="",
@@ -516,16 +524,25 @@ class WireParser(ABC):
         seq: int = 0,
         request_problem: str | None = None,
         response_problem: str | None = None,
+        digests: MessageDigests | None = None,
     ) -> CallTelemetry:
         """Read one call. Never raises: problems are reported in ``parse_error``.
 
         ``response`` is ``None`` when no response was stored (the call failed). The
         ``*_problem`` arguments let a caller say why a body is ``None`` (for example a
         stored body it could not decode); they replace the plain "missing" message.
+        ``digests`` is the message-digest cache of the current load; without one, a
+        fresh cache is used for this call alone.
         """
         try:
             return self._parse(
-                request, response, content_type, seq, request_problem, response_problem
+                request,
+                response,
+                content_type,
+                seq,
+                request_problem,
+                response_problem,
+                digests if digests is not None else MessageDigests(),
             )
         except Exception as exc:  # last line of defence: one bad call must not stop a run
             return unparsed_call(seq, request, f"parser failed: {type(exc).__name__}", self.format)
@@ -538,9 +555,10 @@ class WireParser(ABC):
         seq: int,
         request_problem: str | None,
         response_problem: str | None,
+        digests: MessageDigests,
     ) -> CallTelemetry:
         errors: list[str] = []
-        doc, shape = self._describe_request(request, request_problem, errors)
+        doc, shape = self._describe_request(request, request_problem, errors, digests)
 
         reply = _Reply()
         replied = False
@@ -572,8 +590,11 @@ class WireParser(ABC):
             persona_sha256=shape.persona_sha256,
             thread_key=shape.thread_key,
             history_hashes=shape.history_hashes,
+            last_assistant_index=shape.last_assistant_index,
             # hashed from the text as sent, like the echo it must match
-            reply_hash=shape.reply_hash(reply.raw_text(), tool_calls) if replied else None,
+            reply_hash=(
+                shape.reply_hash(reply.raw_text(), tool_calls, digests) if replied else None
+            ),
             tool_calls=tool_calls,
             reasoning=reasoning,
             text=text,
@@ -583,7 +604,11 @@ class WireParser(ABC):
         )
 
     def _describe_request(
-        self, request: bytes | None, problem: str | None, errors: list[str]
+        self,
+        request: bytes | None,
+        problem: str | None,
+        errors: list[str],
+        digests: MessageDigests,
     ) -> tuple[dict[str, JsonValue] | None, _RequestShape]:
         """The parsed request (``None`` if unreadable) and what it carries."""
         doc, why = _load_object(request, "request", problem)
@@ -595,7 +620,7 @@ class WireParser(ABC):
         if parts is None:
             errors.append("request has no messages")
             return doc, _RequestShape(requested_model=model)
-        return doc, _RequestShape.of(model, parts)
+        return doc, _RequestShape.of(model, parts, digests)
 
     @abstractmethod
     def _request_parts(self, doc: dict[str, JsonValue]) -> _RequestParts | None:
@@ -1064,10 +1089,12 @@ def parse_call(
     seq: int = 0,
     request_problem: str | None = None,
     response_problem: str | None = None,
+    digests: MessageDigests | None = None,
 ) -> CallTelemetry:
     """Read one call whose endpoint path is ``path`` (from the tap's meta).
 
-    An unknown or missing path gives ``format=None`` and a ``parse_error``.
+    An unknown or missing path gives ``format=None`` and a ``parse_error``. Pass the
+    same ``digests`` for every call of one load (see :class:`MessageDigests`).
     """
     fmt = detect_format(path) if path else None
     if fmt is None:
@@ -1080,4 +1107,5 @@ def parse_call(
         seq=seq,
         request_problem=request_problem,
         response_problem=response_problem,
+        digests=digests,
     )
