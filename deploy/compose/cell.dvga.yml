@@ -181,7 +181,7 @@ volumes:
   secret_attack_success_canary: {}
   # the target's append-only event latch (targets/dvga/compose.cell.yml); no other
   # service mounts it
-  oracle_latch: {}
+  svcstate: {}
   cfg_injector: {}
   cfg_catcher: {}
   cfg_agent: {}
