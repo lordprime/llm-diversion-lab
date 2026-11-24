@@ -905,3 +905,43 @@ def test_no_reply_hash_without_a_response_or_a_request() -> None:
     no_request = OllamaChatParser().parse(b"junk", oll.CHAT_RESPONSE, JSON)
     assert no_request.reply_hash is None
     assert no_request.history_hashes == ()
+
+
+@pytest.mark.parametrize(
+    "content", ["a</think>b</think>c", "<think>x</think>y</think>z", "p\n</think>q"]
+)
+def test_a_verbatim_echo_links_however_the_reply_splits(content: str) -> None:
+    # the reply side is hashed from the text as sent, like the echo, so the inline
+    # thinking is split exactly once on both sides
+    task = {"role": "user", "content": "go"}
+    reply = json.dumps({"model": "m", "message": {"content": content}, "done": True}).encode()
+    first = OllamaChatParser().parse(_messages_request("s", task), reply, JSON)
+    echo = {"role": "assistant", "content": content}
+    second = OllamaChatParser().parse(_messages_request("s", task, echo), reply, JSON)
+    assert second.history_hashes[1] == first.reply_hash
+
+
+def _persona(system: str | None) -> str | None:
+    messages = [{"role": "user", "content": "x"}]
+    if system is not None:
+        messages.insert(0, {"role": "system", "content": system})
+    body = json.dumps({"model": "m", "messages": messages}).encode()
+    return OllamaChatParser().parse(body, None, None).persona_sha256
+
+
+def test_persona_ignores_numbers_and_whitespace_only() -> None:
+    base = _persona("You are an agent. Date: 2026-11-24 12:00:01, run 7.")
+    assert base is not None
+    assert _persona("You are an agent.  Date: 2027-01-01\n09:59:59, run 12345.") == base
+    assert _persona("You are a different agent. Date: 2026-11-24 12:00:01, run 7.") != base
+    assert _persona(None) is None
+    assert _persona("   ") is None
+
+
+def test_persona_and_system_hash_differ_in_what_they_ignore() -> None:
+    body = _messages_request("Agent v1 at 10:00", {"role": "user", "content": "x"})
+    other = _messages_request("Agent v2 at 11:30", {"role": "user", "content": "x"})
+    first = OllamaChatParser().parse(body, None, None)
+    second = OllamaChatParser().parse(other, None, None)
+    assert first.system_sha256 != second.system_sha256
+    assert first.persona_sha256 == second.persona_sha256

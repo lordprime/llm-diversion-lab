@@ -313,6 +313,7 @@ def _call(seq: int, **fields: object) -> CallTelemetry:
         "thread_key": "main",
         "history_hashes": (),
         "reply_hash": None,
+        "persona_sha256": None,
         "tool_calls": (),
         "reasoning": "",
         "text": "",
@@ -384,8 +385,8 @@ def test_summarise_counts_agents_tokens_and_tools() -> None:
     assert run.largest_thread_calls == 3  # main: calls 0, 4 and 5
 
 
-def test_telemetry_version_is_bumped_for_the_v2_rules() -> None:
-    assert TELEMETRY_VERSION == "2"
+def test_telemetry_version_is_bumped_for_the_v3_rules() -> None:
+    assert TELEMETRY_VERSION == "3"
 
 
 def test_peak_input_counts_cached_prompt_tokens_for_anthropic() -> None:
@@ -504,7 +505,11 @@ def test_write_derived_round_trip(tmp_path: Path) -> None:
     assert all("reasoning" not in r for r in rows)
     # three separate conversations: each call is its own agent, named by its thread key
     assert rows == [
-        {**c.model_dump(mode="json", exclude={"reasoning"}), "agent": c.thread_key} for c in calls
+        {
+            **c.model_dump(mode="json", exclude={"reasoning", "history_hashes"}),
+            "agent": c.thread_key,
+        }
+        for c in calls
     ]
 
     trace = _read_jsonl(folder / "reasoning.jsonl")
@@ -768,7 +773,7 @@ def test_linking_picks_the_most_recent_matching_thread() -> None:
     summary = summarise(RUN_ID, calls)
     assert summary.agents == 2
     assert summary.largest_thread_calls == 2
-    assert ThreadLinker().assign(calls) == {0: "x", 1: "y", 2: "y"}
+    assert ThreadLinker().link(calls).by_seq == {0: "x", 1: "y", 2: "y"}
 
 
 def test_a_linked_calls_own_key_joins_its_thread_later() -> None:
@@ -779,19 +784,19 @@ def test_a_linked_calls_own_key_joins_its_thread_later() -> None:
         _call(1, thread_key="b", history_hashes=("h", "r0"), reply_hash="r1"),
         _call(2, thread_key="b", history_hashes=("h", "other")),
     ]
-    assert ThreadLinker().assign(calls) == {0: "a", 1: "a", 2: "a"}
+    assert ThreadLinker().link(calls).by_seq == {0: "a", 1: "a", 2: "a"}
     assert summarise(RUN_ID, calls).agents == 1
 
 
 def test_unreadable_calls_belong_to_no_agent() -> None:
     calls = [_call(0, thread_key="a"), _call(1, thread_key="", parse_error="bad")]
-    assert ThreadLinker().assign(calls) == {0: "a"}
+    assert ThreadLinker().link(calls).by_seq == {0: "a"}
 
 
 def test_linking_is_deterministic_and_order_free(tmp_path: Path) -> None:
     calls = _fake_run()
     shuffled = calls[3:] + calls[:3][::-1]
-    assert ThreadLinker().assign(shuffled) == ThreadLinker().assign(calls)
+    assert ThreadLinker().link(shuffled).by_seq == ThreadLinker().link(calls).by_seq
 
 
 def test_write_derived_names_each_calls_agent(tmp_path: Path) -> None:
@@ -804,3 +809,126 @@ def test_write_derived_names_each_calls_agent(tmp_path: Path) -> None:
     assert [(r["thread_key"], r["agent"]) for r in rows] == [("a", "a"), ("b", "a")]
     trace = _read_jsonl(tmp_path / "telemetry" / "reasoning.jsonl")
     assert [r["agent"] for r in trace] == ["a", "a"]
+
+
+def test_calls_jsonl_leaves_out_the_history_hashes(tmp_path: Path) -> None:
+    calls = [_call(0, history_hashes=("h0", "h1"), reply_hash="r0")]
+    write_derived(tmp_path, summarise(RUN_ID, calls), calls)
+    (row,) = _read_jsonl(tmp_path / "telemetry" / "calls.jsonl")
+    assert "history_hashes" not in row
+    assert row["reply_hash"] == "r0"
+
+
+# --------------------------------------------------------------------------- forks and handoffs
+#
+# Built from the reviewer's probes: a link by history alone used to pull forked
+# sub-agents and handed-off personas into the parent's thread, with nothing to show it.
+
+
+def _threads(evidence: Path) -> tuple[RunTelemetry, list[int]]:
+    """The run summary and each thread's size in order of its first call."""
+    calls = load_calls(evidence)
+    by_seq = ThreadLinker().link(calls).by_seq
+    sizes: dict[str, int] = {}
+    for seq in sorted(by_seq):
+        sizes[by_seq[seq]] = sizes.get(by_seq[seq], 0) + 1
+    return summarise(RUN_ID, calls), list(sizes.values())
+
+
+def test_two_parallel_forks_from_one_parent_call_are_three_agents(tmp_path: Path) -> None:
+    run = _OllamaAgentRun(tmp_path)
+    lead = "You are the lead agent."
+    task = _user("Audit 10.0.0.5.")
+    fork = _assistant(tool=("spawn_workers", {"n": 2}))
+    run.call(lead, [task], fork)
+    # each worker gets the parent's history plus its own instruction and persona
+    run.call("You are worker A.", [task, fork, _tool_result("You handle SSH.")], _assistant("A"))
+    run.call("You are worker B.", [task, fork, _tool_result("You handle HTTP.")], _assistant("B"))
+    # the parent carries on with the workers' results
+    run.call(lead, [task, fork, _tool_result("SSH: done. HTTP: done.")], _assistant("Done."))
+
+    summary, sizes = _threads(tmp_path)
+    assert summary.agents == 3
+    assert summary.branch_points == 1
+    assert sizes == [2, 1, 1]  # the parent keeps its own continuation
+
+
+def test_handoff_to_a_new_persona_with_full_history_is_two_agents(tmp_path: Path) -> None:
+    run = _OllamaAgentRun(tmp_path)
+    task = _user("Pentest the web app.")
+    handoff = _assistant(tool=("transfer_to_web_agent", {}))
+    run.call("You are the triage agent.", [task], handoff)
+    history = [task, handoff, _tool_result("Transferred.")]
+    step = _assistant(tool=("http_get", {"url": "/"}))
+    run.call("You are the web agent.", history, step)
+    run.call("You are the web agent.", [*history, step, _tool_result("<html>")], _assistant("ok"))
+
+    summary, sizes = _threads(tmp_path)
+    assert summary.agents == 2
+    assert summary.branch_points == 0
+    assert sizes == [1, 2]
+
+
+def test_timestamp_drift_is_not_a_persona_change(tmp_path: Path) -> None:
+    run = _OllamaAgentRun(tmp_path)
+    history: list[AgentMessage] = [_user("Find the admin panel.")]
+    for minute in range(4):
+        reply = _assistant(tool=("http_get", {"url": f"/p{minute}"}))
+        system = f"You are an agent.\nDate: 2026-11-24 12:{minute:02d}:{minute * 7:02d}"
+        run.call(system, history, reply)
+        history = [*history, reply, _tool_result(f"r{minute}")]
+
+    summary, sizes = _threads(tmp_path)
+    assert (summary.agents, summary.branch_points) == (1, 0)
+    assert sizes == [4]
+
+
+def test_a_retry_is_not_a_branch(tmp_path: Path) -> None:
+    run = _OllamaAgentRun(tmp_path)
+    task = _user("Scan.")
+    step = _assistant(tool=("nmap", {"target": "10.0.0.5"}))
+    run.call("You are an agent. 12:00", [task], step)
+    follow = [task, step, _tool_result("22 open")]
+    # the same continuation sent twice (the first attempt timed out), new timestamp
+    run.call("You are an agent. 12:01", follow, _assistant("x"))
+    run.call("You are an agent. 12:02", follow, _assistant("y"))
+
+    summary, sizes = _threads(tmp_path)
+    assert (summary.agents, summary.branch_points) == (1, 0)
+    assert sizes == [3]
+
+
+def test_same_reply_in_two_threads_goes_to_the_matching_persona(tmp_path: Path) -> None:
+    # two agents with different personas give the same reply to the same task, and
+    # their next calls interleave: each must stay in its own thread
+    run = _OllamaAgentRun(tmp_path)
+    task = _user("Is port 22 open?")
+    same = _assistant("Yes.")
+    run.call("You are agent A.", [task], same)
+    run.call("You are agent B.", [task], same)
+    run.call("You are agent A.", [task, same, _user("A: and 80?")], _assistant("No."))
+    run.call("You are agent B.", [task, same, _user("B: and 443?")], _assistant("No."))
+
+    calls = load_calls(tmp_path)
+    by_seq = ThreadLinker().link(calls).by_seq
+    assert by_seq[2] == by_seq[0]
+    assert by_seq[3] == by_seq[1]
+    assert by_seq[0] != by_seq[1]
+    summary = summarise(RUN_ID, calls)
+    assert (summary.agents, summary.branch_points, summary.largest_thread_calls) == (2, 0, 2)
+
+
+def test_branch_points_are_counted_once_per_parent_reply() -> None:
+    calls = [
+        _call(0, thread_key="p", reply_hash="r"),
+        _call(1, thread_key="p", history_hashes=("t", "r", "n1")),
+        _call(2, thread_key="p", history_hashes=("t", "r", "n2")),
+        _call(3, thread_key="p", history_hashes=("t", "r", "n3")),
+        _call(4, thread_key="p", history_hashes=("t", "r", "n2")),  # retry of call 2
+    ]
+    links = ThreadLinker().link(calls)
+    assert links.branch_points == 1
+    assert links.by_seq[0] == links.by_seq[1] == "p"  # the earliest continuation stays
+    assert len({links.by_seq[1], links.by_seq[2], links.by_seq[3]}) == 3
+    assert links.by_seq[4] == links.by_seq[2]
+    assert summarise(RUN_ID, calls).branch_points == 1

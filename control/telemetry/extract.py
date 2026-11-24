@@ -12,8 +12,9 @@ be rerun at any time; its output goes to a separate folder and never into the ev
   A problem with one call becomes that call's ``parse_error``; it never hides the rest.
 * :func:`summarise` is pure: the same calls always give the same :class:`RunTelemetry`.
 * :func:`write_derived` writes ``telemetry/summary.json``, ``telemetry/calls.jsonl``
-  (one row per call, without the reasoning text) and ``telemetry/reasoning.jsonl`` (the
-  readable thought-process trace) under an output folder, as ASCII-only JSON (see
+  (one row per call, without the reasoning text or history hashes) and
+  ``telemetry/reasoning.jsonl`` (the readable thought-process trace) under an output
+  folder, as ASCII-only JSON (see
   :func:`_json_bytes`). Rows of both JSONL files carry ``agent``, the thread the call
   was linked to (:class:`ThreadLinker`; ``null`` for an unreadable request), next to the
   call's own ``thread_key``. Each file is replaced atomically. It refuses to write inside a
@@ -280,10 +281,13 @@ class DerivedWriter:
         self._check_destination()
         self._folder.mkdir(parents=True, exist_ok=True)
         # the agent thread each call was linked to (None for an unreadable request)
-        agents = ThreadLinker().assign(ordered)
+        agents = ThreadLinker().link(ordered).by_seq
+        # the history hashes only serve the linking, whose result is the agent column;
+        # they grow with every message, so they are left out of the file
+        row_fields = {"reasoning", "history_hashes"}
         files = {
             CALLS_FILE: b"".join(
-                _json_bytes({**c.model_dump(exclude={"reasoning"}), "agent": agents.get(c.seq)})
+                _json_bytes({**c.model_dump(exclude=row_fields), "agent": agents.get(c.seq)})
                 for c in ordered
             ),
             REASONING_FILE: b"".join(

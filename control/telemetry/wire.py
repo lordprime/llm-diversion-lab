@@ -26,42 +26,57 @@ a provider error, or a body over :data:`MAX_BODY_BYTES` all end up in
 Grouping calls into agents
 --------------------------
 This is a heuristic, and it counts *conversations*, not processes. Each call carries
-two kinds of key, and :class:`control.telemetry.model.ThreadLinker` combines them:
+three keys, and :class:`control.telemetry.model.ThreadLinker` combines them (its
+docstring has the exact rules):
 
 * ``history_hashes`` and ``reply_hash``, rolling hashes over the non-system messages.
   An agent that re-sends its growing history sends, as a prefix, the previous call's
   messages followed by that call's reply, so the later call is linked to the earlier
-  one whatever its system prompt says (a timestamp or a changing reminder there does
-  not matter). Messages are compared in a canonical form (whitespace collapsed,
-  reasoning and inline thinking dropped, JSON arguments re-serialised), so the usual
-  ways clients re-echo a reply still match.
+  one even when a timestamp in its system prompt changed. Messages are compared in a
+  canonical form (whitespace collapsed, reasoning and inline thinking dropped, JSON
+  arguments re-serialised), so the usual ways clients re-echo a reply still match.
+* ``persona_sha256``, the system prompt with digits and whitespace normalised away.
+  A continuation under a different persona is a handoff and becomes a new agent; two
+  different continuations of one reply are a fork (a branch point) and each extra
+  one becomes a new agent.
 * ``thread_key``, the fallback for a call that extends no earlier call: the SHA-256 of
   ``system_sha256`` plus the whitespace-normalised text of the first non-system
   message. A sub-agent starts with its own system prompt or its own first task, so it
   gets its own key.
 
-What still breaks it (each makes ``agents`` too high):
+What makes ``agents`` too high (over-count):
 
 * a sliding window or history compaction that drops or rewrites earlier messages, so
   the previous call's messages are no longer a prefix;
 * ``/api/generate``, or any framework that rebuilds one prompt from scratch each round:
   there is no message history to link, and each new prompt looks like a new task;
 * a client that edits the echoed reply beyond the canonical form (for example
-  truncating long tool arguments).
+  truncating long tool arguments), or one agent whose system prompt changes wording
+  (not just digits) between rounds.
 
-Two sub-agents given the same system prompt and the same first task count as one.
-``RunTelemetry.single_call_threads`` and ``largest_thread_calls`` show when linking has
-collapsed: many single-call threads and a small largest thread mean ``agents`` is
-close to ``calls`` and should not be trusted.
+What makes ``agents`` too low (under-count):
+
+* two sub-agents given the same system prompt and the same first task;
+* forks that keep the parent's persona and whose branches send the same next message
+  (they only differ later);
+* a handoff to a persona whose system prompt differs only in digits.
+
+How to read the diagnostics: ``single_call_threads == calls`` (more than one call) is
+the clear over-count alarm, because no call linked to any other; below that, one-shot
+sub-agents legitimately add single-call threads. ``branch_points`` counts the forks the
+linker saw, which is the under-count signal: a framework known to fork that shows 0
+was not seen forking.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import ClassVar, Final
 
 from pydantic import JsonValue
@@ -150,6 +165,18 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
+_DIGITS = re.compile(r"\d+")
+
+
+def _persona(system: str) -> str:
+    """A normalised system prompt with every run of digits turned into ``0``.
+
+    Timestamps, dates and counters in a system prompt change from call to call without
+    the agent changing, so they are ignored when comparing personas.
+    """
+    return _DIGITS.sub("0", system)
+
+
 def _error_text(value: JsonValue | None) -> str:
     """The readable part of a provider's error value (Ollama: text; others: an object)."""
     if isinstance(value, dict):
@@ -176,7 +203,9 @@ def _split_think(text: str) -> tuple[str | None, str]:
     ``<think>`` somewhere later in the text is prose about the tags and is left alone.
     A bare ``</think>`` in ordinary prose cannot be told apart from a pre-filled
     template, so it is split too; replies that mention the closing tag literally are
-    rare enough to accept that.
+    rare enough to accept that. When a pre-filled ``<think>`` reply runs out of tokens
+    before its ``</think>``, nothing marks where thinking ends, so that reasoning stays
+    in the text and is not counted as reasoning.
     """
     stripped = text.lstrip()
     if stripped.startswith(_THINK_OPEN):
@@ -290,11 +319,14 @@ class _Reply:
         if reason not in self.errors:
             self.errors.append(reason)
 
+    def raw_text(self) -> str:
+        """The reply text as sent, before inline thinking is split off."""
+        return "\n\n".join(b for k in sorted(self.text) if (b := "".join(self.text[k])))
+
     def final_text_and_reasoning(self) -> tuple[str, str]:
         """The reply text and reasoning; separate blocks are joined with a blank line."""
-        text = "\n\n".join(b for k in sorted(self.text) if (b := "".join(self.text[k])))
         blocks = ["".join(self.reasoning[k]) for k in sorted(self.reasoning)]
-        thought, text = _split_think(text)
+        thought, text = _split_think(self.raw_text())
         if thought:
             blocks.append(thought)
         return text, "\n\n".join(b for b in blocks if b)
@@ -347,11 +379,22 @@ def _canonical_arguments(arguments: str) -> str:
 #: Length (hex digits) of the history hashes: 64 bits, plenty to tell one run's
 #: message prefixes apart, and short enough to store one per message.
 _HISTORY_HASH_CHARS: Final = 16
+#: How many distinct messages keep their digest in memory. An agent re-sends the same
+#: messages call after call, so each is canonicalised once rather than once per call.
+#: It must be larger than the longest history, or a sequential re-send evicts every
+#: entry before it is reused; the cost is holding that many messages in memory.
+_DIGEST_CACHE_SIZE: Final = 8192
+
+
+@lru_cache(maxsize=_DIGEST_CACHE_SIZE)
+def _message_digest(message: _Message) -> str:
+    """The hash of one message's canonical form (a pure function, so caching is safe)."""
+    return _sha256(message.canonical())[:_HISTORY_HASH_CHARS]
 
 
 def _extend_history(previous: str, message: _Message) -> str:
     """The rolling hash of a history extended by one message."""
-    return _sha256(f"{previous}\n{message.canonical()}")[:_HISTORY_HASH_CHARS]
+    return _sha256(f"{previous}\n{_message_digest(message)}")[:_HISTORY_HASH_CHARS]
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,6 +417,7 @@ class _RequestShape:
     messages: int = 0
     chars: int = 0
     system_sha256: str | None = None
+    persona_sha256: str | None = None
     thread_key: str = ""
     history_hashes: tuple[str, ...] = ()
 
@@ -381,6 +425,7 @@ class _RequestShape:
     def of(cls, model: str | None, parts: _RequestParts) -> _RequestShape:
         system = _normalise("\n".join(parts.system))
         system_sha = _sha256(system) if system else None
+        persona_sha = _sha256(_persona(system)) if system else None
         first = _normalise(parts.turns[0].flat_text()) if parts.turns else ""
         hashes: list[str] = []
         for message in parts.turns:
@@ -391,6 +436,7 @@ class _RequestShape:
             messages=parts.messages,
             chars=sum(map(len, parts.system)) + sum(m.chars for m in parts.turns),
             system_sha256=system_sha,
+            persona_sha256=persona_sha,
             thread_key=_sha256(f"{system_sha or ''}\n{first}"),
             history_hashes=tuple(hashes),
         )
@@ -436,6 +482,7 @@ def unparsed_call(
         request_messages=0,
         request_chars=0,
         system_sha256=None,
+        persona_sha256=None,
         thread_key="",
         history_hashes=(),
         reply_hash=None,
@@ -522,9 +569,11 @@ class WireParser(ABC):
             request_messages=shape.messages,
             request_chars=shape.chars,
             system_sha256=shape.system_sha256,
+            persona_sha256=shape.persona_sha256,
             thread_key=shape.thread_key,
             history_hashes=shape.history_hashes,
-            reply_hash=shape.reply_hash(text, tool_calls) if replied else None,
+            # hashed from the text as sent, like the echo it must match
+            reply_hash=shape.reply_hash(reply.raw_text(), tool_calls) if replied else None,
             tool_calls=tool_calls,
             reasoning=reasoning,
             text=text,
