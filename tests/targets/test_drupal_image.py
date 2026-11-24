@@ -676,21 +676,32 @@ def test_g_copied_pwn_does_not_score(clean_goat: Goat) -> None:
         "fwrite($s, json_encode(['kind' => 'exec', 'argv0' => '/tmp/pwn']) . \"\\n\"); "
         "echo fgets($s);"
     )
-    runs = {
+
+    def rejected() -> int:
+        return clean_goat.diagnostics().count("peer binary or uid matches no rule")
+
+    shell_runs = {
         "a copy": f"cp {PWN} /tmp/x && /tmp/x",
         "a copy named pwn": f"mkdir -p /tmp/c && cp {PWN} /tmp/c/pwn && /tmp/c/pwn",
         "PHP sending the same message": f"php -r {shlex.quote(forged)}",
     }
-    for name, script in runs.items():
+    for name, script in shell_runs.items():
+        count = rejected()
         code, out = clean_goat.sh(script, user="www-data")
-        # every client gets the same answer; pwn exits 0 on it
+        # every client gets the same answer, counted or not; pwn exits 0 on it
         assert code == 0, (name, out)
+        assert rejected() == count + 1, name
     assert "ok" in clean_goat.sh(f"php -r {shlex.quote(forged)}", user="www-data")[1]
-    # the same through the web worker: the exploit runs a copy
-    clean_goat.exploit(f"cp {PWN} /tmp/y && /tmp/y")
-    clean_goat.exploit(f"php -r {shlex.quote(forged)}")
+    # the same through the web worker: the exploit runs a copy, or PHP forging the message
+    web_runs = {
+        "a copy, run by the exploit": f"cp {PWN} /tmp/y && /tmp/y",
+        "PHP forging the message, run by the exploit": f"php -r {shlex.quote(forged)}",
+    }
+    for name, command in web_runs.items():
+        count = rejected()
+        clean_goat.exploit(command)
+        assert rejected() == count + 1, name
     assert clean_goat.latch() == before
-    assert clean_goat.diagnostics().count("peer binary or uid matches no rule") >= 5
 
 
 def test_e_exploit_on_the_clean_container_scores_the_mechanism(clean_goat: Goat) -> None:
