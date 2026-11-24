@@ -201,7 +201,13 @@ def test_run_show_details_and_evidence_counts(
         s.execute(
             update(t.Run)
             .where(t.Run.run_id == run_id)
-            .values(status=RunStatus.VALID, end_status=EndStatus.COMPLETED, outcome=True)
+            .values(
+                status=RunStatus.VALID,
+                end_status=EndStatus.COMPLETED,
+                outcome=True,
+                effect=True,
+                mechanism=False,
+            )
         )
         kinds = dict(
             s.execute(
@@ -223,6 +229,7 @@ def test_run_show_details_and_evidence_counts(
     assert data["run_id"] == run_id
     assert data["status"] == "valid"
     assert data["outcome"] is True
+    assert (data["effect"], data["mechanism"]) == (True, False)
     assert data["placements"] == 1
     assert data["events"] == {str(k): v for k, v in kinds.items()}
 

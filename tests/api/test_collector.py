@@ -130,6 +130,8 @@ def _verdict(run_id: str, **overrides: Any) -> m.Verdict:
         "run_id": run_id,
         "end_status": EndStatus.COMPLETED,
         "outcome": True,
+        "effect": True,
+        "mechanism": False,
         "oracle_message": "ssrf reached the canary",
         "decided_at": TS,
     } | overrides
@@ -446,7 +448,7 @@ def test_verdict_sets_end_status_and_outcome(client: TestClient, engine: Engine)
     assert r.json() == {"run_id": run_id, "result": "stored"}
     run = _run(engine, run_id)
     assert run.end_status is EndStatus.COMPLETED
-    assert run.outcome is True
+    assert (run.outcome, run.effect, run.mechanism) == (True, True, False)
     assert run.oracle_message == "ssrf reached the canary"
     assert run.decided_at == TS
 
@@ -461,7 +463,7 @@ def test_verdict_is_write_once(client: TestClient, engine: Engine) -> None:
     assert again.status_code == 200
     assert again.json() == {"run_id": run_id, "result": "duplicate"}
 
-    other = _verdict(run_id, outcome=False, end_status=EndStatus.TIMEOUT)
+    other = _verdict(run_id, outcome=False, effect=False, end_status=EndStatus.TIMEOUT)
     r = client.post(url, content=other.model_dump_json())
     assert r.status_code == 409
     assert r.json()["reason"] == "conflict"
@@ -469,6 +471,53 @@ def test_verdict_is_write_once(client: TestClient, engine: Engine) -> None:
     assert run.outcome is True
     assert run.end_status is EndStatus.COMPLETED
     assert [x.endpoint for x in _rejected(engine)] == [m.CollectorEndpoint.VERDICT]
+
+
+def test_verdict_with_an_undecidable_mechanism_stores_null(
+    client: TestClient, engine: Engine
+) -> None:
+    run_id, _ = _injected_run(engine)
+    _mark_valid(engine, run_id)
+    body = _verdict(run_id, mechanism=None).model_dump_json()
+    assert client.post(f"/v1/runs/{run_id}/verdict", content=body).status_code == 200
+    assert _run(engine, run_id).mechanism is None
+
+
+def test_verdict_differing_only_in_the_mechanism_is_a_conflict(
+    client: TestClient, engine: Engine
+) -> None:
+    run_id, _ = _injected_run(engine)
+    _mark_valid(engine, run_id)
+    url = f"/v1/runs/{run_id}/verdict"
+    assert client.post(url, content=_verdict(run_id).model_dump_json()).status_code == 200
+    other = _verdict(run_id, mechanism=True)
+    r = client.post(url, content=other.model_dump_json())
+    assert r.status_code == 409 and r.json()["reason"] == "conflict"
+    assert _run(engine, run_id).mechanism is False
+
+
+def test_verdict_whose_outcome_matches_neither_verdict_is_rejected(
+    client: TestClient, engine: Engine
+) -> None:
+    run_id, _ = _injected_run(engine)
+    _mark_valid(engine, run_id)
+    body = _verdict(run_id).model_dump(mode="json") | {
+        "outcome": False,
+        "effect": True,
+        "mechanism": True,
+    }
+    r = client.post(f"/v1/runs/{run_id}/verdict", content=json.dumps(body))
+    assert r.status_code == 422
+    assert _run(engine, run_id).outcome is None
+
+
+def test_verdict_without_an_effect_is_rejected(client: TestClient, engine: Engine) -> None:
+    run_id, _ = _injected_run(engine)
+    _mark_valid(engine, run_id)
+    body = _verdict(run_id).model_dump(mode="json")
+    del body["effect"]
+    r = client.post(f"/v1/runs/{run_id}/verdict", content=json.dumps(body))
+    assert r.status_code == 422
 
 
 def test_verdict_same_instant_other_timezone_is_a_duplicate(

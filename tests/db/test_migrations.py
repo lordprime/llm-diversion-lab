@@ -3,16 +3,20 @@ import uuid
 from typing import Any
 
 import psycopg
+import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from psycopg import sql
-from sqlalchemy import inspect
+from sqlalchemy import Engine, inspect, text, update
+from sqlalchemy.exc import IntegrityError
 
 from control.core.models import EventKind, InvalidReason
-from control.db.engine import create_db_engine
+from control.db import tables as t
+from control.db.engine import create_db_engine, session_scope
 from control.db.tables import Base
 from tests.conftest import _libpq_url, alembic_config
+from tests.db.test_repo import add_run, seed_experiment
 
 EXPECTED_TABLES = {
     "experiments",
@@ -182,3 +186,81 @@ def test_migrated_constraints_match_create_all(db_url: str, pg_server_url: str) 
     only_created = {k: v for k, v in created.items() if migrated.get(k) != v}
     assert only_migrated == {}
     assert only_created == {}
+
+
+def _runs(url: str) -> dict[str, dict[str, Any]]:
+    eng = create_db_engine(url)
+    try:
+        with eng.connect() as conn:
+            rows = conn.exec_driver_sql("SELECT * FROM runs").mappings().all()
+    finally:
+        eng.dispose()
+    return {row["run_id"]: dict(row) for row in rows}
+
+
+def test_dual_verdict_columns_and_check(db_url: str) -> None:
+    """runs.effect and runs.mechanism are nullable booleans (NULL until the verdict is
+    stored); effect is set exactly when outcome is."""
+    command.upgrade(alembic_config(db_url), "head")
+    eng = create_db_engine(db_url)
+    try:
+        insp = inspect(eng)
+        columns = {c["name"]: c for c in insp.get_columns("runs")}
+        checks = {c["name"]: c["sqltext"] for c in insp.get_check_constraints("runs")}
+    finally:
+        eng.dispose()
+    for name in ("effect", "mechanism"):
+        assert columns[name]["nullable"] is True
+        assert str(columns[name]["type"]) == "BOOLEAN"
+    assert "outcome IS NULL" in checks["ck_runs_outcome_has_effect"]
+    assert "effect IS NULL" in checks["ck_runs_outcome_has_effect"]
+
+
+def test_dual_verdict_check_refuses_an_outcome_without_an_effect(engine: Engine) -> None:
+    ids = seed_experiment(engine)
+    run_id = add_run(engine, ids, schedule_index=0)
+    for lopsided in ({"outcome": True}, {"effect": False}):
+        with (
+            pytest.raises(IntegrityError, match="ck_runs_outcome_has_effect"),
+            session_scope(engine) as s,
+        ):
+            s.execute(update(t.Run).where(t.Run.run_id == run_id).values(**lopsided))
+    with session_scope(engine) as s:  # both together, with the mechanism unknown, is fine
+        s.execute(update(t.Run).where(t.Run.run_id == run_id).values(outcome=False, effect=False))
+
+
+def test_dual_verdict_migration_backfills_effect_and_downgrades(db_url: str) -> None:
+    """Existing rows: effect = outcome (NULL stays NULL), mechanism NULL; the downgrade
+    drops the columns and the upgrade can run again."""
+    cfg = alembic_config(db_url)
+    command.upgrade(cfg, "head")
+    eng = create_db_engine(db_url)
+    try:
+        ids = seed_experiment(eng)
+        done_true = add_run(eng, ids, schedule_index=0)
+        done_false = add_run(eng, ids, schedule_index=1)
+        queued = add_run(eng, ids, schedule_index=2)
+    finally:
+        eng.dispose()
+    command.downgrade(cfg, "0006")
+    old = create_db_engine(db_url)
+    try:
+        with old.begin() as conn:
+            for run_id, outcome in ((done_true, True), (done_false, False)):
+                conn.execute(
+                    text(
+                        "UPDATE runs SET status = 'valid', end_status = 'completed', "
+                        "outcome = :outcome WHERE run_id = :run_id"
+                    ),
+                    {"outcome": outcome, "run_id": run_id},
+                )
+        assert "effect" not in {c["name"] for c in inspect(old).get_columns("runs")}
+    finally:
+        old.dispose()
+
+    command.upgrade(cfg, "head")
+    rows = _runs(db_url)
+    assert (rows[done_true]["outcome"], rows[done_true]["effect"]) == (True, True)
+    assert (rows[done_false]["outcome"], rows[done_false]["effect"]) == (False, False)
+    assert (rows[queued]["outcome"], rows[queued]["effect"]) == (None, None)
+    assert {r["mechanism"] for r in rows.values()} == {None}

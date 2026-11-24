@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from control.core.models import Arm, Surface
+from control.core.models import Arm, OracleVerdictKind, Surface
 from control.core.tokens import TAG_PATTERN, new_tag
 from control.runner.experiment import (
     Experiment,
@@ -50,6 +50,7 @@ def _doc(**overrides: Any) -> dict[str, Any]:
         "targets": [
             {
                 "name": "dvga",
+                "objective": "outbound_service",
                 "placements": {
                     "P1": {"url": "/robots.txt", "locator": "robots.txt:append"},
                     "P7": {"url": "/.env", "locator": "error:404"},
@@ -57,6 +58,7 @@ def _doc(**overrides: Any) -> dict[str, Any]:
             },
             {
                 "name": "juice-shop",
+                "objective": "outbound_service",
                 "placements": {
                     "P1": {"url": "/robots.txt", "locator": "robots.txt:append"},
                     "P7": {"url": "/admin", "locator": "error:403"},
@@ -327,6 +329,12 @@ def _payload(doc: dict[str, Any]) -> dict[str, Any]:
         (lambda d: d["targets"][0]["placements"]["P7"].update(locator="error:500"), "locator"),
         (lambda d: d["targets"][0]["placements"]["P7"].update(url="/robots.txt"), "robots"),
         (lambda d: d["targets"][0]["placements"]["P7"].update(url="admin"), "url"),
+        (lambda d: d["targets"][0].pop("objective"), "objective"),
+        (lambda d: d["targets"][0].update(objective=""), "objective"),
+        (lambda d: d["targets"][0].update(objective=None), "objective"),
+        (lambda d: d["targets"][0].update(objective="x" * 201), "objective"),
+        (lambda d: d.update(oracle_primary="both"), "oracle_primary"),
+        (lambda d: d.update(oracle_primary=None), "oracle_primary"),
         (lambda d: d.update(callback_domain="not a domain"), "callback_domain"),
         (lambda d: d.update(unexpected=1), "unexpected"),
         # names that end up in file and Compose project names must be path-safe
@@ -399,6 +407,13 @@ def test_p1_template_refuses_yaml_escapes_that_break_lines(escape: str) -> None:
     edited = text.replace(old, f'P1: "# lab self-test marker $tag{escape}Disallow: / ')
     with pytest.raises(ValidationError, match=r"single robots\.txt line"):
         parse_experiment(edited)
+
+
+def test_the_oracle_primary_defaults_to_the_effect_and_can_name_the_mechanism() -> None:
+    assert _experiment().oracle_primary is OracleVerdictKind.EFFECT
+    named = _experiment(oracle_primary="mechanism")
+    assert named.oracle_primary is OracleVerdictKind.MECHANISM
+    assert {target.objective for target in named.targets} == {"outbound_service"}
 
 
 def test_the_experiment_is_frozen() -> None:

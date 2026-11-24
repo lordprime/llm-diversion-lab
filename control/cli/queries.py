@@ -145,6 +145,8 @@ class RunDetail:
     schedule_index: int
     attempt: int
     tag: str | None
+    effect: bool | None
+    mechanism: bool | None
     oracle_message: str | None
     #: everything that went wrong, redacted (again: rows stored before the runner
     #: redacted it may hold secrets)
@@ -170,6 +172,8 @@ class RunDetail:
             "schedule_index": self.schedule_index,
             "attempt": self.attempt,
             "tag": self.tag,
+            "effect": self.effect,
+            "mechanism": self.mechanism,
             "oracle_message": self.oracle_message,
             "invalid_detail": self.invalid_detail,
             "started_at": ts(self.started_at),
@@ -226,6 +230,8 @@ def get_run(session: Session, run_id: str) -> RunDetail | None:
         schedule_index=run.schedule_index,
         attempt=run.attempt,
         tag=run.tag,
+        effect=run.effect,
+        mechanism=run.mechanism,
         oracle_message=run.oracle_message,
         invalid_detail=None if run.invalid_detail is None else redact_text(run.invalid_detail),
         started_at=run.started_at,

@@ -19,11 +19,12 @@ queued: a leaked cell may still hold a Docker socket, an agent or a gateway rout
 3. **probe** -- the target's own health script, then the injector's pre-flight probe:
    every probed path must answer its expected status (the P7 path its 404, robots.txt
    200); then every infrastructure service must be exactly ``running``, never
-   restarted; then the oracle must answer "not yet" (one answered poll, ``status``
-   false, kept in the oracle evidence). A failure stops here: the agent never starts,
-   no token is spent;
+   restarted; then the oracle must answer "not yet" (one answered poll with
+   ``effect`` and ``mechanism`` not true, kept in the oracle evidence). A failure stops
+   here: the agent never starts, no token is spent;
 4. **run** -- start the agent; poll the oracle (``/opt/support/done.sh`` only) every
-   15 s while it runs, stop it at the run's ``timeout_s``, poll once more after. An
+   15 s while it runs, stop it at the run's ``timeout_s``, poll once more after and
+   dump the latch to ``oracle/latch.jsonl`` (``/opt/support/latch-dump.sh``). An
    agent that never leaves ``created`` is a cell failure, not a timeout;
 5. **collect** -- note which infrastructure is no longer exactly ``running`` with no
    restart (the injector: ``injector_failed``; the tap, catcher or cell-guard:
@@ -116,7 +117,16 @@ from control.runner.cell_spec import (
 )
 from control.runner.compose_backend import CellBackend, CellHandle, ContainerState
 from control.runner.experiment import ExperimentFile
-from control.runner.oracle import DONE_COMMAND, POLL_INTERVAL_S, OracleLog, OracleScore, parse_done
+from control.runner.oracle import (
+    DONE_COMMAND,
+    LATCH_COMMAND,
+    LATCH_FILE,
+    POLL_INTERVAL_S,
+    DoneResult,
+    OracleLog,
+    OracleScore,
+    parse_done,
+)
 from control.runner.render import forbidden_tags_for, render_manifest, verify_manifest_tokens
 from control.runner.schedule import ScheduledRun, ScheduleError, build_schedule, check_schedule
 from control.runner.ship import (
@@ -394,6 +404,7 @@ def write_atomic(path: Path, data: bytes) -> None:
 class _RunState:
     run: ScheduledRun
     evidence_dir: Path
+    score: OracleScore
     heartbeat_seq: int = 0
     manifest: RunManifest | None = None
     cell: CellHandle | None = None
@@ -402,7 +413,6 @@ class _RunState:
     collected: bool = False
     event_lines: list[bytes] = field(default_factory=list)
     end_status: EndStatus | None = None
-    score: OracleScore = field(default_factory=OracleScore)
     final_poll_at: datetime | None = None
     final_poll_answered: bool = False
     verdict: Verdict | None = None
@@ -500,7 +510,8 @@ class Runner:
         """Run a claimed run end to end; never raises for a run-level failure."""
         if self._ef is None:
             raise RuntimeError("register the experiment first")
-        state = _RunState(run, self._runs_dir / run.run_id)
+        objective = self._experiment_file().experiment.target(run.target).objective
+        state = _RunState(run, self._runs_dir / run.run_id, OracleScore(objective))
         try:
             self._heartbeat(state, RunPhase.CLAIMED)
             self._prepare(state)
@@ -683,6 +694,26 @@ class Runner:
                 break
             self._sleep(self._tick_s)
         self._poll(state, oracle_log)  # the final word, after the agent stopped
+        self._keep_latch(state)
+
+    def _keep_latch(self, state: _RunState) -> None:
+        """Dump the target's latch once, after the final poll, as a write-once artifact."""
+        if state.cell is None:  # pragma: no cover - dumped only in a cell
+            raise RuntimeError("no cell")
+        result = self._backend.exec(
+            state.cell, state.cell.project.target_service, LATCH_COMMAND, timeout_s=120
+        )
+        if result.returncode != 0:
+            raise _OracleUnreachableError(
+                f"latch dump exited {result.returncode}: "
+                f"{result.stderr.decode('utf-8', 'replace').strip()[-500:]}"
+            )
+        path = state.evidence_dir / LATCH_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as fh:
+            fh.write(result.stdout)
+            fh.flush()
+            os.fsync(fh.fileno())
 
     def _probe(self, cell: CellHandle, project: ComposeProject) -> None:
         if not self._backend.health(cell, timeout_s=self._health_timeout_s):
@@ -707,9 +738,9 @@ class Runner:
             raise ProbeFailedError(f"pre-flight statuses (expected, got): {wrong}")
 
     def _probe_oracle(self, state: _RunState, oracle_log: OracleLog) -> None:
-        """Before the agent: the oracle must answer, and answer "not yet" (``status``
-        false). An oracle that reports success from the start, or never answers, would
-        make any later verdict meaningless (:class:`ProbeFailedError`)."""
+        """Before the agent: the oracle must answer, and answer "not yet" (no effect, no
+        mechanism). An oracle that reports success from the start, or never answers,
+        would make any later verdict meaningless (:class:`ProbeFailedError`)."""
         last = ""
         for attempt in range(PROBE_POLL_ATTEMPTS):
             if attempt:
@@ -718,10 +749,9 @@ class Runner:
             if isinstance(parsed, str):
                 last = parsed
                 continue
-            status, message = parsed
-            if status:
+            if parsed.effect or parsed.mechanism:
                 raise ProbeFailedError(
-                    f"the oracle reports success before the agent started: {message[:200]!r}"
+                    f"the oracle reports success before the agent started: {parsed.message[:200]!r}"
                 )
             return
         raise ProbeFailedError(
@@ -729,7 +759,7 @@ class Runner:
             f"{last[:300]}"
         )
 
-    def _poll(self, state: _RunState, oracle_log: OracleLog) -> tuple[bool, str] | str:
+    def _poll(self, state: _RunState, oracle_log: OracleLog) -> DoneResult | str:
         if state.cell is None:  # pragma: no cover - polled only in a cell
             raise RuntimeError("no cell")
         result = self._backend.exec(
@@ -901,10 +931,16 @@ class Runner:
             raise _NoLlmCallsError("the agent made no LLM call")
         if state.end_status is None:  # pragma: no cover - set whenever the agent ran
             raise RuntimeError("the agent's end status is unknown")
+        try:
+            outcome = state.score.outcome(self._experiment_file().experiment.oracle_primary)
+        except ValueError as exc:
+            raise _OracleUnexpectedError(str(exc)) from exc
         state.verdict = Verdict(
             run_id=state.run.run_id,
             end_status=state.end_status,
-            outcome=state.score.success,
+            outcome=outcome,
+            effect=state.score.effect,
+            mechanism=state.score.mechanism,
             oracle_message=state.score.message,
             decided_at=state.final_poll_at,
         )

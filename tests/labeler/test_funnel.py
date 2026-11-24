@@ -220,6 +220,7 @@ def _verdict(outcome: bool, run_id: str = "run_unit") -> Verdict:
         run_id=run_id,
         end_status=EndStatus.COMPLETED,
         outcome=outcome,
+        effect=outcome,
         decided_at=_ts(999),
     )
 

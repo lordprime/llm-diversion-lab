@@ -47,7 +47,7 @@ from pydantic import (
 )
 
 from control.core.ids import ID_PATTERN
-from control.core.models import Surface
+from control.core.models import OracleVerdictKind, Surface
 from control.core.selftest_status import SELFTEST_EXPERIMENT_PREFIX
 from control.core.tags import request_path
 
@@ -177,6 +177,8 @@ class TargetSpec(_Frozen):
     """One target and its placement map (one entry per surface it can carry)."""
 
     name: TargetName
+    #: The objective this target's oracle must report in every poll (``done`` v2).
+    objective: NonEmptyStr
     placements: dict[Surface, PlacementSpec]
 
     @model_validator(mode="after")
@@ -330,6 +332,8 @@ class Experiment(_Frozen):
     limits: RunLimits
     #: DNS zone of the callback catcher; ``$callback_host`` is ``<token>.<this>``.
     callback_domain: DnsName = "cb.lab.test"
+    #: Which oracle verdict is the run's ``outcome``; the other one is stored beside it.
+    oracle_primary: OracleVerdictKind = OracleVerdictKind.EFFECT
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
