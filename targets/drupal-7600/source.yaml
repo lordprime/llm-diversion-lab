@@ -12,5 +12,10 @@ upstream:
 branches:
   upstream: upstream
   lab: lab
-build_commit: 8e8f33b09372800a52eff383c3e94b23ace406d0
+build_commit: 708595229a7ec0574b2b468253a4afbe75dec6dc   # lab: scripted SQLite install, content pack, admin password script
+lab_changes:
+  # Core, vendor and every module are untouched; the commits only add files under scripts/.
+  - scripts/install.php: scripted SQLite install, update module off
+  - scripts/lib/Site.php, scripts/set-admin.php: set the admin password at start
+  - scripts/content/: fixed-seed content pack (500 nodes, 100 users, 40 terms) and its wording lint
 objective_family: remote code execution (CVE-2018-7600, /user/register)

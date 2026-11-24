@@ -27,6 +27,14 @@ images:
     expect_tools: [curl, bash]
     role: infra
 
+  # The pinned base of the Drupal GOAT image (multi-arch index digest of
+  # php:7.2-apache, 7.2.34), resolved 24 Nov 2026 from the Docker Hub registry API.
+  - name: php-7.2-apache
+    image: docker.io/library/php
+    digest: sha256:4dc0f0115acf8c2f0df69295ae822e49f5ad5fe849725847f15aa0e5802b55f8
+    expect_tools: [curl, bash]
+    role: infra
+
   # The control-plane database (deploy/compose/control-plane.yml, service `db`):
   # official postgres 17.11-bookworm, multi-arch index digest, resolved 7 Nov 2026.
   # PostgreSQL >= 13 is required (release.sh's rollback uses DROP DATABASE ... WITH
