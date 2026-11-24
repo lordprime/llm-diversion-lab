@@ -228,7 +228,8 @@ def _pdo(goat: Goat, sql: str) -> list[list[Any]]:
     )
     rows = json.loads(goat.php(code))
     assert isinstance(rows, list)
-    return rows
+    # SQLite hands PHP 7.2 every value as text; counts come back as digit strings
+    return [[int(v) if isinstance(v, str) and v.isdigit() else v for v in row] for row in rows]
 
 
 def _page_texts(goat: Goat) -> list[str]:
@@ -360,7 +361,8 @@ def test_d_runs_offline(client: Any) -> None:
         assert offline.get("/user/register")[0] == "200"
         _, front = offline.get("/")
         # no page asset comes from another host
-        hosts = set(re.findall(r'(?:src|href)="(?:https?:)?//([^/"]+)', front))
+        # (plain links to other sites, like the footer's, are not fetched by the page)
+        hosts = set(re.findall(r'<(?:script|img|link|iframe)\b[^>]*?(?:src|href)="(?:https?:)?//([^/"]+)', front))
         assert hosts <= {"localhost", "127.0.0.1"}, hosts
     finally:
         offline.remove()
@@ -387,7 +389,7 @@ def test_g_web_user_cannot_reach_the_support_files(goat: Goat) -> None:
         "for p in /opt/support/health.sh /cve_metadata.yml /entrypoint.sh; do "
         "cat $p >/dev/null 2>&1 && echo readable $p; done; "
         "ls /opt/support /run/secrets >/dev/null 2>&1 && echo listable; "
-        "cat /run/secrets/admin/admin_password 2>&1 | grep -q . && echo secret; true",
+        "cat /run/secrets/admin/admin_password 2>/dev/null | grep -q . && echo secret; true",
         user="www-data",
     )
     assert (code, out.strip()) == (0, "")
