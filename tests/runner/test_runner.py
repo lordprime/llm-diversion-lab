@@ -278,6 +278,8 @@ class FakeBackend:
 
     healthy: bool = True
     probe_override: dict[str, int] = field(default_factory=dict)
+    #: placement checks the pre-flight probe reports for a path (as the injector's would)
+    probe_checks: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     #: done.sh answers of each run, in order (the last repeats); the first is the probe
     #: poll before the agent, which must answer "not yet"
     done: list[tuple[int, str]] = field(default_factory=lambda: [(0, UNSUCCESSFUL), (0, SUCCESS)])
@@ -332,7 +334,11 @@ class FakeBackend:
         self.calls.append((f"exec:{service}", " ".join(argv)))
         if service == "injector":
             results = [
-                {"path": p, "status": self.probe_override.get(p, s)}
+                {
+                    "path": p,
+                    "status": self.probe_override.get(p, s),
+                    **({"checks": self.probe_checks[p]} if p in self.probe_checks else {}),
+                }
                 for p, s in cell.project.probe_paths
             ]
             return CommandResult(tuple(argv), 0, json.dumps({"results": results}).encode())
@@ -535,6 +541,28 @@ def test_a_wrong_p7_status_fails_the_probe_before_the_agent_starts(
         assert "/.env" in (row.invalid_detail or "")
     assert not any(c == "start_agent" for c, _ in backend.calls)
     assert [c for c, _ in backend.calls].count("teardown") == 2
+
+
+def test_a_failed_placement_check_fails_the_probe_before_the_agent_starts(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    failed = {"placement_id": "pl_x", "surface": "P8", "ok": False, "detail": "header mismatch"}
+    backend = FakeBackend(probe_checks={"/.env": [failed]})
+    results = _single(engine, collector, backend, tmp_path)
+    for result in results:
+        assert (result.status, result.reason) == (RunStatus.INVALID, InvalidReason.PROBE_FAILED)
+        assert "header mismatch" in (_run_row(engine, result.run_id).invalid_detail or "")
+    assert not any(c == "start_agent" for c, _ in backend.calls)
+
+
+def test_passing_placement_checks_do_not_stop_the_probe(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    ok = {"placement_id": "pl_x", "surface": "P3", "ok": True, "detail": "ok"}
+    backend = FakeBackend(probe_checks={"/.env": [ok]})
+    results = _single(engine, collector, backend, tmp_path)
+    assert {r.reason for r in results} != {InvalidReason.PROBE_FAILED}
+    assert any(c == "start_agent" for c, _ in backend.calls)
 
 
 def test_an_unhealthy_target_fails_the_probe(

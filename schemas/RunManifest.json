@@ -22,6 +22,20 @@
           "title": "Locator",
           "type": "string"
         },
+        "offset_fraction": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Offset Fraction"
+        },
         "payload_id": {
           "minLength": 1,
           "title": "Payload Id",
@@ -85,7 +99,8 @@
         "P4",
         "P5",
         "P6",
-        "P7"
+        "P7",
+        "P8"
       ],
       "title": "Surface",
       "type": "string"

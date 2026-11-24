@@ -348,7 +348,7 @@ def test_build_plan_rejects_missing_or_extra_content() -> None:
 
 def test_build_plan_rejects_unsupported_surfaces_and_locators() -> None:
     p3 = _placement(P1_ID, Surface.P3, "/login", "css:body", P1_TEXT)
-    _bad_plan(_manifest(p3), {P1_ID: P1_TEXT}, "not supported")
+    _bad_plan(_manifest(p3), {P1_ID: P1_TEXT}, "locator")
     bad_p1 = _placement(P1_ID, Surface.P1, "/robots.txt", "robots.txt:prepend", P1_TEXT)
     _bad_plan(_manifest(bad_p1), {P1_ID: P1_TEXT}, "locator")
     wrong_url = _placement(P1_ID, Surface.P1, "/sitemap.xml", "robots.txt:append", P1_TEXT)
@@ -480,7 +480,12 @@ def test_robots_lines_are_appended_to_the_apps_file(tmp_path: Path) -> None:
     assert meta["synthesized_base"] is False and meta["app_status"] == 200
     assert meta["action"] == "robots" and meta["content_encoding"] == "gzip"
     assert meta["placements"] == [
-        {"placement_id": P1_ID, "byte_offset": len(APP_ROBOTS), "insert_ok": True}
+        {
+            "placement_id": P1_ID,
+            "byte_offset": len(APP_ROBOTS),
+            "offset_fraction": None,  # only in-page surfaces have one
+            "insert_ok": True,
+        }
     ]
 
 

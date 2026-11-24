@@ -56,7 +56,7 @@ from typing import Final
 
 from pydantic import JsonValue, ValidationError
 
-from cell.injector.placement import INJECTOR_STREAM, Planted
+from cell.injector.placement import BODY_SURFACES, INJECTOR_STREAM, Planted
 from control.core.models import Arm, PlacementServe, RunManifest, TargetAccessEvent
 
 __all__ = [
@@ -167,6 +167,17 @@ class ServedBody:
     #: Extra facts for ``NNNN.meta.json`` (action, app/expected status, ...).
     meta: Mapping[str, JsonValue] = field(default_factory=dict)
 
+    def offset_fraction(self, planted: Planted) -> float | None:
+        """Where an in-page plant really landed: its offset over the decoded body length."""
+        if (
+            planted.plant.placement.surface not in BODY_SURFACES
+            or not planted.insert_ok
+            or planted.offset is None
+            or not self.decoded
+        ):
+            return None
+        return min(planted.offset / len(self.decoded), 1.0)
+
     def meta_json(self, seq: int) -> bytes:
         doc: dict[str, JsonValue] = {
             **self.meta,
@@ -176,6 +187,7 @@ class ServedBody:
                 {
                     "placement_id": p.plant.placement.placement_id,
                     "byte_offset": p.offset if p.insert_ok else None,
+                    "offset_fraction": self.offset_fraction(p),
                     "insert_ok": p.insert_ok,
                 }
                 for p in self.plants
@@ -286,6 +298,7 @@ class ServeLog:
                             decoded_sha256=decoded_sha256,
                             wire_sha256=wire_sha256,
                             byte_offset=planted.offset if planted.insert_ok else None,
+                            offset_fraction=served.offset_fraction(planted),
                             insert_ok=planted.insert_ok,
                             probe=access.probe,
                         )

@@ -215,8 +215,8 @@ def test_placement_surface_rejects_unknown(surface: str) -> None:
         Placement.model_validate(placement_dict(surface=surface))
 
 
-def test_surface_enum_is_p1_to_p7() -> None:
-    assert [s.value for s in Surface] == [f"P{i}" for i in range(1, 8)]
+def test_surface_enum_is_p1_to_p8() -> None:
+    assert [s.value for s in Surface] == [f"P{i}" for i in range(1, 9)]
 
 
 def test_enum_values() -> None:

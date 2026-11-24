@@ -34,9 +34,19 @@ code. The runner renders each placement and pins its UTF-8 bytes in the manifest
 (see :mod:`cell.injector.serve_log`) and :func:`build_plan` refuses any text whose hash
 differs or that lacks the run's tag.
 
-Locators understood in M0:
+* ``GET`` on a page path (P2-P6, P8): if the app answers 200, the P2-P6 texts are
+  planted into its own HTML body, each wrapped by :class:`SurfaceMarkup`, at the first
+  tag boundary at or after ``floor(len(decoded body) * offset_fraction)`` inside
+  ``<body>`` (before ``</body>`` if there is none; see :func:`plant_into_body`). A P8
+  text only becomes the ``X-Security-Notice`` response header; the body, status and
+  every other header stay the app's. A page that is not HTML, or not 200, is left
+  alone (``insert_ok`` false).
+
+Locators understood:
 
 * P1: ``robots.txt:append`` and a ``url`` whose path is ``/robots.txt``.
+* P2-P6, P8: the fixed strings in :data:`SURFACE_LOCATORS` and a ``url`` whose path is
+  the page. P2-P6 also carry the manifest's ``offset_fraction``.
 * P7: ``error:403`` or ``error:404`` (the expected status) and a ``url`` whose path is
   the probed path.
 
@@ -48,6 +58,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -59,19 +71,26 @@ from control.core.models import Arm, Placement, RunManifest, Surface
 from control.core.tags import decoy_prefix, request_path, under_decoy
 
 __all__ = [
+    "APP_DIGEST_HEADER",
+    "BODY_SURFACES",
     "DECOY_PAGE",
     "DECOY_PAGE_VERSION",
     "DEFAULT_ROBOTS_BASE",
     "INJECTOR_STREAM",
+    "MAX_NOTICE_BYTES",
+    "NOTICE_HEADER",
     "P7_LOCATOR_PATTERN",
     "PROBE_HEADER",
+    "PROTECTED_HEADERS",
     "ROBOTS_LOCATOR",
     "ROBOTS_PATH",
+    "SURFACE_LOCATORS",
     "Action",
     "ActionKind",
     "InjectionPlan",
     "Plant",
     "Planted",
+    "SurfaceMarkup",
     "build_plan",
     "decode_body",
     "encode_body",
@@ -88,6 +107,9 @@ INJECTOR_STREAM: Final = "injector"
 #: Request header that marks a runner pre-flight probe; its value must equal the
 #: per-run probe secret. Always removed before a request is forwarded.
 PROBE_HEADER: Final = "x-lab-probe"
+#: Response header added to *probe* responses on page paths only: the sha256 of the app's
+#: own decoded body, so the pre-flight can prove the injector left the body alone.
+APP_DIGEST_HEADER: Final = "x-lab-app-body-sha256"
 ROBOTS_PATH: Final = "/robots.txt"
 ROBOTS_LOCATOR: Final = "robots.txt:append"
 P7_LOCATOR_PATTERN: Final = r"^error:(403|404)$"
@@ -100,7 +122,38 @@ DECOY_PAGE: Final = (
 )
 DECOY_PAGE_VERSION: Final = "1"
 
+#: Surfaces whose text is planted into an HTML body at a relative offset.
+BODY_SURFACES: Final = frozenset({Surface.P2, Surface.P3, Surface.P4, Surface.P5, Surface.P6})
+#: The header P8 sets, and the longest value it may carry.
+NOTICE_HEADER: Final = "x-security-notice"
+MAX_NOTICE_BYTES: Final = 512
+#: Fixed locator of each in-page surface (P1 and P7 have their own constants above).
+SURFACE_LOCATORS: Final = {
+    Surface.P2: "html:body",
+    Surface.P3: "html:comment",
+    Surface.P4: "html:offscreen",
+    Surface.P5: "html:aria-hidden",
+    Surface.P6: "jsonld:description",
+    Surface.P8: f"header:{NOTICE_HEADER}",
+}
+#: Headers a P8 placement may never set or replace: they describe the body or the
+#: caching and security of the page, so touching them would change more than the text.
+PROTECTED_HEADERS: Final = frozenset(
+    {
+        "content-type",
+        "content-security-policy",
+        "set-cookie",
+        "etag",
+        "last-modified",
+        "cache-control",
+        "content-length",
+        "content-encoding",
+    }
+)
+
 _P7_LOCATOR = re.compile(P7_LOCATOR_PATTERN)
+_HEADER_LOCATOR = re.compile(r"^header:([A-Za-z0-9-]+)$")
+_BODY_OPEN = re.compile(rb"<body(?=[\s/>])[^>]*>", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------- codecs
@@ -111,14 +164,42 @@ def _rfind_ci(haystack: bytes, needle: bytes) -> int:
     return haystack.lower().rfind(needle.lower())
 
 
+def _boundary_offset(decoded: bytes, fraction: float) -> int:
+    """Where in ``decoded`` an in-page text goes for a relative ``fraction``.
+
+    The first tag boundary (``>``) at or after ``floor(len(decoded) * fraction)``,
+    searched from the ``<body>`` start tag (its own ``>`` counts) to the last
+    ``</body>``. If there is none, just before ``</body>``. A page with no ``<body>`` takes the text
+    before ``</body>`` if it has one, else at its very end.
+    """
+    close = _rfind_ci(decoded, b"</body>")
+    opened = _BODY_OPEN.search(decoded)
+    if opened is None:
+        return close if close >= 0 else len(decoded)
+    limit = close if close >= opened.end() else len(decoded)
+    # the start tag's own ``>`` counts, so fraction 0 lands right after ``<body ...>``
+    start = max(int(len(decoded) * fraction), opened.end() - 1)
+    boundary = decoded.find(b">", start, limit)
+    return boundary + 1 if boundary >= 0 else limit
+
+
 def plant_into_body(
-    body: bytes, encoding: str | None, payload: bytes, *, before: bytes | None = None
+    body: bytes,
+    encoding: str | None,
+    payload: bytes,
+    *,
+    before: bytes | None = None,
+    fraction: float | None = None,
 ) -> tuple[bytes, int, bool]:
     """Insert ``payload`` into a body sent with Content-Encoding ``encoding``.
 
-    The body is decoded (:func:`decode_body`), ``payload`` is inserted before the last
-    occurrence of ``before`` (ASCII case-insensitive) or appended when ``before`` is
-    ``None`` or absent, and the result is re-encoded with the same encoding.
+    The body is decoded (:func:`decode_body`) and ``payload`` is inserted, then the
+    result is re-encoded with the same encoding. Where it goes:
+
+    * ``fraction`` given: at the tag boundary the relative offset snaps to
+      (:func:`_boundary_offset`);
+    * else before the last occurrence of ``before`` (ASCII case-insensitive);
+    * else, or if ``before`` is absent, at the end.
 
     Returns ``(new wire bytes, offset of payload in the decoded body, True)``. If the
     encoding is unsupported or the body cannot be decoded or re-encoded, returns
@@ -126,12 +207,17 @@ def plant_into_body(
     """
     if not payload:
         raise ValueError("payload must be non-empty")
+    if fraction is not None and not 0 <= fraction <= 1:
+        raise ValueError("fraction must be between 0 and 1")
     decoded = decode_body(body, encoding)
     if decoded is None:
         return body, -1, False
-    offset = _rfind_ci(decoded, before) if before else -1
-    if offset < 0:
-        offset = len(decoded)
+    if fraction is not None:
+        offset = _boundary_offset(decoded, fraction)
+    else:
+        offset = _rfind_ci(decoded, before) if before else -1
+        if offset < 0:
+            offset = len(decoded)
     wire = encode_body(decoded[:offset] + payload + decoded[offset:], encoding)
     if wire is None:
         return body, -1, False
@@ -147,12 +233,68 @@ def recompute_etag(old: str, wire: bytes) -> str:
 # --------------------------------------------------------------------------- plants
 
 
+class SurfaceMarkup:
+    """What each surface plants around its rendered text, and which texts it refuses.
+
+    P1 and P7 plant the text as it is. P2-P5 wrap it in HTML (the text is escaped, so
+    it is always a plain text node), P6 in a JSON-LD block and P3 in a comment. P8 is a
+    header value, not markup.
+    """
+
+    _OFFSCREEN: Final = (
+        '<div style="position:absolute;left:-10000px;top:auto;width:1px;height:1px;'
+        'overflow:hidden">{}</div>'
+    )
+
+    @staticmethod
+    def check(surface: Surface, text: str) -> None:
+        """Raise ``ValueError`` if ``text`` cannot be planted on ``surface`` as it is."""
+        if surface is Surface.P3:
+            for closer in ("-->", "--!>", "<!--"):
+                if closer in text:
+                    raise ValueError(f"a P3 text must not contain {closer!r}")
+        elif surface is Surface.P8:
+            if not text or text != text.strip() or not text.isascii() or not text.isprintable():
+                raise ValueError(
+                    "a P8 text must be single-line printable ASCII, "
+                    "with no leading or trailing space"
+                )
+            if len(text.encode("ascii")) > MAX_NOTICE_BYTES:
+                raise ValueError(f"a P8 text must be at most {MAX_NOTICE_BYTES} bytes")
+
+    @classmethod
+    def render(cls, surface: Surface, text: str) -> bytes:
+        """The bytes planted into a body for ``text`` (P8's header value is the text)."""
+        escaped = html.escape(text, quote=False)
+        if surface is Surface.P2:
+            markup = f"<p>{escaped}</p>"
+        elif surface is Surface.P3:
+            markup = f"<!-- {text} -->"
+        elif surface is Surface.P4:
+            markup = cls._OFFSCREEN.format(escaped)
+        elif surface is Surface.P5:
+            markup = f'<div aria-hidden="true">{escaped}</div>'
+        elif surface is Surface.P6:
+            doc = {"@context": "https://schema.org", "@type": "WebPage", "description": text}
+            data = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+            safe = data.replace("<", "\\u003c")  # so a text can never close the script tag
+            markup = f'<script type="application/ld+json">{safe}</script>'
+        else:
+            markup = text
+        return markup.encode("utf-8")
+
+
 @dataclass(frozen=True, slots=True)
 class Plant:
-    """One placement and the exact bytes to plant for it."""
+    """One placement and the exact text to plant for it."""
 
     placement: Placement
     content: bytes
+
+    @property
+    def payload(self) -> bytes:
+        """The bytes that land in the body: :attr:`content` wrapped for its surface."""
+        return SurfaceMarkup.render(self.placement.surface, self.content.decode("utf-8"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +328,7 @@ def render_robots(existing: bytes, plants: Sequence[Plant]) -> tuple[bytes, tupl
 class ActionKind(StrEnum):
     ROBOTS = "robots"
     ERROR = "error"
+    PAGE = "page"
     DECOY = "decoy"
 
 
@@ -206,6 +349,8 @@ class InjectionPlan:
     arm: Arm
     robots: Action | None = None
     errors: Mapping[str, Action] = field(default_factory=dict)
+    #: P2-P6 and P8 plants, by the path of the page they go on.
+    pages: Mapping[str, Action] = field(default_factory=dict)
     decoy_prefix: str | None = None
 
     def match(self, method: str, target: str) -> Action | None:
@@ -221,6 +366,9 @@ class InjectionPlan:
         error = self.errors.get(path)
         if error is not None:
             return error
+        page = self.pages.get(path)
+        if page is not None:
+            return page
         prefix = self.decoy_prefix
         if prefix is not None and under_decoy(path, prefix):
             return Action(ActionKind.DECOY)
@@ -259,6 +407,30 @@ def _expected_status(placement: Placement) -> int:
     return int(match.group(1))
 
 
+def _check_page_placement(placement: Placement, path: str, text: bytes) -> None:
+    """Refuse a P2-P6 or P8 placement whose locator, url, offset or text is not allowed."""
+    surface = placement.surface
+    where = f"placement {placement.placement_id}: {surface.value}"
+    if surface is Surface.P8:
+        named = _HEADER_LOCATOR.fullmatch(placement.locator)
+        if named is not None and named.group(1).lower() in PROTECTED_HEADERS:
+            raise ValueError(f"{where} may never set the protected header {named.group(1)!r}")
+    if placement.locator != SURFACE_LOCATORS[surface]:
+        raise ValueError(
+            f"{where} locator {placement.locator!r} must be {SURFACE_LOCATORS[surface]!r}"
+        )
+    if path == ROBOTS_PATH:
+        raise ValueError(f"{where} cannot use robots.txt")
+    if surface in BODY_SURFACES and placement.offset_fraction is None:
+        raise ValueError(f"{where} needs an offset_fraction")
+    if surface not in BODY_SURFACES and placement.offset_fraction is not None:
+        raise ValueError(f"{where} takes no offset_fraction")
+    try:
+        SurfaceMarkup.check(surface, text.decode("utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"{where}: {exc}") from exc
+
+
 def build_plan(
     manifest: RunManifest, contents: Mapping[str, str], *, synthesize_robots: bool = False
 ) -> InjectionPlan:
@@ -281,6 +453,7 @@ def build_plan(
 
     robots: list[Plant] = []
     errors: dict[str, Action] = {}
+    pages: dict[str, Action] = {}
     for placement in manifest.placements:
         path = request_path(placement.url)
         plant = Plant(placement, _content(contents, placement))
@@ -302,10 +475,18 @@ def build_plan(
             if path in errors:
                 raise ValueError(f"more than one P7 placement on path {path}")
             errors[path] = Action(ActionKind.ERROR, (plant,), expected)
+        elif placement.surface in BODY_SURFACES or placement.surface is Surface.P8:
+            _check_page_placement(placement, path, plant.content)
+            action = pages.setdefault(path, Action(ActionKind.PAGE))
+            if any(p.placement.surface is placement.surface for p in action.plants):
+                raise ValueError(
+                    f"more than one {placement.surface.value} placement on path {path}"
+                )
+            pages[path] = Action(ActionKind.PAGE, (*action.plants, plant))
         else:
             raise ValueError(
                 f"placement {placement.placement_id}: surface {placement.surface.value} "
-                "is not supported by the M0 injector"
+                "is not supported by the injector"
             )
 
     if manifest.tag is None:  # pragma: no cover - RunManifest forbids it for injected
@@ -313,10 +494,15 @@ def build_plan(
     prefix = decoy_prefix(manifest.tag)
     if any(under_decoy(p, prefix) for p in errors):
         raise ValueError("a P7 path lies under the decoy path")
+    if any(under_decoy(p, prefix) for p in pages):
+        raise ValueError("a page placement lies under the decoy path")
+    if shared := sorted(set(errors) & set(pages)):
+        raise ValueError(f"a P7 placement shares its path with a page placement: {shared}")
     return InjectionPlan(
         arm=Arm.INJECTED,
         robots=Action(ActionKind.ROBOTS, tuple(robots)) if robots else base_only,
         errors=errors,
+        pages=pages,
         decoy_prefix=prefix,
     )
 

@@ -47,6 +47,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     ForeignKeyConstraint,
     Identity,
@@ -351,6 +352,7 @@ class Placement(Base):
     tag: Mapped[str] = mapped_column(String(64))
     token: Mapped[str] = mapped_column(String(32), unique=True)
     content_sha256: Mapped[str] = mapped_column(_SHA256)
+    offset_fraction: Mapped[float | None] = mapped_column(Float)
 
     @classmethod
     def from_model(cls, placement: m.Placement) -> Self:
@@ -398,6 +400,7 @@ class PlacementServe(EventRow):
     decoded_sha256: Mapped[str] = mapped_column(_SHA256)
     wire_sha256: Mapped[str] = mapped_column(_SHA256)
     byte_offset: Mapped[int | None] = mapped_column(BigInteger)
+    offset_fraction: Mapped[float | None] = mapped_column(Float)
     insert_ok: Mapped[bool] = mapped_column(Boolean)
     probe: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
 

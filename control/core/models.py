@@ -102,6 +102,8 @@ Tag = Annotated[str, StringConstraints(pattern=TAG_PATTERN)]
 Token = Annotated[str, StringConstraints(pattern=TOKEN_PATTERN)]
 NonEmptyStr = Annotated[str, StringConstraints(min_length=1)]
 HttpStatus = Annotated[int, Field(ge=100, le=599)]
+#: A relative position in a response body, 0 (start) to 1 (end).
+Fraction = Annotated[float, Field(ge=0, le=1)]
 
 #: Accepted shape of an event producer stream name.
 STREAM_PATTERN = r"^[a-z][a-z0-9-]{0,31}$"
@@ -120,6 +122,7 @@ class Surface(StrEnum):
     P5 = "P5"  # aria-hidden element
     P6 = "P6"  # JSON-LD descriptive field
     P7 = "P7"  # 403/404 error body on a commonly probed path
+    P8 = "P8"  # X-Security-Notice response header
 
 
 class Arm(StrEnum):
@@ -281,6 +284,8 @@ class Placement(_Model):
     tag: Tag
     token: Token
     content_sha256: Sha256
+    #: Where in the page body the text goes, for the in-page surfaces P2-P6.
+    offset_fraction: Fraction | None = None
 
 
 # --------------------------------------------------------------------------- events
@@ -298,6 +303,8 @@ class PlacementServe(_Event):
     decoded_sha256: Sha256
     wire_sha256: Sha256
     byte_offset: NonNegativeInt | None = None
+    #: The realised position of the text: ``byte_offset`` over the decoded body length.
+    offset_fraction: Fraction | None = None
     insert_ok: bool
     probe: bool = False
 

@@ -27,8 +27,8 @@ Hooks:
   reaches the app), and notes the planned action. The request is forwarded untouched
   otherwise.
 * ``response``: applies the action, then logs a :class:`TargetAccessEvent` and, for
-  robots.txt and P7 requests, one :class:`PlacementServe` per placement plus the served
-  body and its meta (see :mod:`cell.injector.serve_log`). Any other response is
+  robots.txt, P7 and page (P2-P6, P8) requests, one :class:`PlacementServe` per placement
+  plus the served body and its meta (see :mod:`cell.injector.serve_log`). Any other response is
   forwarded byte-for-byte. A request whose evidence cannot be written (or whose
   transform fails) is answered with ``502`` instead (fail closed, like the tap).
 * ``error``: a request that ended without a response is still logged (``status`` null).
@@ -36,6 +36,7 @@ Hooks:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from collections.abc import Mapping
@@ -47,8 +48,10 @@ from mitmproxy import http
 from pydantic import JsonValue
 
 from cell.injector.placement import (
+    APP_DIGEST_HEADER,
     DECOY_PAGE,
     DEFAULT_ROBOTS_BASE,
+    NOTICE_HEADER,
     PROBE_HEADER,
     Action,
     ActionKind,
@@ -63,6 +66,7 @@ from cell.injector.placement import (
     render_robots,
 )
 from cell.injector.serve_log import AccessRecord, InjectorConfig, ServedBody, ServeLog
+from control.core.models import Surface
 
 __all__ = ["SurfaceInjector", "plant_into_response", "plantable"]
 
@@ -74,6 +78,7 @@ _TEXT_PLAIN: Final = "text/plain; charset=utf-8"
 _TEXT_HTML: Final = "text/html; charset=utf-8"
 _UNPLANTABLE_STATUS: Final = frozenset({204, 206, 304})
 _STALE_DIGESTS: Final = ("digest", "repr-digest", "content-digest", "content-md5")
+_HTML_TYPES: Final = frozenset({"text/html", "application/xhtml+xml"})
 
 
 # --------------------------------------------------------------------------- response edits
@@ -116,7 +121,11 @@ def _replace_representation(
 
 
 def plant_into_response(
-    response: http.Response, payload: bytes, *, before: bytes | None = None
+    response: http.Response,
+    payload: bytes,
+    *,
+    before: bytes | None = None,
+    fraction: float | None = None,
 ) -> tuple[int, bool]:
     """Plant ``payload`` into an app response in its own Content-Encoding.
 
@@ -129,7 +138,7 @@ def plant_into_response(
     if raw is None or not plantable(response):
         return -1, False
     wire, offset, ok = plant_into_body(
-        raw, response.headers.get("content-encoding"), payload, before=before
+        raw, response.headers.get("content-encoding"), payload, before=before, fraction=fraction
     )
     if not ok:
         return -1, False
@@ -189,6 +198,62 @@ def _apply_error(
         meta["note"] = "app error body cannot be planted into (encoding or range)"
         return _not_planted(action), meta
     return (Planted(plant, offset, True),), meta
+
+
+def _is_html(response: http.Response) -> bool:
+    media_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+    return media_type in _HTML_TYPES
+
+
+def _apply_page(
+    response: http.Response, action: Action
+) -> tuple[tuple[Planted, ...], dict[str, JsonValue]]:
+    """Plant P2-P6 into the app's own HTML and set the P8 header; nothing else changes."""
+    status = response.status_code
+    meta: dict[str, JsonValue] = {}
+    if status != 200:
+        meta["note"] = f"app answered {status}, not 200; nothing planted"
+        return _not_planted(action), meta
+    app_body = decode_body(response.raw_content or b"", response.headers.get("content-encoding"))
+    if app_body is not None:
+        meta["app_decoded_sha256"] = hashlib.sha256(app_body).hexdigest()
+    results: list[Planted] = []
+    for plant in action.plants:
+        if plant.placement.surface is Surface.P8:
+            meta["replaced_header"] = NOTICE_HEADER in response.headers
+            response.headers[NOTICE_HEADER] = plant.content.decode("ascii")
+            results.append(Planted(plant, None, True))
+            continue
+        offset, ok = (
+            plant_into_response(response, plant.payload, fraction=plant.placement.offset_fraction)
+            if _is_html(response)
+            else (-1, False)
+        )
+        if not ok:
+            meta["note"] = "app page is not HTML or cannot be planted into (encoding or range)"
+            results.append(Planted(plant, None, False))
+            continue
+        # text planted earlier at or after this point has moved right
+        results = [
+            Planted(p.plant, p.offset + len(plant.payload), True)
+            if p.insert_ok and p.offset is not None and p.offset >= offset
+            else p
+            for p in results
+        ]
+        results.append(Planted(plant, offset, True))
+    return tuple(results), meta
+
+
+def _landed(response: http.Response, decoded: bytes, planted: Planted) -> bool:
+    """Whether a plant is really in the response the client gets."""
+    plant = planted.plant
+    if not planted.insert_ok:
+        return False
+    if plant.placement.surface is Surface.P8:
+        return response.headers.get_all(NOTICE_HEADER) == [plant.content.decode("ascii")]
+    if planted.offset is None:
+        return False
+    return decoded[planted.offset : planted.offset + len(plant.payload)] == plant.payload
 
 
 def _apply_decoy(response: http.Response) -> None:
@@ -269,7 +334,9 @@ class SurfaceInjector:
     def request(self, flow: http.HTTPFlow) -> None:
         flow.metadata[_METADATA_KEY] = self._classify(flow)
 
-    def _apply(self, response: http.Response, action: Action) -> ServedBody | None:
+    def _apply(
+        self, response: http.Response, action: Action, probe: bool = False
+    ) -> ServedBody | None:
         """Transform the app's response; return what to log for planted surfaces."""
         app_status = response.status_code
         if action.kind is ActionKind.DECOY:
@@ -277,6 +344,11 @@ class SurfaceInjector:
             return None
         if action.kind is ActionKind.ROBOTS:
             planted, meta = _apply_robots(response, action)
+        elif action.kind is ActionKind.PAGE:
+            planted, meta = _apply_page(response, action)
+            digest = meta.get("app_decoded_sha256")
+            if probe and isinstance(digest, str):  # lets the pre-flight probe see the app's body
+                response.headers[APP_DIGEST_HEADER] = digest
         else:
             planted, meta = _apply_error(response, action)
         wire = response.raw_content or b""
@@ -285,12 +357,7 @@ class SurfaceInjector:
         except ValueError:  # cannot happen after a successful plant; record raw bytes
             decoded = wire
         checked = tuple(
-            p
-            if p.insert_ok
-            and p.offset is not None
-            and decoded[p.offset : p.offset + len(p.plant.content)] == p.plant.content
-            else Planted(p.plant, None, False)
-            for p in planted
+            p if _landed(response, decoded, p) else Planted(p.plant, None, False) for p in planted
         )
         meta.update(
             action=action.kind.value,
@@ -309,7 +376,7 @@ class SurfaceInjector:
         served: ServedBody | None = None
         if state.action is not None and flow.response is not None:
             try:
-                served = self._apply(flow.response, state.action)
+                served = self._apply(flow.response, state.action, state.probe)
             except Exception:
                 log.exception("injector: cannot transform flow %s; withholding it", flow.id)
                 _refuse(flow)

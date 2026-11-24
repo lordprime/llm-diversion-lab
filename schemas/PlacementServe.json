@@ -9,7 +9,8 @@
         "P4",
         "P5",
         "P6",
-        "P7"
+        "P7",
+        "P8"
       ],
       "title": "Surface",
       "type": "string"
@@ -50,6 +51,20 @@
       "default": "placement_serve",
       "title": "Kind",
       "type": "string"
+    },
+    "offset_fraction": {
+      "anyOf": [
+        {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Offset Fraction"
     },
     "placement_id": {
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",

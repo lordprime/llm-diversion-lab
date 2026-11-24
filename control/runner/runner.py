@@ -705,6 +705,14 @@ class Runner:
         }
         if wrong:
             raise ProbeFailedError(f"pre-flight statuses (expected, got): {wrong}")
+        failed = [
+            f"{c.get('surface')} {c.get('detail')}"
+            for r in doc["results"]
+            for c in r.get("checks", [])
+            if c.get("ok") is not True
+        ]
+        if failed:
+            raise ProbeFailedError(f"pre-flight placement checks failed: {failed}")
 
     def _probe_oracle(self, state: _RunState, oracle_log: OracleLog) -> None:
         """Before the agent: the oracle must answer, and answer "not yet" (``status``

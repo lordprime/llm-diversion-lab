@@ -5,13 +5,15 @@ targets (each with its placement map), agents, models, repetitions, per-run limi
 the schedule seed and the two arms of the matched-pair design:
 
 * ``control``: the clean site, no planted content (no fields; DEVELOPMENT_PLAN 4.4);
-* ``injected``: the surfaces planted (P1 and P7 in M0) and the payload (family, style,
+* ``injected``: the surfaces planted (P1-P8) and the payload (family, style,
   version and one text template per surface).
 
 Payload wording never lives in code: it comes from the templates in the file. A template
 is a :class:`string.Template` that may use only :data:`TEMPLATE_FIELDS` and must use
 ``$tag`` (the injector refuses a text without the run's tag). A P1 text becomes one line
-of ``/robots.txt``, so a P1 template must be a single line.
+of ``/robots.txt``, so a P1 template must be a single line. A P8 text becomes the value of
+one response header, so it must be single-line printable ASCII of at most 512 bytes;
+a P3 text may not close its own comment (see :class:`~cell.injector.placement.SurfaceMarkup`).
 
 The file is *frozen by hash*: :func:`read_experiment` returns the exact text and its
 sha256 (``experiments.definition_yaml`` / ``definition_sha256``). Any edit is a new
@@ -46,12 +48,15 @@ from pydantic import (
     model_validator,
 )
 
+from cell.injector.placement import BODY_SURFACES, SURFACE_LOCATORS, SurfaceMarkup
 from control.core.ids import ID_PATTERN
 from control.core.models import Surface
 from control.core.selftest_status import SELFTEST_EXPERIMENT_PREFIX
-from control.core.tags import request_path
+from control.core.tags import decoy_prefix, request_path
+from control.core.tokens import TAG_LENGTH, TOKEN_LENGTH
 
 __all__ = [
+    "DEFAULT_OFFSET_FRACTION",
     "LABEL_PATTERN",
     "MAX_SEED",
     "P7_LOCATOR_PATTERN",
@@ -82,8 +87,8 @@ __all__ = [
     "read_experiment",
 ]
 
-#: Surfaces the M0 surface injector can plant (``cell.injector.placement``).
-SUPPORTED_SURFACES: Final = frozenset({Surface.P1, Surface.P7})
+#: Surfaces the surface injector can plant (``cell.injector.placement``).
+SUPPORTED_SURFACES: Final = frozenset(Surface)
 #: Locator and path of a P1 placement (must equal the injector's own constants).
 ROBOTS_LOCATOR: Final = "robots.txt:append"
 ROBOTS_PATH: Final = "/robots.txt"
@@ -98,6 +103,8 @@ P7_LOCATOR_PATTERN: Final = r"^error:(403|404)$"
 TEMPLATE_FIELDS: Final = frozenset({"tag", "token", "decoy_path", "callback_host"})
 #: Largest seed (``experiments.schedule_seed`` is a Postgres ``BIGINT``).
 MAX_SEED: Final = 2**63 - 1
+#: Where an in-page text goes when a placement does not say (the middle of the body).
+DEFAULT_OFFSET_FRACTION: Final = 0.5
 
 _P7_LOCATOR = re.compile(P7_LOCATOR_PATTERN)
 
@@ -125,6 +132,8 @@ DnsName = Annotated[
     ),
 ]
 StrictPositiveInt = Annotated[int, Strict(), Field(ge=1)]
+#: Callback zone used when a payload is checked on its own (an experiment re-checks with its own).
+DEFAULT_CALLBACK_DOMAIN: Final = "cb.lab.test"
 
 
 class PayloadFamily(StrEnum):
@@ -164,6 +173,9 @@ class PlacementSpec(_Frozen):
 
     url: NonEmptyStr
     locator: NonEmptyStr
+    #: Relative position in the page body for P2-P6 (0 = start, 1 = end); fixed per
+    #: experiment, never chosen per run. Any other surface leaves it at the default (unused).
+    offset_fraction: Annotated[float, Strict(), Field(ge=0, le=1)] = DEFAULT_OFFSET_FRACTION
 
     @field_validator("url")
     @classmethod
@@ -193,6 +205,13 @@ class TargetSpec(_Frozen):
                     raise ValueError(f"{where}: locator must match {P7_LOCATOR_PATTERN}")
                 if spec.url == ROBOTS_PATH:
                     raise ValueError(f"{where}: a P7 placement cannot use robots.txt")
+            else:
+                if spec.locator != SURFACE_LOCATORS[surface]:
+                    raise ValueError(f"{where}: locator must be {SURFACE_LOCATORS[surface]!r}")
+                if spec.url == ROBOTS_PATH:
+                    raise ValueError(f"{where}: only P1 may use robots.txt")
+            if surface not in BODY_SURFACES and spec.offset_fraction != DEFAULT_OFFSET_FRACTION:
+                raise ValueError(f"{where}: offset_fraction applies to P2-P6 only")
         return self
 
 
@@ -268,7 +287,29 @@ class PayloadSpec(_Frozen):
                 raise ValueError(f"{where}: must use $tag")
             if surface is Surface.P1:
                 _check_robots_line(text, where)
+        self.check_rendered()
         return self
+
+    def check_rendered(self, callback_domain: str = DEFAULT_CALLBACK_DOMAIN) -> None:
+        """Render every template with stand-in values and check the surface's own rules.
+
+        The stand-ins are as long as the real ones, so a P8 text that is too long, or a
+        P3 text that closes its comment, is refused when the experiment is read.
+        """
+        tag, token = "0" * TAG_LENGTH, "a" * TOKEN_LENGTH
+        for surface, text in self.templates.items():
+            rendered = Template(text).substitute(
+                tag=tag,
+                token=token,
+                decoy_path=decoy_prefix(tag),
+                callback_host=f"{token}.{callback_domain}",
+            )
+            try:
+                SurfaceMarkup.check(surface, rendered)
+            except ValueError as exc:
+                raise ValueError(
+                    f"payload {self.payload_id} template {surface.value}: {exc}"
+                ) from exc
 
 
 class ControlArmSpec(_Frozen):
@@ -287,7 +328,7 @@ class InjectedArmSpec(_Frozen):
         for surface in self.surfaces:
             if surface not in SUPPORTED_SURFACES:
                 raise ValueError(
-                    f"surface {surface.value} is not supported in M0 "
+                    f"surface {surface.value} is not supported "
                     f"(supported: {', '.join(sorted(s.value for s in SUPPORTED_SURFACES))})"
                 )
             if surface not in self.payload.templates:
@@ -329,13 +370,14 @@ class Experiment(_Frozen):
     arms: ExperimentArms
     limits: RunLimits
     #: DNS zone of the callback catcher; ``$callback_host`` is ``<token>.<this>``.
-    callback_domain: DnsName = "cb.lab.test"
+    callback_domain: DnsName = DEFAULT_CALLBACK_DOMAIN
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
         _unique(tuple(t.name for t in self.targets), "target")
         _unique(self.agents, "agent")
         _unique(self.models, "model")
+        self.arms.injected.payload.check_rendered(self.callback_domain)
         for target in self.targets:
             for surface in self.arms.injected.surfaces:
                 if surface not in target.placements:
