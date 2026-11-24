@@ -29,6 +29,7 @@ from control.telemetry.model import (
     TELEMETRY_VERSION,
     CallTelemetry,
     RunTelemetry,
+    ThreadLinker,
     ToolCallRecord,
 )
 from control.telemetry.wire import WireFormat
@@ -310,6 +311,8 @@ def _call(seq: int, **fields: object) -> CallTelemetry:
         "request_chars": 100,
         "system_sha256": "a" * 64,
         "thread_key": "main",
+        "history_hashes": (),
+        "reply_hash": None,
         "tool_calls": (),
         "reasoning": "",
         "text": "",
@@ -377,6 +380,12 @@ def test_summarise_counts_agents_tokens_and_tools() -> None:
     assert run.reasoning_chars == len("plan the work") + len("ports")
     assert run.calls_with_reasoning == 2
     assert run.parse_errors == 1
+    assert run.single_call_threads == 1  # sub-b
+    assert run.largest_thread_calls == 3  # main: calls 0, 4 and 5
+
+
+def test_telemetry_version_is_bumped_for_the_v2_rules() -> None:
+    assert TELEMETRY_VERSION == "2"
 
 
 def test_peak_input_counts_cached_prompt_tokens_for_anthropic() -> None:
@@ -412,6 +421,7 @@ def test_summarise_an_empty_run() -> None:
     assert run.peak_input_tokens is None
     assert run.peak_request_chars == 0
     assert run.calls_by_format == {} and run.tool_calls_by_name == {}
+    assert (run.single_call_threads, run.largest_thread_calls) == (0, 0)
 
 
 def test_unreadable_requests_do_not_count_as_agents() -> None:
@@ -492,10 +502,15 @@ def test_write_derived_round_trip(tmp_path: Path) -> None:
     rows = _read_jsonl(folder / "calls.jsonl")
     assert [r["seq"] for r in rows] == [0, 1, 2]
     assert all("reasoning" not in r for r in rows)
-    assert rows == [c.model_dump(mode="json", exclude={"reasoning"}) for c in calls]
+    # three separate conversations: each call is its own agent, named by its thread key
+    assert rows == [
+        {**c.model_dump(mode="json", exclude={"reasoning"}), "agent": c.thread_key} for c in calls
+    ]
 
     trace = _read_jsonl(folder / "reasoning.jsonl")
-    assert [set(r) for r in trace] == [{"seq", "thread_key", "reasoning", "text", "tool_calls"}] * 3
+    keys = {"seq", "agent", "thread_key", "reasoning", "text", "tool_calls"}
+    assert [set(r) for r in trace] == [keys] * 3
+    assert [r["agent"] for r in trace] == [c.thread_key for c in calls]
     assert trace[0]["reasoning"] == "Port 80 is open."
     assert trace[2]["reasoning"] == "The handler compares passwords with ==.\n\n[redacted]"
     assert trace[1]["tool_calls"] == [
@@ -632,3 +647,160 @@ def test_non_ascii_text_is_escaped_and_reads_back_unchanged(tmp_path: Path) -> N
     assert (row["text"], row["reasoning"]) == ("réponse 🚀", "思考")
     run = RunTelemetry.model_validate_json((folder / "summary.json").read_bytes())
     assert run.calls_by_model == {"qwen3:8b-ü": 1}
+
+
+# --------------------------------------------------------------------------- agent linking
+#
+# These go through the real recorder, loader and Ollama parser, with requests shaped the
+# way an agent framework re-sends its history.
+
+AgentMessage = dict[str, object]
+
+
+def _user(text: str) -> AgentMessage:
+    return {"role": "user", "content": text}
+
+
+def _tool_result(text: str) -> AgentMessage:
+    return {"role": "tool", "content": text}
+
+
+def _assistant(text: str = "", tool: tuple[str, dict[str, object]] | None = None) -> AgentMessage:
+    """An assistant message: the echo of an earlier reply in a later request."""
+    message: AgentMessage = {"role": "assistant", "content": text}
+    if tool is not None:
+        message["tool_calls"] = [{"function": {"name": tool[0], "arguments": tool[1]}}]
+    return message
+
+
+class _OllamaAgentRun:
+    """Records Ollama /api/chat calls the way an agent framework sends them."""
+
+    def __init__(self, evidence: Path) -> None:
+        self._recorder = _recorder(evidence)
+        self.evidence = evidence
+
+    def call(self, system: str, history: list[AgentMessage], reply: AgentMessage) -> None:
+        request = {
+            "model": "qwen3:8b",
+            "messages": [{"role": "system", "content": system}, *history],
+        }
+        response = {
+            "model": "qwen3:8b",
+            "message": reply,
+            "done": True,
+            "prompt_eval_count": 100 * (len(history) + 1),
+            "eval_count": 10,
+        }
+        _record(
+            self._recorder, "/api/chat", json.dumps(request).encode(), json.dumps(response).encode()
+        )
+
+    def summary(self) -> RunTelemetry:
+        return summarise(RUN_ID, load_calls(self.evidence))
+
+
+def test_main_agent_and_two_sub_agents_count_as_three(tmp_path: Path) -> None:
+    run = _OllamaAgentRun(tmp_path)
+    lead = "You are the lead agent."
+    task = _user("Audit 10.0.0.5.")
+    spawn_scan = _assistant(tool=("Task", {"prompt": "scan ports"}))
+    spawn_web = _assistant(tool=("Task", {"prompt": "check http"}))
+    # main agent, first round: hands work to a sub-agent
+    run.call(lead, [task], spawn_scan)
+    # sub-agent A shares the main system prompt but has its own task
+    run.call(lead, [_user("scan ports")], _assistant("22 and 80 are open."))
+    # sub-agent B has its own system prompt
+    run.call("You are a web sub-agent.", [_user("check http")], _assistant("Nothing found."))
+    # main agent continues with its growing history
+    history = [task, spawn_scan, _tool_result("22 and 80 are open.")]
+    run.call(lead, history, spawn_web)
+    run.call(lead, [*history, spawn_web, _tool_result("Nothing found.")], _assistant("Done."))
+
+    summary = run.summary()
+    assert summary.calls == 5
+    assert summary.agents == 3
+    assert summary.largest_thread_calls == 3
+    assert summary.single_call_threads == 2
+
+
+def test_timestamped_system_prompt_is_still_one_agent(tmp_path: Path) -> None:
+    run = _OllamaAgentRun(tmp_path)
+    task = _user("Find the admin panel.")
+    step1 = _assistant(tool=("http_get", {"url": "/admin"}))
+    step2 = _assistant(tool=("http_get", {"url": "/wp-admin"}))
+    history: list[AgentMessage] = [task]
+    for second, reply in enumerate([step1, step2, _assistant("Found /wp-admin.")]):
+        run.call(f"You are an agent. Current time: 12:00:{second:02d}", history, reply)
+        history = [*history, reply, _tool_result(f"result {second}")]
+
+    summary = run.summary()
+    assert summary.agents == 1
+    assert summary.largest_thread_calls == 3
+    assert summary.single_call_threads == 0
+
+
+def test_known_over_count_for_a_prompt_rebuilt_every_round(tmp_path: Path) -> None:
+    """A framework that rebuilds one prompt each round (or uses /api/generate) cannot be
+    linked: every call looks like a new conversation. The diagnostics show it."""
+    rec = _recorder(tmp_path)
+    for step in range(3):
+        request = {
+            "model": "qwen3:8b",
+            "system": "You are a pentest planner.",
+            "prompt": f"Step {step}. Everything found so far: {'x' * step}. What next?",
+        }
+        response = {"model": "qwen3:8b", "response": f"do {step}", "done": True}
+        _record(rec, "/api/generate", json.dumps(request).encode(), json.dumps(response).encode())
+
+    summary = summarise(RUN_ID, load_calls(tmp_path))
+    assert summary.agents == 3  # really one agent: a known over-count
+    assert summary.single_call_threads == summary.calls == 3
+    assert summary.largest_thread_calls == 1
+
+
+def test_linking_picks_the_most_recent_matching_thread() -> None:
+    calls = [
+        _call(0, thread_key="x", reply_hash="r"),
+        _call(1, thread_key="y", reply_hash="r"),  # same reply text in another thread
+        _call(2, thread_key="z", history_hashes=("q", "r", "s")),
+    ]
+    summary = summarise(RUN_ID, calls)
+    assert summary.agents == 2
+    assert summary.largest_thread_calls == 2
+    assert ThreadLinker().assign(calls) == {0: "x", 1: "y", 2: "y"}
+
+
+def test_a_linked_calls_own_key_joins_its_thread_later() -> None:
+    # call 1 links to call 0 by history; call 2 has no history link but the same
+    # system prompt and first task as call 1 (a retry), so it joins the same thread
+    calls = [
+        _call(0, thread_key="a", reply_hash="r0"),
+        _call(1, thread_key="b", history_hashes=("h", "r0"), reply_hash="r1"),
+        _call(2, thread_key="b", history_hashes=("h", "other")),
+    ]
+    assert ThreadLinker().assign(calls) == {0: "a", 1: "a", 2: "a"}
+    assert summarise(RUN_ID, calls).agents == 1
+
+
+def test_unreadable_calls_belong_to_no_agent() -> None:
+    calls = [_call(0, thread_key="a"), _call(1, thread_key="", parse_error="bad")]
+    assert ThreadLinker().assign(calls) == {0: "a"}
+
+
+def test_linking_is_deterministic_and_order_free(tmp_path: Path) -> None:
+    calls = _fake_run()
+    shuffled = calls[3:] + calls[:3][::-1]
+    assert ThreadLinker().assign(shuffled) == ThreadLinker().assign(calls)
+
+
+def test_write_derived_names_each_calls_agent(tmp_path: Path) -> None:
+    calls = [
+        _call(0, thread_key="a", reply_hash="r0"),
+        _call(1, thread_key="b", history_hashes=("h", "r0")),
+    ]
+    write_derived(tmp_path, summarise(RUN_ID, calls), calls)
+    rows = _read_jsonl(tmp_path / "telemetry" / "calls.jsonl")
+    assert [(r["thread_key"], r["agent"]) for r in rows] == [("a", "a"), ("b", "a")]
+    trace = _read_jsonl(tmp_path / "telemetry" / "reasoning.jsonl")
+    assert [r["agent"] for r in trace] == ["a", "a"]

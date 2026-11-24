@@ -14,22 +14,45 @@ There is one parser per wire format, all behind :class:`WireParser`:
   in ``message_delta``. Reasoning is ``thinking`` blocks; a ``redacted_thinking`` block
   shows up as ``[redacted]``.
 
-In every format a leading ``<think>...</think>`` span in the reply text (models with no
-reasoning parser in front of them) is moved into the reasoning.
+In every format, inline thinking in the reply text (models with no reasoning parser in
+front of them) is moved into the reasoning: a leading ``<think>...</think>`` span, or
+everything before a bare ``</think>`` when the chat template pre-filled the opening tag
+(see :func:`_split_think` for how a tag inside ordinary prose is treated).
 
 Parsers never raise on bad input. A body that is not JSON, a stream cut off half way,
 a provider error, or a body over :data:`MAX_BODY_BYTES` all end up in
 ``parse_error``, and whatever could be read is still returned.
 
-Grouping calls into agents (``thread_key``)
--------------------------------------------
-This is a heuristic. The key is the SHA-256 of the call's ``system_sha256`` plus the
-whitespace-normalised text of the first non-system message. An agent that re-sends its
-growing history keeps the same system prompt and first task, so all its calls share a
-key; a sub-agent starts with its own system prompt or its own first task, so it gets a
-new key. It therefore counts distinct *conversations*, not processes: two sub-agents
-given the same prompt and the same task count as one, and an agent that rewrites its
-first message (for example when it compacts its history) counts as a new one.
+Grouping calls into agents
+--------------------------
+This is a heuristic, and it counts *conversations*, not processes. Each call carries
+two kinds of key, and :class:`control.telemetry.model.ThreadLinker` combines them:
+
+* ``history_hashes`` and ``reply_hash``, rolling hashes over the non-system messages.
+  An agent that re-sends its growing history sends, as a prefix, the previous call's
+  messages followed by that call's reply, so the later call is linked to the earlier
+  one whatever its system prompt says (a timestamp or a changing reminder there does
+  not matter). Messages are compared in a canonical form (whitespace collapsed,
+  reasoning and inline thinking dropped, JSON arguments re-serialised), so the usual
+  ways clients re-echo a reply still match.
+* ``thread_key``, the fallback for a call that extends no earlier call: the SHA-256 of
+  ``system_sha256`` plus the whitespace-normalised text of the first non-system
+  message. A sub-agent starts with its own system prompt or its own first task, so it
+  gets its own key.
+
+What still breaks it (each makes ``agents`` too high):
+
+* a sliding window or history compaction that drops or rewrites earlier messages, so
+  the previous call's messages are no longer a prefix;
+* ``/api/generate``, or any framework that rebuilds one prompt from scratch each round:
+  there is no message history to link, and each new prompt looks like a new task;
+* a client that edits the echoed reply beyond the canonical form (for example
+  truncating long tool arguments).
+
+Two sub-agents given the same system prompt and the same first task count as one.
+``RunTelemetry.single_call_threads`` and ``largest_thread_calls`` show when linking has
+collapsed: many single-call threads and a small largest thread mean ``agents`` is
+close to ``calls`` and should not be trusted.
 """
 
 from __future__ import annotations
@@ -37,7 +60,7 @@ from __future__ import annotations
 import hashlib
 import json
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import ClassVar, Final
 
@@ -139,20 +162,33 @@ def _error_text(value: JsonValue | None) -> str:
 
 
 def _split_think(text: str) -> tuple[str | None, str]:
-    """Split a leading ``<think>`` span off ``text``: ``(thought, rest)``.
+    """Split the model's inline thinking off ``text``: ``(thought, rest)``.
 
-    ``thought`` is ``None`` when the text does not start with ``<think>`` (leading
-    whitespace allowed). A span that is never closed (the model ran out of tokens while
-    thinking) is all thought.
+    Two shapes are recognised:
+
+    * a leading ``<think>...</think>`` span (leading whitespace allowed). A span that
+      is never closed (the model ran out of tokens while thinking) is all thought;
+    * a closing ``</think>`` with no opening tag before it, which is what a chat
+      template that pre-fills ``<think>`` produces (DeepSeek-R1 distills, some Qwen
+      templates): everything before the first ``</think>`` is thought.
+
+    ``thought`` is ``None`` when neither shape is there. A ``</think>`` that follows a
+    ``<think>`` somewhere later in the text is prose about the tags and is left alone.
+    A bare ``</think>`` in ordinary prose cannot be told apart from a pre-filled
+    template, so it is split too; replies that mention the closing tag literally are
+    rare enough to accept that.
     """
     stripped = text.lstrip()
-    if not stripped.startswith(_THINK_OPEN):
+    if stripped.startswith(_THINK_OPEN):
+        body = stripped[len(_THINK_OPEN) :]
+        end = body.find(_THINK_CLOSE)
+        if end < 0:
+            return body.strip(), ""
+        return body[:end].strip(), body[end + len(_THINK_CLOSE) :].lstrip()
+    end = text.find(_THINK_CLOSE)
+    if end < 0 or _THINK_OPEN in text[:end]:
         return None, text
-    body = stripped[len(_THINK_OPEN) :]
-    end = body.find(_THINK_CLOSE)
-    if end < 0:
-        return body.strip(), ""
-    return body[:end].strip(), body[end + len(_THINK_CLOSE) :].lstrip()
+    return text[:end].strip(), text[end + len(_THINK_CLOSE) :].lstrip()
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,7 +291,8 @@ class _Reply:
             self.errors.append(reason)
 
     def final_text_and_reasoning(self) -> tuple[str, str]:
-        text = "".join("".join(self.text[k]) for k in sorted(self.text))
+        """The reply text and reasoning; separate blocks are joined with a blank line."""
+        text = "\n\n".join(b for k in sorted(self.text) if (b := "".join(self.text[k])))
         blocks = ["".join(self.reasoning[k]) for k in sorted(self.reasoning)]
         thought, text = _split_think(text)
         if thought:
@@ -264,12 +301,71 @@ class _Reply:
 
 
 @dataclass(frozen=True, slots=True)
+class _Message:
+    """One message of a request (or a reply), reduced to what telemetry needs.
+
+    ``texts`` is every piece of text the model reads in it (content, text parts or
+    blocks, tool results); ``tools`` is the ``(name, arguments)`` of each tool call it
+    carries. Reasoning sent back in history is left out on purpose: clients often drop
+    or rewrite it, and the model does not always see it again.
+    """
+
+    role: str
+    texts: tuple[str, ...] = ()
+    tools: tuple[tuple[str, str], ...] = ()
+    system: bool = False
+
+    @property
+    def chars(self) -> int:
+        return sum(map(len, self.texts)) + sum(len(arguments) for _, arguments in self.tools)
+
+    def flat_text(self) -> str:
+        return "".join(self.texts) + "".join(arguments for _, arguments in self.tools)
+
+    def canonical(self) -> str:
+        """A form that survives how clients echo a reply back in the next request.
+
+        Whitespace is collapsed, inline thinking is dropped from assistant text, and
+        tool arguments that are JSON are re-serialised with sorted keys, so ``content:
+        null`` versus ``""``, re-spaced arguments or a stripped ``<think>`` span still
+        give the same form.
+        """
+        text = "\n\n".join(self.texts)
+        if self.role == "assistant":
+            text = _split_think(text)[1]
+        tools = "".join(f"\x1f{name}\x1e{_canonical_arguments(args)}" for name, args in self.tools)
+        return f"{self.role}\x1d{_normalise(text)}{tools}"
+
+
+def _canonical_arguments(arguments: str) -> str:
+    doc = parse_json(arguments.encode("utf-8", errors="surrogatepass"))
+    if doc is None:
+        return _normalise(arguments)
+    return json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+#: Length (hex digits) of the history hashes: 64 bits, plenty to tell one run's
+#: message prefixes apart, and short enough to store one per message.
+_HISTORY_HASH_CHARS: Final = 16
+
+
+def _extend_history(previous: str, message: _Message) -> str:
+    """The rolling hash of a history extended by one message."""
+    return _sha256(f"{previous}\n{message.canonical()}")[:_HISTORY_HASH_CHARS]
+
+
+@dataclass(frozen=True, slots=True)
 class _RequestParts:
-    """The text a request carries: system prompt pieces and one text per other message."""
+    """What a request carries: its message count, system prompt and other messages.
+
+    ``system`` is the system prompt text; ``turns`` is every other message in order
+    (a system message after the first non-system one stays in ``turns`` but has
+    ``system`` set, so it is counted in characters but kept out of the history).
+    """
 
     messages: int
     system: list[str]
-    turns: list[str]
+    turns: list[_Message]
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,19 +375,32 @@ class _RequestShape:
     chars: int = 0
     system_sha256: str | None = None
     thread_key: str = ""
+    history_hashes: tuple[str, ...] = ()
 
     @classmethod
     def of(cls, model: str | None, parts: _RequestParts) -> _RequestShape:
         system = _normalise("\n".join(parts.system))
         system_sha = _sha256(system) if system else None
-        first = _normalise(parts.turns[0]) if parts.turns else ""
+        first = _normalise(parts.turns[0].flat_text()) if parts.turns else ""
+        hashes: list[str] = []
+        for message in parts.turns:
+            if not message.system:
+                hashes.append(_extend_history(hashes[-1] if hashes else "", message))
         return cls(
             requested_model=model,
             messages=parts.messages,
-            chars=sum(map(len, parts.system)) + sum(map(len, parts.turns)),
+            chars=sum(map(len, parts.system)) + sum(m.chars for m in parts.turns),
             system_sha256=system_sha,
             thread_key=_sha256(f"{system_sha or ''}\n{first}"),
+            history_hashes=tuple(hashes),
         )
+
+    def reply_hash(self, text: str, tools: Sequence[ToolCallRecord]) -> str | None:
+        """The history hash once the reply is appended (``None`` without a request)."""
+        if not self.thread_key:
+            return None
+        reply = _Message("assistant", (text,), tuple((t.name, t.arguments) for t in tools))
+        return _extend_history(self.history_hashes[-1] if self.history_hashes else "", reply)
 
 
 def _load_object(
@@ -328,6 +437,8 @@ def unparsed_call(
         request_chars=0,
         system_sha256=None,
         thread_key="",
+        history_hashes=(),
+        reply_hash=None,
         tool_calls=(),
         reasoning="",
         text="",
@@ -382,9 +493,10 @@ class WireParser(ABC):
         response_problem: str | None,
     ) -> CallTelemetry:
         errors: list[str] = []
-        shape = self._describe_request(request, request_problem, errors)
+        doc, shape = self._describe_request(request, request_problem, errors)
 
         reply = _Reply()
+        replied = False
         if response is None:
             errors.append(response_problem or "response missing")
         elif len(response) > MAX_BODY_BYTES:
@@ -392,10 +504,12 @@ class WireParser(ABC):
         elif not response.strip():
             errors.append("response is empty")
         else:
-            self._read_response(response, content_type, reply)
+            self._read_response(response, content_type, reply, doc)
+            replied = True
         errors.extend(reply.errors)
 
         text, reasoning = reply.final_text_and_reasoning()
+        tool_calls = tuple(t.record() for t in reply.tools)
         return CallTelemetry(
             seq=seq,
             format=self.format,
@@ -409,7 +523,9 @@ class WireParser(ABC):
             request_chars=shape.chars,
             system_sha256=shape.system_sha256,
             thread_key=shape.thread_key,
-            tool_calls=tuple(t.record() for t in reply.tools),
+            history_hashes=shape.history_hashes,
+            reply_hash=shape.reply_hash(text, tool_calls) if replied else None,
+            tool_calls=tool_calls,
             reasoning=reasoning,
             text=text,
             stop_reason=reply.stop_reason,
@@ -419,25 +535,36 @@ class WireParser(ABC):
 
     def _describe_request(
         self, request: bytes | None, problem: str | None, errors: list[str]
-    ) -> _RequestShape:
+    ) -> tuple[dict[str, JsonValue] | None, _RequestShape]:
+        """The parsed request (``None`` if unreadable) and what it carries."""
         doc, why = _load_object(request, "request", problem)
         if doc is None:
             errors.append(why or "request unreadable")
-            return _RequestShape()
+            return None, _RequestShape()
         model = _str(doc.get("model"))
         parts = self._request_parts(doc)
         if parts is None:
             errors.append("request has no messages")
-            return _RequestShape(requested_model=model)
-        return _RequestShape.of(model, parts)
+            return doc, _RequestShape(requested_model=model)
+        return doc, _RequestShape.of(model, parts)
 
     @abstractmethod
     def _request_parts(self, doc: dict[str, JsonValue]) -> _RequestParts | None:
-        """The request's system text and message texts, or ``None`` if it has none."""
+        """The request's system text and messages, or ``None`` if it has none."""
 
     @abstractmethod
-    def _read_response(self, body: bytes, content_type: str | None, reply: _Reply) -> None:
-        """Fill ``reply`` from a non-empty response body (JSON or a stream)."""
+    def _read_response(
+        self,
+        body: bytes,
+        content_type: str | None,
+        reply: _Reply,
+        request: dict[str, JsonValue] | None,
+    ) -> None:
+        """Fill ``reply`` from a non-empty response body (JSON or a stream).
+
+        ``request`` is the parsed request (``None`` if unreadable), for formats whose
+        reply shape depends on what was asked for.
+        """
 
 
 # --------------------------------------------------------------------------- messages-array formats
@@ -446,10 +573,11 @@ class WireParser(ABC):
 class _MessagesArrayParser(WireParser):
     """Shared request reading for formats with a ``messages`` array (Ollama, OpenAI).
 
-    The leading messages whose role is a system role are the system prompt. A message's
-    text is its ``content`` (a string or a list of ``{"text": ...}`` parts) plus the
-    arguments of any tool calls it carries; tool results are ``role: tool`` messages, so
-    they are counted as ordinary content.
+    The leading messages whose role is a system role are the system prompt; a system
+    message further down is counted in characters but kept out of the history hashes.
+    A message's text is its ``content`` (a string or a list of ``{"text": ...}`` parts);
+    its tools are the ``tool_calls`` it carries. Tool results are ``role: tool``
+    messages, so they are ordinary content.
     """
 
     _system_roles: ClassVar[frozenset[str]] = frozenset({"system"})
@@ -459,33 +587,38 @@ class _MessagesArrayParser(WireParser):
         if not isinstance(messages, list):
             return None
         system: list[str] = []
-        turns: list[str] = []
-        for message in messages:
-            if not isinstance(message, dict):
-                turns.append("")
-                continue
-            text = "".join(self._message_pieces(message))
-            if not turns and message.get("role") in self._system_roles:
-                system.append(text)
+        turns: list[_Message] = []
+        for raw in messages:
+            message = self._message(raw)
+            if message.system and not turns:
+                system.append(message.flat_text())
             else:
-                turns.append(text)
+                turns.append(message)
         return _RequestParts(len(messages), system, turns)
 
-    @staticmethod
-    def _message_pieces(message: dict[str, JsonValue]) -> Iterator[str]:
-        content = message.get("content")
+    def _message(self, raw: JsonValue) -> _Message:
+        if not isinstance(raw, dict):
+            return _Message("")
+        role = _str(raw.get("role")) or ""
+        texts: list[str] = []
+        content = raw.get("content")
         if isinstance(content, str):
-            yield content
+            texts.append(content)
         elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and isinstance(part.get("text"), str):
-                    yield str(part["text"])
-        tool_calls = message.get("tool_calls")
+            texts.extend(
+                str(part["text"])
+                for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
+        tools: list[tuple[str, str]] = []
+        tool_calls = raw.get("tool_calls")
         if isinstance(tool_calls, list):
             for call in tool_calls:
                 function = call.get("function") if isinstance(call, dict) else None
                 if isinstance(function, dict):
-                    yield _arguments(function.get("arguments"))
+                    name = _str(function.get("name")) or ""
+                    tools.append((name, _arguments(function.get("arguments"))))
+        return _Message(role, tuple(texts), tuple(tools), role in self._system_roles)
 
     @staticmethod
     def _read_tool_calls(
@@ -534,31 +667,48 @@ class OllamaChatParser(_MessagesArrayParser):
         if not isinstance(prompt, str):
             return None
         system = _str(doc.get("system"))
-        return _RequestParts(1, [system] if system else [], [prompt])
+        return _RequestParts(1, [system] if system else [], [_Message("user", (prompt,))])
 
-    def _read_response(self, body: bytes, content_type: str | None, reply: _Reply) -> None:
+    def _read_response(
+        self,
+        body: bytes,
+        content_type: str | None,
+        reply: _Reply,
+        request: dict[str, JsonValue] | None,
+    ) -> None:
+        """Read a single JSON object or an NDJSON stream.
+
+        ``streamed`` follows what was asked for: both endpoints stream unless the
+        request sets ``"stream": false``. An NDJSON content type, or a body of several
+        objects, also counts as streamed. If the request could not be read, only those
+        two signs are used.
+        """
+        asked = request is not None and request.get("stream", True) is not False
+        ndjson = content_type is not None and "ndjson" in content_type.lower()
+        reply.streamed = asked or ndjson
         drafts: dict[int, _ToolDraft] = {}
         doc = parse_json(body)
         if isinstance(doc, dict):
-            self._read_chunk(doc, reply, drafts)
-            return
-        if doc is not None:
+            chunks: list[dict[str, JsonValue]] = [doc]
+        elif doc is not None:
             reply.fail("response is not a JSON object")
             return
-        lines = [line for line in body.splitlines() if line.strip()]
-        done = False
-        for number, line in enumerate(lines):
-            chunk = parse_json(line)
-            if not isinstance(chunk, dict):
-                if number == 0:
-                    reply.fail("response is not JSON or NDJSON")
-                else:
+        else:
+            chunks = []
+            lines = [line for line in body.splitlines() if line.strip()]
+            for number, line in enumerate(lines):
+                chunk = parse_json(line)
+                if not isinstance(chunk, dict):
+                    if number == 0:
+                        reply.fail("response is not JSON or NDJSON")
+                        return
                     reply.fail(f"truncated stream: line {number + 1} is not a JSON object")
-                return
+                    break
+                chunks.append(chunk)
             reply.streamed = True
+        for chunk in chunks:
             self._read_chunk(chunk, reply, drafts)
-            done = chunk.get("done") is True
-        if not done:
+        if not reply.errors and chunks[-1].get("done") is not True:
             reply.fail("truncated stream: no final done object")
 
     def _read_chunk(
@@ -589,7 +739,13 @@ class OpenAIChatParser(_MessagesArrayParser):
     # newer OpenAI models take the system prompt as a "developer" message
     _system_roles = frozenset({"system", "developer"})
 
-    def _read_response(self, body: bytes, content_type: str | None, reply: _Reply) -> None:
+    def _read_response(
+        self,
+        body: bytes,
+        content_type: str | None,
+        reply: _Reply,
+        request: dict[str, JsonValue] | None,
+    ) -> None:
         drafts: dict[int, _ToolDraft] = {}
         if not _looks_like_sse(body, content_type):
             doc = parse_json(body)
@@ -679,40 +835,52 @@ class AnthropicMessagesParser(WireParser):
         messages = doc.get("messages")
         if not isinstance(messages, list):
             return None
-        system = doc.get("system")
-        system_texts = [system] if isinstance(system, str) else list(self._block_texts(system))
-        turns = [
-            "".join(self._block_texts(m.get("content"))) if isinstance(m, dict) else ""
-            for m in messages
-        ]
-        return _RequestParts(len(messages), system_texts, turns)
+        system = self._message({"role": "system", "content": doc.get("system")})
+        return _RequestParts(
+            len(messages), list(system.texts), [self._message(m) for m in messages]
+        )
 
     @classmethod
-    def _block_texts(cls, content: JsonValue | None) -> Iterator[str]:
-        """Text the model reads from a content value: text, tool input and tool results."""
+    def _message(cls, raw: JsonValue) -> _Message:
+        """A message's text blocks and tool results as text, its ``tool_use`` as tools.
+
+        Thinking blocks sent back in history are left out (see :class:`_Message`).
+        """
+        if not isinstance(raw, dict):
+            return _Message("")
+        role = _str(raw.get("role")) or ""
+        content = raw.get("content")
         if isinstance(content, str):
-            yield content
-            return
-        if not isinstance(content, list):
-            return
-        for block in content:
+            return _Message(role, (content,))
+        texts: list[str] = []
+        tools: list[tuple[str, str]] = []
+        for block in content if isinstance(content, list) else []:
             if not isinstance(block, dict):
                 continue
             kind = block.get("type")
             if kind == "text" and isinstance(block.get("text"), str):
-                yield str(block["text"])
+                texts.append(str(block["text"]))
             elif kind == "tool_use":
-                yield _arguments(block.get("input"))
+                tools.append((_str(block.get("name")) or "", _arguments(block.get("input"))))
             elif kind == "tool_result":
                 inner = block.get("content")
                 if isinstance(inner, str):
-                    yield inner
+                    texts.append(inner)
                 elif isinstance(inner, list):  # text blocks only, never nested results
-                    for part in inner:
-                        if isinstance(part, dict) and isinstance(part.get("text"), str):
-                            yield str(part["text"])
+                    texts.extend(
+                        str(part["text"])
+                        for part in inner
+                        if isinstance(part, dict) and isinstance(part.get("text"), str)
+                    )
+        return _Message(role, tuple(texts), tuple(tools))
 
-    def _read_response(self, body: bytes, content_type: str | None, reply: _Reply) -> None:
+    def _read_response(
+        self,
+        body: bytes,
+        content_type: str | None,
+        reply: _Reply,
+        request: dict[str, JsonValue] | None,
+    ) -> None:
         drafts: dict[int, _ToolDraft] = {}
         if not _looks_like_sse(body, content_type):
             doc = parse_json(body)
@@ -812,12 +980,17 @@ class AnthropicMessagesParser(WireParser):
         reply: _Reply,
         fields: tuple[tuple[str, str], ...] | None = None,
     ) -> None:
-        """Set each usage count present in ``usage``; counts not present are left alone."""
+        """Set each usable count in ``usage``.
+
+        A count that is missing, ``null`` or not a count leaves the earlier value alone,
+        so a ``message_delta`` with nulls cannot wipe what ``message_start`` reported.
+        """
         if not isinstance(usage, dict):
             return
         for wire_name, attribute in fields or cls._USAGE_FIELDS:
-            if wire_name in usage:
-                setattr(reply, attribute, _count(usage[wire_name]))
+            count = _count(usage.get(wire_name))
+            if count is not None:
+                setattr(reply, attribute, count)
 
 
 # --------------------------------------------------------------------------- dispatch

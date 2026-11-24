@@ -392,6 +392,18 @@ def test_message_delta_cumulative_usage_wins_when_present() -> None:
         ("<think>never closed because max_tokens hit", "never closed because max_tokens hit", ""),
         ("answer <think>not leading</think>", "", "answer <think>not leading</think>"),
         ("<think>a</think>b<think>c</think>", "a", "b<think>c</think>"),
+        # the chat template pre-filled <think>, so only the closing tag is in the reply
+        ("Let me think...\n</think>\n\nProbe 80.", "Let me think...", "Probe 80."),
+        ("</think>answer", "", "answer"),
+        ("a</think>b</think>c", "a", "b</think>c"),
+        # a closing tag after an opening tag in prose is left alone
+        (
+            "Use <think> to open and </think> to close.",
+            "",
+            "Use <think> to open and </think> to close.",
+        ),
+        # a bare closing tag in prose looks exactly like a pre-filled template: it is split
+        ("Close the span with </think> and go on.", "Close the span with", "and go on."),
         ("plain", "", "plain"),
         ("", "", ""),
     ],
@@ -697,3 +709,199 @@ def test_random_json_shapes_never_raise(request_doc: object, response_doc: objec
         assert isinstance(
             parser.parse(request_body, response + b"\n" + response, NDJSON), CallTelemetry
         )
+
+
+# --------------------------------------------------------------------------- v2 rule changes
+
+
+def test_anthropic_text_blocks_are_joined_like_reasoning_blocks() -> None:
+    response = json.dumps(
+        {
+            "model": "claude-sonnet-4-5",
+            "content": [
+                {"type": "text", "text": "First part."},
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+                {"type": "text", "text": "Second part."},
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+        }
+    ).encode()
+    call = AnthropicMessagesParser().parse(anth.REQUEST, response, JSON)
+    assert call.text == "First part.\n\nSecond part."
+
+
+def test_anthropic_null_usage_does_not_wipe_earlier_counts() -> None:
+    stream = anth.STREAM.replace(
+        b'"usage":{"output_tokens":210}',
+        b'"usage":{"output_tokens":210,"input_tokens":null,"cache_read_input_tokens":null,'
+        b'"cache_creation_input_tokens":"bad"}',
+    )
+    call = AnthropicMessagesParser().parse(anth.REQUEST, stream, SSE)
+    assert (call.input_tokens, call.output_tokens) == (12, 210)
+    assert (call.cache_read_tokens, call.cache_write_tokens) == (5000, 300)
+
+
+def _ollama_body(stream: object = None) -> bytes:
+    doc: dict[str, object] = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    if stream is not None:
+        doc["stream"] = stream
+    return json.dumps(doc).encode()
+
+
+ONE_DONE_OBJECT = b'{"model":"m","message":{"content":"ok"},"done":true,"eval_count":1}'
+
+
+@pytest.mark.parametrize(
+    ("request_body", "content_type", "response", "streamed"),
+    [
+        # /api/chat and /api/generate stream unless the request says "stream": false
+        (_ollama_body(), JSON, ONE_DONE_OBJECT, True),
+        (_ollama_body(stream=True), JSON, ONE_DONE_OBJECT, True),
+        (_ollama_body(stream=False), JSON, ONE_DONE_OBJECT, False),
+        (_ollama_body(stream=False), NDJSON, ONE_DONE_OBJECT, True),
+        (_ollama_body(stream=False), None, oll.CHAT_STREAM, True),
+        (oll.GENERATE_REQUEST, JSON, oll.GENERATE_RESPONSE, False),
+        (b'{"model":"m","prompt":"x"}', None, oll.GENERATE_RESPONSE, True),
+        (b"not json", None, ONE_DONE_OBJECT, False),
+    ],
+)
+def test_ollama_streamed_follows_the_request(
+    request_body: bytes, content_type: str | None, response: bytes, streamed: bool
+) -> None:
+    call = OllamaChatParser().parse(request_body, response, content_type)
+    assert call.streamed is streamed
+
+
+def test_ollama_streamed_single_object_without_done_is_truncated() -> None:
+    body = b'{"model":"m","message":{"content":"o"}}'
+    call = OllamaChatParser().parse(_ollama_body(), body, None)
+    assert call.parse_error is not None
+    assert "truncated" in call.parse_error
+
+
+def test_ollama_error_body_is_not_also_called_truncated() -> None:
+    call = OllamaChatParser().parse(_ollama_body(), oll.ERROR_RESPONSE, JSON)
+    assert call.parse_error is not None
+    assert "truncated" not in call.parse_error
+
+
+# --------------------------------------------------------------------------- history hashes
+
+
+def _messages_request(system: str, *messages: dict[str, object]) -> bytes:
+    return json.dumps(
+        {"model": "m", "messages": [{"role": "system", "content": system}, *messages]}
+    ).encode()
+
+
+def test_ollama_next_call_extends_the_previous_reply() -> None:
+    task = {"role": "user", "content": oll.TASK}
+    first = OllamaChatParser().parse(
+        _messages_request("sys at 12:00", task), oll.CHAT_RESPONSE, JSON
+    )
+    echo = {
+        "role": "assistant",
+        "content": "",
+        "thinking": "not part of the history hash",
+        "tool_calls": [
+            {"function": {"name": "http_get", "arguments": {"url": "http://10.0.0.5/"}}}
+        ],
+    }
+    tool = {"role": "tool", "content": "<html>"}
+    second = OllamaChatParser().parse(
+        _messages_request("sys at 12:01", task, echo, tool), oll.CHAT_RESPONSE, JSON
+    )
+    assert len(first.history_hashes) == 1
+    assert len(second.history_hashes) == 3
+    assert second.history_hashes[0] == first.history_hashes[0]
+    assert first.reply_hash is not None
+    assert second.history_hashes[1] == first.reply_hash
+
+
+def test_openai_echo_with_reformatted_arguments_still_links() -> None:
+    first = OpenAIChatParser().parse(oai.STREAM_REQUEST, oai.STREAM_TWO_TOOLS, SSE)
+    calls = [
+        ("call_a", "http_get", '{"url":"http://10.0.0.7/admin"}'),
+        ("call_b", "dns_lookup", '{ "name" : "admin.lab" }'),
+    ]
+    echo = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": i, "type": "function", "function": {"name": n, "arguments": a}}
+            for i, n, a in calls
+        ],
+    }
+    request = json.dumps(
+        {
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "A different system prompt."},
+                {"role": "user", "content": oai.TASK},
+                echo,
+                {"role": "tool", "tool_call_id": "call_a", "content": "404"},
+                {"role": "system", "content": "a reminder injected mid-history"},
+                {"role": "tool", "tool_call_id": "call_b", "content": "NXDOMAIN"},
+            ],
+        }
+    ).encode()
+    second = OpenAIChatParser().parse(request, oai.RESPONSE, JSON)
+    assert second.history_hashes[1] == first.reply_hash
+    assert len(second.history_hashes) == 4  # system messages are not part of the history
+
+
+def test_anthropic_echo_with_thinking_blocks_still_links() -> None:
+    first = AnthropicMessagesParser().parse(anth.REQUEST_STRING_SYSTEM, anth.RESPONSE, JSON)
+    echo = [
+        {"type": "thinking", "thinking": "x", "signature": "s"},
+        {"type": "redacted_thinking", "data": "d"},
+        {"type": "text", "text": "The login handler is vulnerable to timing attacks."},
+        {
+            "type": "tool_use",
+            "id": "toolu_02",
+            "name": "Grep",
+            "input": {"path": "app.py", "pattern": "=="},
+        },
+    ]
+    result = [{"type": "tool_result", "tool_use_id": "toolu_02", "content": "12: if a == b"}]
+    request = json.dumps(
+        {
+            "model": "claude-haiku-4-5",
+            "system": "You are a sub-agent that searches files.",
+            "messages": [
+                {"role": "user", "content": "Find every call to eval()."},
+                {"role": "assistant", "content": echo},
+                {"role": "user", "content": result},
+            ],
+        }
+    ).encode()
+    second = AnthropicMessagesParser().parse(request, anth.RESPONSE, JSON)
+    assert second.history_hashes[1] == first.reply_hash
+
+
+@pytest.mark.parametrize("echoed", ["<think>plan</think>answer", "answer", "plan\n</think>answer"])
+def test_inline_think_echo_links_with_or_without_the_thought(echoed: str) -> None:
+    task = {"role": "user", "content": "go"}
+    reply = json.dumps(
+        {"model": "m", "message": {"content": "<think>plan</think>answer"}, "done": True}
+    ).encode()
+    first = OllamaChatParser().parse(_messages_request("s", task), reply, JSON)
+    echo = {"role": "assistant", "content": echoed}
+    more = {"role": "user", "content": "more"}
+    second = OllamaChatParser().parse(_messages_request("s", task, echo, more), reply, JSON)
+    assert second.history_hashes[1] == first.reply_hash
+
+
+def test_a_different_reply_does_not_link() -> None:
+    task = {"role": "user", "content": "go"}
+    first = OllamaChatParser().parse(_messages_request("s", task), ONE_DONE_OBJECT, JSON)
+    echo = {"role": "assistant", "content": "something else"}
+    second = OllamaChatParser().parse(_messages_request("s", task, echo), ONE_DONE_OBJECT, JSON)
+    assert first.reply_hash not in second.history_hashes
+
+
+def test_no_reply_hash_without_a_response_or_a_request() -> None:
+    assert OllamaChatParser().parse(oll.CHAT_REQUEST, None, None).reply_hash is None
+    no_request = OllamaChatParser().parse(b"junk", oll.CHAT_RESPONSE, JSON)
+    assert no_request.reply_hash is None
+    assert no_request.history_hashes == ()

@@ -14,7 +14,9 @@ be rerun at any time; its output goes to a separate folder and never into the ev
 * :func:`write_derived` writes ``telemetry/summary.json``, ``telemetry/calls.jsonl``
   (one row per call, without the reasoning text) and ``telemetry/reasoning.jsonl`` (the
   readable thought-process trace) under an output folder, as ASCII-only JSON (see
-  :func:`_json_bytes`). Each file is replaced atomically. It refuses to write inside a
+  :func:`_json_bytes`). Rows of both JSONL files carry ``agent``, the thread the call
+  was linked to (:class:`ThreadLinker`; ``null`` for an unreadable request), next to the
+  call's own ``thread_key``. Each file is replaced atomically. It refuses to write inside a
   run's evidence directory or through a symlink, so raw evidence can never be
   overwritten.
 """
@@ -35,7 +37,7 @@ from pydantic import JsonValue
 
 from control.core.codecs import DecodedTooLargeError, decode_body_bounded
 from control.core.tags import parse_json
-from control.telemetry.model import TELEMETRY_VERSION, CallTelemetry, RunTelemetry
+from control.telemetry.model import TELEMETRY_VERSION, CallTelemetry, RunTelemetry, ThreadLinker
 from control.telemetry.wire import MAX_BODY_BYTES, parse_call, unparsed_call
 
 __all__ = [
@@ -277,12 +279,18 @@ class DerivedWriter:
             raise ValueError(f"summary counts {run.calls} calls but {len(ordered)} were given")
         self._check_destination()
         self._folder.mkdir(parents=True, exist_ok=True)
+        # the agent thread each call was linked to (None for an unreadable request)
+        agents = ThreadLinker().assign(ordered)
         files = {
-            CALLS_FILE: b"".join(_json_bytes(c.model_dump(exclude={"reasoning"})) for c in ordered),
+            CALLS_FILE: b"".join(
+                _json_bytes({**c.model_dump(exclude={"reasoning"}), "agent": agents.get(c.seq)})
+                for c in ordered
+            ),
             REASONING_FILE: b"".join(
                 _json_bytes(
                     {
                         "seq": c.seq,
+                        "agent": agents.get(c.seq),
                         "thread_key": c.thread_key,
                         "reasoning": c.reasoning,
                         "text": c.text,
