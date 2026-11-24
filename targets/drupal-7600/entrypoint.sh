@@ -33,7 +33,7 @@ exposed=$(find /run/secrets -type f \( ! -uid 0 -o -perm /0077 \) -print)
 # environment is not passed through (env -i), so nothing set on the container
 # reaches the site or a shell an attacker gets from it.
 as_web_user() {
-    setpriv --reuid=www-data --regid=www-data --init-groups --inh-caps=-all --no-new-privs -- \
+    setpriv --reuid=www-data --regid=www-data --init-groups --no-new-privs -- \
         env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/var/www LANG=C.UTF-8 "$@"
 }
 
