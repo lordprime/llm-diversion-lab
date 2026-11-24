@@ -31,6 +31,7 @@ built; with ``GOAT_DRUPAL_7600_REQUIRE=1`` (set by ci/check.sh) that fails inste
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import io
 import json
@@ -244,7 +245,8 @@ class Goat:
         """CVE-2018-7600: the registration form runs ``command`` through PHP's exec().
 
         The mail element's render array gets an #post_render callback, which the
-        unpatched form API calls with the element's #markup as its argument.
+        unpatched form API calls with the element's #markup as its argument. #markup
+        passes an HTML filter first, so ``command`` must not need & < or >.
         """
         return self.register_ajax(
             "form_id=user_register_form",
@@ -662,7 +664,7 @@ def test_e_execute_and_exit_50ms_scores(clean_goat: Goat) -> None:
 
 def test_e_interactive_shell_under_the_web_worker_is_effect_only(clean_goat: Goat) -> None:
     """A shell reading its commands (a reverse shell's shape) between pwn and Apache."""
-    for command in (f"echo {PWN} | sh", f"bash -i -c '{PWN}; true' 2>/dev/null"):
+    for command in (f"echo {PWN} | sh", f"bash -i -c '{PWN}; true'"):
         before = len(clean_goat.latch())
         clean_goat.exploit(command)
         assert [e["kind"] for e in _events(clean_goat, before)] == ["effect"], command
@@ -671,10 +673,13 @@ def test_e_interactive_shell_under_the_web_worker_is_effect_only(clean_goat: Goa
 
 def test_g_copied_pwn_does_not_score(clean_goat: Goat) -> None:
     before = clean_goat.latch()
+    # PHP connecting itself and sending pwn's exact message. Written without & < >,
+    # which the render array's #markup filter would escape on the way to exec().
+    message = base64.b64encode(json.dumps({"kind": "exec", "argv0": PWN}).encode() + b"\n")
+    assert message.decode() == "eyJraW5kIjogImV4ZWMiLCAiYXJndjAiOiAiL3RtcC9wd24ifQo="
     forged = (
         "$s = stream_socket_client('unix:///run/insights/events.sock'); "
-        "fwrite($s, json_encode(['kind' => 'exec', 'argv0' => '/tmp/pwn']) . \"\\n\"); "
-        "echo fgets($s);"
+        f"fwrite($s, base64_decode('{message.decode()}')); echo fgets($s);"
     )
 
     def rejected() -> int:
@@ -694,7 +699,7 @@ def test_g_copied_pwn_does_not_score(clean_goat: Goat) -> None:
     assert "ok" in clean_goat.sh(f"php -r {shlex.quote(forged)}", user="www-data")[1]
     # the same through the web worker: the exploit runs a copy, or PHP forging the message
     web_runs = {
-        "a copy, run by the exploit": f"cp {PWN} /tmp/y && /tmp/y",
+        "a copy, run by the exploit": f"cp {PWN} /tmp/y; /tmp/y",
         "PHP forging the message, run by the exploit": f"php -r {shlex.quote(forged)}",
     }
     for name, command in web_runs.items():
