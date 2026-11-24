@@ -239,7 +239,10 @@ def _apply_page(
                 results[plant.placement.placement_id] = Planted(plant, at, True, now)
             meta["offset_reference"] = "original decoded body"
         else:
-            meta["note"] = "app page is not HTML or cannot be planted into (encoding or range)"
+            meta["note"] = (
+                "app page is not HTML, has no safe place for the text, "
+                "or cannot be planted into (encoding or range)"
+            )
             for plant in body_plants:
                 results[plant.placement.placement_id] = Planted(plant, None, False)
     served = decode_body(response.raw_content or b"", encoding)

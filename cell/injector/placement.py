@@ -175,38 +175,64 @@ class _TagScanner(HTMLParser):
     """Records where each start and end tag of a page ends, in normal content only.
 
     The page is read as Latin-1, so a character index is a byte index whatever the
-    page's real charset. Tags inside ``<script>``, ``<style>``, ``<textarea>`` and
-    ``<title>`` are skipped, and so is the end of those four start tags (that point is
-    inside their content). Comments, declarations and text never count. Each entry is
-    ``(start, end, tag, is_end_tag)``.
+    page's real charset. Tags inside raw-text or non-rendered elements (:data:`_RAW`:
+    script, style, textarea, title, xmp, iframe, noembed, noframes, noscript and
+    plaintext) are skipped, and so is the end of their start tags (that point is inside
+    their content). ``plaintext`` never ends. Comments, declarations and text never
+    count. Each entry is ``(start, end, tag, is_end_tag)``.
+
+    The end of a tag is the index the parser itself returns for it (rebased to the
+    whole page, because the parser trims what it has already read), so a ``>`` inside a
+    quoted attribute value is never mistaken for it.
     """
 
-    _RAW: Final = frozenset({"script", "style", "textarea", "title"})
+    _RAW: Final = (
+        frozenset(HTMLParser.CDATA_CONTENT_ELEMENTS)
+        | frozenset(getattr(HTMLParser, "RCDATA_CONTENT_ELEMENTS", ()))
+        | {"script", "style", "textarea", "title"}
+        | {"xmp", "iframe", "noembed", "noframes", "noscript", "plaintext"}
+    )
 
     def __init__(self, decoded: bytes) -> None:
         super().__init__(convert_charrefs=False)
-        text = decoded.decode("latin-1")
-        self._lines = [0] + [m.end() for m in re.finditer("\n", text)]
+        self._text = decoded.decode("latin-1")
+        self._lines = [0] + [m.end() for m in re.finditer("\n", self._text)]
         self._raw: str | None = None
+        self._pending: tuple[int, str, bool] | None = None
         self.tags: list[tuple[int, int, str, bool]] = []
         # a page the parser rejects just has fewer boundaries
         with contextlib.suppress(Exception):
-            self.feed(text)
+            self.feed(self._text)
             self.close()
 
     def _here(self) -> int:
         line, col = self.getpos()
         return self._lines[line - 1] + col
 
+    def _finish(self, end: int) -> None:
+        """Record the tag the handler just saw, now that the parser says where it ends."""
+        pending, self._pending = self._pending, None
+        if pending is not None and end > 0:
+            start, tag, is_end = pending
+            self.tags.append((start, len(self._text) - len(self.rawdata) + end, tag, is_end))
+
+    def parse_starttag(self, i: int) -> int:
+        end = super().parse_starttag(i)
+        self._finish(end)
+        return end
+
+    def parse_endtag(self, i: int) -> int:
+        end = super().parse_endtag(i)
+        self._finish(end)
+        return end
+
     def _start(self, tag: str) -> None:
         if self._raw is not None:
             return
-        start = self._here()
-        end = start + len(self.get_starttag_text() or "")
         if tag in self._RAW:
             self._raw = tag
         else:
-            self.tags.append((start, end, tag, False))
+            self._pending = (self._here(), tag, False)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self._start(tag)
@@ -215,39 +241,42 @@ class _TagScanner(HTMLParser):
         self._start(tag)
 
     def handle_endtag(self, tag: str) -> None:
-        if self._raw is not None and tag != self._raw:
+        if self._raw is not None and (self._raw == "plaintext" or tag != self._raw):
             return
         self._raw = None
-        start = self._here()
-        close = self.rawdata.find(">", start)
-        if close >= 0:
-            self.tags.append((start, close + 1, tag, True))
+        self._pending = (self._here(), tag, True)
 
 
-def _boundary_offsets(decoded: bytes, fractions: Sequence[float]) -> list[int]:
+def _boundary_offsets(decoded: bytes, fractions: Sequence[float]) -> list[int] | None:
     """Where in ``decoded`` the in-page text for each relative fraction goes.
 
     The page is tokenised once (:class:`_TagScanner`). The point is the end of the
     first start or end tag that lies after ``floor(len(decoded) * fraction)``, between
     the real ``<body>`` start tag (its own end counts) and the real last ``</body>``.
-    If there is none, just before that ``</body>``. A page with no ``<body>`` takes the
-    text before its ``</body>``, or at its very end if it has none. Positions are in
-    ``decoded``; nothing is ever inserted inside a script, style, textarea, title,
+    If there is none, just before that ``</body>``. With no real ``</body>`` (an
+    unclosed script, comment, plaintext or quote swallowed it) the point is the end of
+    the last tag in normal content, which always lies before the swallowing construct.
+    ``None`` if the page has no tag in normal content at all: there is no safe place.
+    Positions are in ``decoded``; nothing is ever inserted inside a raw-text element,
     comment, tag or attribute value.
     """
     tags = _TagScanner(decoded).tags
     opened = next((t for t in tags if t[2] == "body" and not t[3]), None)
-    closes = [t[0] for t in tags if t[2] == "body" and t[3]]
-    close = closes[-1] if closes else len(decoded)
+    floor = opened[1] if opened is not None else 0
+    closes = [t[0] for t in tags if t[2] == "body" and t[3] and t[0] >= floor]
+    inside = [t[1] for t in tags if t[1] >= floor]
+    if closes:
+        close = closes[-1]
+    elif inside:
+        close = inside[-1]
+    else:
+        return None
     if opened is None:
         return [close] * len(fractions)
-    if close < opened[1]:
-        close = len(decoded)
-    inside = [t[1] for t in tags if opened[1] <= t[1] <= close]
     out: list[int] = []
     for fraction in fractions:
         target = int(len(decoded) * fraction)
-        out.append(next((end for end in inside if end > target), close))
+        out.append(next((end for end in inside if end > target and end <= close), close))
     return out
 
 
@@ -281,7 +310,10 @@ def plant_into_body(
     if decoded is None:
         return body, -1, False
     if fraction is not None:
-        offset = _boundary_offsets(decoded, [fraction])[0]
+        offsets = _boundary_offsets(decoded, [fraction])
+        if offsets is None:
+            return body, -1, False
+        offset = offsets[0]
     else:
         offset = _rfind_ci(decoded, before) if before else -1
         if offset < 0:
@@ -313,7 +345,10 @@ def plant_many_into_body(
     decoded = decode_body(body, encoding)
     if decoded is None:
         return body, (), (), False
-    original = _boundary_offsets(decoded, [fraction for _, fraction in items])
+    found = _boundary_offsets(decoded, [fraction for _, fraction in items])
+    if found is None:
+        return body, (), (), False
+    original = found
     order = sorted(range(len(items)), key=lambda i: (original[i], i))
     final = [0] * len(items)
     parts: list[bytes] = []

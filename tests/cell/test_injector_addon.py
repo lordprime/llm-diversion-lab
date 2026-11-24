@@ -133,10 +133,17 @@ def test_page_without_body_tag_gets_the_text_at_the_end(tmp_path: Path) -> None:
     assert _decoded(resp) == fragment + SurfaceMarkup.render(Surface.P4, TEXT)
 
 
-@pytest.mark.parametrize(
-    "body", [b"", b"<", b"<body", b"<<<>>>", b"<body><p>unclosed", b"\xff\xfe\x00<body>"]
-)
-def test_malformed_and_empty_pages_still_take_the_text(tmp_path: Path, body: bytes) -> None:
+@pytest.mark.parametrize("body", [b"", b"<", b"<body", b"<<<>>>"])
+def test_pages_with_no_tag_at_all_are_left_alone(tmp_path: Path, body: bytes) -> None:
+    injector = _injector_for(tmp_path, page_placement(Surface.P3))
+    app = _page(body, encoding=None)
+    raw = app.raw_content
+    assert _serve(injector, _flow(PAGE), app).raw_content == raw
+    assert _events(tmp_path)[1].insert_ok is False
+
+
+@pytest.mark.parametrize("body", [b"<body><p>unclosed", b"\xff\xfe\x00<body>"])
+def test_malformed_pages_with_a_tag_still_take_the_text(tmp_path: Path, body: bytes) -> None:
     injector = _injector_for(tmp_path, page_placement(Surface.P3))
     resp = _serve(injector, _flow(PAGE), _page(body, encoding=None))
     comment = f"<!-- {TEXT} -->".encode()
@@ -723,3 +730,25 @@ def test_texts_with_angle_brackets_never_nest_and_manifest_order_does_not_matter
     # the offsets are points of the app's own page, every one at a tag boundary there
     for at in offsets[0].values():
         assert at is not None and APP_PAGE[at - 1 : at] == b">"
+
+
+def test_a_page_with_no_safe_place_is_left_alone_and_says_why(tmp_path: Path) -> None:
+    for n, body in enumerate((b"just words, no tags at all", b"<script>var x = 1;</body></html>")):
+        injector = _injector_for(tmp_path / str(n), page_placement(Surface.P3))
+        app = _page(body, encoding=None)
+        raw, fields = app.raw_content, app.headers.fields
+        resp = _serve(injector, _flow(PAGE), app)
+        assert (resp.raw_content, resp.headers.fields) == (raw, fields)
+        serve = _events(tmp_path / str(n))[1]
+        assert serve.insert_ok is False and serve.byte_offset is None
+        assert "no safe place" in _meta(tmp_path / str(n))["note"]
+
+
+def test_a_page_with_an_unterminated_comment_is_planted_before_the_comment(
+    tmp_path: Path,
+) -> None:
+    body = b"<html><body><p>a</p><!-- todo <p>b</p></body></html>"
+    injector = _injector_for(tmp_path, page_placement(Surface.P4, offset=0.9))
+    decoded = _decoded(_serve(injector, _flow(PAGE), _page(body, encoding=None)))
+    payload = SurfaceMarkup.render(Surface.P4, TEXT)
+    assert decoded.index(payload) < decoded.index(b"<!--")

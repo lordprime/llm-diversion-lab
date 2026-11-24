@@ -9,9 +9,12 @@ from __future__ import annotations
 import gzip
 import json
 import re
+from html.parser import HTMLParser
 from typing import Any
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from cell.injector.placement import (
     BODY_SURFACES,
@@ -21,6 +24,8 @@ from cell.injector.placement import (
     ActionKind,
     Plant,
     SurfaceMarkup,
+    _boundary_offsets,
+    _TagScanner,
     build_plan,
     plant_into_body,
     plant_many_into_body,
@@ -243,24 +248,23 @@ def test_look_alike_tags_are_not_the_body_tag() -> None:
     ("page", "expected"),
     [
         (b"<html><p>one</p><p>two</p></body></html>", b"</body>"),  # close only
-        (b"plain text with no markup at all", None),  # nothing: the very end
-        (b"<p>fragment</p>", None),
+        (b"<p>fragment</p>", len(b"<p>fragment</p>")),  # the end of its last tag
+        (b"<body><p>unclosed", len(b"<body><p>")),  # no close: after the last tag
+        (b"text<b>x</b> tail text", len(b"text<b>x</b>")),  # trailing text stays after
+        (b"plain text with no markup at all", None),  # no tag: no safe place
         (b"", None),
         (b"<body", None),  # malformed: an unfinished start tag
-        (b"<body><p>unclosed", None),  # no close tag: boundary search runs to the end
     ],
 )
-def test_a_body_with_no_body_tag_pair_still_takes_the_text(
-    page: bytes, expected: bytes | None
+def test_a_page_without_a_body_pair_takes_the_text_at_a_real_tag_end_or_not_at_all(
+    page: bytes, expected: bytes | int | None
 ) -> None:
     wire, offset, ok = plant_into_body(page, None, b"X", fraction=0.5)
+    if expected is None:
+        assert (wire, offset, ok) == (page, -1, False)  # never appended blindly
+        return
     assert ok is True and wire == _at(page, offset, b"X")
-    if expected is not None:
-        assert offset == page.index(expected)
-    elif page.startswith(b"<body><p>"):
-        assert page[offset - 1 : offset] == b">"
-    else:
-        assert offset == len(page)
+    assert offset == (page.index(expected) if isinstance(expected, bytes) else expected)
 
 
 def test_body_close_before_body_open_is_ignored_as_a_limit() -> None:
@@ -561,13 +565,29 @@ def test_a_greater_than_in_a_script_is_not_a_boundary() -> None:
         assert not script_start <= offset <= script_end - 1 or offset == script_end
 
 
-def test_an_open_script_swallows_the_rest_so_the_text_goes_before_the_close() -> None:
-    page = b"<html><body><p>a</p><script>never closed <p>b</p> > </body></html>"
-    # the browser would treat everything after <script> as script text, </body> included
-    # no real </body> is left, so the text is appended at the very end
-    assert plant_into_body(page, None, b"X", fraction=1.0)[1] == len(page)
-    offset = plant_into_body(page, None, b"X", fraction=0.0)[1]
-    assert offset == page.index(b"<p>a</p>")
+@pytest.mark.parametrize(
+    "tail",
+    [
+        b"<!-- todo <p>b</p></body></html>",  # an unterminated comment
+        b"<script>var x = 1;</body></html>",  # an unclosed script
+        b"<plaintext>text</body></html>",  # plaintext never ends
+        b"<style>a { b: c }</body></html>",
+        b'<a href="never closed></body></html>',  # an unterminated attribute quote
+        b"<textarea>text</body></html>",
+        b"<title>t</body></html>",
+    ],
+)
+@pytest.mark.parametrize("fraction", [0.0, 0.5, 0.9, 1.0])
+def test_an_unterminated_construct_swallows_the_close_so_the_text_goes_before_it(
+    tail: bytes, fraction: float
+) -> None:
+    head = b"<html><body><p>a</p>"
+    page = head + tail
+    wire, offset, ok = plant_into_body(page, None, b"X", fraction=fraction)
+    assert ok is True and wire == _at(page, offset, b"X")
+    # a browser reads everything from the construct on as its content: stay before it
+    assert offset <= len(head)
+    assert page[offset - 1 : offset] == b">"
 
 
 def test_the_body_tag_inside_a_comment_or_script_is_not_the_body() -> None:
@@ -609,11 +629,173 @@ def test_multi_line_pages_map_their_positions_to_bytes() -> None:
 @pytest.mark.parametrize(
     "junk", [b"<", b"<<<", b"<a", b'<a b="', b"<!--", b"<![CDATA[", b"</", b"<?x"]
 )
-def test_unterminated_markup_never_breaks_planting(junk: bytes) -> None:
+def test_unterminated_markup_is_never_planted_into(junk: bytes) -> None:
+    """Whatever the junk is, the text lands at the end of a real tag before it, or nowhere."""
     for page in (b"<html><body><p>a</p>" + junk, junk + b"<body><p>a</p></body>", junk):
-        wire, offset, ok = plant_into_body(page, None, b"X", fraction=0.5)
-        assert ok is True and wire == _at(page, offset, b"X")
-        assert 0 <= offset <= len(page)
+        for fraction in (0.0, 0.5, 1.0):
+            wire, offset, ok = plant_into_body(page, None, b"X", fraction=fraction)
+            if not ok:
+                assert (wire, offset) == (page, -1)
+                continue
+            assert wire == _at(page, offset, b"X")
+            assert re.search(rb"<[^<>]*>\Z", page[:offset]), page[:offset]  # right after a tag
+            if page.endswith(junk) and not page.startswith(junk):
+                assert offset <= len(page) - len(junk)  # never past the junk
+
+
+# --------------------------------------------------------------------------- tag ends
+
+
+# the exact pages that put plants inside a tag, a style or a list in the first review
+AMPERSAND_PAGES = [
+    b"<html><body><h1>R&#D</h1><div><span>row</span></div><p>x</p><style>a{b:c;}</style>"
+    b"</body></html>",
+    b"<html><body><p>Q&#A; see FAQ</p><ul><li>one</li><li>two</li></ul><p>end</p></body></html>",
+    b"<p>Q&#A; see FAQ</p><ul><li>x</li></ul>",
+]
+
+
+def _ends_a_tag(prefix: bytes) -> bool:
+    """Whether ``prefix`` ends with a whole start or end tag (quoted ``>`` allowed)."""
+    return (
+        re.search(rb"""</?[a-zA-Z][^<>"']*(?:(?:"[^"]*"|'[^']*')[^<>"']*)*>\Z""", prefix)
+        is not None
+    )
+
+
+@pytest.mark.parametrize("page", AMPERSAND_PAGES)
+def test_a_bad_character_reference_does_not_shift_later_tag_ends(page: bytes) -> None:
+    for tenth in range(11):
+        wire, offset, ok = plant_into_body(page, None, b"|PLANT|", fraction=tenth / 10)
+        assert ok is True
+        assert _ends_a_tag(page[:offset]), (tenth, page[:offset])
+        assert wire == _at(page, offset, b"|PLANT|")
+
+
+def test_the_style_in_the_first_probe_is_never_split() -> None:
+    page = AMPERSAND_PAGES[0]
+    inside = range(page.index(b"<style>") + len(b"<style>"), page.index(b"</style>") + 1)
+    for tenth in range(11):
+        assert plant_into_body(page, None, b"X", fraction=tenth / 10)[1] not in inside
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        b'<body><p class="x>y">a</p class="x>y"><p>b</p><p>c</p></body>',
+        b"<body><p id='a>b'>a</p id='a>b'><p>b</p></body>",
+        b'<body><div></div title="x>y"><p>b</p></body>',
+    ],
+)
+def test_an_end_tag_with_a_quoted_greater_than_ends_where_the_parser_says(page: bytes) -> None:
+    for tenth in range(11):
+        offset = plant_into_body(page, None, b"X", fraction=tenth / 10)[1]
+        assert _ends_a_tag(page[:offset]), page[:offset]
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        b"<p>a</p><iframe><p>n</p></iframe><p>z</p>",
+        b"<p>a</p><xmp><p>n</p></xmp><p>z</p>",
+        b"<p>a</p><noembed><p>n</p></noembed><p>z</p>",
+        b"<p>a</p><noframes><p>n</p></noframes><p>z</p>",
+        b"<p>a</p><noscript><p>n</p></noscript><p>z</p>",
+        b"<p>a</p><plaintext><p>n</p><p>z</p>",
+        b"<p>a</p><textarea><p>n</p></textarea><p>z</p>",
+        b"<p>a</p><title><p>n</p></title><p>z</p>",
+    ],
+)
+def test_raw_text_and_non_rendered_elements_are_never_planted_into(page: bytes) -> None:
+    name = re.search(rb"<(iframe|xmp|noembed|noframes|noscript|plaintext|textarea|title)>", page)
+    assert name is not None
+    start = page.index(name.group(0)) + len(name.group(0))
+    end = page.find(b"</" + name.group(1) + b">")
+    end = len(page) if end < 0 else end
+    for tenth in range(11):
+        offset = plant_into_body(page, None, b"X", fraction=tenth / 10)[1]
+        assert not start <= offset <= end, (name.group(1), tenth, page[:offset])
+        assert _ends_a_tag(page[:offset])
+
+
+def test_the_html_parser_behaviour_the_scanner_relies_on_has_not_drifted() -> None:
+    """The cell image's Python patch release may differ from this host's: fail loudly."""
+    assert {"script", "style"} <= set(HTMLParser.CDATA_CONTENT_ELEMENTS)
+    assert {"textarea", "title"} <= set(getattr(HTMLParser, "RCDATA_CONTENT_ELEMENTS", ()))
+    assert {"script", "style", "textarea", "title", "xmp", "iframe", "noscript"} <= _TagScanner._RAW
+
+    def tags(page: bytes) -> list[tuple[str, bool]]:
+        return [(t[2], t[3]) for t in _TagScanner(page).tags]
+
+    assert tags(b"<p>a</p>") == [("p", False), ("p", True)]
+    assert tags(b"<!-- x <p>y</p> --><b>") == [("b", False)]
+    assert tags(b"<script>if (a > b) {}</script><i>") == [("script", True), ("i", False)]
+    assert tags(b"<textarea><p>x</p></textarea>") == [("textarea", True)]
+    assert tags(b"<plaintext><p>x</p></plaintext>") == []
+    assert tags(b"<p>a</p><!-- never closed <p>b</p>") == [("p", False), ("p", True)]
+    assert tags(b"<p>a</p><script>never closed <p>b</p>") == [("p", False), ("p", True)]
+    # an end tag's end is the parser's own, even after an invalid character reference
+    page = b"<h1>R&#D</h1><div><span>x</span></div><style>a{b:c;}</style>"
+    for _start, end, tag, is_end in _TagScanner(page).tags:
+        assert page[:end].endswith(b">"), (tag, is_end, page[:end])
+        assert _ends_a_tag(page[:end])
+    assert [page[: t[1]][-8:] for t in _TagScanner(page).tags][-1] == b"</style>"
+
+
+# --------------------------------------------------------------------------- property test
+
+_TEXT = st.sampled_from(
+    [b"hello", b" a > b ", b"R&#D", b"Q&#A; see FAQ", b"&amp;", b"&#", b"&", b";", b"&#x;", b"\n"]
+)
+_TAGS = st.sampled_from(
+    [b"<p>", b"</p>", b'<a href="x>y">', b"</a>", b'</p class="x>y">', b"<br/>", b"<b id='q>'>"]
+)
+_COMMENT = st.sampled_from([b"<!-- a > b <p> -->", b"<!---->", b"<!-- &#D; -->"])
+_RAW_NAMES = st.sampled_from(
+    [b"script", b"style", b"textarea", b"title", b"xmp", b"iframe", b"noembed", b"noframes"]
+)
+_RAW_CONTENT = st.sampled_from(
+    [b"a > b", b"<p>", b"if (x) { y = '<b>' }", b"&#D;", b"<!-- not a comment ->", b"x;"]
+)
+
+
+@st.composite
+def _documents(draw: Any) -> tuple[bytes, set[int]]:
+    """A page and the offsets that are safe: right after a tag in normal content."""
+    page = b"<html><body>"
+    safe = {len(page)}  # the body start tag's own end
+    for _ in range(draw(st.integers(0, 14))):
+        kind = draw(st.sampled_from(["text", "tag", "tag", "comment", "raw"]))
+        if kind == "text":
+            page += draw(_TEXT)
+        elif kind == "tag":
+            page += draw(_TAGS)
+            safe.add(len(page))
+        elif kind == "comment":
+            page += draw(_COMMENT)
+        else:
+            name = draw(_RAW_NAMES)
+            page += b"<" + name + b">" + draw(_RAW_CONTENT) + b"</" + name + b">"
+            safe.add(len(page))  # only the end of the closing tag is in normal content
+    safe.add(len(page))  # just before </body>
+    return page + b"</body></html>", safe
+
+
+@settings(max_examples=300, deadline=None)
+@given(doc=_documents(), fractions=st.lists(st.floats(0, 1), min_size=1, max_size=6))
+def test_every_recorded_boundary_is_the_end_of_a_real_tag_in_normal_content(
+    doc: tuple[bytes, set[int]], fractions: list[float]
+) -> None:
+    page, safe = doc
+    offsets = _boundary_offsets(page, fractions)
+    assert offsets is not None
+    for fraction, offset in zip(fractions, offsets, strict=True):
+        assert offset in safe, (fraction, page[:offset], page[offset:])
+        assert offset >= page.index(b"<body>") + len(b"<body>")
+        assert offset <= page.index(b"</body>")
+    # and nothing the scanner records is ever inside a raw element or comment
+    for _start, end, _tag, _is_end in _TagScanner(page).tags:
+        assert end in safe or end > page.index(b"</body>") or page[:end].endswith(b"<html>")
 
 
 # --------------------------------------------------------------------------- several texts at once
