@@ -13,9 +13,10 @@ be rerun at any time; its output goes to a separate folder and never into the ev
 * :func:`summarise` is pure: the same calls always give the same :class:`RunTelemetry`.
 * :func:`write_derived` writes ``telemetry/summary.json``, ``telemetry/calls.jsonl``
   (one row per call, without the reasoning text) and ``telemetry/reasoning.jsonl`` (the
-  readable thought-process trace) under an output folder. Each file is replaced
-  atomically. It refuses to write inside a run's evidence directory or through a
-  symlink, so raw evidence can never be overwritten.
+  readable thought-process trace) under an output folder, as ASCII-only JSON (see
+  :func:`_json_bytes`). Each file is replaced atomically. It refuses to write inside a
+  run's evidence directory or through a symlink, so raw evidence can never be
+  overwritten.
 """
 
 from __future__ import annotations
@@ -249,11 +250,18 @@ def summarise(run_id: str, calls: Sequence[CallTelemetry]) -> RunTelemetry:
 # --------------------------------------------------------------------------- writing
 
 
-def _json_line(doc: JsonValue) -> bytes:
-    # backslashreplace turns a lone surrogate (possible in model output) into a \\uXXXX
-    # escape, which is still valid JSON and reads back as the same text
-    text = json.dumps(doc, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return text.encode("utf-8", errors="backslashreplace") + b"\n"
+def _json_bytes(doc: object, *, indent: int | None = None) -> bytes:
+    """One JSON document as pure ASCII bytes, ending in a newline.
+
+    The policy for every derived file: ``ensure_ascii`` writes each non-ASCII character
+    as a ``\\uXXXX`` escape, so the bytes never depend on an encoding or locale, and
+    text that is not valid UTF-8 (a lone surrogate, which JSON allows and a model can
+    emit) is kept exactly and reads back as the same string. Documents come from
+    pydantic's python-mode dump, because its JSON mode replaces such characters.
+    """
+    separators = (",", ":") if indent is None else (",", ": ")
+    text = json.dumps(doc, sort_keys=True, ensure_ascii=True, indent=indent, separators=separators)
+    return text.encode("ascii") + b"\n"
 
 
 class DerivedWriter:
@@ -270,24 +278,21 @@ class DerivedWriter:
         self._check_destination()
         self._folder.mkdir(parents=True, exist_ok=True)
         files = {
-            CALLS_FILE: b"".join(
-                _json_line(c.model_dump(mode="json", exclude={"reasoning"})) for c in ordered
-            ),
+            CALLS_FILE: b"".join(_json_bytes(c.model_dump(exclude={"reasoning"})) for c in ordered),
             REASONING_FILE: b"".join(
-                _json_line(
+                _json_bytes(
                     {
                         "seq": c.seq,
                         "thread_key": c.thread_key,
                         "reasoning": c.reasoning,
                         "text": c.text,
-                        "tool_calls": [t.model_dump(mode="json") for t in c.tool_calls],
+                        "tool_calls": [t.model_dump() for t in c.tool_calls],
                     }
                 )
                 for c in ordered
             ),
             # the summary goes last: once it is there, the other two are complete
-            SUMMARY_FILE: json.dumps(run.model_dump(mode="json"), indent=2, sort_keys=True).encode()
-            + b"\n",
+            SUMMARY_FILE: _json_bytes(run.model_dump(), indent=2),
         }
         for name, data in files.items():
             self._replace(self._folder / name, data)

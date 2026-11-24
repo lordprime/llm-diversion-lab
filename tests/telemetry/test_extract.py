@@ -599,6 +599,7 @@ def test_write_derived_for_an_empty_run(tmp_path: Path) -> None:
 
 def test_lone_surrogates_from_a_model_survive_the_round_trip(tmp_path: Path) -> None:
     # JSON allows "\ud800" on its own; Python keeps it, but it is not valid UTF-8.
+    # The contract: every derived file is ASCII, with such text kept as a \uXXXX escape.
     calls = [
         _call(
             0,
@@ -613,3 +614,21 @@ def test_lone_surrogates_from_a_model_survive_the_round_trip(tmp_path: Path) -> 
     assert (row["text"], row["reasoning"]) == ("a\ud800b", "t\udc00")
     summary = json.loads((folder / "summary.json").read_bytes())
     assert summary["tool_calls_by_name"] == {"x\udfff": 1}
+    (row,) = _read_jsonl(folder / "calls.jsonl")
+    assert row["text"] == "a\ud800b"
+    assert row["tool_calls"] == [{"name": "x\udfff", "arguments": "{}"}]
+    for name in ("summary.json", "calls.jsonl", "reasoning.jsonl"):
+        data = (folder / name).read_bytes()
+        assert data.isascii()
+    assert b"\\ud800" in (folder / "reasoning.jsonl").read_bytes()
+
+
+def test_non_ascii_text_is_escaped_and_reads_back_unchanged(tmp_path: Path) -> None:
+    calls = [_call(0, text="réponse 🚀", reasoning="思考", returned_model="qwen3:8b-ü")]
+    write_derived(tmp_path, summarise(RUN_ID, calls), calls)
+    folder = tmp_path / "telemetry"
+    assert all((folder / n).read_bytes().isascii() for n in os.listdir(folder))
+    (row,) = _read_jsonl(folder / "reasoning.jsonl")
+    assert (row["text"], row["reasoning"]) == ("réponse 🚀", "思考")
+    run = RunTelemetry.model_validate_json((folder / "summary.json").read_bytes())
+    assert run.calls_by_model == {"qwen3:8b-ü": 1}
