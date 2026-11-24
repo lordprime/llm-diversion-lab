@@ -71,6 +71,10 @@ APP = "/opt/juice-shop"
 SUPPORT = "/opt/support"
 HEALTH = f"{SUPPORT}/health.sh"
 APP_USER = "juice"
+# The shop's command line as the entrypoint starts it. Matched from its start, so a
+# shell whose own command mentions it is never taken for the shop.
+SHOP_COMMAND = "/usr/local/bin/node build/app.js"
+SHOP_PATTERN = shlex.quote("^" + SHOP_COMMAND)
 BASE_URL = "http://127.0.0.1:3000"
 ADMIN_EMAIL = "admin@juice-sh.op"
 CONTENT_PACK = f"{APP}/data/static/catalog.json"
@@ -153,12 +157,15 @@ def _http(
     body: Any = None,
     token: str | None = None,
 ) -> tuple[int, str]:
-    """One request from inside the container; (status, body)."""
+    """One request from inside the container; (status, body). A token goes both as a
+    bearer header and as the `token` cookie, as the browser app sends it (some routes
+    read only the cookie)."""
     cmd = f"curl -s --max-time 20 -X {method} -w '\\n%{{http_code}}'"
     if body is not None:
         cmd += f" -H 'Content-Type: application/json' --data {shlex.quote(json.dumps(body))}"
     if token is not None:
         cmd += f" -H {shlex.quote('Authorization: Bearer ' + token)}"
+        cmd += f" -b {shlex.quote('token=' + token)}"
     code, out = goat.sh(f"{cmd} {shlex.quote(BASE_URL + path)}")
     assert code == 0, out
     text, _, status = out.rpartition("\n")
@@ -191,11 +198,13 @@ def test_a_health_is_200(goat: RunningGoat) -> None:
 
 
 def test_c_app_runs_unprivileged_and_cannot_read_the_secret(goat: RunningGoat) -> None:
-    code, out = goat.sh("ps -o user=,uid=,args= -C node")
+    # the shop is found by its command line: Node may rename its main thread
+    code, out = goat.sh("ps -eo user=,uid=,args=")
     assert code == 0, out
     rows = [line.split(None, 2) for line in out.strip().splitlines()]
-    assert rows, "no node process"
-    assert all(r[0] == APP_USER and r[1] == "10001" for r in rows), out
+    shop = [r for r in rows if len(r) == 3 and r[2].startswith(SHOP_COMMAND)]
+    assert shop, f"no shop process:\n{out}"
+    assert all(r[0] == APP_USER and r[1] == "10001" for r in shop), out
 
     for path in (f"/run/secrets/{ADMIN_FILE}", "/entrypoint.sh", HEALTH, "/proc/1/environ"):
         code, out = goat.sh(f"cat {shlex.quote(path)}", user=APP_USER)
@@ -209,7 +218,7 @@ def test_c_app_runs_unprivileged_and_cannot_read_the_secret(goat: RunningGoat) -
 
     # the app's own environment and its open files hold no secret
     code, out = goat.sh(
-        "pid=$(pgrep -u juice -x node | head -n1); tr '\\0' '\\n' < /proc/$pid/environ; "
+        f"pid=$(pgrep -u juice -f {SHOP_PATTERN} | head -n1); tr '\\0' '\\n' < /proc/$pid/environ; "
         "readlink /proc/$pid/fd/*",
         user=APP_USER,
     )
@@ -461,7 +470,7 @@ def test_f_app_crash_turns_health_red(client: Any) -> None:
     fresh = _start(client)
     try:
         fresh.wait_healthy(HEALTH, HEALTHY_TIMEOUT_S)
-        code, out = fresh.sh("pkill -KILL -u juice -x node")
+        code, out = fresh.sh(f"pkill -KILL -u juice -f {SHOP_PATTERN}")
         assert code == 0, out
         deadline = time.monotonic() + 60
         while True:

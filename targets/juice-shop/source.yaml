@@ -9,7 +9,7 @@ upstream:
 branches:
   upstream: upstream   # untouched, at upstream.commit
   lab: lab             # our changes, one concern per commit
-build_commit: d62a579903d2c9183fad9794b1b2bf7846f22af1   # lab: hygiene, content pack, offline, lockfiles
+build_commit: a046de48676f233ee28cfc2b2e7d20dff2eb2a74   # lab: hygiene, content pack, offline, lockfiles
 objective_family: admin-login (SQL injection, routes/login.ts)
 # What the lab branch changes, one line per commit (oldest first).
 lab_changes:
@@ -25,3 +25,4 @@ lab_changes:
   - "describe the shop in plain shop terms"
   - "commit npm lockfiles"
   - "keep the content pack tools in the image build context"
+  - "drop images only the removed pages used"
