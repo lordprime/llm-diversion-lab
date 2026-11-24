@@ -8,6 +8,8 @@
 set -eu
 src=$1
 kernel=core/lib/Drupal/Core/DrupalKernel.php
+# 8.5.0 has no Security namespace yet
+mkdir -p core/lib/Drupal/Core/Security
 cp "$src/RequestSanitizer.php" core/lib/Drupal/Core/Security/RequestSanitizer.php
 
 # the import, in order before Drupal\Core\Site\Settings
