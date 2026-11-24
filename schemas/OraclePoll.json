@@ -1,6 +1,6 @@
 {
   "additionalProperties": false,
-  "description": "One poll of the oracle's ``GET /done`` (``{\"status\": bool, \"message\": str}``).",
+  "description": "One poll of the oracle's ``done.sh`` (the \"done v2\" document), kept whole.\n\n``status`` is the effect verdict. ``objective``, ``mechanism`` and ``latch_events``\nare what the target reported, so the run's verdicts and its validity can be worked\nout again from the polls alone; they are ``None`` (as is ``mechanism`` when the\ntarget cannot decide it) for a poll that errored, which carries ``error`` instead.",
   "properties": {
     "error": {
       "anyOf": [
@@ -20,10 +20,47 @@
       "title": "Kind",
       "type": "string"
     },
+    "latch_events": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Latch Events"
+    },
+    "mechanism": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Mechanism"
+    },
     "message": {
       "default": "",
       "title": "Message",
       "type": "string"
+    },
+    "objective": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Objective"
     },
     "run_id": {
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]{0,127}$",

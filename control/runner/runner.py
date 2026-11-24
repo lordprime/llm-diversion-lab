@@ -43,10 +43,10 @@ queued: a leaked cell may still hold a Docker socket, an agent or a gateway rout
    ``unknown_placement``) ``contaminated``;
 8. **decide** -- the run is invalid if anything above failed, if the injector's events
    lack the pre-flight probe's accesses and serves (``injector_failed``), if the oracle
-   never answered, did not answer the final poll after the agent, or reported an
-   unexpected success, or if the agent made no LLM call at all (``no_llm_calls``,
-   DEVELOPMENT_PLAN 5.4). The verdict is built here (``decided_at`` = the final,
-   answered poll) and kept as ``<run>.verdict.pending.json`` (atomic), not posted;
+   never answered, did not answer the final poll after the agent, or broke its
+   contract (another objective, a shrinking latch, an undecidable primary verdict), or
+   if the agent made no LLM call at all (``no_llm_calls``, DEVELOPMENT_PLAN 5.4).
+   The verdict is built here (``decided_at`` = the final, answered poll) and kept as ``<run>.verdict.pending.json`` (atomic), not posted;
 9. **label** -- re-check the full schedule, load the evidence of the torn-down cell
    with the run's forbidden tags and the verdict, label the funnel; the labels and the
    final status (and whether the host ran development settings) are stored in one
@@ -739,8 +739,9 @@ class Runner:
 
     def _probe_oracle(self, state: _RunState, oracle_log: OracleLog) -> None:
         """Before the agent: the oracle must answer, and answer "not yet" (no effect, no
-        mechanism). An oracle that reports success from the start, or never answers,
-        would make any later verdict meaningless (:class:`ProbeFailedError`)."""
+        mechanism) for the target's own objective. An oracle that reports success from
+        the start, names another objective or never answers would make any later
+        verdict meaningless (:class:`ProbeFailedError`)."""
         last = ""
         for attempt in range(PROBE_POLL_ATTEMPTS):
             if attempt:
@@ -749,6 +750,8 @@ class Runner:
             if isinstance(parsed, str):
                 last = parsed
                 continue
+            if state.score.unexpected:
+                raise ProbeFailedError(f"the oracle is not the target's: {state.score.unexpected}")
             if parsed.effect or parsed.mechanism:
                 raise ProbeFailedError(
                     f"the oracle reports success before the agent started: {parsed.message[:200]!r}"
@@ -920,7 +923,9 @@ class Runner:
         """Validity checks that need the shipped evidence, then the verdict."""
         self._check_injector(state)
         if state.score.unexpected:
-            raise _OracleUnexpectedError(f"unexpected oracle success: {state.score.unexpected}")
+            raise _OracleUnexpectedError(
+                f"the oracle reported what it never should: {state.score.unexpected}"
+            )
         if not state.score.decided or state.final_poll_at is None:
             raise _OracleUnreachableError(f"none of {state.score.polls} oracle polls answered")
         if not state.final_poll_answered:

@@ -421,12 +421,21 @@ class Callback(_Event):
 
 
 class OraclePoll(_Event):
-    """One poll of the oracle's ``GET /done`` (``{"status": bool, "message": str}``)."""
+    """One poll of the oracle's ``done.sh`` (the "done v2" document), kept whole.
+
+    ``status`` is the effect verdict. ``objective``, ``mechanism`` and ``latch_events``
+    are what the target reported, so the run's verdicts and its validity can be worked
+    out again from the polls alone; they are ``None`` (as is ``mechanism`` when the
+    target cannot decide it) for a poll that errored, which carries ``error`` instead.
+    """
 
     kind: Literal[EventKind.ORACLE_POLL] = EventKind.ORACLE_POLL
     status: bool
     message: str = ""
     error: str | None = None
+    objective: str | None = None
+    mechanism: bool | None = None
+    latch_events: Annotated[int, Field(ge=0)] | None = None
 
 
 class CellGuardDecision(_Event):

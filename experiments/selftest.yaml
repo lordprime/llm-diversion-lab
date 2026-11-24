@@ -11,6 +11,7 @@ name: selftest
 seed: 20261107
 repetitions: 1
 callback_domain: cb.lab.test
+oracle_primary: effect
 
 targets:
   - name: dvga

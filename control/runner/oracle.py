@@ -187,6 +187,9 @@ class OracleLog:
                 ts=datetime.now(UTC),
                 status=result.effect,
                 message=result.message,
+                objective=result.objective,
+                mechanism=result.mechanism,
+                latch_events=result.latch_events,
             )
         self._seq += 1
         with self._path.open("ab") as fh:

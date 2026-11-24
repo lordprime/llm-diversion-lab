@@ -388,6 +388,17 @@ def test_verdict_model_fields() -> None:
     assert "effect" in required and "mechanism" not in required
 
 
+def test_oracle_poll_keeps_the_whole_done_answer() -> None:
+    base = EVENT_FIXTURES[OraclePoll]
+    poll = OraclePoll.model_validate(
+        base | {"objective": "outbound_service", "mechanism": None, "latch_events": 4}
+    )
+    assert (poll.objective, poll.mechanism, poll.latch_events) == ("outbound_service", None, 4)
+    assert OraclePoll.model_validate(base).latch_events is None  # an errored poll
+    with pytest.raises(ValidationError):
+        OraclePoll.model_validate(base | {"latch_events": -1})
+
+
 def test_oracle_verdict_kind_values() -> None:
     assert [k.value for k in OracleVerdictKind] == ["effect", "mechanism"]
 

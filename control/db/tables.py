@@ -496,6 +496,9 @@ class OraclePoll(EventRow):
     status: Mapped[bool] = mapped_column(Boolean)
     message: Mapped[str] = mapped_column(Text, default="", server_default=text("''"))
     error: Mapped[str | None] = mapped_column(Text)
+    objective: Mapped[str | None] = mapped_column(Text)
+    mechanism: Mapped[bool | None] = mapped_column(Boolean)
+    latch_events: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class CellGuardDecisionRow(EventRow):

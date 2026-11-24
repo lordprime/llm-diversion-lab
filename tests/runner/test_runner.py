@@ -54,7 +54,7 @@ from control.runner import runner as runner_module
 from control.runner.cell_spec import AgentSpec, CellError, CellSettings, ComposeProject
 from control.runner.compose_backend import CellHandle, CollectReport, CommandResult, ContainerState
 from control.runner.experiment import read_experiment
-from control.runner.oracle import LATCH_COMMAND, LATCH_FILE
+from control.runner.oracle import LATCH_COMMAND, LATCH_FILE, DoneResult, OracleScore
 from control.runner.runner import (
     DEFAULT_RUNNER_LOCK,
     CellLeftBehindError,
@@ -1548,3 +1548,83 @@ def test_a_latch_already_holding_the_mechanism_fails_the_probe(
     dirty = done_v2(effect=False, mechanism=True, latch_events=1)
     results = _single(engine, collector, FakeBackend(done=[(0, dirty)]), tmp_path)
     assert {r.reason for r in results} == {InvalidReason.PROBE_FAILED}
+
+
+# --------------------------------------------------------------------------- oracle evidence
+
+
+def _replay(engine: Engine, run_id: str) -> OracleScore:
+    """Score the run again from its stored oracle polls alone."""
+    score = OracleScore(OBJECTIVE)
+    with session_scope(engine) as s:
+        polls = s.scalars(
+            select(t.OraclePoll).where(t.OraclePoll.run_id == run_id).order_by(t.OraclePoll.seq)
+        ).all()
+    for poll in polls:
+        if poll.error is not None:
+            score.add(poll.error)
+        else:
+            assert poll.objective is not None and poll.latch_events is not None
+            score.add(
+                DoneResult(
+                    poll.objective, poll.status, poll.mechanism, poll.latch_events, poll.message
+                )
+            )
+    return score
+
+
+def test_the_verdicts_can_be_worked_out_again_from_the_stored_polls(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    undecided = done_v2(effect=True, mechanism=None, latch_events=1)
+    for name, backend in (
+        ("a", FakeBackend()),
+        ("b", FakeBackend(done=[(0, done_v2(effect=False, mechanism=None)), (0, undecided)])),
+    ):
+        for result in _single(engine, collector, backend, tmp_path / name):
+            row = _run_row(engine, result.run_id)
+            score = _replay(engine, result.run_id)
+            assert (score.effect, score.mechanism) == (row.effect, row.mechanism)
+            assert not score.unexpected and row.status is RunStatus.VALID
+
+
+def test_a_wrong_objective_is_recorded_and_the_run_invalid(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    other = done_v2(effect=True, mechanism=True, latch_events=1, objective="remote_code")
+    backend = FakeBackend(done=[(0, UNSUCCESSFUL), (0, other)])
+    for result in _single(engine, collector, backend, tmp_path):
+        assert result.reason is InvalidReason.ORACLE_UNEXPECTED
+        with session_scope(engine) as s:
+            last = s.scalars(
+                select(t.OraclePoll)
+                .where(t.OraclePoll.run_id == result.run_id)
+                .order_by(t.OraclePoll.seq.desc())
+            ).first()
+        assert last is not None and last.objective == "remote_code" and last.latch_events == 1
+        assert _replay(engine, result.run_id).unexpected  # invalid again, from the polls
+
+
+def test_a_probe_poll_with_the_wrong_objective_stops_before_the_agent(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    wrong = done_v2(effect=False, objective="remote_code")
+    backend = FakeBackend(done=[(0, wrong)])
+    results = _single(engine, collector, backend, tmp_path)
+    assert {r.reason for r in results} == {InvalidReason.PROBE_FAILED}
+    assert all("not the target's" in r.detail for r in results)
+    assert not any(c == "start_agent" for c, _ in backend.calls)
+    for result in results:
+        assert _replay(engine, result.run_id).unexpected
+
+
+def test_a_probe_poll_in_the_old_v1_format_stops_before_the_agent(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    v1 = json.dumps({"status": False, "message": "Attack unsuccessful."})
+    backend = FakeBackend(done=[(0, v1)])
+    results = _single(engine, collector, backend, tmp_path)
+    assert {r.reason for r in results} == {InvalidReason.PROBE_FAILED}
+    assert not any(c == "start_agent" for c, _ in backend.calls)
+    for result in results:
+        assert _count(engine, t.OraclePoll, result.run_id) >= 1  # kept as error polls
