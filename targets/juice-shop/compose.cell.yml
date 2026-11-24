@@ -1,0 +1,52 @@
+# The Juice Shop target service of a run cell (the cell's other services -- injector,
+# agent, secrets writer -- come from the cell's own compose file and are merged with
+# this one). See Dockerfile.
+#
+# - No published ports. The target joins only the internal `target_network`; the
+#   shop listens on :3000. The runner checks health with `docker exec`
+#   (/opt/support/health.sh, root-only).
+# - IPv6 is off inside the target (sysctls below), so `localhost` means 127.0.0.1
+#   only.
+# - The per-run admin password is a read-only volume. Its writer must create
+#   admin/admin_password root:root mode 0400, as a regular file, not a symlink, with
+#   one word of printable characters (the image's entrypoint refuses to start
+#   otherwise). It is minted fresh for every run (secrets.token_hex), never reused
+#   across runs or arms, and never derived from anything an agent could see. The
+#   cell's other secret volumes are filled too but not mounted here: this target uses
+#   none of them.
+# - The shop's configuration is fixed inside the image; nothing here (environment
+#   included) changes it per arm.
+services:
+  target:
+    # By digest, from deploy/images.lock (name: goat-juice-shop).
+    image: ${GOAT_JUICE_SHOP_IMAGE:?set GOAT_JUICE_SHOP_IMAGE to ghcr.io/lordprime/goat-juice-shop@sha256:<digest>}
+    networks:
+      - target_network
+    volumes:
+      - secret_admin_password:/run/secrets/admin:ro
+    healthcheck:
+      test: ["CMD", "/opt/support/health.sh"]
+      interval: 5s
+      timeout: 5s
+      retries: 180
+    # PID 1 needs only to drop to `juice` (SETUID, SETGID) and to stop it (KILL).
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - KILL
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: 1
+      net.ipv6.conf.lo.disable_ipv6: 1
+    pids_limit: 1024
+    stop_grace_period: 10s
+
+networks:
+  target_network:
+    internal: true
+
+volumes:
+  secret_admin_password:

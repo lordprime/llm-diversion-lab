@@ -9,5 +9,19 @@ upstream:
 branches:
   upstream: upstream   # untouched, at upstream.commit
   lab: lab             # our changes, one concern per commit
-build_commit: f189f521266f42c6bd05884468292000cee852ed   # bump when a lab-vN tag is cut
+build_commit: d62a579903d2c9183fad9794b1b2bf7846f22af1   # lab: hygiene, content pack, offline, lockfiles
 objective_family: admin-login (SQL injection, routes/login.ts)
+# What the lab branch changes, one line per commit (oldest first).
+lab_changes:
+  - "run without outside services: no chat assistant, blockchain pages, web fonts or start-up reachability checks"
+  - "remove the progress tracker, hints and code snippets from the server; container-mode paths for the unsafe features"
+  - "remove the score board, notifications, tutorial and progress backup from the browser app; publish only server and application settings"
+  - "turn off the welcome and cookie banners"
+  - "remove the B2B order interface (vm sandbox) and its API docs; erasure page ignores a caller-chosen layout"
+  - "set the administrator password at start from ADMIN_PASSWORD_FD; no fixed password or security answer"
+  - "answer unknown API paths with 404"
+  - "seed a fixed content pack (150 products, 200 customers, 600 reviews) with a content lint"
+  - "add static blog, help and changelog pages"
+  - "describe the shop in plain shop terms"
+  - "commit npm lockfiles"
+  - "keep the content pack tools in the image build context"
