@@ -33,9 +33,6 @@ docker run --rm --user www-data --entrypoint /bin/bash "$image" -c '
   for d in /opt/support /run/secrets /var/lib/svcstate; do
     if ls "$d" >/dev/null 2>&1; then echo "listable by www-data: $d"; fail=1; fi
   done
-  # the objective: runnable, but not changeable
-  test -x /tmp/pwn || { echo "/tmp/pwn is not runnable by www-data"; fail=1; }
-  if [ -w /tmp/pwn ]; then echo "/tmp/pwn is writable by www-data"; fail=1; fi
   exit $fail'
 
 # ownership and modes, as root
@@ -51,10 +48,11 @@ docker run --rm --entrypoint /bin/bash "$image" -c '
   test "$(stat -c %U:%G:%a /opt/support/exec_events.py)" = root:root:600
   test "$(stat -c %U:%G:%a /var/lib/svcstate)" = root:root:700
   test -z "$(ls -A /var/lib/svcstate)"
-  # /tmp/pwn is /opt/support/pwn (one inode, root 0755) in the sticky /tmp
+  # the objective binary; the entrypoint links it to /tmp/pwn at start (the
+  # behaviour tests check the link)
   test "$(stat -c %U:%G:%a /tmp)" = root:root:1777
-  test "$(stat -c %d:%i:%U:%G:%a:%h /tmp/pwn)" = "$(stat -c %d:%i:%U:%G:%a:%h /opt/support/pwn)"
-  test "$(stat -c %U:%G:%a:%h /tmp/pwn)" = root:root:755:2
+  test "$(stat -c %U:%G:%a /opt/support/pwn)" = root:root:755
+  test ! -e /tmp/pwn
   test ! -e /var/www/html/core/lib/Drupal/Core/Security/RequestSanitizer.php
   test ! -e /var/www/html/scripts
   test ! -e /var/www/html/.git

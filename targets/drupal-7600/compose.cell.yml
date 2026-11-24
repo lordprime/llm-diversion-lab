@@ -18,10 +18,10 @@
 #   It lives outside the site's database and caches, so neither a cache rebuild
 #   nor a site reset undoes a recorded run. done.sh and latch-dump.sh read it;
 #   nothing else does.
-# - /tmp/pwn (the objective) is not a mount: the image hard-links the root-owned
-#   /opt/support/pwn into the sticky /tmp, so the web user can run it but cannot
-#   write, rename or remove it. Never mount a tmpfs or a volume on /tmp: that hides
-#   /tmp/pwn and the target refuses to start.
+# - /tmp/pwn (the objective) is not a mount: the entrypoint hard-links the
+#   root-owned /opt/support/pwn into the sticky /tmp at start, so the web user can
+#   run it but cannot write, rename or remove it. Never mount a tmpfs or a volume
+#   on /tmp: the link cannot cross filesystems and the target refuses to start.
 services:
   target:
     # By digest, from deploy/images.lock (name: goat-drupal-7600).

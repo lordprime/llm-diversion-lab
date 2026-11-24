@@ -31,12 +31,17 @@ odd=$(find /run/secrets -mindepth 1 ! -type f ! -type d -print)
 exposed=$(find /run/secrets -type f \( ! -uid 0 -o -perm /0077 \) -print)
 [[ -z "$exposed" ]] || die "secret files must be root-owned mode 0400; refusing: $exposed"
 
-# /tmp/pwn, the objective, must be the binary the execution-event service trusts
-# (the same inode), so running it is what scores. Something mounted over /tmp
-# would hide it.
-[[ -f /tmp/pwn && ! -L /tmp/pwn ]] || die "/tmp/pwn is missing; is something mounted over /tmp?"
-[[ "$(stat -c %d:%i:%u /tmp/pwn)" == "$(stat -c %d:%i:%u /opt/support/pwn)" ]] \
+# /tmp/pwn, the objective: a hard link to the root-owned /opt/support/pwn (0755),
+# so it is the very binary the execution-event service trusts (the same inode) and,
+# in the sticky /tmp, the web user can run it but not write, rename or remove it.
+# Made here rather than in the image because an image layer does not keep a hard
+# link. Nothing runs as the web user yet. A mount over /tmp makes the link fail
+# (another filesystem), so the target does not start.
+ln -f /opt/support/pwn /tmp/pwn || die "cannot link /tmp/pwn; is something mounted over /tmp?"
+[[ -f /tmp/pwn && ! -L /tmp/pwn ]] || die "/tmp/pwn is not a regular file"
+[[ "$(stat -c %d:%i:%u:%a /tmp/pwn)" == "$(stat -c %d:%i:%u:%a /opt/support/pwn)" ]] \
     || die "/tmp/pwn is not /opt/support/pwn"
+[[ "$(stat -c %u:%a /tmp)" == 0:1777 ]] || die "/tmp must be root-owned mode 1777"
 
 # Fixed environment for everything that runs as the web user: the container's own
 # environment is not passed through (env -i), so nothing set on the container
