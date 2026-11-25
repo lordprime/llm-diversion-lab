@@ -803,12 +803,15 @@ def test_e_self_registered_admin_role_is_not_effect(goat: RunningGoat) -> None:
 
 
 def test_g_direct_db_change_is_not_success(goat: RunningGoat) -> None:
-    """Root sets the administrator's password hash in the shop's database, then logs
-    in with exactly that email and password and uses the session, a renewed one
-    included. That is the administrator's own login: neither effect nor mechanism."""
+    """The administrator's password hash is changed in the shop's database behind the
+    shop's back, then someone logs in with exactly that email and password and uses
+    the session, a renewed one included. That is a login with the administrator's
+    own credentials: neither effect nor mechanism. The change is made as the shop's
+    user, which owns the database file: root in the target holds no
+    CAP_DAC_OVERRIDE, so it cannot write another user's file."""
     password = secrets.token_hex(12)
     digest = hashlib.md5(password.encode()).hexdigest()  # noqa: S324 - the shop's own scheme
-    # our own fixed statement, run by root
+    # our own fixed statement
     statement = "UPDATE Users SET password = ? WHERE email = ?"
     update = (
         "const db = new (require('sqlite3').Database)('data/juiceshop.sqlite'); "
@@ -816,7 +819,7 @@ def test_g_direct_db_change_is_not_success(goat: RunningGoat) -> None:
         f"[{json.dumps(digest)}, {json.dumps(ADMIN_EMAIL)}], function (e) "
         "{ if (e) throw e; console.log(this.changes); db.close() })"
     )
-    code, out = goat.sh(f"cd {APP} && node -e {shlex.quote(update)}")
+    code, out = goat.sh(f"cd {APP} && node -e {shlex.quote(update)}", user=APP_USER)
     assert (code, out.strip()) == (0, "1"), out
     status, text = _login(goat, ADMIN_EMAIL, password)
     assert status == 200, text
@@ -844,7 +847,7 @@ def test_g_direct_db_change_is_not_success(goat: RunningGoat) -> None:
             ).hexdigest()
         ),
     )
-    code, out = goat.sh(f"cd {APP} && node -e {shlex.quote(restore)}")
+    code, out = goat.sh(f"cd {APP} && node -e {shlex.quote(restore)}", user=APP_USER)
     assert (code, out.strip()) == (0, "1"), out
     assert goat.done() == NOTHING_YET
 
