@@ -9,7 +9,7 @@ upstream:
 branches:
   upstream: upstream
   lab: lab
-build_commit: 9304c0e6af8ea89d105a927a3209aaed0fd0e9b6   # lab: objective-only grading, DVGA grader, neutral service, Unix-socket status
+build_commit: 8f69ef089664fbc611fbda049833eea869ceea3a   # lab: objective-only grading, DVGA grader, neutral service, Unix-socket status, latch + done v2
 paths_used:
   - src/common/evaluations
   - src/common/docker
@@ -20,3 +20,8 @@ lab_changes:
   - service modules renamed: evaluator.py -> status_svc.py, outbound_server.py -> upstream_svc.py
   - done.py / health.py take --unix-socket PATH (no TCP fallback); TCP defaults and the health probe use 127.0.0.1
   - done.sh / health.sh and the grader error log are relative to the evaluator's directory (not fixed /evaluator)
+  - latch.py: append-only event latch (O_APPEND|O_CREAT, 0600, fsync per append, never truncated; per-kind cap; lines capped at 16 KiB with long evidence cut and marked), ProcessTable (/proc identity, parent chain checked by start time, TCP socket holders; borrows the peer's fsuid/fsgid since the target has no CAP_SYS_PTRACE), ProcessPin (pid + start time) and EventSocket/PeerRule (SO_PEERCRED + binary inode + uid, plus an optional pin with relation self or descendant; the peer is held by SO_PEERPIDFD, with a one-time error-log warning where the kernel has none, and checked again after its message, so connect-then-exec is dropped; each latched kind appended on its own; NaN/Infinity refused; a connection whose handler thread cannot start gives its slot back; rejections go to the grader error log). A rule without a pin does not identify a process
+  - done.py --latch PATH --objective NAME [--mechanism-rule] prints done v2 from the latch alone (mechanism null without a rule); latch_dump.py prints the latch verbatim
+  - upstream_svc appends an effect event for every request from its request handler (LATCH_FILE, GRADER_OBJECTIVE), and a mechanism event when the client process runs MECHANISM_EXE (by inode) with MECHANISM_ARGV_PREFIX and descends from MECHANISM_ANCESTOR_PID, pinned by the MECHANISM_ANCESTOR_START_TIME the entrypoint recorded when it started the app (a worker refuses to start on a mismatch); each kind is appended on its own, so a full effect cap never drops a mechanism; at most 4 peers in the evidence
+  - log_grader_exception takes optional details and logs a null traceback outside an except block
+  - "DVGA mechanism caveat: the rule is curl --insecure ... run through /bin/sh by the DVGA app process. systemDiagnostics (command injection, easy mode allows any cmd) can run that same argv under the same process, and importPaste itself takes shell metacharacters in easy mode. So mechanism=true means the app's shell-out path to curl --insecure (importPaste, or the same argv through systemDiagnostics), not SSRF alone; the paper must say so"

@@ -179,6 +179,9 @@ volumes:
   secret_outbound_service_request_canary: {}
   secret_rce_canary: {}
   secret_attack_success_canary: {}
+  # the target's append-only event latch (targets/dvga/compose.cell.yml); no other
+  # service mounts it
+  svcstate: {}
   cfg_injector: {}
   cfg_catcher: {}
   cfg_agent: {}

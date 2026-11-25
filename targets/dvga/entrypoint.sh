@@ -50,10 +50,19 @@ setpriv --reuid=dvga --regid=dvga --init-groups --inh-caps=-all --no-new-privs -
     DVGA_LOCKED_MODE=easy \
     /opt/venv/bin/python app.py &
 APPLICATION_PID=$!
+# Pin the app here, where it was started: its pid plus its start time (field 22 of
+# /proc/<pid>/stat), since a pid alone could later name another process. The
+# command name (field 2) may hold spaces, so count the fields after its last ")".
+# exec keeps the start time, so it is the python process's own.
+app_stat=$(cat "/proc/$APPLICATION_PID/stat")
+read -r -a app_fields <<<"${app_stat##*) }"
+APPLICATION_START_TIME=${app_fields[19]}
 
-# The evaluator: root, its own environment set in its own root-only script.
+# The evaluator: root, its own environment set in its own root-only script. It
+# gets the app's pid and start time (setpriv and env exec, so $! is the python
+# process itself) to tell the app's own requests apart from anyone else's.
 cd /
-/opt/support/launch.sh &
+APP_PID=$APPLICATION_PID APP_START_TIME=$APPLICATION_START_TIME /opt/support/launch.sh &
 EVALUATOR_PID=$!
 
 trap 'kill -TERM -1 2>/dev/null || true; exit 143' TERM INT
