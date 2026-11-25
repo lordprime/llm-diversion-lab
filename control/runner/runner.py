@@ -117,6 +117,7 @@ from control.runner.cell_spec import (
     render_cell,
 )
 from control.runner.compose_backend import CellBackend, CellHandle, ContainerState
+from control.runner.derive import TelemetryDeriver
 from control.runner.experiment import ExperimentFile
 from control.runner.oracle import (
     DONE_COMMAND,
@@ -464,6 +465,7 @@ class Runner:
         self._clock = clock
         self._agent_specs = agent_specs
         self._templates_root = templates_root
+        self._deriver = TelemetryDeriver()
         self._ef: ExperimentFile | None = None
 
     def __repr__(self) -> str:  # the key never appears in a repr or traceback local
@@ -527,6 +529,7 @@ class Runner:
                     self._ship_evidence(state)
                 except Exception as exc:
                     state.problems.append(exc)
+                self._derive_telemetry(state)
             if state.problems:
                 raise _RunFailed(state.problems)
             self._decide(state)
@@ -899,6 +902,27 @@ class Runner:
         self._collector.post_artifacts(state.run.run_id, scan_artifacts(state.evidence_dir))
         if skipped:  # shipped all the same, but an event was lost: the run is not whole
             raise _RecordingFailedError(f"torn event lines (an event was lost): {skipped[:10]}")
+
+    def _derive_telemetry(self, state: _RunState) -> None:
+        """Derive the run's telemetry, ship its files and store its summary.
+
+        Telemetry is derived data: it can never change the run's status or verdict. Any
+        failure is logged and kept as the run's ``telemetry_error``, and this method
+        never raises.
+        """
+        run_id = state.run.run_id
+        try:
+            derived = self._deriver.derive(
+                run_id, state.evidence_dir, TelemetryDeriver.derived_dir(state.evidence_dir)
+            )
+            self._collector.post_artifacts(run_id, derived.artifacts)
+            self._store.record_telemetry(derived.summary)
+        except Exception as exc:
+            log.warning("run %s: telemetry not derived: %s", run_id, _describe(exc))
+            try:
+                self._store.record_telemetry_error(run_id, _describe(exc))
+            except Exception:
+                log.exception("run %s: cannot record its telemetry error", run_id)
 
     def _check_injector(self, state: _RunState) -> None:
         """The injector's evidence must hold the pre-flight probe it served."""

@@ -712,6 +712,7 @@ def test_api_exposes_no_way_to_update_or_delete_evidence() -> None:
         "/v1/runs/{run_id}/artifacts": {"post"},
         "/v1/runs/{run_id}/verdict": {"post"},
         "/v1/runs/{run_id}/status": {"post"},
+        "/v1/runs/{run_id}/telemetry": {"get"},  # read-only, derived data
         "/healthz": {"get"},
         "/readyz": {"get"},
     }

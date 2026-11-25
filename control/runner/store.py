@@ -18,7 +18,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy import Engine, and_, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -32,6 +32,7 @@ from control.db.engine import session_scope
 from control.db.repo import claim_next_run
 from control.runner.experiment import ExperimentFile
 from control.runner.schedule import ScheduledRun
+from control.telemetry.model import RunTelemetry
 
 __all__ = [
     "AgentRecord",
@@ -41,6 +42,10 @@ __all__ = [
     "TargetRecord",
     "placement_map_sha256",
 ]
+
+
+#: Longest telemetry error text kept.
+TELEMETRY_ERROR_CHARS: Final = 4000
 
 
 class StoreError(ValueError):
@@ -410,3 +415,46 @@ class RunStore:
         if row is None:
             raise StoreError(f"no run {run_id}")
         return row.status, row.invalid_reason
+
+    # telemetry (derived data: never touches the run's status)
+
+    def record_telemetry(self, summary: RunTelemetry) -> None:
+        """Store a run's telemetry summary; it is write-once.
+
+        The same summary again is a no-op (deriving twice is safe). A different one is
+        refused. An error row left by an earlier failed try is replaced.
+        """
+        values = {name: getattr(summary, name) for name in t.TELEMETRY_FIELDS}
+        with session_scope(self._engine) as s:
+            row = self._telemetry_row(s, summary.run_id)
+            if row is None:
+                s.add(t.RunTelemetryRow(run_id=summary.run_id, **values))
+                return
+            if row.telemetry_error is not None:
+                for name, value in values.items():
+                    setattr(row, name, value)
+                row.telemetry_error = None
+                return
+            if any(getattr(row, name) != value for name, value in values.items()):
+                raise StoreError(f"run {summary.run_id} already has different telemetry")
+
+    def record_telemetry_error(self, run_id: str, error: str) -> None:
+        """Record why a run's telemetry could not be derived (redacted, bounded).
+
+        Replaces an earlier error; a stored summary is never touched (refused).
+        """
+        text = redact_text(error)[:TELEMETRY_ERROR_CHARS] or "unknown error"
+        with session_scope(self._engine) as s:
+            row = self._telemetry_row(s, run_id)
+            if row is None:
+                s.add(t.RunTelemetryRow(run_id=run_id, telemetry_error=text))
+            elif row.telemetry_error is None:
+                raise StoreError(f"run {run_id} already has its telemetry summary")
+            else:
+                row.telemetry_error = text
+
+    @staticmethod
+    def _telemetry_row(s: Session, run_id: str) -> t.RunTelemetryRow | None:
+        if s.get(t.Run, run_id) is None:
+            raise StoreError(f"no run {run_id}")
+        return s.get(t.RunTelemetryRow, run_id)

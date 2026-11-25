@@ -50,6 +50,7 @@ from control.core.models import (
 from control.db import tables as t
 from control.db.engine import session_scope
 from control.db.repo import invalid_runs_by_reason
+from control.runner import derive as derive_module
 from control.runner import runner as runner_module
 from control.runner.cell_spec import AgentSpec, CellError, CellSettings, ComposeProject
 from control.runner.compose_backend import CellHandle, CollectReport, CommandResult, ContainerState
@@ -66,6 +67,8 @@ from control.runner.runner import (
 )
 from control.runner.ship import CollectorClient
 from control.runner.store import RunStore, StoreError
+from tests.runner.test_derive import ARTIFACTS as TELEMETRY_ARTIFACTS
+from tests.runner.test_derive import record_ollama_calls
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SELFTEST = REPO_ROOT / "experiments" / "selftest.yaml"
@@ -324,6 +327,8 @@ class FakeBackend:
     probe_serves: bool = True
     unplanned_serve: bool = False
     torn_line: bool = False
+    #: Ollama chat exchanges the tap also recorded, as one more agent would make them
+    ollama_calls: int = 0
     #: what latch-dump.sh answers: (exit code, stdout)
     latch: tuple[int, bytes] = (0, LATCH_DUMP)
     #: exit code of an infrastructure service after the runner stopped it (default 0)
@@ -416,6 +421,8 @@ class FakeBackend:
             unplanned_serve=self.unplanned_serve,
             torn_line=self.torn_line,
         )
+        if self.ollama_calls:
+            record_ollama_calls(dest, cell.project.run_id, self.ollama_calls)
         return CollectReport(files=["..."], refused=list(self.refuse))
 
     def teardown(self, cell: CellHandle) -> None:
@@ -1628,3 +1635,142 @@ def test_a_probe_poll_in_the_old_v1_format_stops_before_the_agent(
     assert not any(c == "start_agent" for c, _ in backend.calls)
     for result in results:
         assert _count(engine, t.OraclePoll, result.run_id) >= 1  # kept as error polls
+
+
+# --------------------------------------------------------------------------- telemetry
+
+
+def _telemetry(engine: Engine, run_id: str) -> t.RunTelemetryRow | None:
+    with session_scope(engine) as s:
+        return s.get(t.RunTelemetryRow, run_id)
+
+
+def _artifact_paths(engine: Engine, run_id: str) -> set[str]:
+    with session_scope(engine) as s:
+        rows = s.scalars(select(t.Artifact.path).where(t.Artifact.run_id == run_id)).all()
+    return set(rows)
+
+
+def test_a_run_with_ollama_traffic_gets_a_telemetry_row_and_artifacts(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    results = _runner(engine, collector, FakeBackend(ollama_calls=2), tmp_path).run_experiment(
+        read_experiment(SELFTEST)
+    )
+    assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
+    for result in results:
+        row = _telemetry(engine, result.run_id)
+        assert row is not None and row.telemetry_error is None
+        assert row.calls == 3 and row.telemetry_version is not None  # the stub call plus two
+        assert row.reasoning_chars and row.reasoning_chars > 0
+        assert _artifact_paths(engine, result.run_id) >= TELEMETRY_ARTIFACTS
+        out = derive_module.TelemetryDeriver.derived_dir(tmp_path / "runs" / result.run_id)
+        assert json.loads((out / "telemetry" / "summary.json").read_text())["calls"] == 3
+
+
+def test_broken_telemetry_leaves_the_run_valid_and_records_the_error(
+    engine: Engine,
+    collector: CollectorClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(_evidence: Path) -> list[Any]:
+        raise RuntimeError("telemetry exploded at postgresql://lab:hunter2secret@db/lab")
+
+    monkeypatch.setattr(derive_module, "load_calls", boom)
+    results = _runner(engine, collector, FakeBackend(), tmp_path).run_experiment(
+        read_experiment(SELFTEST)
+    )
+    assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
+    for result in results:
+        row = _run_row(engine, result.run_id)
+        assert (row.status, row.outcome, row.invalid_reason) == (RunStatus.VALID, True, None)
+        assert _labels(engine, result.run_id)  # labelled as ever
+        telemetry = _telemetry(engine, result.run_id)
+        assert telemetry is not None and telemetry.calls is None
+        assert telemetry.telemetry_error and "telemetry exploded" in telemetry.telemetry_error
+        assert "hunter2secret" not in telemetry.telemetry_error
+        assert not _artifact_paths(engine, result.run_id) & TELEMETRY_ARTIFACTS
+
+
+def test_a_telemetry_store_that_fails_too_still_leaves_the_run_valid(
+    engine: Engine,
+    collector: CollectorClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse(*_args: Any, **_kwargs: Any) -> None:
+        raise StoreError("database down")
+
+    monkeypatch.setattr(RunStore, "record_telemetry", refuse)
+    monkeypatch.setattr(RunStore, "record_telemetry_error", refuse)
+    results = _runner(engine, collector, FakeBackend(), tmp_path).run_experiment(
+        read_experiment(SELFTEST)
+    )
+    assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
+    assert all(_telemetry(engine, r.run_id) is None for r in results)
+
+
+def test_telemetry_artifacts_that_the_collector_refuses_are_an_error_not_an_invalid_run(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    class RefusingCollector(CollectorClient):
+        def post_artifacts(self, run_id: str, files: Any) -> int:
+            if any(f.path.startswith("telemetry/") for f in files):
+                raise RuntimeError("collector said no")
+            return super().post_artifacts(run_id, files)
+
+    refusing = RefusingCollector(collector._http)
+    results = _runner(engine, refusing, FakeBackend(), tmp_path).run_experiment(
+        read_experiment(SELFTEST)
+    )
+    assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
+    row = _telemetry(engine, results[0].run_id)
+    assert row is not None and row.telemetry_error and "collector said no" in row.telemetry_error
+
+
+def test_an_invalid_run_that_reached_collection_still_gets_its_telemetry(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    results = _runner(
+        engine, collector, FakeBackend(torn_line=True, ollama_calls=1), tmp_path
+    ).run_experiment(read_experiment(SELFTEST))
+    assert all(r.status is RunStatus.INVALID for r in results)
+    row = _telemetry(engine, results[0].run_id)
+    assert row is not None and row.telemetry_error is None and row.calls == 2
+
+
+def test_a_run_that_made_no_llm_call_has_an_empty_summary_and_stays_invalid(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    results = _runner(engine, collector, FakeBackend(llm_calls=False), tmp_path).run_experiment(
+        read_experiment(SELFTEST)
+    )
+    assert all(r.reason is InvalidReason.NO_LLM_CALLS for r in results)
+    row = _telemetry(engine, results[0].run_id)
+    assert row is not None and row.calls == 0 and row.agents == 0
+
+
+def test_telemetry_is_derived_again_without_conflict(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    runner = _runner(engine, collector, FakeBackend(ollama_calls=1), tmp_path)
+    ef = read_experiment(SELFTEST)
+    (result, *_) = runner.run_experiment(ef)
+    scheduled = next(
+        r for r in runner._store.load_schedule(ef.experiment.experiment_id)
+        if r.run_id == result.run_id
+    )  # fmt: skip
+    before, artifacts = _telemetry(engine, result.run_id), _artifact_paths(engine, result.run_id)
+    state = runner_module._RunState(
+        scheduled, tmp_path / "runs" / result.run_id, OracleScore(OBJECTIVE)
+    )
+    runner._derive_telemetry(state)
+    after = _telemetry(engine, result.run_id)
+    assert before is not None and after is not None
+    assert (after.calls, after.created_at, after.telemetry_error) == (
+        before.calls,
+        before.created_at,
+        None,
+    )
+    assert _artifact_paths(engine, result.run_id) == artifacts

@@ -86,6 +86,7 @@ from control.core.models import (
 __all__ = [
     "EVENT_KEY",
     "EVENT_TABLES",
+    "TELEMETRY_FIELDS",
     "Agent",
     "AgentEvent",
     "Artifact",
@@ -105,6 +106,7 @@ __all__ = [
     "RejectedBatch",
     "Run",
     "RunHeartbeatRow",
+    "RunTelemetryRow",
     "Target",
     "TargetAccess",
 ]
@@ -626,6 +628,83 @@ class RunHeartbeatRow(Base):
     ts: Mapped[datetime] = mapped_column(_TS)
     message: Mapped[str] = mapped_column(Text, default="", server_default=text("''"))
     received_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now())
+
+
+#: The summary columns a stored (non-error) telemetry row must all have.
+_TELEMETRY_REQUIRED: Final = (
+    "calls",
+    "agents",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_chars",
+    "calls_with_reasoning",
+    "single_call_threads",
+    "largest_thread_calls",
+    "branch_points",
+    "persona_splits",
+    "agents_source",
+)
+
+
+#: The :class:`RunTelemetryRow` columns that hold the summary, in display order.
+TELEMETRY_FIELDS: Final = (
+    "telemetry_version",
+    "calls",
+    "agents",
+    "agents_source",
+    "peak_input_tokens",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_chars",
+    "calls_with_reasoning",
+    "single_call_threads",
+    "largest_thread_calls",
+    "branch_points",
+    "persona_splits",
+)
+
+
+class RunTelemetryRow(Base):
+    """A run's derived telemetry summary (see :class:`control.telemetry.model.RunTelemetry`).
+
+    Derived data: the evidence is the source and the summary can be worked out again.
+    Either the summary columns are all set, or ``telemetry_error`` says why deriving
+    failed and they are all NULL. A summary is write-once; an error row is replaced
+    by a later summary (see :meth:`control.runner.store.RunStore.record_telemetry`).
+    """
+
+    __tablename__ = "run_telemetry"
+    __table_args__ = (
+        CheckConstraint(
+            "(telemetry_error IS NULL) = (telemetry_version IS NOT NULL)",
+            name="summary_xor_error",
+        ),
+        CheckConstraint(
+            "telemetry_error IS NOT NULL OR ("
+            + " AND ".join(f"{c} IS NOT NULL" for c in _TELEMETRY_REQUIRED)
+            + ")",
+            name="summary_complete",
+        ),
+    )
+
+    run_id: Mapped[str] = mapped_column(_ID, ForeignKey("runs.run_id"), primary_key=True)
+    telemetry_version: Mapped[str | None] = mapped_column(_VERSION)
+    calls: Mapped[int | None] = mapped_column(BigInteger)
+    agents: Mapped[int | None] = mapped_column(BigInteger)
+    agents_source: Mapped[str | None] = mapped_column(String(16))
+    #: NULL when no call reported a prompt size
+    peak_input_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    input_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    output_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    reasoning_chars: Mapped[int | None] = mapped_column(BigInteger)
+    calls_with_reasoning: Mapped[int | None] = mapped_column(BigInteger)
+    single_call_threads: Mapped[int | None] = mapped_column(BigInteger)
+    largest_thread_calls: Mapped[int | None] = mapped_column(BigInteger)
+    branch_points: Mapped[int | None] = mapped_column(BigInteger)
+    persona_splits: Mapped[int | None] = mapped_column(BigInteger)
+    #: why deriving failed (redacted, bounded); NULL for a stored summary
+    telemetry_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now())
 
 
 class RejectedBatch(Base):
