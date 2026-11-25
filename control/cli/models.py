@@ -26,6 +26,7 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ from control.runner.compose_backend import CommandResult, CommandRunner
 __all__ = [
     "CONTAINER_MARKERS",
     "DEFAULT_LOCK_PATH",
+    "LOCK_OWNER_UID",
     "MODEL_ID_PATTERN",
     "OLLAMA_PORT",
     "OLLAMA_SERVICE",
@@ -59,6 +61,8 @@ UPLINK_NETWORK: Final = "lab-ollama-uplink"
 UPLINK_LABEL: Final = "lab.role=ollama-uplink"
 #: Held (exclusive, non-blocking) for the whole of a pull or removal.
 DEFAULT_LOCK_PATH: Final = Path("/run/lab/ollama-models.lock")
+#: The lock directory and file must belong to this uid (root).
+LOCK_OWNER_UID: Final = 0
 #: Files that exist only inside a container (Docker, Podman).
 CONTAINER_MARKERS: Final = (Path("/.dockerenv"), Path("/run/.containerenv"))
 #: ``name[:tag]`` as the Ollama registry writes it; ``/`` and ``.`` allow namespaces
@@ -302,14 +306,39 @@ class OllamaAdmin(OllamaService):
             raise ModelsError(f"docker {' '.join(argv[:2])} failed: {_text(result)}")
         return result.text.strip()
 
+    def _open_lock(self) -> int:
+        """Open the lock file safely: root's own directory, no symlinks, a regular file.
+
+        labctl runs as root, so a planted symlink or a writable directory must never
+        make it create or open a file somewhere else.
+        """
+        path, folder = self._lock_path, self._lock_path.parent
+        try:
+            folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+            seen = os.lstat(folder)
+        except OSError as exc:
+            raise ModelsError(f"cannot use the lock directory {folder}: {exc.strerror}") from None
+        if not stat.S_ISDIR(seen.st_mode):  # lstat: a symlink to a directory is not one
+            raise ModelsError(f"refused: {folder} is not a real directory (a symlink?)")
+        if seen.st_uid != LOCK_OWNER_UID:
+            raise ModelsError(f"refused: {folder} is owned by uid {seen.st_uid}, not root")
+        if seen.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ModelsError(f"refused: {folder} is writable by group or others")
+        flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            fd = os.open(path, flags, 0o600)
+        except OSError as exc:
+            raise ModelsError(f"cannot open the lock {path}: {exc.strerror}") from None
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != LOCK_OWNER_UID:
+            os.close(fd)
+            raise ModelsError(f"refused: {path} is not a regular file owned by root")
+        return fd
+
     @contextlib.contextmanager
     def _exclusive(self) -> Iterator[None]:
         """One pull or removal at a time (an exclusive, non-blocking file lock)."""
-        try:
-            self._lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        except OSError as exc:
-            raise ModelsError(f"cannot open the lock {self._lock_path}: {exc.strerror}") from None
+        fd = self._open_lock()
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -318,6 +347,8 @@ class OllamaAdmin(OllamaService):
                     "another model operation is running (a pull or removal holds "
                     f"{self._lock_path}); wait for it to finish"
                 ) from None
+            except OSError as exc:
+                raise ModelsError(f"cannot lock {self._lock_path}: {exc.strerror}") from None
             yield
         finally:
             os.close(fd)  # closing the descriptor drops the lock
@@ -380,8 +411,9 @@ class OllamaAdmin(OllamaService):
                 raise ModelsError(f"could not create the uplink network: {_text(created)}")
             info = self._json("network", "inspect", UPLINK_NETWORK)
             by_hand = (
-                f"`docker network disconnect --force {UPLINK_NETWORK} {cid}` (for each "
-                f"attached container) and `docker network rm {UPLINK_NETWORK}`"
+                f"`docker network disconnect --force {UPLINK_NETWORK} <id>` for each container "
+                f"listed by `docker network inspect {UPLINK_NETWORK}`, then "
+                f"`docker network rm {UPLINK_NETWORK}`"
             )
             if (info.get("Labels") or {}).get("lab.role") != "ollama-uplink":
                 raise UplinkInUse(

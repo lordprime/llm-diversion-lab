@@ -8,6 +8,7 @@ and that nothing runs at all when the caller is refused.
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -33,6 +34,8 @@ TAGS_BODY = {
 @pytest.fixture(autouse=True)
 def _lock_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(models_module, "DEFAULT_LOCK_PATH", tmp_path / "run" / "models.lock")
+    # the tests are not root: the owner the lock must belong to is the test user
+    monkeypatch.setattr(models_module, "LOCK_OWNER_UID", os.getuid())
 
 
 def _http(body: str, status: str = "200 OK") -> bytes:
@@ -636,3 +639,91 @@ def test_cli_rm_and_a_bad_id(
 
 def test_cli_needs_a_subcommand() -> None:
     assert labctl.main(["models"]) == 2
+
+
+# --------------------------------------------------------------------- the lock file
+
+
+def _locked_admin(lock: Path) -> OllamaAdmin:
+    return OllamaAdmin(
+        FakeDocker(), geteuid=lambda: 0, container_markers=(), environ={}, lock_path=lock
+    )
+
+
+def test_the_lock_is_created_0600_in_a_0700_directory(tmp_path: Path) -> None:
+    lock = tmp_path / "fresh" / "ollama.lock"
+    _locked_admin(lock).remove("qwen3:32b")
+    assert lock.stat().st_mode & 0o777 == 0o600
+    assert lock.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_a_symlinked_lock_file_is_refused_and_its_target_untouched(tmp_path: Path) -> None:
+    folder = tmp_path / "d"
+    folder.mkdir(mode=0o700)
+    target = tmp_path / "victim"
+    target.write_text("keep")
+    (folder / "l.lock").symlink_to(target)
+    with pytest.raises(ModelsError, match="cannot open the lock"):
+        _locked_admin(folder / "l.lock").remove("qwen3:32b")
+    assert target.read_text() == "keep"
+
+
+def test_a_symlinked_lock_directory_is_refused(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    (tmp_path / "link").symlink_to(real)
+    with pytest.raises(ModelsError, match="not a real directory"):
+        _locked_admin(tmp_path / "link" / "l.lock").remove("qwen3:32b")
+    assert list(real.iterdir()) == []
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o707, 0o777])
+def test_a_group_or_other_writable_lock_directory_is_refused(tmp_path: Path, mode: int) -> None:
+    folder = tmp_path / "d"
+    folder.mkdir()
+    folder.chmod(mode)
+    with pytest.raises(ModelsError, match="writable by group or others"):
+        _locked_admin(folder / "l.lock").remove("qwen3:32b")
+    assert list(folder.iterdir()) == []
+
+
+def test_a_lock_directory_owned_by_someone_else_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = tmp_path / "d"
+    folder.mkdir(mode=0o700)
+    monkeypatch.setattr(models_module, "LOCK_OWNER_UID", os.getuid() + 1)  # "root" is someone else
+    with pytest.raises(ModelsError, match="owned by uid"):
+        _locked_admin(folder / "l.lock").remove("qwen3:32b")
+
+
+def test_a_lock_file_that_is_not_a_regular_file_owned_by_root_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = tmp_path / "d"
+    folder.mkdir(mode=0o700)
+    real_fstat = os.fstat
+
+    def foreign(fd: int) -> os.stat_result:
+        info = real_fstat(fd)
+        return os.stat_result((info.st_mode, *info[1:4], info.st_uid + 1, *info[5:]))
+
+    monkeypatch.setattr(models_module.os, "fstat", foreign)
+    with pytest.raises(ModelsError, match="regular file owned by root"):
+        _locked_admin(folder / "l.lock").remove("qwen3:32b")
+
+
+def test_an_oserror_from_flock_is_a_models_error_and_the_fd_is_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[int] = []
+    real_close = os.close
+    monkeypatch.setattr(models_module.os, "close", lambda fd: (closed.append(fd), real_close(fd)))
+
+    def boom(fd: int, op: int) -> None:
+        raise OSError(37, "No locks available")
+
+    monkeypatch.setattr(models_module.fcntl, "flock", boom)
+    with pytest.raises(ModelsError, match="No locks available"):
+        _locked_admin(tmp_path / "d" / "l.lock").remove("qwen3:32b")
+    assert closed
