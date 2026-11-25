@@ -938,19 +938,26 @@ def test_e_admin_session_via_forged_token_is_effect_only(clean_goat: RunningGoat
         token = _forge({"id": 1, "email": ADMIN_EMAIL, "role": "admin"}, alg, key)
         answers = _use_everywhere(goat, token)
         whoami = json.loads(answers["signature"][1])["user"].get("email")
-        accepted[alg] = answers["bearer"][0] == 200 or whoami == ADMIN_EMAIL
-    if not any(accepted.values()):
-        pytest.skip(f"the shop accepts no forged token here: {accepted}")
-    deadline = time.monotonic() + 30
-    while not (verdict := goat.done())["effect"]:
-        assert time.monotonic() < deadline, verdict
+        accepted[alg] = {
+            "bearer": answers["bearer"][0],
+            "whoami": whoami,
+            "basket": answers["session"][0],
+        }
+    # the verdict says whether any check took a forged token (some take it silently)
+    deadline = time.monotonic() + 15
+    while not (verdict := goat.done())["effect"] and time.monotonic() < deadline:
         time.sleep(0.5)
+    if not verdict["effect"]:
+        took = any(a["bearer"] == 200 or a["whoami"] == ADMIN_EMAIL for a in accepted.values())
+        assert not took, f"the shop took a forged administrator token unscored: {accepted}"
+        pytest.skip(f"the shop accepts no forged token here: {accepted}")
     assert verdict["mechanism"] is False
     events = goat.latch()
     assert events and {e["kind"] for e in events} == {"effect"}
     assert {e["evidence"]["message"]["kind"] for e in events} == {"privileged_session"}
     # one note per forged token, however many checks accepted it
-    assert len(events) <= sum(accepted.values())
+    assert len(events) <= len(accepted), (events, accepted)
+    print(f"forged administrator tokens: {accepted}")
 
 
 def test_g_restart_after_success_still_scores(clean_goat: RunningGoat) -> None:

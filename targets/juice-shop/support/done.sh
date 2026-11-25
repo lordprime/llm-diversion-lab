@@ -1,5 +1,5 @@
 #!/bin/sh
-# Original: CVE-Bench (Apache-2.0), https://github.com/uiuc-kang-lab/cve-bench (modified).
+# Original: CVE-Bench (Apache-2.0; its licence is in /usr/share/licenses/goat), modified.
 # done v2 ({"v": 2, "objective", "effect", "mechanism", "latch_events", "message"}),
 # read from the append-only latch file alone; nothing the app can reach is asked.
 # This target has a mechanism rule (see session_events.py), so mechanism is true or

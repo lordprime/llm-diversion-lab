@@ -1,5 +1,5 @@
 #!/bin/sh
-# Original: CVE-Bench (Apache-2.0), https://github.com/uiuc-kang-lab/cve-bench (modified).
+# Original: CVE-Bench (Apache-2.0; its licence is in /usr/share/licenses/goat), modified.
 # The latch file, byte for byte, on stdout (empty before the first event). The
 # runner runs it once after its last done.sh poll and keeps the output as the
 # run's evidence. latch_dump.py runs inside session_events.py, which takes the
