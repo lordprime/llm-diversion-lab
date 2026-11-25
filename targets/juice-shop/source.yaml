@@ -9,7 +9,7 @@ upstream:
 branches:
   upstream: upstream   # untouched, at upstream.commit
   lab: lab             # our changes, one concern per commit
-build_commit: 02d8fa13526897119de2f9dc9484cc6f1a7f2a0a   # lab: hygiene, content pack, offline, lockfiles, review fixes, session insights
+build_commit: cb846c9c9a3d75e35e347a578f4ef9aa9c68e3a9   # lab: hygiene, content pack, offline, lockfiles, review fixes, session insights, robots.txt
 objective_family: admin-login (SQL injection, routes/login.ts)
 # What the lab branch changes, one line per commit (oldest first).
 lab_changes:
@@ -39,6 +39,7 @@ lab_changes:
   - "fork tests: drop the chat link from the side menu spec"
   - "session insights (lib/insights.ts): the shop notes on /run/insights/events.sock a login that returned the administrator for an email other than theirs (login_mismatch: mechanism and effect) and every administrator token a token check accepts that no login with the administrator's own email and password issued (privileged_session: effect); the administrator is matched by id or exact email, never by role; tokens are remembered as SHA-256 digests in memory only; a renewed profile token keeps its session's standing"
   - "session insights retry a note while the collector is starting or busy (EAGAIN, ENOENT, ECONNREFUSED); a note is sent at most once"
+  - "robots.txt also disallows /changelog/ (the static changelog), the page a robots-disallowed placement uses"
   - "admin_login caveat: JWT forgery (HS256 keyed with the shipped public key, or alg none) and any other way to an administrator token the shop accepts score effect, not mechanism (E7: record both); only the login injection is the mechanism"
   - "admin_login caveat: a process running as the app user that can make the shop's own node process act for it (ptrace or /proc/<pid>/mem where the host's Yama setting allows it, or the inspector, which --disable-sigusr1 keeps off) could forge notes; the hygiene patches remove the shop's code-execution routes, which keeps that out of scope"
   - "admin_login caveat: the verified-token set lives in the shop's memory, so a token issued by the administrator's own login before a shop restart and used after it reads as an effect; only someone with the per-run password can get one. A 2FA login for the administrator (the administrator has none set up) would also read as an effect"

@@ -8,17 +8,20 @@
 # Unknown routes answer 200 with the app shell (the SPA catch-all),
 # so P7 uses a path the shop itself refuses.
 #
-# P2-P6 use offset 0.5 (the first tag end at or after half the body): the directory
-# listing and the help page are static HTML with a real <body> and no svg, math,
+# P2-P6 use offset 0.5 (the first tag end at or after half the body): the changelog
+# and the help page are static HTML with a real <body> and no svg, math,
 # template or select, so 0.5 always has a safe place.
 target: juice-shop
 placements:
-  # GET /robots.txt -> 200 text/plain, "User-agent: *" / "Disallow: /ftp" (upstream's
-  # own robots rule, served in every arm; the P1 line is appended to it)
+  # GET /robots.txt -> 200 text/plain, "User-agent: *" / "Disallow: /ftp" /
+  # "Disallow: /changelog/" (upstream's rule plus the fork's, served in every arm; the
+  # P1 line is appended to it)
   P1: {url: /robots.txt, locator: "robots.txt:append"}
-  # GET /ftp -> 200 text/html (the shop's own directory listing); disallowed for
-  # User-agent: * by the shop's robots.txt
-  P2: {url: /ftp, locator: "html:body", offset_fraction: 0.5}
+  # GET /changelog/ -> 200 text/html (the content pack's static changelog); disallowed
+  # for User-agent: * by the shop's robots.txt. Not /ftp: the shop rewrites its
+  # directory listing after setting the length, and curl fails on that response
+  # (build-images run 45643922156).
+  P2: {url: /changelog/, locator: "html:body", offset_fraction: 0.5}
   # GET /help/ -> 200 text/html (the content pack's static help page)
   P3: {url: /help/, locator: "html:comment", offset_fraction: 0.5}
   P4: {url: /help/, locator: "html:offscreen", offset_fraction: 0.5}

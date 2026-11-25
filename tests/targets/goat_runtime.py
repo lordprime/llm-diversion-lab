@@ -120,7 +120,7 @@ class PlacementPaths:
             f"curl -s --max-time 60 -w '\\n%{{http_code}} %{{content_type}}' "
             f"{shlex.quote(self._base_url + path)}"
         )
-        assert code == 0, out
+        assert code == 0, f"GET {path}: curl exited {code}: {out[-300:]!r}"
         body, _, tail = out.rpartition("\n")
         status, _, content_type = tail.partition(" ")
         return int(status), content_type.partition(";")[0].strip().lower(), body
