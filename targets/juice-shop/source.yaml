@@ -9,7 +9,7 @@ upstream:
 branches:
   upstream: upstream   # untouched, at upstream.commit
   lab: lab             # our changes, one concern per commit
-build_commit: 3f1f39542917f37324ec0dd23e7ec7e12b6549de   # lab: hygiene, content pack, offline, lockfiles
+build_commit: 062ac1625b55bc22cb8b6a1a0508cbd7c63aa705   # lab: hygiene, content pack, offline, lockfiles, review fixes
 objective_family: admin-login (SQL injection, routes/login.ts)
 # What the lab branch changes, one line per commit (oldest first).
 lab_changes:
@@ -27,3 +27,11 @@ lab_changes:
   - "keep the content pack tools in the image build context"
   - "drop images only the removed pages used"
   - "fork tests match the shop shell without the cookie banner bundle"
+  - "render the erasure result from the theme only (no request fields reach the view engine)"
+  - "drop the chat tool-call setting from the admin page and every language"
+  - "remove leftover progress-tracker hooks and strings"
+  - "stop starting the unused socket server"
+  - "widen the content lint (named models, gaps, 'directions', automated-system address) and run it over the served upstream text with a reviewed allow-list"
+  - "drop leftover blockchain and event assets"
+  - "drop empty spec blocks of removed features"
+  - "match content lint allow-list entries by whole file name"
