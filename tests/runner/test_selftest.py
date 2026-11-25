@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import dataclasses
 import hashlib
 import inspect
 import io
@@ -39,12 +40,13 @@ from control.core.models import (
     InvalidReason,
     RunManifest,
     RunStatus,
+    Surface,
 )
 from control.core.selftest_status import read_selftest_status
 from control.db import tables as t
 from control.db.engine import session_scope
 from control.runner import selftest
-from control.runner.cell_spec import CellError, CellSettings, ComposeProject
+from control.runner.cell_spec import CellError, CellSettings, ComposeProject, ResetSpec
 from control.runner.compose_backend import CellHandle, CollectReport, CommandResult, ContainerState
 from control.runner.experiment import parse_experiment, read_experiment
 from control.runner.runner import Runner
@@ -68,10 +70,13 @@ from tests.runner.test_runner import (
     FakeBackend,
     _file,
     _write_events,
+    done_v2,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SELFTEST_YAML = REPO_ROOT / "experiments" / "selftest.yaml"
+#: The self-test's targets, in the order experiments/selftest.yaml lists them.
+TARGETS = ("dvga", "juice-shop", "drupal-7600")
 LAN = "192.168.1.1"
 
 
@@ -282,22 +287,66 @@ def test_a_healthy_pair_passes(engine: Engine, collector: CollectorClient, tmp_p
     report = run_selftest(_deps(engine, collector, tmp_path, backend, probe_engine), quick=False)
     assert report.passed, _failed(report)
     assert not report.critical
-    assert len(report.runs) == 2 and {r["arm"] for r in report.runs} == {"injected", "control"}
+    assert len(report.runs) == 6
+    assert {(r["target"], r["arm"]) for r in report.runs} == {
+        (target, arm) for target in TARGETS for arm in ("injected", "control")
+    }
     names = {c.name for c in report.checks}
-    for arm in ("injected", "control"):
-        assert f"{arm}: valid" in names and f"{arm}: completed" in names
-        assert f"{arm}: contained" in names and f"{arm}: nothing left" in names
-    assert "injected: callbacks" in names and "control: no tags" in names
-    # full mode probes every cell, each before its agent starts
-    assert len(report.probes) == 2 and all(p.contained for p in report.probes)
-    for run_id in (r["run_id"] for r in report.runs):
-        mine = [c for c, arg in backend.calls if arg == run_id]
-        assert mine == ["prepare", "up", "health", "probe", "start_agent", "collect", "teardown"]
+    for target in TARGETS:
+        for arm in ("injected", "control"):
+            for what in ("valid", "completed", "contained", "nothing left", "oracle"):
+                assert f"{target} {arm}: {what}" in names
+            assert f"{target} {arm}: reset after success" in names
+        assert f"{target} injected: callbacks" in names and f"{target} control: no tags" in names
+    # full mode probes every cell, each before its agent starts; every cell is reset
+    # after its final poll, before anything is stopped
+    assert len(report.probes) == 6 and all(p.contained for p in report.probes)
+    assert len(report.resets) == 6 and all(r.ok for r in report.resets)
+    for run in report.runs:
+        mine = [c for c, arg in backend.calls if arg == run["run_id"]]
+        reset = "restart" if run["target"] == "juice-shop" else "reset"
+        assert mine == [
+            "prepare",
+            "up",
+            "health",
+            "probe",
+            "start_agent",
+            reset,
+            *(["health"] if reset == "restart" else []),
+            "collect",
+            "teardown",
+        ]
+        assert run["effect"] is True and run["mechanism"] is True
     # the summary is short and carries no tag or token
     assert report.summary.startswith("passed")
     data = report.to_json()
     assert data["passed"] is True and data["quick"] is False
+    assert len(data["resets"]) == 6
     json.dumps(data)
+    assert "juice-shop injected" in report.render_text()
+
+
+def test_selftest_covers_all_targets(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    """Full mode runs one matched pair per target of experiments/selftest.yaml, every
+    surface planted on each; quick mode keeps the first target's pair."""
+    ef = read_experiment(SELFTEST_YAML)
+    assert [t.name for t in ef.experiment.targets] == list(TARGETS)
+    backend = SelftestBackend()
+    report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=False)
+    assert report.passed, _failed(report)
+    by_target = {t: [r for r in report.runs if r["target"] == t] for t in TARGETS}
+    assert all(len(runs) == 2 for runs in by_target.values())
+    planted = {
+        _manifest(p).target: {pl.surface for pl in _manifest(p).placements}
+        for p in backend.projects
+        if _manifest(p).arm is Arm.INJECTED
+    }
+    assert planted == {t: set(Surface) for t in TARGETS}
+    quick = run_selftest(_deps(engine, collector, tmp_path / "q", SelftestBackend()), quick=True)
+    assert quick.passed, _failed(quick)
+    assert {r["target"] for r in quick.runs} == {"dvga"} and len(quick.runs) == 2
 
 
 def test_quick_runs_the_pair_and_probes_one_cell(
@@ -335,9 +384,9 @@ def test_a_tag_leaked_into_the_control_fails(
     )
     assert not report.passed
     failed = _failed(report)
-    assert "contaminated" in failed["control: valid"]
-    assert "control: no tags" in failed
-    assert "injected: valid" not in failed
+    assert "contaminated" in failed["dvga control: valid"]
+    assert "dvga control: no tags" in failed
+    assert "dvga injected: valid" not in failed
 
 
 def test_a_crashed_agent_fails_although_the_runs_are_valid(
@@ -347,9 +396,9 @@ def test_a_crashed_agent_fails_although_the_runs_are_valid(
     report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=False)
     assert not report.passed
     failed = _failed(report)
-    assert "injected: valid" not in failed and "control: valid" not in failed
-    assert "crashed" in failed["injected: completed"]
-    assert "crashed" in failed["control: completed"]
+    assert "dvga injected: valid" not in failed and "dvga control: valid" not in failed
+    assert "crashed" in failed["dvga injected: completed"]
+    assert "crashed" in failed["dvga control: completed"]
 
 
 def test_reachable_internet_is_a_critical_failure_and_the_agent_never_starts(
@@ -444,7 +493,7 @@ def test_missing_http_callback_fails(
 ) -> None:
     backend = SelftestBackend(http_callback=False)
     report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=True)
-    assert "http" in _failed(report)["injected: callbacks"]
+    assert "http" in _failed(report)["dvga injected: callbacks"]
     assert not report.critical
 
 
@@ -453,7 +502,7 @@ def test_a_callback_whose_token_is_not_the_runs_fails(
 ) -> None:
     backend = SelftestBackend(wrong_token=True)
     report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=True)
-    assert "http" in _failed(report)["injected: callbacks"]
+    assert "http" in _failed(report)["dvga injected: callbacks"]
 
 
 def test_leftovers_after_teardown_fail(
@@ -464,8 +513,8 @@ def test_leftovers_after_teardown_fail(
         quick=True,
     )
     failed = _failed(report)
-    assert "networks" in failed["injected: nothing left"]
-    assert "networks" in failed["control: nothing left"]
+    assert "networks" in failed["dvga injected: nothing left"]
+    assert "networks" in failed["dvga control: nothing left"]
 
 
 def test_another_runner_holding_the_host_lock_fails(
@@ -491,7 +540,7 @@ def test_a_missing_dns_callback_fails(
 ) -> None:
     backend = SelftestBackend(dns_callback=False)
     report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=True)
-    assert _failed(report)["injected: callbacks"] == "no verified callback on dns"
+    assert _failed(report)["dvga injected: callbacks"] == "no verified callback on dns"
 
 
 def test_a_host_gateway_that_is_not_this_hosts_fails_but_is_not_a_breach(
@@ -518,7 +567,7 @@ def test_a_cell_failing_before_its_agent_is_a_cell_failure_not_containment(
         )
         assert not report.passed and not report.critical
         failed = _failed(report)
-        assert "probe_failed" in failed["injected: valid"]
+        assert "probe_failed" in failed["dvga injected: valid"]
         assert all("not probed" in d for n, d in failed.items() if n.endswith("contained"))
         assert not report.probes
 
@@ -542,7 +591,7 @@ def test_a_work_directory_left_behind_fails(
     report = run_selftest(
         _deps(engine, collector, tmp_path, SelftestBackend(cell_dirs=True)), quick=True
     )
-    assert "work_dir" in _failed(report)["injected: nothing left"]
+    assert "work_dir" in _failed(report)["dvga injected: nothing left"]
 
 
 def test_a_failed_engine_listing_fails(
@@ -562,7 +611,7 @@ def test_a_failed_engine_listing_fails(
     deps.resources = leftovers
     report = run_selftest(deps, quick=True)
     failed = _failed(report)
-    assert "listing failed" in failed["injected: nothing left"]
+    assert "listing failed" in failed["dvga injected: nothing left"]
     assert "cannot list" in failed["earlier self-tests swept"]
 
 
@@ -601,7 +650,7 @@ def test_a_base64_tag_in_the_controls_catcher_evidence_fails(
     report = run_selftest(
         _deps(engine, collector, tmp_path, SelftestBackend(extra=extra)), quick=True
     )
-    assert "catcher/http/events.jsonl" in _failed(report)["control: no tags"]
+    assert "catcher/http/events.jsonl" in _failed(report)["dvga control: no tags"]
 
 
 def test_an_injected_token_in_the_control_fails(
@@ -621,7 +670,7 @@ def test_an_injected_token_in_the_control_fails(
     report = run_selftest(
         _deps(engine, collector, tmp_path, SelftestBackend(extra=extra)), quick=True
     )
-    assert "llm/late.req.json" in _failed(report)["control: no tags"]
+    assert "llm/late.req.json" in _failed(report)["dvga control: no tags"]
 
 
 def test_earlier_selftest_leftovers_are_swept_and_study_runs_never(
@@ -807,25 +856,29 @@ def test_derive_experiment_gives_a_fresh_definition_each_time(tmp_path: Path) ->
     assert a.experiment.experiment_id.startswith("exp_selftest_")
     assert a.definition_sha256 != original.definition_sha256
     assert a.definition_sha256 == hashlib.sha256(a.definition_yaml.encode()).hexdigest()
-    assert parse_experiment(a.definition_yaml, selftest=True) == a.experiment
     with pytest.raises(ValueError, match="reserved"):  # never as a study experiment
-        parse_experiment(a.definition_yaml)
-    assert original.definition_sha256 in a.definition_yaml  # provenance
+        parse_experiment(a.definition_yaml, root=REPO_ROOT)
+    # provenance: the source file's own sha256, and every placement map it read
+    assert hashlib.sha256(SELFTEST_YAML.read_bytes()).hexdigest() in a.definition_yaml
+    for target in TARGETS:
+        assert f"# frozen placement map targets/{target}/placements.yaml" in a.definition_yaml
+    assert parse_experiment(a.definition_yaml, selftest=True, root=REPO_ROOT) == a.experiment
     # everything but the id is the file's
     assert a.experiment.model_copy(update={"experiment_id": "x"}) == (
         original.experiment.model_copy(update={"experiment_id": "x"})
     )
 
 
-def test_quick_keeps_only_the_first_target(tmp_path: Path) -> None:
-    text = SELFTEST_YAML.read_text()
-    block = text.split("targets:\n", 1)[1].split("\nagents:", 1)[0]
-    two = text.replace(block, block + "\n" + block.replace("- name: dvga", "- name: other"))
-    path = tmp_path / "two.yaml"
-    path.write_text(two)
-    assert len(read_experiment(path).experiment.targets) == 2
-    assert [t.name for t in derive_experiment(path, quick=True).experiment.targets] == ["dvga"]
-    assert len(derive_experiment(path, quick=False).experiment.targets) == 2
+def test_quick_keeps_only_the_first_target() -> None:
+    full = derive_experiment(SELFTEST_YAML, quick=False)
+    quick = derive_experiment(SELFTEST_YAML, quick=True)
+    assert [t.name for t in full.experiment.targets] == list(TARGETS)
+    assert [t.name for t in quick.experiment.targets] == ["dvga"]
+    # quick mode re-dumps the YAML: the map reference survives, and only the first
+    # target's map is read and frozen
+    assert "targets/dvga/placements.yaml" in quick.definition_yaml
+    assert "# frozen placement map targets/juice-shop/" not in quick.definition_yaml
+    assert quick.experiment.targets[0] == full.experiment.targets[0]
 
 
 def test_the_gate_delegates_and_probes_before_the_agent() -> None:
@@ -858,11 +911,217 @@ def _dummy_project() -> ComposeProject:
     )
 
 
+# --------------------------------------------------------------------------- reset
+
+
+def test_selftest_reset_after_success_check_fails_when_effect_drops(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    """An oracle whose success an app reset undoes fails the check on every target,
+    while the runner's own verdict (taken before the reset) stays true."""
+    backend = SelftestBackend(after_reset=[(0, UNSUCCESSFUL)])
+    report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=False)
+    assert not report.passed and not report.critical
+    failed = _failed(report)
+    for target in TARGETS:
+        for arm in ("injected", "control"):
+            assert (
+                "undid the success: effect, mechanism"
+                in failed[f"{target} {arm}: reset after success"]
+            )
+            assert f"{target} {arm}: oracle" not in failed
+            assert f"{target} {arm}: valid" not in failed
+    assert all(r["outcome"] is True for r in report.runs)
+
+
+@pytest.mark.parametrize(
+    ("after", "lost"),
+    [
+        (done_v2(effect=True, mechanism=False, latch_events=2), "mechanism"),
+        (done_v2(effect=True, mechanism=None, latch_events=2), "mechanism"),
+        (done_v2(effect=True, mechanism=True, latch_events=1), "latch events"),
+        (done_v2(effect=True, mechanism=True, latch_events=0), "latch events"),
+        (done_v2(effect=False, mechanism=True, latch_events=2), "effect"),
+        (
+            done_v2(effect=True, mechanism=True, latch_events=2, objective="something_else"),
+            "objective",
+        ),
+    ],
+)
+def test_any_part_of_the_success_lost_in_the_reset_fails_it(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, after: str, lost: str
+) -> None:
+    backend = SelftestBackend(after_reset=[(0, after)])
+    report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=True)
+    detail = _failed(report)["dvga injected: reset after success"]
+    assert f"undid the success: {lost}" in detail or f", {lost}" in detail
+
+
+@pytest.mark.parametrize(
+    ("over", "detail"),
+    [
+        ({"reset_code": 7}, "reset exited 7: reset boom"),
+        ({"after_reset": [(1, "")]}, "after the reset:"),
+        ({"after_reset": [(0, "not json at all")]}, "after the reset:"),
+        ({"after_reset": [(0, '{"status": "success"}')]}, "after the reset:"),
+    ],
+)
+def test_a_reset_that_fails_or_silences_the_oracle_fails_the_check(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, over: dict[str, Any], detail: str
+) -> None:
+    backend = SelftestBackend(**over)
+    report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=True)
+    assert detail in _failed(report)["dvga injected: reset after success"]
+
+
+def test_a_run_with_no_success_has_nothing_to_reset_after(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    backend = SelftestBackend(done=[(0, UNSUCCESSFUL)])
+    report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=True)
+    failed = _failed(report)
+    assert (
+        failed["dvga injected: reset after success"] == "no success to reset after (effect false)"
+    )
+    assert "dvga injected: oracle" in failed
+
+
+def test_a_cell_failing_before_its_agent_is_never_reset(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    backend = SelftestBackend(healthy=False)
+    report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=True)
+    assert not report.resets
+    assert ("reset", report.runs[0]["run_id"]) not in backend.calls
+    failed = _failed(report)
+    assert failed["dvga injected: reset after success"] == "not checked: the agent never started"
+
+
+class _Oracle:
+    """A target for the reset gate alone: scripted done.sh answers, a reset, a restart."""
+
+    def __init__(
+        self,
+        answers: Sequence[tuple[int, str]],
+        *,
+        reset_code: int = 0,
+        healthy: bool = True,
+        restart_error: Exception | None = None,
+    ) -> None:
+        self.answers = list(answers)
+        self.reset_code = reset_code
+        self.healthy = healthy
+        self.restart_error = restart_error
+        self.calls: list[tuple[str, ...]] = []
+
+    def start_agent(self, cell: CellHandle) -> None:
+        self.calls.append(("start_agent",))
+
+    def stop(self, cell: CellHandle, services: Sequence[str], *, timeout_s: int) -> None:
+        self.calls.append(("stop", *services))
+
+    def exec(
+        self,
+        cell: CellHandle,
+        service: str,
+        argv: Sequence[str],
+        *,
+        timeout_s: float,
+        user: str | None = None,
+    ) -> CommandResult:
+        if tuple(argv) == ("/opt/support/done.sh",):
+            self.calls.append(("done",))
+            code, out = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+            return CommandResult(tuple(argv), code, out.encode())
+        self.calls.append(("exec", service, user or "-", *argv))
+        return CommandResult(tuple(argv), self.reset_code, b"", b"no such table")
+
+    def restart(self, cell: CellHandle, service: str, *, timeout_s: int) -> None:
+        self.calls.append(("restart", service))
+        if self.restart_error is not None:
+            raise self.restart_error
+
+    def health(self, cell: CellHandle, *, timeout_s: float) -> bool:
+        self.calls.append(("health",))
+        return self.healthy
+
+
+def _cell(reset: ResetSpec | None) -> CellHandle:
+    project = dataclasses.replace(_dummy_project(), reset=reset)
+    return CellHandle(project=project, compose_file=Path("/nonexistent"))
+
+
+CACHE_RESET = ResetSpec(("php", "-r", "truncate the caches"), user="www-data")
+
+
+def test_the_reset_gate_resets_once_after_the_final_word_and_then_stops() -> None:
+    inner = _Oracle([(0, SUCCESS)])
+    gate = selftest.ResetGate(inner)  # type: ignore[arg-type]
+    cell = _cell(CACHE_RESET)
+    gate.stop(cell, ["agent"], timeout_s=5)  # the agent never started: nothing checked
+    assert not gate.records and inner.calls == [("stop", "agent")]
+    inner.calls.clear()
+    gate.start_agent(cell)
+    gate.stop(cell, ["goat", "injector"], timeout_s=5)  # not the agent's stop
+    gate.stop(cell, ["agent"], timeout_s=5)
+    gate.stop(cell, ["agent"], timeout_s=5)  # a second stop: checked once only
+    assert inner.calls == [
+        ("start_agent",),
+        ("stop", "goat", "injector"),
+        ("done",),
+        ("exec", "goat", "www-data", "php", "-r", "truncate the caches"),
+        ("done",),
+        ("stop", "agent"),
+        ("stop", "agent"),
+    ]
+    assert gate.records == [
+        selftest.ResetRecord("run_x", True, "reset: 2 events latched, effect kept")
+    ]
+
+
+def test_the_reset_gate_restarts_and_waits_for_health() -> None:
+    inner = _Oracle([(0, SUCCESS)])
+    gate = selftest.ResetGate(inner, health_timeout_s=9)  # type: ignore[arg-type]
+    record = gate.check(_cell(ResetSpec(restart=True)))
+    assert record.ok, record
+    assert inner.calls == [("done",), ("restart", "goat"), ("health",), ("done",)]
+
+
+@pytest.mark.parametrize(
+    ("inner", "reset", "detail"),
+    [
+        (_Oracle([(0, SUCCESS)]), None, "the cell file declares no reset"),
+        (_Oracle([(0, SUCCESS)], healthy=False), ResetSpec(restart=True), "never became healthy"),
+        (
+            _Oracle([(0, SUCCESS)], restart_error=CellError("compose restart: exit 1")),
+            ResetSpec(restart=True),
+            "CellError: compose restart: exit 1",
+        ),
+        (_Oracle([(0, SUCCESS)], reset_code=1), CACHE_RESET, "reset exited 1: no such table"),
+        (_Oracle([(2, "")]), CACHE_RESET, "before the reset:"),
+        (_Oracle([(0, "{}")]), CACHE_RESET, "before the reset:"),
+        (_Oracle([(0, UNSUCCESSFUL)]), CACHE_RESET, "no success to reset after"),
+        (_Oracle([(0, SUCCESS), (0, UNSUCCESSFUL)]), CACHE_RESET, "undid the success: effect"),
+        (
+            _Oracle([(0, SUCCESS), (0, done_v2(effect=True, mechanism=True, latch_events=99))]),
+            CACHE_RESET,
+            "reset: 99 events latched, effect kept",
+        ),
+    ],
+)
+def test_the_reset_gate_judges_every_outcome_and_never_raises(
+    inner: _Oracle, reset: ResetSpec | None, detail: str
+) -> None:
+    record = selftest.ResetGate(inner, health_timeout_s=1).check(_cell(reset))  # type: ignore[arg-type]
+    assert detail in record.detail
+    assert record.ok is detail.endswith("effect kept")
+
+
 # --------------------------------------------------------------------------- labctl
 
 
 def _report(passed: bool, *, critical: bool = False) -> SelftestReport:
-    check = selftest.Check("injected: contained", passed, "" if passed else "breach", critical)
+    check = selftest.Check("dvga injected: contained", passed, "" if passed else "breach", critical)
     return SelftestReport(
         quick=True,
         experiment_id="exp_selftest_x",
@@ -901,7 +1160,7 @@ def test_labctl_selftest_exit_code_and_recorded_result(
 
     assert cli.main(["selftest", "--json"]) == code
     data = json.loads(capsys.readouterr().out)
-    assert data["passed"] is passed and data["checks"][0]["name"] == "injected: contained"
+    assert data["passed"] is passed and data["checks"][0]["name"] == "dvga injected: contained"
 
 
 def test_labctl_selftest_usage_error_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
@@ -1110,8 +1369,8 @@ def test_the_control_must_score_outcome_true(
     backend = SelftestBackend(done=[(0, UNSUCCESSFUL)])
     report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=True)
     failed = _failed(report)
-    assert "outcome False" in failed["control: oracle"]
-    assert "injected: oracle" in failed
+    assert "outcome False" in failed["dvga control: oracle"]
+    assert "dvga injected: oracle" in failed
 
 
 def test_an_oracle_reporting_success_before_the_agent_fails_the_self_test(
@@ -1120,8 +1379,8 @@ def test_an_oracle_reporting_success_before_the_agent_fails_the_self_test(
     backend = SelftestBackend(done=[(0, SUCCESS)])
     report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=True)
     failed = _failed(report)
-    assert "probe_failed" in failed["injected: valid"]
-    assert "success before the agent" in failed["control: valid"]
+    assert "probe_failed" in failed["dvga injected: valid"]
+    assert "success before the agent" in failed["dvga control: valid"]
     assert not any(c == "start_agent" for c, _ in backend.calls)
 
 

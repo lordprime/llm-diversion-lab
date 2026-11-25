@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from cell.injector.placement import BODY_SURFACES, SURFACE_LOCATORS
 from control.core.models import Surface
 from control.runner.experiment import (
     DEFAULT_OFFSET_FRACTION,
+    MAX_PLACEMENT_MAP_BYTES,
     SUPPORTED_SURFACES,
     Experiment,
+    PlacementMapFile,
     PlacementSpec,
+    TargetSpec,
+    parse_experiment,
+    read_experiment,
 )
 from control.runner.render import render_manifest
 from control.runner.schedule import build_schedule
@@ -203,3 +211,330 @@ def test_the_manifest_carries_the_registered_offset_for_in_page_surfaces() -> No
 def test_a_dumped_experiment_validates_again() -> None:
     exp = Experiment.model_validate(_full())
     assert Experiment.model_validate(exp.model_dump(mode="json")) == exp
+
+
+# --------------------------------------------------------------------------- unavailable
+
+
+def test_unavailable_surface_refused_with_reason() -> None:
+    doc = _with(["targets", 0, "placements", "P7"], {"unavailable": "spa catch-all returns 200"})
+    with pytest.raises(ValidationError) as caught:
+        Experiment.model_validate(doc)
+    message = str(caught.value)
+    assert "target dvga cannot carry surface P7" in message
+    assert "unavailable: spa catch-all returns 200" in message
+
+
+def test_an_unavailable_surface_not_planted_is_fine_and_kept_apart() -> None:
+    doc = _with(["targets", 0, "placements", "P7"], {"unavailable": "spa catch-all returns 200"})
+    doc["arms"]["injected"]["surfaces"] = ["P1", "P3"]
+    doc["arms"]["injected"]["payload"]["templates"] = {"P1": TEXTS[Surface.P1], "P3": "c $tag"}
+    target = Experiment.model_validate(doc).targets[0]
+    assert Surface.P7 not in target.placements
+    assert target.unavailable == {Surface.P7: "spa catch-all returns 200"}
+    # it validates again from its own dump
+    again = Experiment.model_validate(Experiment.model_validate(doc).model_dump(mode="json"))
+    assert again.targets[0].unavailable == target.unavailable
+
+
+@pytest.mark.parametrize(
+    ("entry", "error"),
+    [
+        ({"unavailable": "x", "url": "/.env"}, "takes only its reason"),
+        ({"unavailable": "x", "locator": "error:404"}, "takes only its reason"),
+        ({"unavailable": ""}, "at least 1 character"),
+        ({"unavailable": "x" * 201}, "at most 200 characters"),
+        ({"unavailable": None}, "valid string"),
+        ({"unavailable": ["a", "b"]}, "valid string"),
+        ({"unavailable": 404}, "valid string"),
+    ],
+)
+def test_a_bad_unavailable_entry_is_refused(entry: Any, error: str) -> None:
+    doc = _with(["targets", 0, "placements", "P7"], entry)
+    doc["arms"]["injected"]["surfaces"] = ["P1"]
+    doc["arms"]["injected"]["payload"]["templates"] = {"P1": TEXTS[Surface.P1]}
+    with pytest.raises(ValidationError, match=error):
+        Experiment.model_validate(doc)
+
+
+def test_a_surface_both_placed_and_unavailable_is_refused() -> None:
+    doc = _full()
+    doc["targets"][0]["unavailable"] = {"P7": "no 4xx path"}
+    with pytest.raises(ValidationError, match="P7 both placed and unavailable"):
+        Experiment.model_validate(doc)
+    doc = _full()
+    doc["targets"][0]["unavailable"] = {"P7": "no 4xx path"}
+    doc["targets"][0]["placements"]["P7"] = {"unavailable": "again"}
+    with pytest.raises(ValidationError, match="listed twice"):
+        Experiment.model_validate(doc)
+
+
+def test_an_unknown_surface_cannot_be_unavailable() -> None:
+    doc = _with(["targets", 0, "placements", "P9"], {"unavailable": "no such surface"})
+    with pytest.raises(ValidationError, match="P9"):
+        Experiment.model_validate(doc)
+
+
+# --------------------------------------------------------------------------- placement files
+
+MAP = "targets/dvga/placements.yaml"
+
+
+def _tree(tmp_path: Path, map_text: str | None = None, *, name: str = "dvga") -> Path:
+    """A tree with experiments/x.yaml reading targets/<name>/placements.yaml."""
+    doc = _full()
+    doc["targets"][0]["placements"] = {"from": f"targets/{name}/placements.yaml"}
+    (tmp_path / "experiments").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "experiments" / "x.yaml").write_text(yaml.safe_dump(doc, sort_keys=False))
+    if map_text is None:
+        map_text = yaml.safe_dump({"target": name, "placements": _placements()}, sort_keys=False)
+    (tmp_path / "targets" / name).mkdir(parents=True, exist_ok=True)
+    (tmp_path / "targets" / name / "placements.yaml").write_text(map_text)
+    return tmp_path / "experiments" / "x.yaml"
+
+
+def test_placements_load_from_the_targets_file(tmp_path: Path) -> None:
+    ef = read_experiment(_tree(tmp_path))
+    inline = Experiment.model_validate(_full())
+    assert ef.experiment.targets == inline.targets
+
+
+def test_placements_file_changes_experiment_hash(tmp_path: Path) -> None:
+    path = _tree(tmp_path)
+    first = read_experiment(path)
+    map_file = tmp_path / MAP
+    # same entries, one more comment: still a new definition
+    map_file.write_text(map_file.read_text() + "# probed again\n")
+    second = read_experiment(path)
+    assert second.experiment == first.experiment
+    assert second.definition_sha256 != first.definition_sha256
+    # a different offset: a different experiment too
+    placements = _placements()
+    placements["P3"]["offset_fraction"] = 0.25
+    map_file.write_text(yaml.safe_dump({"target": "dvga", "placements": placements}))
+    third = read_experiment(path)
+    assert third.definition_sha256 not in {first.definition_sha256, second.definition_sha256}
+    assert third.experiment.targets[0].placements[Surface.P3].offset_fraction == 0.25
+    # the experiment file itself is unchanged throughout
+    assert first.definition_yaml.startswith(path.read_text())
+
+
+def test_the_frozen_definition_carries_every_line_of_the_map(tmp_path: Path) -> None:
+    path = _tree(tmp_path)
+    ef = read_experiment(path)
+    data = (tmp_path / MAP).read_bytes()
+    assert ef.definition_sha256 == hashlib.sha256(ef.definition_yaml.encode()).hexdigest()
+    assert f"# frozen placement map {MAP} sha256 {hashlib.sha256(data).hexdigest()}" in (
+        ef.definition_yaml
+    )
+    for line in data.decode().splitlines():
+        assert f"#| {line}\n" in ef.definition_yaml
+    # the frozen definition is itself a valid experiment with the same content
+    assert parse_experiment(ef.definition_yaml, root=tmp_path) == ef.experiment
+
+
+def test_without_a_map_file_the_hash_is_the_files_own(tmp_path: Path) -> None:
+    path = tmp_path / "experiments" / "x.yaml"
+    path.parent.mkdir()
+    path.write_bytes(yaml.safe_dump(_full()).encode())
+    ef = read_experiment(path)
+    assert ef.definition_yaml == path.read_text()
+    assert ef.definition_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_an_experiment_file_without_a_final_newline_still_freezes_cleanly(tmp_path: Path) -> None:
+    path = _tree(tmp_path)
+    path.write_text(path.read_text().rstrip("\n"))
+    ef = read_experiment(path)
+    assert "\n# frozen placement map " in ef.definition_yaml
+
+
+def test_placements_from_a_file_need_a_root() -> None:
+    doc = _full()
+    doc["targets"][0]["placements"] = {"from": MAP}
+    with pytest.raises(ValueError, match="need the tree the experiment belongs to"):
+        parse_experiment(yaml.safe_dump(doc))
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "/etc/passwd",
+        "../targets/dvga/placements.yaml",
+        "targets/dvga/../dvga/placements.yaml",
+        "targets/../../x/placements.yaml",
+        "targets/dvga/placements.yml",
+        "targets/dvga/other.yaml",
+        "targets/DVGA/placements.yaml",
+        "experiments/selftest.yaml",
+        "targets//placements.yaml",
+        "targets/dvga/placements.yaml\n",
+        "",
+        42,
+        None,
+        ["targets/dvga/placements.yaml"],
+        {"path": "targets/dvga/placements.yaml"},
+    ],
+)
+def test_a_bad_map_reference_is_refused(tmp_path: Path, ref: Any) -> None:
+    path = _tree(tmp_path)
+    doc = yaml.safe_load(path.read_text())
+    doc["targets"][0]["placements"] = {"from": ref}
+    path.write_text(yaml.safe_dump(doc))
+    with pytest.raises(ValueError, match="must be a path matching"):
+        read_experiment(path)
+
+
+def test_from_takes_no_other_key(tmp_path: Path) -> None:
+    path = _tree(tmp_path)
+    doc = yaml.safe_load(path.read_text())
+    doc["targets"][0]["placements"] = {"from": MAP, "P1": _placements()["P1"]}
+    path.write_text(yaml.safe_dump(doc))
+    with pytest.raises(ValueError, match="takes no other key"):
+        read_experiment(path)
+
+
+def test_one_map_file_for_two_targets_is_refused(tmp_path: Path) -> None:
+    path = _tree(tmp_path)
+    doc = yaml.safe_load(path.read_text())
+    doc["targets"].append({"name": "juice-shop", "objective": "x", "placements": {"from": MAP}})
+    path.write_text(yaml.safe_dump(doc))
+    with pytest.raises(ValueError, match="used twice"):
+        read_experiment(path)
+
+
+def test_a_map_for_another_target_is_refused(tmp_path: Path) -> None:
+    text = yaml.safe_dump({"target": "juice-shop", "placements": _placements()})
+    with pytest.raises(ValueError, match="for target 'juice-shop', not 'dvga'"):
+        read_experiment(_tree(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    ("text", "error"),
+    [
+        ("", "exactly target and placements"),
+        ("- P1\n", "exactly target and placements"),
+        ("just text\n", "exactly target and placements"),
+        ("target: dvga\n", "exactly target and placements"),
+        ("target: dvga\nplacements: {}\nextra: 1\n", "exactly target and placements"),
+        ("target: dvga\nplacements: [P1]\n", "placements must be a mapping"),
+        ("target: dvga\nplacements: {P1: {url: /robots.txt}\n", "does not parse"),
+        ("target: dvga\ntarget: dvga\nplacements: {}\n", "duplicate key"),
+        ("target: dvga\nplacements: !!python/object:os.system {}\n", "does not parse"),
+    ],
+)
+def test_a_malformed_map_is_refused(tmp_path: Path, text: str, error: str) -> None:
+    with pytest.raises(ValueError, match=error):
+        read_experiment(_tree(tmp_path, text))
+
+
+def test_a_map_with_a_bad_entry_is_refused_like_an_inline_one(tmp_path: Path) -> None:
+    placements = _placements()
+    placements["P7"] = {"url": "/.env", "locator": "error:500"}
+    with pytest.raises(ValidationError, match="P7"):
+        read_experiment(
+            _tree(tmp_path, yaml.safe_dump({"target": "dvga", "placements": placements}))
+        )
+
+
+def test_a_map_that_is_not_utf8_is_refused(tmp_path: Path) -> None:
+    path = _tree(tmp_path)
+    (tmp_path / MAP).write_bytes(b"target: dvga\nplacements: {}\n# \xff\xfe\n")
+    with pytest.raises(ValueError, match="does not parse"):
+        read_experiment(path)
+
+
+def test_a_huge_map_is_refused(tmp_path: Path) -> None:
+    path = _tree(tmp_path)
+    (tmp_path / MAP).write_text("# x\n" * (MAX_PLACEMENT_MAP_BYTES // 4 + 1))
+    with pytest.raises(ValueError, match="larger than"):
+        read_experiment(path)
+
+
+def test_a_missing_map_is_refused(tmp_path: Path) -> None:
+    path = _tree(tmp_path)
+    (tmp_path / MAP).unlink()
+    with pytest.raises(ValueError, match="not a regular file"):
+        read_experiment(path)
+
+
+def test_a_directory_named_like_a_map_is_refused(tmp_path: Path) -> None:
+    path = _tree(tmp_path)
+    (tmp_path / MAP).unlink()
+    (tmp_path / MAP).mkdir()
+    with pytest.raises(ValueError, match="not a regular file"):
+        read_experiment(path)
+
+
+def test_a_symlinked_map_is_refused(tmp_path: Path) -> None:
+    path = _tree(tmp_path)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.yaml"
+    outside.write_text((tmp_path / MAP).read_text())
+    (tmp_path / MAP).unlink()
+    (tmp_path / MAP).symlink_to(outside)
+    with pytest.raises(ValueError, match="not a regular file"):
+        read_experiment(path)
+
+
+def test_a_map_under_a_symlinked_directory_outside_the_tree_is_refused(tmp_path: Path) -> None:
+    path = _tree(tmp_path)
+    elsewhere = tmp_path.parent / f"{tmp_path.name}-elsewhere"
+    (elsewhere / "dvga").mkdir(parents=True)
+    (elsewhere / "dvga" / "placements.yaml").write_text((tmp_path / MAP).read_text())
+    (tmp_path / "targets" / "dvga" / "placements.yaml").unlink()
+    (tmp_path / "targets" / "dvga").rmdir()
+    (tmp_path / "targets" / "dvga").symlink_to(elsewhere / "dvga")
+    with pytest.raises(ValueError, match="lies outside"):
+        read_experiment(path)
+
+
+def test_an_explicit_root_is_where_maps_are_read(tmp_path: Path) -> None:
+    path = _tree(tmp_path / "a")
+    other = tmp_path / "b"
+    _tree(other)
+    placements = _placements()
+    placements["P3"]["offset_fraction"] = 1
+    (other / MAP).write_text(yaml.safe_dump({"target": "dvga", "placements": placements}))
+    assert read_experiment(path).experiment.targets[0].placements[Surface.P3].offset_fraction == 0.5
+    moved = read_experiment(path, root=other).experiment.targets[0]
+    assert moved.placements[Surface.P3].offset_fraction == 1.0
+
+
+# --------------------------------------------------------------------------- the real maps
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize("target", ["dvga", "juice-shop", "drupal-7600"])
+def test_each_targets_frozen_map_covers_every_surface(target: str) -> None:
+    found = PlacementMapFile.read(REPO_ROOT, f"targets/{target}/placements.yaml")
+    spec = TargetSpec.model_validate(
+        {"name": target, "objective": "x", "placements": found.placements(target)}
+    )
+    assert set(spec.placements) | set(spec.unavailable) == set(Surface)
+    for surface, placement in spec.placements.items():
+        if surface in BODY_SURFACES:
+            assert placement.offset_fraction == DEFAULT_OFFSET_FRACTION
+    # P2's page is not robots.txt and not the P7 error path
+    assert spec.placements[Surface.P2].url not in {"/robots.txt", spec.placements[Surface.P7].url}
+    # every entry has a probe note right above it (command and status)
+    text = found.data.decode()
+    assert text.count(" -> ") >= 4
+
+
+def test_selftest_covers_every_target_and_surface_with_its_objective() -> None:
+    ef = read_experiment(REPO_ROOT / "experiments" / "selftest.yaml")
+    exp = ef.experiment
+    assert exp.oracle_primary.value == "effect"
+    assert {t.name: t.objective for t in exp.targets} == {
+        "dvga": "outbound_service",
+        "juice-shop": "admin_login",
+        "drupal-7600": "code_execution",
+    }
+    assert set(exp.arms.injected.surfaces) == set(Surface)
+    for target in exp.targets:
+        assert not target.unavailable  # every surface is available on every target today
+    for target in ("dvga", "juice-shop", "drupal-7600"):
+        assert f"# frozen placement map targets/{target}/placements.yaml sha256 " in (
+            ef.definition_yaml
+        )

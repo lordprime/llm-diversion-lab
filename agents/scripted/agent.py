@@ -14,8 +14,12 @@ funnel stage end to end without spending tokens:
 * ``callback_dns``: resolve that host once more (a DNS-only callback). Lookups use the
   container's resolver, or the script's ``dns_server`` asked directly where the
   engine's embedded resolver cannot reach the cell's catcher (local Podman);
-* ``graphql``: ``POST`` a GraphQL query (the self-test's objective: DVGA's importPaste
-  fetching the target's own ``http://localhost:8000/``).
+* ``post``: ``POST`` a JSON ``body`` or an HTML-form ``form`` to a target path: the
+  self-test's objective, one per target (``x-lab.objective`` in
+  ``deploy/compose/cell.<target>.yml``): DVGA's importPaste fetching the target's own
+  ``http://localhost:8000/``, Juice Shop's login with an injected email, Drupal's
+  registration form running ``/tmp/pwn`` (CVE-2018-7600). Each is sent only to the
+  run's own target container.
 
 The script never contains the tag or a token: the agent finds them only in what the
 target serves, so a control run (nothing planted) finds nothing and only reaches the
@@ -41,6 +45,7 @@ import re
 import socket
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -53,6 +58,7 @@ from dnslib import QTYPE, DNSError, DNSRecord  # type: ignore[import-untyped]
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Field,
     IPvAnyAddress,
     JsonValue,
     StringConstraints,
@@ -105,29 +111,46 @@ class StepAction(StrEnum):
     FOLLOW_DECOY = "follow_decoy"
     CALLBACK_HTTP = "callback_http"
     CALLBACK_DNS = "callback_dns"
-    GRAPHQL = "graphql"
+    POST = "post"
 
 
 class _Frozen(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+FormField = tuple[
+    Annotated[str, StringConstraints(min_length=1, max_length=256)],
+    Annotated[str, StringConstraints(max_length=8192)],
+]
+
+
 class Step(_Frozen):
-    """One scripted step; ``path`` for ``fetch``/``graphql``, ``query`` for ``graphql``."""
+    """One scripted step.
+
+    ``path`` for ``fetch`` and ``post``; a ``post`` also takes exactly one of ``body``
+    (sent as JSON) or ``form`` (name and value pairs, sent URL-encoded in order, so a
+    name may repeat).
+    """
 
     action: StepAction
     path: Annotated[str, StringConstraints(pattern=_PATH, max_length=2048)] | None = None
-    query: Annotated[str, StringConstraints(min_length=1, max_length=8192)] | None = None
+    body: JsonValue = None
+    form: Annotated[tuple[FormField, ...], Field(min_length=1, max_length=64)] | None = None
 
     @model_validator(mode="after")
     def _fields(self) -> Self:
-        needs_path = self.action in (StepAction.FETCH, StepAction.GRAPHQL)
+        needs_path = self.action in (StepAction.FETCH, StepAction.POST)
         if needs_path != (self.path is not None):
             raise ValueError(
                 f"{self.action.value}: path is {'required' if needs_path else 'unused'}"
             )
-        if (self.action is StepAction.GRAPHQL) != (self.query is not None):
-            raise ValueError(f"{self.action.value}: query is only for graphql (and required)")
+        given = (self.body is not None) + (self.form is not None)
+        if self.action is StepAction.POST and given != 1:
+            raise ValueError("post: exactly one of body or form")
+        if self.action is not StepAction.POST and given:
+            raise ValueError(f"{self.action.value}: body and form are only for post")
+        if len(json.dumps(self.body)) > 8192:
+            raise ValueError("post: body larger than 8192 bytes as JSON")
         return self
 
 
@@ -293,10 +316,10 @@ class _Agent:
         url: str,
         *,
         body: bytes | None = None,
-        json_body: bool = False,
+        content_type: str | None = None,
         host: str | None = None,
     ) -> HttpResult | None:
-        headers = {"content-type": "application/json"} if json_body else {}
+        headers = {"content-type": content_type} if content_type else {}
         args: dict[str, JsonValue] = {"method": method, "url": url}
         if host is not None:
             headers["host"] = args["host"] = host
@@ -403,10 +426,16 @@ class _Agent:
         if found is not None:
             self._lookup(found[0])
 
-    def graphql(self, step: Step) -> None:
-        body = json.dumps({"query": step.query}).encode()
+    def post(self, step: Step) -> None:
+        """Send the step's JSON body or form, as the target's own client would."""
+        if step.form is not None:
+            body = urllib.parse.urlencode(step.form).encode()
+            content_type = "application/x-www-form-urlencoded"
+        else:
+            body = json.dumps(step.body).encode()
+            content_type = "application/json"
         result = self._send(
-            "POST", f"{self.script.target_url}{step.path}", body=body, json_body=True
+            "POST", f"{self.script.target_url}{step.path}", body=body, content_type=content_type
         )
         if result is not None:
             self.log.record(AgentEventType.MESSAGE, text=_text(result.body)[:4096])
@@ -418,7 +447,7 @@ class _Agent:
             StepAction.FOLLOW_DECOY: self.follow_decoy,
             StepAction.CALLBACK_HTTP: self.callback_http,
             StepAction.CALLBACK_DNS: self.callback_dns,
-            StepAction.GRAPHQL: self.graphql,
+            StepAction.POST: self.post,
         }
         for step in self.script.steps:
             handlers[step.action](step)

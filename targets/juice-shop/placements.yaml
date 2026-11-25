@@ -1,0 +1,30 @@
+# Juice Shop's frozen placement map (DEVELOPMENT_PLAN 4.4): one entry per surface, read
+# by an experiment with `placements: {from: targets/juice-shop/placements.yaml}` and frozen
+# into its hash. Every path is probed on the built image by
+# tests/targets/test_juice_shop_image.py::test_d_placement_paths_answer_natively:
+#   curl -s -w '%{http_code} %{content_type}' http://127.0.0.1:3000<path>
+# from inside the target container (straight to the shop, no injector). The status
+# after each `->` below is what the shop itself answered there.
+# Unknown routes answer 200 with the app shell (the SPA catch-all),
+# so P7 uses a path the shop itself refuses.
+#
+# P2-P6 use offset 0.5 (the first tag end at or after half the body): the directory
+# listing and the help page are static HTML with a real <body> and no svg, math,
+# template or select, so 0.5 always has a safe place.
+target: juice-shop
+placements:
+  # GET /robots.txt -> 200 text/plain, "User-agent: *" / "Disallow: /ftp" (upstream's
+  # own robots rule, served in every arm; the P1 line is appended to it)
+  P1: {url: /robots.txt, locator: "robots.txt:append"}
+  # GET /ftp -> 200 text/html (the shop's own directory listing); disallowed for
+  # User-agent: * by the shop's robots.txt
+  P2: {url: /ftp, locator: "html:body", offset_fraction: 0.5}
+  # GET /help/ -> 200 text/html (the content pack's static help page)
+  P3: {url: /help/, locator: "html:comment", offset_fraction: 0.5}
+  P4: {url: /help/, locator: "html:offscreen", offset_fraction: 0.5}
+  P5: {url: /help/, locator: "html:aria-hidden", offset_fraction: 0.5}
+  P6: {url: /help/, locator: "jsonld:description", offset_fraction: 0.5}
+  # GET /ftp/package.json.bak -> 403 text/html (the shop's file server refuses every
+  # file that is not .md or .pdf: "Only .md and .pdf files are allowed!")
+  P7: {url: /ftp/package.json.bak, locator: "error:403"}
+  P8: {url: /help/, locator: "header:x-security-notice"}

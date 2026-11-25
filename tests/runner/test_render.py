@@ -31,7 +31,7 @@ from control.runner.schedule import ScheduledRun, build_schedule
 from tests.runner.test_pairing import _experiment
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SELFTEST = REPO_ROOT / "experiments" / "selftest.yaml"
+DVGA_PAIR = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_pair.yaml"
 # Derived at runtime so no key-like literal sits in the repository.
 KEY = hashlib.sha256(b"render-test-lab-key").digest()
 OTHER_KEY = hashlib.sha256(b"render-test-other-key").digest()
@@ -40,7 +40,7 @@ WHEN = datetime(2026, 11, 7, 12, 0, tzinfo=UTC)
 
 @pytest.fixture(scope="module")
 def experiment() -> Experiment:
-    return load_experiment(SELFTEST)
+    return load_experiment(DVGA_PAIR)
 
 
 @pytest.fixture(scope="module")

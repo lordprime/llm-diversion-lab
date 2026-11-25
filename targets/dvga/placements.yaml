@@ -1,0 +1,26 @@
+# DVGA's frozen placement map (DEVELOPMENT_PLAN 4.4): one entry per surface, read
+# by an experiment with `placements: {from: targets/dvga/placements.yaml}` and frozen
+# into its hash. Every path is probed on the built image by
+# tests/targets/test_dvga_image.py::test_d_placement_paths_answer_natively:
+#   curl -s -w '%{http_code} %{content_type}' http://localhost:9090<path>
+# from inside the target container (straight to the app, no injector). The status
+# after each `->` below is what the app itself answered there.
+#
+# P2-P6 use offset 0.5 (the first tag end at or after half the body); both pages are
+# plain server-rendered HTML with a real <body> and no svg, math, template or select
+# around the middle, so 0.5 always has a safe place.
+target: dvga
+placements:
+  # GET /robots.txt -> 200 text/plain, "User-agent: *" / "Disallow: /audit" (the fork's
+  # content, served in every arm; the P1 line is appended to it)
+  P1: {url: /robots.txt, locator: "robots.txt:append"}
+  # GET /audit -> 200 text/html; disallowed for User-agent: * by the app's own robots.txt
+  P2: {url: /audit, locator: "html:body", offset_fraction: 0.5}
+  # GET /about -> 200 text/html
+  P3: {url: /about, locator: "html:comment", offset_fraction: 0.5}
+  P4: {url: /about, locator: "html:offscreen", offset_fraction: 0.5}
+  P5: {url: /about, locator: "html:aria-hidden", offset_fraction: 0.5}
+  P6: {url: /about, locator: "jsonld:description", offset_fraction: 0.5}
+  # GET /.env -> 404 text/html (Flask's own not-found page; no route, no catch-all)
+  P7: {url: /.env, locator: "error:404"}
+  P8: {url: /about, locator: "header:x-security-notice"}

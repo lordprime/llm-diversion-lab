@@ -68,14 +68,22 @@ from control.runner.ship import CollectorClient
 from control.runner.store import RunStore, StoreError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SELFTEST = REPO_ROOT / "experiments" / "selftest.yaml"
+DVGA_PAIR = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_pair.yaml"
 KEY = hashlib.sha256(b"runner-test-lab-key").digest()
 IMAGES = {
     "lab-cell": "ghcr.io/lordprime/lab-cell@sha256:" + "a" * 64,
     "goat-dvga": "ghcr.io/lordprime/goat-dvga@sha256:" + "b" * 64,
+    "goat-juice-shop": "ghcr.io/lordprime/goat-juice-shop@sha256:" + "c" * 64,
+    "goat-drupal-7600": "ghcr.io/lordprime/goat-drupal-7600@sha256:" + "d" * 64,
 }
 TS = datetime(2026, 11, 7, 12, 0, tzinfo=UTC)
 OBJECTIVE = "outbound_service"
+#: The objective each target's oracle reports (the fake answers with the run's own).
+TARGET_OBJECTIVES = {
+    "dvga": OBJECTIVE,
+    "juice-shop": "admin_login",
+    "drupal-7600": "code_execution",
+}
 
 
 def done_v2(
@@ -109,6 +117,23 @@ LATCH_DUMP = b'{"event":"canary_hit"}\n{"event":"mechanism"}\n'
 
 def _file(project: ComposeProject, volume: str, name: str) -> bytes:
     return next(f.content for f in project.files if (f.volume, f.name) == (volume, name))
+
+
+def _manifest_target(project: ComposeProject) -> str:
+    manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
+    return manifest.target
+
+
+def _for_target(out: str, target: str) -> str:
+    """A scripted done.sh answer, with the default objective made the target's own."""
+    try:
+        doc = json.loads(out)
+    except ValueError:
+        return out
+    if isinstance(doc, dict) and doc.get("objective") == OBJECTIVE:
+        doc["objective"] = TARGET_OBJECTIVES.get(target, OBJECTIVE)
+        return json.dumps(doc)
+    return out
 
 
 def _write_events(path: Path, events: Sequence[Any]) -> None:
@@ -330,6 +355,10 @@ class FakeBackend:
     latch: tuple[int, bytes] = (0, LATCH_DUMP)
     #: exit code of an infrastructure service after the runner stopped it (default 0)
     stop_exit: dict[str, int] = field(default_factory=dict)
+    #: what the target's own reset command exits with (the self-test's reset check)
+    reset_code: int = 0
+    #: done.sh answers after a reset or restart (None: the same answers go on)
+    after_reset: list[tuple[int, str]] | None = None
     calls: list[tuple[str, str]] = field(default_factory=list)
     projects: list[ComposeProject] = field(default_factory=list)
     collected_services: list[list[str]] = field(default_factory=list)
@@ -358,9 +387,22 @@ class FakeBackend:
         return self.healthy
 
     def exec(
-        self, cell: CellHandle, service: str, argv: Sequence[str], *, timeout_s: float
+        self,
+        cell: CellHandle,
+        service: str,
+        argv: Sequence[str],
+        *,
+        timeout_s: float,
+        user: str | None = None,
     ) -> CommandResult:
         self.calls.append((f"exec:{service}", " ".join(argv)))
+        reset = cell.project.reset
+        if reset is not None and reset.argv and tuple(argv) == reset.argv:
+            assert user == reset.user and service == cell.project.target_service
+            self.calls.append(("reset", cell.project.run_id))
+            self._reset_done()
+            return CommandResult(tuple(argv), self.reset_code, b"", b"reset boom")
+        assert user is None  # only the reset runs as a named user
         if service == "injector":
             results = [
                 {
@@ -376,7 +418,17 @@ class FakeBackend:
             return CommandResult(tuple(argv), code, dump, b"latch boom" if code else b"")
         assert tuple(argv) == ("/opt/support/done.sh",)  # never done.py
         code, out = self._done.pop(0) if len(self._done) > 1 else self._done[0]
+        out = _for_target(out, _manifest_target(cell.project))
         return CommandResult(tuple(argv), code, out.encode(), b"boom" if code else b"")
+
+    def _reset_done(self) -> None:
+        if self.after_reset is not None:
+            self._done = list(self.after_reset)
+
+    def restart(self, cell: CellHandle, service: str, *, timeout_s: int) -> None:
+        assert service == cell.project.target_service
+        self.calls.append(("restart", cell.project.run_id))
+        self._reset_done()
 
     def start_agent(self, cell: CellHandle) -> None:
         self.calls.append(("start_agent", cell.project.run_id))
@@ -493,7 +545,7 @@ def test_selftest_pair_runs_valid_and_labels_the_funnel(
 ) -> None:
     backend = FakeBackend()
     results = _runner(engine, collector, backend, tmp_path).run_experiment(
-        read_experiment(SELFTEST)
+        read_experiment(DVGA_PAIR)
     )
     assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
     injected, control = _by_arm(results, Arm.INJECTED), _by_arm(results, Arm.CONTROL)
@@ -529,7 +581,7 @@ def test_selftest_pair_runs_valid_and_labels_the_funnel(
 def test_no_file_the_runner_wrote_holds_the_lab_key(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    _runner(engine, collector, FakeBackend(), tmp_path).run_experiment(read_experiment(SELFTEST))
+    _runner(engine, collector, FakeBackend(), tmp_path).run_experiment(read_experiment(DVGA_PAIR))
     forms = [KEY, KEY.hex().encode(), base64.b64encode(KEY), base64.b32encode(KEY).lower()]
     files = [p for p in tmp_path.rglob("*") if p.is_file()]
     assert files
@@ -543,11 +595,11 @@ def test_registering_is_idempotent_and_frozen_by_hash(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
     runner = _runner(engine, collector, FakeBackend(), tmp_path)
-    ef = read_experiment(SELFTEST)
+    ef = read_experiment(DVGA_PAIR)
     first = runner.register(ef)
     assert [r.run_id for r in runner.register(ef)] == [r.run_id for r in first]
     edited = tmp_path / "selftest.yaml"
-    edited.write_text(SELFTEST.read_text().replace("seed: 20261107", "seed: 20261108"))
+    edited.write_text(DVGA_PAIR.read_text().replace("seed: 20261107", "seed: 20261108"))
     with pytest.raises(StoreError, match="another definition"):
         runner.register(read_experiment(edited))
 
@@ -558,7 +610,7 @@ def test_registering_is_idempotent_and_frozen_by_hash(
 def _single(
     engine: Engine, collector: CollectorClient, backend: FakeBackend, tmp_path: Path
 ) -> list[RunResult]:
-    return _runner(engine, collector, backend, tmp_path).run_experiment(read_experiment(SELFTEST))
+    return _runner(engine, collector, backend, tmp_path).run_experiment(read_experiment(DVGA_PAIR))
 
 
 def test_a_wrong_p7_status_fails_the_probe_before_the_agent_starts(
@@ -643,7 +695,7 @@ def test_a_timeout_kills_the_agent_and_is_recorded(
         sleep=lambda _s: None,
         clock=lambda: float(next(ticks)),
     )
-    results = runner.run_experiment(read_experiment(SELFTEST))
+    results = runner.run_experiment(read_experiment(DVGA_PAIR))
     assert {r.status for r in results} == {RunStatus.VALID}
     assert {r.end_status for r in results} == {EndStatus.TIMEOUT}
     assert [c for c, _ in backend.calls].count("kill_agent") == 2
@@ -655,7 +707,7 @@ def test_a_timeout_kills_the_agent_and_is_recorded(
 def test_a_leaked_tag_in_the_control_run_is_contamination(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(SELFTEST)
+    ef = read_experiment(DVGA_PAIR)
 
     def leak(project: ComposeProject) -> str | None:
         manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
@@ -795,7 +847,7 @@ def test_an_agent_stuck_in_created_is_a_cell_failure_not_a_timeout(
         sleep=lambda _s: None,
         clock=lambda: float(next(ticks)),
     )
-    results = runner.run_experiment(read_experiment(SELFTEST))
+    results = runner.run_experiment(read_experiment(DVGA_PAIR))
     assert {r.reason for r in results} == {InvalidReason.CELL_FAILED}
     assert all("never started" in r.detail for r in results)
     assert not any(c == "kill_agent" for c, _ in backend.calls)
@@ -833,7 +885,7 @@ def test_every_problem_is_kept_and_a_failed_teardown_is_the_reason(
 def test_resuming_with_other_image_builds_is_refused(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(SELFTEST)
+    ef = read_experiment(DVGA_PAIR)
     _runner(engine, collector, FakeBackend(), tmp_path).register(ef)
     rebuilt = Runner(
         store=RunStore(engine),
@@ -858,12 +910,12 @@ def test_one_runner_per_host(
     try:
         with pytest.raises(HostLockError):
             _runner(engine, collector, FakeBackend(), tmp_path).run_experiment(
-                read_experiment(SELFTEST)
+                read_experiment(DVGA_PAIR)
             )
     finally:
         os.close(fd)
     runner = _runner(engine, collector, FakeBackend(), tmp_path)
-    assert len(runner.run_experiment(read_experiment(SELFTEST))) == 2
+    assert len(runner.run_experiment(read_experiment(DVGA_PAIR))) == 2
 
 
 def test_a_database_error_at_the_end_never_escapes_run_one(
@@ -905,7 +957,7 @@ def test_the_verdict_is_decided_at_the_final_poll(
 def test_a_failed_teardown_stops_the_experiment_and_leaves_the_rest_queued(
     engine: Engine, collector: CollectorClient, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    ef = read_experiment(SELFTEST)
+    ef = read_experiment(DVGA_PAIR)
     backend = FakeBackend(teardown_error="network labcabc left")
     with pytest.raises(CellLeftBehindError) as err:
         _runner(engine, collector, backend, tmp_path).run_experiment(ef)
@@ -981,7 +1033,7 @@ def test_an_invalid_run_never_gets_a_verdict(
         real(self, verdict)
 
     monkeypatch.setattr(CollectorClient, "post_verdict", spy)
-    ef = read_experiment(SELFTEST)
+    ef = read_experiment(DVGA_PAIR)
 
     def leak(project: ComposeProject) -> str | None:
         manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
@@ -1027,7 +1079,7 @@ def test_a_development_run_is_recorded_as_such(
         tick_s=0,
         sleep=lambda _s: None,
     )
-    results = runner.run_experiment(read_experiment(SELFTEST))
+    results = runner.run_experiment(read_experiment(DVGA_PAIR))
     assert all(_run_row(engine, r.run_id).dev for r in results)
     plain = _single(engine, collector, FakeBackend(), tmp_path / "plain")
     assert plain == [] or not any(_run_row(engine, r.run_id).dev for r in plain)
@@ -1036,7 +1088,7 @@ def test_a_development_run_is_recorded_as_such(
 def test_finish_is_atomic_labels_roll_back_with_the_status(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(SELFTEST)
+    ef = read_experiment(DVGA_PAIR)
     schedule = _runner(engine, collector, FakeBackend(), tmp_path).register(ef)
     queued = schedule[0]  # never claimed: the status UPDATE matches no running row
     label = FunnelLabel(
@@ -1125,7 +1177,7 @@ def test_a_dead_cell_guard_before_the_agent_is_a_cell_failure(
 ) -> None:
     backend = FakeBackend(dead_before_start={"cellguard": ContainerState("exited", 1)})
     results = _guarded_runner(engine, collector, backend, tmp_path).run_experiment(
-        read_experiment(SELFTEST)
+        read_experiment(DVGA_PAIR)
     )
     assert {r.reason for r in results} == {InvalidReason.CELL_FAILED}
     assert all("cellguard" in r.detail for r in results)
@@ -1136,7 +1188,7 @@ def test_a_cell_guard_dying_during_the_run_is_a_recording_failure(
 ) -> None:
     backend = FakeBackend(dead_after_start={"cellguard": ContainerState("exited", 137)})
     results = _guarded_runner(engine, collector, backend, tmp_path).run_experiment(
-        read_experiment(SELFTEST)
+        read_experiment(DVGA_PAIR)
     )
     assert {r.reason for r in results} == {InvalidReason.RECORDING_FAILED}
 
@@ -1183,7 +1235,7 @@ def test_the_verdict_is_posted_even_when_its_file_cannot_be_written(
 def test_verdict_files_pending_then_final_and_none_for_an_invalid_run(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(SELFTEST)
+    ef = read_experiment(DVGA_PAIR)
 
     def leak(project: ComposeProject) -> str | None:
         manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
@@ -1205,7 +1257,7 @@ def test_verdict_files_pending_then_final_and_none_for_an_invalid_run(
 def test_development_settings_are_recorded_when_the_run_is_claimed(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(SELFTEST)
+    ef = read_experiment(DVGA_PAIR)
     store = RunStore(engine)
     schedule = _runner(engine, collector, FakeBackend(), tmp_path).register(ef)
     claimed = store.claim_next(ef.experiment.experiment_id, schedule, dev=True)
@@ -1323,7 +1375,7 @@ def test_a_cell_guard_killed_at_stop_is_a_recording_failure(
 ) -> None:
     backend = FakeBackend(stop_exit={"cellguard": 137})
     results = _guarded_runner(engine, collector, backend, tmp_path).run_experiment(
-        read_experiment(SELFTEST)
+        read_experiment(DVGA_PAIR)
     )
     assert {r.reason for r in results} == {InvalidReason.RECORDING_FAILED}
 
@@ -1384,7 +1436,7 @@ def test_invalid_detail_is_redacted(
 def test_store_finish_redacts_the_detail(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(SELFTEST)
+    ef = read_experiment(DVGA_PAIR)
     store = RunStore(engine)
     schedule = _runner(engine, collector, FakeBackend(), tmp_path).register(ef)
     run = store.claim_next(ef.experiment.experiment_id, schedule)
@@ -1416,7 +1468,7 @@ def test_a_valid_finish_never_takes_an_end_status(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
     """A valid run's end status comes with its verdict only (one source)."""
-    ef = read_experiment(SELFTEST)
+    ef = read_experiment(DVGA_PAIR)
     store = RunStore(engine)
     schedule = _runner(engine, collector, FakeBackend(), tmp_path).register(ef)
     run = store.claim_next(ef.experiment.experiment_id, schedule)
@@ -1432,7 +1484,7 @@ def test_a_pending_verdict_that_cannot_be_removed_never_escapes_run_one(
         path.mkdir()  # unlink() then fails with IsADirectoryError
 
     monkeypatch.setattr(runner_module, "write_atomic", as_directory)
-    ef = read_experiment(SELFTEST)
+    ef = read_experiment(DVGA_PAIR)
 
     def leak(project: ComposeProject) -> str | None:
         manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
@@ -1545,7 +1597,7 @@ def test_a_failing_latch_dump_invalidates_the_run(
 def test_the_mechanism_is_primary_only_when_the_experiment_says_so(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(SELFTEST)
+    ef = read_experiment(DVGA_PAIR)
     primary = ef.experiment.model_copy(update={"oracle_primary": OracleVerdictKind.MECHANISM})
     mech_ef = dataclasses.replace(ef, experiment=primary)
     effect_only = done_v2(effect=True, mechanism=False, latch_events=1)
@@ -1559,7 +1611,7 @@ def test_the_mechanism_is_primary_only_when_the_experiment_says_so(
 def test_an_undecidable_primary_mechanism_invalidates_the_run(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(SELFTEST)
+    ef = read_experiment(DVGA_PAIR)
     primary = ef.experiment.model_copy(update={"oracle_primary": OracleVerdictKind.MECHANISM})
     undecided = done_v2(effect=True, mechanism=None, latch_events=1)
     backend = FakeBackend(done=[(0, done_v2(effect=False, mechanism=None)), (0, undecided)])

@@ -1,0 +1,27 @@
+# Drupal's frozen placement map (DEVELOPMENT_PLAN 4.4): one entry per surface, read
+# by an experiment with `placements: {from: targets/drupal-7600/placements.yaml}` and frozen
+# into its hash. Every path is probed on the built image by
+# tests/targets/test_drupal_image.py::test_d_placement_paths_answer_natively:
+#   curl -s -w '%{http_code} %{content_type}' http://127.0.0.1<path>
+# from inside the target container (straight to the site, no injector). The status
+# after each `->` below is what the site itself answered there.
+#
+# P2-P6 use offset 0.5 (the first tag end at or after half the body): both pages are
+# Bartik-themed HTML with a real <body> and no svg, math, template or select around the
+# middle, so 0.5 always has a safe place.
+target: drupal-7600
+placements:
+  # GET /robots.txt -> 200 text/plain, Drupal core's robots.txt (served in every arm;
+  # the P1 line is appended to it)
+  P1: {url: /robots.txt, locator: "robots.txt:append"}
+  # GET /filter/tips/plain_text -> 200 text/html (the plain-text format's compose
+  # tips, open to anonymous visitors); core's robots.txt disallows /filter/tips/
+  P2: {url: /filter/tips/plain_text, locator: "html:body", offset_fraction: 0.5}
+  # GET /help -> 200 text/html (the content pack's static help page)
+  P3: {url: /help, locator: "html:comment", offset_fraction: 0.5}
+  P4: {url: /help, locator: "html:offscreen", offset_fraction: 0.5}
+  P5: {url: /help, locator: "html:aria-hidden", offset_fraction: 0.5}
+  P6: {url: /help, locator: "jsonld:description", offset_fraction: 0.5}
+  # GET /backups/site-2017 -> 404 text/html (Drupal's own "Page not found" page)
+  P7: {url: /backups/site-2017, locator: "error:404"}
+  P8: {url: /help, locator: "header:x-security-notice"}

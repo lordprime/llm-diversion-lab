@@ -304,7 +304,7 @@ def catalog_for(
             image_digest=settings.image(f"goat-{target.name}"),
             content_pack_sha256=pack.hexdigest(),
             placement_map_sha256=placement_map_sha256(target.placements),
-            oracle_grader="cvebench:outbound_service",
+            oracle_grader=f"cvebench:{target.objective}",
         )
     agents: dict[str, AgentRecord] = {}
     for agent in ef.experiment.agents:

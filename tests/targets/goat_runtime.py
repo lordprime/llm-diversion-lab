@@ -11,9 +11,12 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import tarfile
 import time
-from collections.abc import Iterator, Mapping, Sequence
+import urllib.parse
+import urllib.robotparser
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -21,9 +24,12 @@ import pytest
 import yaml
 
 from control.core.ids import new_id
-from control.core.models import Arm
+from control.core.models import Arm, Surface
 from control.runner.cell_spec import project_name
+from control.runner.experiment import PlacementMapFile, TargetSpec
 from control.runner.schedule import ScheduledRun
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 try:
     import docker
@@ -88,6 +94,86 @@ def file_tar(name: str, value: str) -> bytes:
         info.mtime = int(time.time())
         tar.addfile(info, io.BytesIO(data))
     return buf.getvalue()
+
+
+class PlacementPaths:
+    """A target's frozen placement map (``targets/<target>/placements.yaml``) against
+    what its built image serves natively: straight from the app, no injector.
+
+    P1 is the app's own robots.txt (200, text/plain); P2 a 200 HTML page with a body
+    that this robots.txt disallows for every user agent (the page and the rule exist in
+    every arm); P3-P6 and P8 200 HTML pages with a body; P7 the 4xx its locator names,
+    answered by the app itself. :meth:`check` returns one evidence line per path.
+    """
+
+    def __init__(self, target: str, sh: Callable[[str], tuple[int, str]], base_url: str):
+        found = PlacementMapFile.read(REPO_ROOT, f"targets/{target}/placements.yaml")
+        self.spec = TargetSpec.model_validate(
+            {"name": target, "objective": "probe", "placements": found.placements(target)}
+        )
+        self._sh = sh
+        self._base_url = base_url
+
+    def fetch(self, path: str) -> tuple[int, str, str]:
+        """``(status, media type, body)`` of an anonymous GET of ``path``."""
+        code, out = self._sh(
+            f"curl -s --max-time 60 -w '\\n%{{http_code}} %{{content_type}}' "
+            f"{shlex.quote(self._base_url + path)}"
+        )
+        assert code == 0, out
+        body, _, tail = out.rpartition("\n")
+        status, _, content_type = tail.partition(" ")
+        return int(status), content_type.partition(";")[0].strip().lower(), body
+
+    def check(self) -> list[str]:
+        evidence: list[str] = []
+        robots: urllib.robotparser.RobotFileParser | None = None
+        for surface, placement in sorted(self.spec.placements.items()):
+            status, media, body = self.fetch(placement.url)
+            evidence.append(f"{surface.value} GET {placement.url} -> {status} {media}")
+            where = f"{surface.value} {placement.url}: {status} {media}"
+            if surface is Surface.P1:
+                assert (status, media) == (200, "text/plain"), where
+                robots = urllib.robotparser.RobotFileParser()
+                robots.parse(body.splitlines())
+            elif surface is Surface.P7:
+                expected = int(placement.locator.rpartition(":")[2])
+                assert status == expected, where
+            else:
+                assert (status, media) == (200, "text/html"), where
+                assert "<body" in body.lower() and "</body>" in body.lower(), where
+        p2 = self.spec.placements.get(Surface.P2)
+        if p2 is not None:
+            assert robots is not None, "P2 needs the app's own robots.txt (P1)"
+            assert not robots.can_fetch("*", p2.url), f"robots.txt does not disallow {p2.url}"
+            evidence.append(f"P2 robots.txt disallows {p2.url} for User-agent: *")
+        return evidence
+
+
+class CellSteps:
+    """What a target's cell file (``deploy/compose/cell.<target>.yml``, ``x-lab``) has
+    the self-test do there: the scripted agent's objective step and the reset."""
+
+    def __init__(self, target: str) -> None:
+        cell = yaml.safe_load((REPO_ROOT / "deploy" / "compose" / f"cell.{target}.yml").read_text())
+        self.objective: dict[str, Any] = cell["x-lab"]["objective"]
+        self.reset: dict[str, Any] = cell["x-lab"]["reset"]
+
+    def objective_curl(self, base_url: str) -> str:
+        """A curl command sending the objective step's request exactly as the scripted
+        agent builds it (``agents/scripted/agent.py``, ``post``)."""
+        step = self.objective
+        assert step["action"] == "post"
+        if "form" in step:
+            body = urllib.parse.urlencode([tuple(pair) for pair in step["form"]])
+            kind = "application/x-www-form-urlencoded"
+        else:
+            body = json.dumps(step["body"])
+            kind = "application/json"
+        return (
+            f"curl -s --max-time 120 -H {shlex.quote('Content-Type: ' + kind)} "
+            f"--data-binary {shlex.quote(body)} {shlex.quote(base_url + step['path'])}"
+        )
 
 
 def cell_project(target: str) -> str:

@@ -54,7 +54,7 @@ from typing import Any, NoReturn
 import pytest
 import yaml
 
-from tests.targets.goat_runtime import cell_project
+from tests.targets.goat_runtime import CellSteps, PlacementPaths, cell_project
 
 try:
     import docker
@@ -548,6 +548,15 @@ def test_d_runs_offline(client: Any) -> None:
         offline.remove()
 
 
+def test_d_placement_paths_answer_natively(goat: Goat) -> None:
+    """targets/drupal-7600/placements.yaml against the built image, straight from the
+    site: core's robots.txt (disallowing /filter/tips/), the pages, and Drupal's own
+    "Page not found"."""
+    evidence = PlacementPaths("drupal-7600", goat.sh, "http://127.0.0.1").check()
+    assert "P7 GET /backups/site-2017 -> 404 text/html" in evidence
+    assert "P2 robots.txt disallows /filter/tips/plain_text for User-agent: *" in evidence
+
+
 # --- (e) the objective ------------------------------------------------------------------
 
 
@@ -610,6 +619,33 @@ def test_g_cache_rebuild_after_success_still_scores(goat: Goat) -> None:
     assert goat.get("/")[0] == "200"  # the site rebuilds what it needs
     assert goat.done() == before
     assert goat.latch() == latched
+
+
+def test_g_cell_reset_keeps_the_success(goat: Goat) -> None:
+    """The self-test's reset (x-lab.reset in deploy/compose/cell.drupal-7600.yml), run
+    as the runner runs it, empties the caches and leaves the verdict and the latch."""
+    reset = CellSteps("drupal-7600").reset
+    before, latched = goat.done(), goat.latch()
+    assert before["effect"] is True and before["mechanism"] is True
+    assert goat.get("/")[0] == "200"  # something in the caches again
+    assert _pdo(goat, "SELECT COUNT(*) FROM cache_render") != [[0]]
+    code, out = goat.container.exec_run(reset["exec"], user=reset["user"])
+    assert code == 0, out
+    assert _pdo(goat, "SELECT COUNT(*) FROM cache_render") == [[0]]
+    assert goat.done() == before
+    assert goat.latch() == latched
+
+
+def test_g_cell_objective_step_scores_effect_and_mechanism(goat: Goat) -> None:
+    """The self-test's own exploit (x-lab.objective in deploy/compose/cell.drupal-7600.yml),
+    sent exactly as the scripted agent sends it, runs /tmp/pwn under the web server."""
+    before = goat.done()["latch_events"]
+    code, out = goat.sh(CellSteps("drupal-7600").objective_curl("http://127.0.0.1"))
+    assert code == 0, out
+    after = goat.done()
+    assert after["effect"] is True and after["mechanism"] is True
+    assert after["latch_events"] == before + 2
+    assert [e["kind"] for e in goat.latch()[-2:]] == ["mechanism", "effect"]
 
 
 def test_g_app_user_cannot_read_or_write_the_latch(goat: Goat) -> None:

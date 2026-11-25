@@ -41,7 +41,7 @@ from control.runner.schedule import build_schedule
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = REPO_ROOT / "deploy" / "compose" / "cell.dvga.yml"
-SELFTEST = REPO_ROOT / "experiments" / "selftest.yaml"
+DVGA_PAIR = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_pair.yaml"
 KEY = hashlib.sha256(b"cell-compose-test-key").digest()
 WHEN = datetime(2026, 11, 7, 12, 0, tzinfo=UTC)
 POOL = ipaddress.IPv4Network("10.232.0.0/16")
@@ -73,7 +73,7 @@ def _size(text: str) -> int:
 
 @pytest.fixture(scope="module", params=[Arm.CONTROL, Arm.INJECTED])
 def rendered(request: pytest.FixtureRequest) -> dict[str, Any]:
-    experiment = load_experiment(SELFTEST)
+    experiment = load_experiment(DVGA_PAIR)
     run = next(r for r in build_schedule(experiment) if r.arm is request.param)
     manifest = render_manifest(run, experiment, KEY, created_at=WHEN)
     project = render_cell(

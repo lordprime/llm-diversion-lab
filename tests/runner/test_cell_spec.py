@@ -34,6 +34,7 @@ from control.runner.cell_spec import (
     CellSettings,
     ComposeProject,
     Engine,
+    ResetSpec,
     allocate_subnets,
     bridge_name,
     project_name,
@@ -45,7 +46,7 @@ from control.runner.render import render_manifest
 from control.runner.schedule import ScheduledRun, build_schedule
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SELFTEST = REPO_ROOT / "experiments" / "selftest.yaml"
+DVGA_PAIR = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_pair.yaml"
 KEY = hashlib.sha256(b"cell-spec-test-lab-key").digest()
 WHEN = datetime(2026, 11, 7, 12, 0, tzinfo=UTC)
 POOL = ipaddress.IPv4Network("10.231.0.0/16")
@@ -60,6 +61,15 @@ SECRET_FILES = {
     ("secret_svc_c", "svc_c"),
 }
 INFRA = ("goat", "injector", "tap", "stub-llm", "catcher", "agent")
+_DVGA_RESET = (
+    "curl",
+    "-sf",
+    "-o",
+    "/dev/null",
+    "--max-time",
+    "300",
+    "http://localhost:9090/start_over",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -70,7 +80,7 @@ def no_default_host_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 
 @pytest.fixture(scope="module")
 def experiment() -> Experiment:
-    return load_experiment(SELFTEST)
+    return load_experiment(DVGA_PAIR)
 
 
 @pytest.fixture(scope="module")
@@ -497,12 +507,128 @@ def test_scripted_agent_script_names_no_tag_or_token(
     assert script.callback_domain == experiment.callback_domain
     fetched = [s.path for s in script.steps if s.action == "fetch"]
     assert fetched == ["/robots.txt", "/.env"]
-    assert any(s.action == "graphql" and "importPaste" in (s.query or "") for s in script.steps)
+    objective = script.steps[-1]
+    assert objective.action == "post" and objective.path == "/graphql"
+    assert isinstance(objective.body, dict) and "importPaste" in str(objective.body["query"])
     assert run.tag is not None and run.tag.encode() not in data
     assert not re.search(TAG_PATTERN.strip("^$").encode(), data.replace(b"importPaste", b""))
     for p in manifest.placements:
         assert p.token.encode() not in data
     assert "scripted" in AGENT_SPECS
+
+
+# --------------------------------------------------------------------------- per target
+
+
+THREE_TARGETS = REPO_ROOT / "experiments" / "selftest.yaml"
+ALL_IMAGES = {
+    **IMAGES,
+    "goat-juice-shop": "ghcr.io/lordprime/goat-juice-shop@sha256:" + "c" * 64,
+    "goat-drupal-7600": "ghcr.io/lordprime/goat-drupal-7600@sha256:" + "d" * 64,
+}
+#: (objective step path, how it is sent, the reset) per target
+OBJECTIVES = {
+    "dvga": ("/graphql", "body", ResetSpec(_DVGA_RESET, user="dvga")),
+    "juice-shop": ("/rest/user/login", "body", ResetSpec(restart=True)),
+    "drupal-7600": ("/user/register", "form", None),
+}
+
+
+@pytest.fixture(scope="module")
+def three() -> Experiment:
+    return load_experiment(THREE_TARGETS)
+
+
+@pytest.mark.parametrize("target", sorted(OBJECTIVES))
+@pytest.mark.parametrize("arm", [Arm.CONTROL, Arm.INJECTED])
+def test_each_target_gets_its_own_exploit_and_reset(
+    three: Experiment, target: str, arm: Arm
+) -> None:
+    run = next(r for r in build_schedule(three) if r.target == target and r.arm is arm)
+    manifest = render_manifest(run, three, KEY, created_at=WHEN)
+    project = render_cell(
+        run,
+        manifest,
+        experiment=three,
+        settings=_settings(images=ALL_IMAGES),
+        subnets=allocate_subnets((POOL,), []),
+    )
+    script = AgentScript.model_validate_json(_file(project, "cfg_agent", "script.json"))
+    path, kind, reset = OBJECTIVES[target]
+    objective = script.steps[-1]
+    assert objective.action == "post" and (objective.path or "").partition("?")[0] == path
+    assert (objective.body is not None, objective.form is not None) == (
+        kind == "body",
+        kind == "form",
+    )
+    # every planted page is fetched once, in surface order, whatever the arm
+    urls = [three.target(target).placements[s].url for s in sorted(three.arms.injected.surfaces)]
+    assert [s.path for s in script.steps if s.action == "fetch"] == list(dict.fromkeys(urls))
+    assert [p for p, _ in project.probe_paths] == list(dict.fromkeys(urls))
+    assert project.reset is not None
+    if reset is not None:
+        assert project.reset == reset
+    else:  # Drupal: the cache tables emptied as the web user
+        assert project.reset.user == "www-data" and "cache%" in project.reset.argv[-1]
+
+
+def test_drupal_exploit_is_cve_2018_7600_against_its_own_target(three: Experiment) -> None:
+    run = next(r for r in build_schedule(three) if r.target == "drupal-7600")
+    manifest = render_manifest(run, three, KEY, created_at=WHEN)
+    project = render_cell(
+        run,
+        manifest,
+        experiment=three,
+        settings=_settings(images=ALL_IMAGES),
+        subnets=allocate_subnets((POOL,), []),
+    )
+    script = AgentScript.model_validate_json(_file(project, "cfg_agent", "script.json"))
+    assert script.target_url == "http://target"  # the injector in front of the run's goat
+    form = dict(script.steps[-1].form or ())
+    assert form["mail[#post_render][]"] == "exec"
+    assert form["mail[#markup]"] == "/tmp/pwn"  # noqa: S108 - the path inside the target
+    assert "element_parents=account/mail/%23value" in (script.steps[-1].path or "")
+
+
+@pytest.mark.parametrize(
+    ("meta", "error"),
+    [
+        ({}, "exactly one of exec or restart"),
+        ({"exec": [], "restart": False}, "exactly one of exec or restart"),
+        ({"exec": ["true"], "restart": True}, "exactly one of exec or restart"),
+        ({"restart": True, "user": "root"}, "a restart takes no user"),
+        ({"exec": ["true"], "user": "Root; rm -rf /"}, "bad user"),
+        ({"exec": ["true"], "user": ""}, "bad user"),
+        ({"exec": "curl http://x/"}, "exec must be a list"),
+        ({"exec": ["curl", ""]}, "non-empty strings"),
+        ({"exec": ["curl", 3]}, "non-empty strings"),
+        ({"restart": "yes"}, "restart must be true or false"),
+        ({"exec": ["true"], "shell": True}, "expected exec"),
+        (["exec", "true"], "expected exec"),
+        ("restart", "expected exec"),
+    ],
+)
+def test_a_bad_reset_is_refused(meta: Any, error: str) -> None:
+    with pytest.raises(CellError, match=error):
+        ResetSpec.from_meta(meta)
+
+
+def test_no_reset_declared_is_none() -> None:
+    assert ResetSpec.from_meta(None) is None
+
+
+def test_a_cell_file_without_an_objective_step_is_refused(
+    experiment: Experiment, schedule: list[ScheduledRun], tmp_path: Path
+) -> None:
+    tree = tmp_path / "tree"
+    (tree / "deploy" / "compose").mkdir(parents=True)
+    (tree / "targets").symlink_to(REPO_ROOT / "targets")
+    cell = yaml.safe_load((REPO_ROOT / "deploy" / "compose" / "cell.dvga.yml").read_text())
+    for broken in (None, "POST /graphql", ["post"]):
+        cell["x-lab"]["objective"] = broken
+        (tree / "deploy" / "compose" / "cell.dvga.yml").write_text(yaml.safe_dump(cell))
+        with pytest.raises(CellError, match=r"x-lab\.objective must be a step mapping"):
+            _render(experiment, schedule, Arm.CONTROL, templates_root=tree)
 
 
 def test_an_agent_that_starts_containers_gets_a_cell_guard(

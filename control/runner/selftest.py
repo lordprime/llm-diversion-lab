@@ -1,23 +1,33 @@
 """The instrumentation self-test: ``labctl selftest [--quick]`` (DEVELOPMENT_PLAN 5.3).
 
-It runs ``experiments/selftest.yaml`` (one injected and one matched control DVGA cell,
-the scripted agent, the stub LLM; no model is called) through the real
-:class:`~control.runner.runner.Runner`, holding the host's runner lock for the whole
-self-test, and then checks the result from the database, the evidence on disk and the
-container engine. It **passes** only if all of these hold:
+It runs ``experiments/selftest.yaml`` (one injected and one matched control cell per
+target -- DVGA, Juice Shop and Drupal -- with every surface each target's frozen
+placement map carries, the scripted agent, the stub LLM; no model is called) through the
+real :class:`~control.runner.runner.Runner`, holding the host's runner lock for the
+whole self-test, and then checks the result from the database, the evidence on disk and
+the container engine. The scripted agent's last step is the target's own exploit
+(``x-lab.objective`` in the target's cell file: DVGA's importPaste SSRF, Juice Shop's
+login SQL injection, Drupal's CVE-2018-7600), sent only to the run's own target. Every
+check is named ``<target> <arm>: <what>``. It **passes** only if all of these hold, on
+every target:
 
 * both runs are ``valid`` **and** ended ``completed`` (a crashed agent still gives a
   valid run: crashing is an outcome, so ``valid`` alone is not enough);
-* injected run: Access, Visible, Uptake and Outcome are all true; the stored verdict
-  (``runs.outcome``, ``runs.decided_at``) is true; the catcher recorded a callback on
-  **both** channels (HTTP and DNS) whose token is the one the lab key derives for one
-  of the run's own placements;
-* control run: Access, Visible and Uptake are false, its stored verdict is true (the
-  scripted agent runs the exploit in both arms; the runner's probe already required
-  the oracle to answer "not yet" before each agent), no token callback reached it,
-  and no file of its evidence holds any injected run's tag or token, base64 fields
-  (``body_b64``) decoded (the labeller's forbidden-tag check already made a leaking
-  control ``contaminated``; the scan repeats it independently);
+* both runs' stored verdict is Outcome, effect **and** mechanism true
+  (``runs.outcome``, ``runs.effect``, ``runs.mechanism``, ``runs.decided_at``): the
+  scripted exploit runs in both arms, and the runner's probe already required the
+  oracle to answer "not yet" before each agent;
+* injected run: Access, Visible, Uptake and Outcome are all true; the catcher recorded
+  a callback on **both** channels (HTTP and DNS) whose token is the one the lab key
+  derives for one of the run's own placements;
+* control run: Access, Visible and Uptake are false, no token callback reached it,
+  and no file of its evidence holds any injected run's tag or token (any target's),
+  base64 fields (``body_b64``) decoded (the labeller's forbidden-tag check already
+  made a leaking control ``contaminated``; the scan repeats it independently);
+* **reset after success**, on both runs: after the runner's final poll and latch dump,
+  the target's own reset (``x-lab.reset``: DVGA's ``/start_over``, a Juice Shop
+  restart, Drupal's cache tables emptied) leaves effect, mechanism and the latch as they
+  were (:class:`ResetGate`; the runner's verdict was already taken);
 * **containment** (critical): before a cell is trusted, i.e. after the runner's health
   check, pre-flight probe and liveness check and before its agent starts,
   ``cell/probe/containment.py`` runs in a sibling container on the cell's agent network
@@ -53,11 +63,11 @@ A cell that fails before its agent would start (so before the probe) is reported
 cell failure, not as a containment failure.
 
 ``--quick`` is what ``deploy/remote/release.sh`` runs after every deploy. It keeps the
-**first target only** (one matched pair: two cells, the smallest unit the matched-pair
-schedule can run, and the control's zero-tag check is a core claim) and runs the
-containment probe in the **first cell only** (the cells differ only by subnet; the
-host firewall covers the whole cell range). Every other check is the same. With
-M0's single target, full mode differs from quick mode only by probing every cell.
+**first target only** (DVGA: one matched pair, two cells, the smallest unit the
+matched-pair schedule can run, and the control's zero-tag check is a core claim) and
+runs the containment probe in the **first cell only** (the cells differ only by subnet;
+the host firewall covers the whole cell range). Every other check is the same. Full
+mode runs every target's pair and probes every cell.
 
 Each invocation registers a **fresh experiment** (``exp_selftest_<ULID>``; the file's
 text with that id and a provenance comment), so self-tests can be repeated and a new
@@ -145,8 +155,10 @@ from control.runner.compose_backend import (
     ContainerState,
     SubprocessRunner,
 )
-from control.runner.experiment import ExperimentFile, parse_experiment
+from control.runner.experiment import ExperimentFile, freeze_experiment, parse_experiment
+from control.runner.oracle import DONE_COMMAND, DoneResult, parse_done
 from control.runner.runner import (
+    HEALTH_TIMEOUT_S,
     CellLeftBehindError,
     HostLockError,
     Runner,
@@ -161,6 +173,7 @@ __all__ = [
     "CONTROL_PLANE_FILE",
     "CONTROL_PLANE_PROJECT",
     "SELFTEST_EXPERIMENT",
+    "BackendGate",
     "CellLayout",
     "CellResources",
     "Check",
@@ -170,6 +183,8 @@ __all__ = [
     "DockerLeftovers",
     "LabContext",
     "ProbeRecord",
+    "ResetGate",
+    "ResetRecord",
     "SelftestConfigError",
     "SelftestDeps",
     "SelftestReport",
@@ -256,6 +271,7 @@ class SelftestReport:
     checks: tuple[Check, ...]
     runs: tuple[Mapping[str, Any], ...] = ()
     probes: tuple[ProbeRecord, ...] = ()
+    resets: tuple[ResetRecord, ...] = ()
 
     @property
     def passed(self) -> bool:
@@ -293,6 +309,7 @@ class SelftestReport:
             "checks": [c.to_json() for c in self.checks],
             "runs": [dict(r) for r in self.runs],
             "probes": [p.to_json() for p in self.probes],
+            "resets": [r.to_json() for r in self.resets],
         }
 
     def render_text(self) -> str:
@@ -303,7 +320,7 @@ class SelftestReport:
             shown = " ".join(f"{k}={str(v).lower()}" for k, v in labels.items()) or "no labels"
             outcome = run.get("outcome")
             lines.append(
-                f"  run {run['run_id']} {run['arm']}: {run['status']}"
+                f"  run {run['run_id']} {run.get('target') or '-'} {run['arm']}: {run['status']}"
                 + (f" ({run['reason']})" if run.get("reason") else "")
                 + f", end {run.get('end_status') or '-'}, outcome "
                 + f"{'-' if outcome is None else str(outcome).lower()}, {shown}"
@@ -346,8 +363,10 @@ def derive_experiment(
 
     The stored definition is exactly what runs: the file's text with the new id and a
     provenance comment naming the source file's sha256 (re-dumped YAML only when quick
-    mode drops targets).
+    mode drops targets), frozen with the placement maps it reads from the tree the file
+    sits in (``<tree>/experiments/selftest.yaml``).
     """
+    root = path.resolve().parents[1]
     data = path.read_bytes()
     text = data.decode("utf-8")
     source_sha = hashlib.sha256(data).hexdigest()
@@ -357,7 +376,7 @@ def derive_experiment(
     if len(_EXPERIMENT_ID_LINE.findall(text)) != 1:
         raise ValueError(f"{path}: expected exactly one top-level experiment_id line")
     body = _EXPERIMENT_ID_LINE.sub(f"experiment_id: {new}", text)
-    if quick and len(parse_experiment(body, selftest=True).targets) > 1:
+    if quick and len(parse_experiment(body, selftest=True, root=root).targets) > 1:
         doc = yaml.safe_load(body)
         doc["targets"] = doc["targets"][:1]
         body = yaml.safe_dump(doc, sort_keys=False, allow_unicode=True)
@@ -365,12 +384,7 @@ def derive_experiment(
         f"# labctl selftest ({'quick' if quick else 'full'}): derived from "
         f"{SELFTEST_EXPERIMENT.as_posix()} sha256 {source_sha}\n"
     )
-    final = header + body
-    return ExperimentFile(
-        experiment=parse_experiment(final, selftest=True),
-        definition_yaml=final,
-        definition_sha256=hashlib.sha256(final.encode("utf-8")).hexdigest(),
-    )
+    return freeze_experiment(header + body, root=root, selftest=True)
 
 
 # --------------------------------------------------------------------------- addresses
@@ -738,20 +752,79 @@ class DockerContainmentProbe:
         return ProbeRecord(run_id, not problems, doc, tuple(problems), breach=bool(problems))
 
 
-class ContainmentGate:
+class BackendGate:
+    """A :class:`CellBackend` that hands every call to ``inner``; the self-test's gates
+    override the one or two calls they watch."""
+
+    def __init__(self, inner: CellBackend) -> None:
+        self._inner = inner
+
+    def subnets_in_use(self) -> list[ipaddress.IPv4Network]:
+        return self._inner.subnets_in_use()
+
+    def prepare(self, project: Any, workdir: Path) -> CellHandle:
+        return self._inner.prepare(project, workdir)
+
+    def up(self, cell: CellHandle) -> None:
+        self._inner.up(cell)
+
+    def health(self, cell: CellHandle, *, timeout_s: float) -> bool:
+        return self._inner.health(cell, timeout_s=timeout_s)
+
+    def exec(
+        self,
+        cell: CellHandle,
+        service: str,
+        argv: Sequence[str],
+        *,
+        timeout_s: float,
+        user: str | None = None,
+    ) -> CommandResult:
+        if user is None:  # a plain call stays plain, as every backend takes it
+            return self._inner.exec(cell, service, argv, timeout_s=timeout_s)
+        return self._inner.exec(cell, service, argv, timeout_s=timeout_s, user=user)
+
+    def start_agent(self, cell: CellHandle) -> None:
+        self._inner.start_agent(cell)
+
+    def state(self, cell: CellHandle, service: str) -> ContainerState:
+        return self._inner.state(cell, service)
+
+    def kill_agent(self, cell: CellHandle) -> None:
+        self._inner.kill_agent(cell)
+
+    def restart(self, cell: CellHandle, service: str, *, timeout_s: int) -> None:
+        self._inner.restart(cell, service, timeout_s=timeout_s)
+
+    def stop(self, cell: CellHandle, services: Sequence[str], *, timeout_s: int) -> None:
+        self._inner.stop(cell, services, timeout_s=timeout_s)
+
+    def logs(self, cell: CellHandle, service: str) -> str:
+        return self._inner.logs(cell, service)
+
+    def collect(
+        self, cell: CellHandle, dest: Path, services: Sequence[str] | None = None
+    ) -> CollectReport:
+        return self._inner.collect(cell, dest, services)
+
+    def teardown(self, cell: CellHandle) -> None:
+        self._inner.teardown(cell)
+
+
+class ContainmentGate(BackendGate):
     """A :class:`CellBackend` that probes a cell's containment before its agent starts.
 
-    Everything is delegated to ``inner``; :meth:`start_agent` first runs ``probe`` (for
-    the first ``limit`` cells, all if ``None``) and raises :class:`CellError` if the cell
-    is not proven contained, so the agent never starts there and the runner tears it
-    down. The gate then stays shut: no later cell's agent starts, probed or not (the
+    Everything else is delegated to ``inner``; :meth:`start_agent` first runs ``probe``
+    (for the first ``limit`` cells, all if ``None``) and raises :class:`CellError` if the
+    cell is not proven contained, so the agent never starts there and the runner tears
+    it down. The gate then stays shut: no later cell's agent starts, probed or not (the
     cells differ only by subnet, so one breach speaks for all).
     """
 
     def __init__(
         self, inner: CellBackend, probe: ContainmentProbe, *, limit: int | None = None
     ) -> None:
-        self._inner = inner
+        super().__init__(inner)
         self._probe = probe
         self._limit = limit
         self._shut: str | None = None
@@ -774,44 +847,110 @@ class ContainmentGate:
             log.info("selftest: cell of run %s is contained", record.run_id)
         self._inner.start_agent(cell)
 
-    # delegation
 
-    def subnets_in_use(self) -> list[ipaddress.IPv4Network]:
-        return self._inner.subnets_in_use()
+@dataclass(frozen=True, slots=True)
+class ResetRecord:
+    """The reset-after-success check on one run's cell."""
 
-    def prepare(self, project: Any, workdir: Path) -> CellHandle:
-        return self._inner.prepare(project, workdir)
+    run_id: str
+    ok: bool
+    detail: str = ""
 
-    def up(self, cell: CellHandle) -> None:
-        self._inner.up(cell)
+    def to_json(self) -> dict[str, Any]:
+        return {"run_id": self.run_id, "ok": self.ok, "detail": self.detail}
 
-    def health(self, cell: CellHandle, *, timeout_s: float) -> bool:
-        return self._inner.health(cell, timeout_s=timeout_s)
 
-    def exec(
-        self, cell: CellHandle, service: str, argv: Sequence[str], *, timeout_s: float
-    ) -> CommandResult:
-        return self._inner.exec(cell, service, argv, timeout_s=timeout_s)
+class ResetGate(BackendGate):
+    """A :class:`CellBackend` that checks an app reset after a success undoes nothing.
 
-    def state(self, cell: CellHandle, service: str) -> ContainerState:
-        return self._inner.state(cell, service)
+    The runner stops a cell's agent service first when it collects the run, after the
+    final oracle poll and the latch dump: the run's verdict is final there. On that
+    stop, for a cell whose agent started, the gate reads ``done.sh``, runs the target's
+    own reset (the cell file's ``x-lab.reset``: a command in the target container, or a
+    restart of it followed by the health check) and reads ``done.sh`` again. The check
+    holds when the success is still there: effect true before and after, the mechanism
+    not lost, the latch no shorter and the objective the same. The runner's verdict is
+    never touched: it was taken before the reset.
+    """
 
-    def kill_agent(self, cell: CellHandle) -> None:
-        self._inner.kill_agent(cell)
+    def __init__(self, inner: CellBackend, *, health_timeout_s: float = HEALTH_TIMEOUT_S) -> None:
+        super().__init__(inner)
+        self._health_timeout_s = health_timeout_s
+        self._started: set[str] = set()
+        self.records: list[ResetRecord] = []
+
+    def start_agent(self, cell: CellHandle) -> None:
+        self._inner.start_agent(cell)
+        self._started.add(cell.project.run_id)
 
     def stop(self, cell: CellHandle, services: Sequence[str], *, timeout_s: int) -> None:
+        project = cell.project
+        if project.agent_service in services and project.run_id in self._started:
+            self._started.discard(project.run_id)
+            record = self.check(cell)
+            self.records.append(record)
+            if record.ok:
+                log.info("selftest: run %s: the success outlived the reset", record.run_id)
+            else:
+                log.error("selftest: run %s: reset after success: %s", record.run_id, record.detail)
         self._inner.stop(cell, services, timeout_s=timeout_s)
 
-    def logs(self, cell: CellHandle, service: str) -> str:
-        return self._inner.logs(cell, service)
+    def _done(self, cell: CellHandle) -> DoneResult | str:
+        result = self._inner.exec(cell, cell.project.target_service, DONE_COMMAND, timeout_s=120)
+        return parse_done(result.returncode, result.text, result.stderr.decode("utf-8", "replace"))
 
-    def collect(
-        self, cell: CellHandle, dest: Path, services: Sequence[str] | None = None
-    ) -> CollectReport:
-        return self._inner.collect(cell, dest, services)
-
-    def teardown(self, cell: CellHandle) -> None:
-        self._inner.teardown(cell)
+    def check(self, cell: CellHandle) -> ResetRecord:
+        """Reset the target and compare ``done.sh`` before and after; never raises."""
+        project = cell.project
+        run_id = project.run_id
+        try:
+            if project.reset is None:
+                return ResetRecord(run_id, False, "the cell file declares no reset")
+            before = self._done(cell)
+            if isinstance(before, str):
+                return ResetRecord(run_id, False, f"before the reset: {before}"[:300])
+            if not before.effect:
+                return ResetRecord(run_id, False, "no success to reset after (effect false)")
+            reset = project.reset
+            if reset.restart:
+                self._inner.restart(cell, project.target_service, timeout_s=30)
+                if not self._inner.health(cell, timeout_s=self._health_timeout_s):
+                    return ResetRecord(run_id, False, "the target never became healthy again")
+                what = "restart"
+            else:
+                result = self.exec(
+                    cell, project.target_service, reset.argv, timeout_s=600, user=reset.user
+                )
+                if result.returncode != 0:
+                    err = result.stderr.decode("utf-8", "replace").strip()[-200:]
+                    return ResetRecord(run_id, False, f"reset exited {result.returncode}: {err}")
+                what = "reset"
+            after = self._done(cell)
+            if isinstance(after, str):
+                return ResetRecord(run_id, False, f"after the {what}: {after}"[:300])
+            lost = [
+                name
+                for name, gone in (
+                    ("effect", not after.effect),
+                    ("mechanism", before.mechanism is True and after.mechanism is not True),
+                    ("latch events", after.latch_events < before.latch_events),
+                    ("objective", after.objective != before.objective),
+                )
+                if gone
+            ]
+            if lost:
+                return ResetRecord(
+                    run_id,
+                    False,
+                    f"the {what} undid the success: {', '.join(lost)} "
+                    f"(before {before.latch_events} events, after {after.latch_events})",
+                )
+            return ResetRecord(
+                run_id, True, f"{what}: {after.latch_events} events latched, effect kept"
+            )
+        except Exception as exc:
+            log.exception("selftest: reset check on run %s failed", run_id)
+            return ResetRecord(run_id, False, f"{type(exc).__name__}: {exc}"[:300])
 
 
 # --------------------------------------------------------------------------- control plane
@@ -970,6 +1109,8 @@ class SelftestDeps:
     work_dir: Path
     lock_path: Path
     templates_root: Path = REPO_ROOT
+    #: how long the target may take to be healthy again after a reset restart
+    health_timeout_s: float = HEALTH_TIMEOUT_S
     #: extra Runner keyword arguments (tests: no sleeping)
     runner_options: Mapping[str, Any] = field(default_factory=dict)
 
@@ -989,6 +1130,7 @@ def run_selftest(
         return failed_report(quick, "experiment", str(exc)[:300], started_at=started)
     experiment_id = ef.experiment.experiment_id
     gate = ContainmentGate(deps.backend, deps.probe, limit=1 if quick else None)
+    resets = ResetGate(gate, health_timeout_s=deps.health_timeout_s)
     checks: list[Check] = []
     results: list[RunResult] = []
     try:
@@ -997,7 +1139,7 @@ def run_selftest(
             runner = Runner(
                 store=RunStore(deps.engine),
                 collector=deps.collector,
-                backend=gate,
+                backend=resets,
                 settings=deps.settings,
                 lab_key=deps.lab_key,
                 runs_dir=deps.runs_dir,
@@ -1012,7 +1154,7 @@ def run_selftest(
             except CellLeftBehindError as exc:
                 results = list(exc.results)
                 checks.append(Check("run the pair", False, f"stopped: {exc}"[:500]))
-            checks += _check_results(deps, ef, results, gate.records, quick=quick)
+            checks += _check_results(deps, ef, results, gate.records, resets.records, quick=quick)
     except HostLockError as exc:
         checks.append(Check("run the pair", False, f"another runner is active: {exc}"))
     except Exception as exc:
@@ -1034,6 +1176,7 @@ def run_selftest(
         checks=tuple(checks),
         runs=runs,
         probes=tuple(gate.records),
+        resets=tuple(resets.records),
     )
     log.info("selftest: %s", report.summary)
     return report
@@ -1153,21 +1296,35 @@ def _labels(engine: Engine, run_id: str) -> dict[FunnelStage, bool]:
         return {row.stage: row.value for row in rows}
 
 
-def _stored_verdict(engine: Engine, run_id: str) -> tuple[bool | None, Any]:
+def _stored_verdict(
+    engine: Engine, run_id: str
+) -> tuple[bool | None, bool | None, bool | None, Any]:
+    """``(outcome, effect, mechanism, decided_at)`` as stored for the run."""
     with session_scope(engine) as s:
         row = s.get(t.Run, run_id)
-        return (None, None) if row is None else (row.outcome, row.decided_at)
+        if row is None:
+            return None, None, None, None
+        return row.outcome, row.effect, row.mechanism, row.decided_at
 
 
 def _run_summary(engine: Engine, result: RunResult) -> dict[str, Any]:
-    outcome, decided_at = _stored_verdict(engine, result.run_id)
+    outcome, effect, mechanism, decided_at = _stored_verdict(engine, result.run_id)
+    with session_scope(engine) as s:
+        target = s.scalar(
+            select(t.Target.name)
+            .join(t.Run, t.Run.target_id == t.Target.target_id)
+            .where(t.Run.run_id == result.run_id)
+        )
     return {
         "run_id": result.run_id,
+        "target": target,
         "arm": result.arm.value,
         "status": result.status.value,
         "reason": result.reason.value if result.reason else None,
         "end_status": result.end_status.value if result.end_status else None,
         "outcome": outcome,
+        "effect": effect,
+        "mechanism": mechanism,
         "decided_at": None if decided_at is None else str(decided_at),
         "labels": {stage.value: value for stage, value in _labels(engine, result.run_id).items()},
     }
@@ -1178,17 +1335,16 @@ def _check_results(
     ef: ExperimentFile,
     results: Sequence[RunResult],
     probes: Sequence[ProbeRecord],
+    resets: Sequence[ResetRecord],
     *,
     quick: bool,
 ) -> list[Check]:
+    """Every check on the runs, named ``<target> <arm>: <what>`` (one pair per target)."""
     checks: list[Check] = []
     expected = 2 * len(ef.experiment.targets)
     checks.append(
         Check("runs", len(results) == expected, f"{len(results)} runs, expected {expected}")
     )
-    for arm in (Arm.INJECTED, Arm.CONTROL):
-        if not any(r.arm is arm for r in results):
-            checks.append(Check(f"{arm.value}: valid", False, "no run of this arm"))
     with session_scope(deps.engine) as s:
         rows = s.scalars(
             select(t.Run).where(t.Run.experiment_id == ef.experiment.experiment_id)
@@ -1198,9 +1354,24 @@ def _check_results(
         needles |= set(
             s.scalars(select(t.Placement.token).where(t.Placement.run_id.in_(injected_ids))).all()
         )
+        target_of: dict[str, str] = {
+            run_id: name
+            for run_id, name in s.execute(
+                select(t.Run.run_id, t.Target.name)
+                .join(t.Target, t.Run.target_id == t.Target.target_id)
+                .where(t.Run.experiment_id == ef.experiment.experiment_id)
+            ).all()
+        }
+    for target in ef.experiment.targets:
+        for arm in (Arm.INJECTED, Arm.CONTROL):
+            if not any(r.arm is arm and target_of.get(r.run_id) == target.name for r in results):
+                checks.append(
+                    Check(f"{target.name} {arm.value}: valid", False, "no run of this arm")
+                )
     probed = {p.run_id: p for p in probes}
+    reset_of = {r.run_id: r for r in resets}
     for result in results:
-        name = result.arm.value
+        name = f"{target_of.get(result.run_id, '?')} {result.arm.value}"
         valid = result.status is RunStatus.VALID
         detail = "" if valid else f"{result.status.value} ({result.reason}): {result.detail[:300]}"
         checks.append(Check(f"{name}: valid", valid, detail))
@@ -1213,11 +1384,9 @@ def _check_results(
             )
         )
         labels = _labels(deps.engine, result.run_id)
-        outcome, decided_at = _stored_verdict(deps.engine, result.run_id)
         if result.arm is Arm.INJECTED:
             checks.append(_funnel_check(name, labels, want_true=tuple(FunnelStage)))
-            checks.append(_oracle_check(name, outcome, decided_at))
-            checks.append(_callback_check(deps, result.run_id))
+            checks.append(_callback_check(deps, name, result.run_id))
         else:
             checks.append(
                 _funnel_check(
@@ -1226,9 +1395,17 @@ def _check_results(
                     want_false=(FunnelStage.ACCESS, FunnelStage.VISIBLE, FunnelStage.UPTAKE),
                 )
             )
-            # the scripted agent runs importPaste in both arms: the control succeeds too
-            checks.append(_oracle_check(name, outcome, decided_at))
-            checks.append(_control_clean(deps, result.run_id, needles))
+            checks.append(_control_clean(deps, name, result.run_id, needles))
+        # the scripted agent runs the target's exploit in both arms: both succeed
+        checks.append(_oracle_check(name, *_stored_verdict(deps.engine, result.run_id)))
+        reset = reset_of.get(result.run_id)
+        checks.append(
+            Check(
+                f"{name}: reset after success",
+                reset is not None and reset.ok,
+                "not checked: the agent never started" if reset is None else reset.detail,
+            )
+        )
         record = probed.get(result.run_id)
         if record is not None:
             checks.append(
@@ -1261,12 +1438,20 @@ def _check_results(
     return checks
 
 
-def _oracle_check(arm: str, outcome: bool | None, decided_at: Any) -> Check:
-    """The stored verdict is Outcome true (the oracle answered "not yet" before the agent,
-    which the runner's probe requires, and saw the scripted exploit after it)."""
-    ok = outcome is True and decided_at is not None
-    detail = "" if ok else f"stored verdict: outcome {outcome}, decided at {decided_at}"
-    return Check(f"{arm}: oracle", ok, detail)
+def _oracle_check(
+    name: str, outcome: bool | None, effect: bool | None, mechanism: bool | None, decided_at: Any
+) -> Check:
+    """The stored verdict: Outcome, effect and mechanism all true (the oracle answered
+    "not yet" before the agent, which the runner's probe requires, and then saw the
+    scripted exploit do its work by the route the target's mechanism rule names)."""
+    ok = outcome is True and effect is True and mechanism is True and decided_at is not None
+    detail = (
+        ""
+        if ok
+        else f"stored verdict: outcome {outcome}, effect {effect}, mechanism {mechanism}, "
+        f"decided at {decided_at}"
+    )
+    return Check(f"{name}: oracle", ok, detail)
 
 
 def _funnel_check(
@@ -1286,7 +1471,7 @@ def _funnel_check(
     return Check(f"{arm}: funnel", not wrong, ", ".join(wrong))
 
 
-def _callback_check(deps: SelftestDeps, run_id: str) -> Check:
+def _callback_check(deps: SelftestDeps, name: str, run_id: str) -> Check:
     """A token-verified callback mapped to one of the run's placements, per channel."""
     with session_scope(deps.engine) as s:
         placements = {
@@ -1307,7 +1492,7 @@ def _callback_check(deps: SelftestDeps, run_id: str) -> Check:
     }
     missing = [c.value for c in (CallbackChannel.HTTP, CallbackChannel.DNS) if c not in verified]
     detail = "" if not missing else f"no verified callback on {', '.join(missing)}"
-    return Check("injected: callbacks", not missing, detail)
+    return Check(f"{name}: callbacks", not missing, detail)
 
 
 def _b64_values(node: Any) -> Iterator[str]:
@@ -1347,7 +1532,7 @@ def _holds(data: bytes, needles: Iterable[bytes]) -> bool:
     return False
 
 
-def _control_clean(deps: SelftestDeps, run_id: str, needles: set[str]) -> Check:
+def _control_clean(deps: SelftestDeps, name: str, run_id: str, needles: set[str]) -> Check:
     problems: list[str] = []
     with session_scope(deps.engine) as s:
         tokened = [
@@ -1370,7 +1555,7 @@ def _control_clean(deps: SelftestDeps, run_id: str, needles: set[str]) -> Check:
         problems.append(
             f"an injected tag or token is in {len(leaked)} evidence files: {leaked[:5]}"
         )
-    return Check("control: no tags", not problems, "; ".join(problems))
+    return Check(f"{name}: no tags", not problems, "; ".join(problems))
 
 
 def _files(root: Path) -> Iterator[Path]:
