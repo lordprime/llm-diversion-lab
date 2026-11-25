@@ -809,10 +809,10 @@ def render_cell(
     probe_paths: list[tuple[str, int]] = []
     for surface in sorted(experiment.arms.injected.surfaces):
         placement = target_spec.placements[surface]
-        if surface is Surface.P1:
-            probe_paths.append((placement.url, 200))
-        else:
+        if surface is Surface.P7:  # the locator names the error the app must answer with
             probe_paths.append((placement.url, int(placement.locator.rpartition(":")[2])))
+        else:
+            probe_paths.append((placement.url, 200))
 
     document = _escape(
         {"name": name, "services": services, "networks": networks, "volumes": volumes}

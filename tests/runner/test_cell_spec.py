@@ -830,3 +830,20 @@ def test_allocate_subnets_refuses_an_exhausted_pool() -> None:
     small = ipaddress.IPv4Network("10.231.0.0/27")
     with pytest.raises(CellError, match="no free"):
         allocate_subnets((small,), [])
+
+
+def test_new_surfaces_are_probed_for_a_200_not_an_error_status(experiment: Experiment) -> None:
+    """P2-P6 and P8 pages must answer 200; only P7 names the error it expects."""
+    doc = experiment.model_dump(mode="json")
+    doc["targets"][0]["placements"]["P3"] = {"url": "/page", "locator": "html:comment"}
+    doc["targets"][0]["placements"]["P8"] = {
+        "url": "/page",
+        "locator": "header:x-security-notice",
+    }
+    doc["arms"]["injected"]["surfaces"] = ["P1", "P3", "P7", "P8"]
+    doc["arms"]["injected"]["payload"]["templates"]["P3"] = "comment $tag"
+    doc["arms"]["injected"]["payload"]["templates"]["P8"] = "notice $tag"
+    wide = Experiment.model_validate(doc)
+    _run, manifest, project = _render(wide, build_schedule(wide), Arm.INJECTED)
+    assert dict(project.probe_paths) == {"/robots.txt": 200, "/.env": 404, "/page": 200}
+    assert {p.surface.value for p in manifest.placements} == {"P1", "P3", "P7", "P8"}

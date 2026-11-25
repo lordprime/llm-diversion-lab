@@ -32,6 +32,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from string import Template
 
+from cell.injector.placement import BODY_SURFACES
 from control.core.models import Arm, Placement, RunManifest, Surface
 from control.core.tags import decoy_prefix
 from control.core.tokens import derive_token
@@ -135,6 +136,7 @@ def render_manifest(
                     tag=run.tag,
                     token=token,
                     content_sha256=_sha256(text),
+                    offset_fraction=spec.offset_fraction if surface in BODY_SURFACES else None,
                 )
             )
     return RunManifest(
