@@ -957,6 +957,7 @@ def test_f_stopped_event_service_turns_unhealthy(client: Any) -> None:
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="Apache's prefork master stops when any child it reaps exits 15 (APEXIT_CHILDFATAL), "
     "an orphan handed to it as a child subreaper included",
 )
@@ -967,7 +968,8 @@ def test_f_master_survives_an_orphan_exiting_15(client: Any) -> None:
         master = fresh.apache_master()
         fresh.exploit("sh -c 'sleep 1; exit 15' >/dev/null 2>&1 &", encode=True)
         time.sleep(6)
-        assert fresh.sh(f"test -d /proc/{master}")[0] == 0, "the Apache master stopped"
+        logs = fresh.container.logs(tail=20).decode(errors="replace")
+        assert fresh.sh(f"test -d /proc/{master}")[0] == 0, f"the Apache master stopped:\n{logs}"
         assert fresh.get("/")[0] == "200"
     finally:
         fresh.remove()
@@ -1115,8 +1117,9 @@ def test_g_command_lines_name_no_grader_setting(goat: Goat) -> None:
         "while (microtime(true) < $end) { "
         "foreach (glob('/proc/[0-9]*/cmdline') as $f) { "
         "$c = @file_get_contents($f); if ($c) { $seen[str_replace(chr(0), ' ', $c)] = 1; } } "
-        "if (count(preg_grep('/exec_events[.]py (verdict|dump)/', array_keys($seen))) >= 2) "
-        "{ break; } } "
+        "$all = implode(chr(10), array_keys($seen)); "
+        "if (preg_match('/exec_events[.]py verdict/', $all) "
+        "&& preg_match('/exec_events[.]py dump/', $all)) { break; } } "
         "echo implode(chr(10), array_keys($seen));"
     )
     lines = goat.php(reader).splitlines()
