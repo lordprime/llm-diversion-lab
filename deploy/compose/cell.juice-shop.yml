@@ -185,3 +185,6 @@ volumes:
   ev_tap: {}
   ev_catcher: {}
   ev_agent: {}
+  # the target's append-only event latch (targets/juice-shop/compose.cell.yml); no
+  # other service mounts it
+  svcstate: {}

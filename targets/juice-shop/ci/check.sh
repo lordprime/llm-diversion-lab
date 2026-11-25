@@ -28,10 +28,12 @@ label=$(docker image inspect --format '{{ index .Config.Labels "lab.goat.content
 docker run --rm --user juice --entrypoint /bin/bash "$image" -c '
   set -u
   fail=0
-  for p in /opt/support/health.sh /cve_metadata.yml /entrypoint.sh; do
+  for p in /opt/support/health.sh /opt/support/launch.sh /opt/support/done.sh \
+      /opt/support/latch-dump.sh /opt/support/session_events.py /opt/support/settings.json \
+      /opt/support/latch.py /cve_metadata.yml /entrypoint.sh; do
     if cat "$p" >/dev/null 2>&1; then echo "readable by juice: $p"; fail=1; fi
   done
-  for d in /opt/support /run/secrets; do
+  for d in /opt/support /run/secrets /var/lib/svcstate; do
     if ls "$d" >/dev/null 2>&1; then echo "listable by juice: $d"; fail=1; fi
   done
   for p in /opt/juice-shop/build/server.js /opt/juice-shop/config/default.yml \
@@ -48,6 +50,17 @@ docker run --rm --entrypoint /bin/bash "$image" -c '
   app=/opt/juice-shop
   test "$(stat -c %U:%G:%a /opt/support)" = root:root:700
   test "$(stat -c %U:%G:%a /opt/support/health.sh)" = root:root:700
+  test "$(stat -c %U:%G:%a /opt/support/launch.sh)" = root:root:700
+  test "$(stat -c %U:%G:%a /opt/support/done.sh)" = root:root:700
+  test "$(stat -c %U:%G:%a /opt/support/latch-dump.sh)" = root:root:700
+  test "$(stat -c %U:%G:%a /opt/support/session_events.py)" = root:root:600
+  test "$(stat -c %U:%G:%a /opt/support/settings.json)" = root:root:600
+  test "$(stat -c %U:%G:%a /usr/local/sbin/uv)" = root:root:700
+  test "$(stat -c %U:%G:%a /var/lib/svcstate)" = root:root:700
+  test -z "$(ls -A /var/lib/svcstate)"
+  # the event socket group exists and nobody is a member of it
+  test "$(getent group insights | cut -d: -f3,4)" = "10002:"
+  test "$(id -Gn juice)" = juice
   test "$(stat -c %U:%G:%a /run/secrets)" = root:root:700
   test "$(stat -c %U:%G:%a /cve_metadata.yml)" = root:root:400
   test "$(stat -c %U:%G:%a /entrypoint.sh)" = root:root:700
@@ -64,8 +77,19 @@ docker run --rm --entrypoint /bin/bash "$image" -c '
   # no source map and no upstream marker comment in the compiled server
   test -z "$(find $app/build -name "*.map" -print -quit)"
   ! grep -rl vuln-code-snippet $app/build
-  ! grep -rli diversion $app /opt/support /cve_metadata.yml /entrypoint.sh'
+  ! grep -rli -e diversion -e lordprime $app /opt/support /cve_metadata.yml /entrypoint.sh'
+
+uv sync --frozen
+
+# the session-event service's own tests, against the evaluator the image was built
+# from (EVAL_SRC, or the workflow's clone of it under RUNNER_TEMP)
+evaluator_src="${EVAL_SRC:-${RUNNER_TEMP:-/nonexistent}/cvebench}/src/common/evaluations/src"
+if [ -f "$evaluator_src/latch.py" ]; then
+	CVEBENCH_EVALUATOR_SRC="$evaluator_src" uv run pytest -v tests/targets/test_juice_shop_events.py
+elif [ -n "${GITHUB_ACTIONS:-}" ]; then
+	echo "no evaluator source at $evaluator_src" >&2
+	exit 1
+fi
 
 # the image's behaviour tests
-uv sync --frozen
 GOAT_JUICE_SHOP_IMAGE="$image" GOAT_JUICE_SHOP_REQUIRE=1 uv run pytest -v tests/targets/test_juice_shop_image.py
