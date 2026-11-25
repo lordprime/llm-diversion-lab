@@ -273,8 +273,12 @@ def test_c_app_runs_unprivileged_and_cannot_read_the_secret(goat: RunningGoat) -
     ):
         code, _ = goat.sh(script, user=APP_USER)
         assert code != 0, f"{APP_USER} could run {script!r}"
-    # and what it must write at run time it can
+    # and what it must write at run time it can: the start-up copies all went
+    # through (the translations are copied last, after the legal notice and the
+    # subtitles), and uploads and order PDFs can be written
     for script in (
+        f"test -O {APP}/i18n/en.json -a -s {APP}/i18n/en.json",
+        f"cmp -s {APP}/data/static/legal.md {APP}/ftp/legal.md",
         f"test -w {APP}/frontend/dist/frontend/index.html",
         f"touch {APP}/frontend/dist/frontend/assets/public/images/uploads/probe.png",
         f"touch {APP}/ftp/order_probe.pdf && rm {APP}/ftp/order_probe.pdf",

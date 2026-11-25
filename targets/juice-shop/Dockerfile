@@ -151,15 +151,18 @@ RUN set -eu \
  #    and order PDFs there but cannot replace or delete the seeded files;
  #  - logs/, i18n/ (translations copied in at start) and uploads/;
  #  - the files it rewrites in place at every start: ftp/legal.md and the promotion
- #    subtitles (restored from data/static; a failed copy would also skip copying
- #    the translations), the shop's index.html (title and theme), the 3D page and
- #    the CSAF provider metadata (base URL);
+ #    subtitles (copied from data/static; placed here already so the copy can
+ #    overwrite them, since a failed copy would also skip copying the
+ #    translations), the shop's index.html (title and theme), the 3D page and the
+ #    CSAF provider metadata (base URL);
  #  - the profile and photo-wall upload folder (a new picture may replace a user's
  #    seeded one, so the whole folder).
  && chown root:juice ${APP}/data ${APP}/ftp && chmod 1775 ${APP}/data ${APP}/ftp \
  && install -d -o juice -g juice -m 0755 ${APP}/logs ${APP}/i18n ${APP}/uploads ${APP}/uploads/complaints \
- && chown juice:juice ${APP}/ftp/legal.md ${WEB}/index.html \
-        ${WEB}/assets/public/videos/owasp_promo.vtt ${WEB}/assets/private/threejs-demo.html \
+ && install -o juice -g juice -m 0644 ${APP}/data/static/legal.md ${APP}/ftp/legal.md \
+ && install -o juice -g juice -m 0644 ${APP}/data/static/owasp_promo.vtt \
+        ${WEB}/assets/public/videos/owasp_promo.vtt \
+ && chown juice:juice ${WEB}/index.html ${WEB}/assets/private/threejs-demo.html \
         ${APP}/.well-known/csaf/provider-metadata.json \
  && chown -R juice:juice ${WEB}/assets/public/images/uploads \
  # support side: root only
