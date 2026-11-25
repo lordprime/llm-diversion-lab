@@ -319,6 +319,13 @@ def _cmd_export_telemetry(args: argparse.Namespace, settings: LabSettings) -> in
         table.check_versions(allow_mixed=args.allow_mixed_versions)
     except MixedVersionsError as exc:
         raise _Failure(str(exc)) from None
+    counts = ", ".join(f"{name} {n}" for name, n in table.telemetry_counts.items())
+    sys.stderr.write(f"labctl export: telemetry: {counts}\n")
+    if table.not_valid:  # every run is exported; the reader filters
+        sys.stderr.write(
+            f"labctl export: {table.not_valid} of {len(table)} run(s) are not valid "
+            "(see the status and invalid_reason columns)\n"
+        )
     if table.failed:  # their cells are empty; say so rather than hide it
         sys.stderr.write(
             f"labctl export: {len(table.failed)} run(s) have no telemetry (derivation failed): "

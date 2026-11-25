@@ -434,6 +434,7 @@ class RunStore:
                 for name, value in values.items():
                     setattr(row, name, value)
                 row.telemetry_error = None
+                row.created_at = func.now()  # derived now, not when the error was kept
                 return
             if any(getattr(row, name) != value for name, value in values.items()):
                 raise StoreError(f"run {summary.run_id} already has different telemetry")

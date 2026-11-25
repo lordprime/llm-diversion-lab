@@ -1774,3 +1774,55 @@ def test_telemetry_is_derived_again_without_conflict(
         None,
     )
     assert _artifact_paths(engine, result.run_id) == artifacts
+
+
+def _valid_and_untouched(engine: Engine, results: list[RunResult]) -> None:
+    """Both runs are valid, with their verdict, outcome and labels as they always are."""
+    assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
+    for result in results:
+        row = _run_row(engine, result.run_id)
+        assert (row.status, row.invalid_reason, row.outcome) == (RunStatus.VALID, None, True)
+        assert (row.effect, row.mechanism, row.end_status) == (True, True, EndStatus.COMPLETED)
+        assert row.decided_at is not None and _labels(engine, result.run_id)
+
+
+@pytest.mark.parametrize("step", ["summarise", "write_derived"])
+def test_a_telemetry_step_that_raises_leaves_status_and_verdict_untouched(
+    engine: Engine,
+    collector: CollectorClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    step: str,
+) -> None:
+    def boom(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError(f"{step} exploded")
+
+    monkeypatch.setattr(derive_module, step, boom)
+    results = _runner(engine, collector, FakeBackend(), tmp_path).run_experiment(
+        read_experiment(SELFTEST)
+    )
+    _valid_and_untouched(engine, results)
+    for result in results:
+        row = _telemetry(engine, result.run_id)
+        assert row is not None and row.telemetry_error and f"{step} exploded" in row.telemetry_error
+        assert not _artifact_paths(engine, result.run_id) & TELEMETRY_ARTIFACTS
+
+
+def test_a_failing_summary_store_is_recorded_as_an_error_and_the_run_is_untouched(
+    engine: Engine,
+    collector: CollectorClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse(*_args: Any, **_kwargs: Any) -> None:
+        raise StoreError("summary store down")
+
+    monkeypatch.setattr(RunStore, "record_telemetry", refuse)  # the error store still works
+    results = _runner(engine, collector, FakeBackend(), tmp_path).run_experiment(
+        read_experiment(SELFTEST)
+    )
+    _valid_and_untouched(engine, results)
+    for result in results:
+        row = _telemetry(engine, result.run_id)
+        assert row is not None and row.calls is None
+        assert row.telemetry_error and "summary store down" in row.telemetry_error

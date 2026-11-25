@@ -704,7 +704,18 @@ class RunTelemetryRow(Base):
     persona_splits: Mapped[int | None] = mapped_column(BigInteger)
     #: why deriving failed (redacted, bounded); NULL for a stored summary
     telemetry_error: Mapped[str | None] = mapped_column(Text)
+    #: when the row last changed (an error row promoted to a summary gets a new time)
     created_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now())
+
+    @property
+    def status(self) -> str:
+        """``ok`` (a stored summary) or ``error`` (derivation failed)."""
+        return "error" if self.telemetry_error is not None else "ok"
+
+    def summary(self) -> dict[str, Any]:
+        """The summary fields by name (:data:`TELEMETRY_FIELDS`): the one list every
+        reader (CLI, export, API) takes its fields from."""
+        return {name: getattr(self, name) for name in TELEMETRY_FIELDS}
 
 
 class RejectedBatch(Base):

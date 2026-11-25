@@ -58,10 +58,13 @@ EXPORT_COLUMNS: Final = (
     "agent",
     "model",
     "end_status",
+    "status",
+    "invalid_reason",
     "effect",
     "mechanism",
     *(f for f in TELEMETRY_FIELDS if f != "telemetry_version"),
     "telemetry_version",
+    "telemetry_status",
 )
 
 
@@ -287,21 +290,22 @@ def get_run_telemetry(session: Session, run_id: str) -> dict[str, Any] | None:
         return None
     return {
         "run_id": run_id,
-        **{name: getattr(row, name) for name in TELEMETRY_FIELDS},
+        **row.summary(),
         "telemetry_error": row.telemetry_error,
         "derived_at": row.created_at.isoformat(),
     }
 
 
 def telemetry_export_rows(session: Session, experiment_id: str) -> list[dict[str, Any]] | None:
-    """One row per run of the experiment that has a telemetry record, keyed by
-    :data:`EXPORT_COLUMNS` plus ``telemetry_error``; ordered by schedule index, attempt
-    and run id. ``None`` for an unknown experiment."""
+    """One row for every run of the experiment, keyed by :data:`EXPORT_COLUMNS` plus
+    ``telemetry_error``; ordered by schedule index, attempt and run id. Nothing is left
+    out: a run without a telemetry record has ``telemetry_status`` ``missing`` and empty
+    summary cells. ``None`` for an unknown experiment."""
     if session.get(Experiment, experiment_id) is None:
         return None
     stmt = (
         select(Run, RunTelemetryRow)
-        .join(RunTelemetryRow, RunTelemetryRow.run_id == Run.run_id)
+        .outerjoin(RunTelemetryRow, RunTelemetryRow.run_id == Run.run_id)
         .where(Run.experiment_id == experiment_id)
         .order_by(Run.schedule_index, Run.attempt, Run.run_id)
     )
@@ -313,10 +317,13 @@ def telemetry_export_rows(session: Session, experiment_id: str) -> list[dict[str
             "agent": run.agent_id,
             "model": run.model_id,
             "end_status": _value(run.end_status),
+            "status": _value(run.status),
+            "invalid_reason": _value(run.invalid_reason),
             "effect": run.effect,
             "mechanism": run.mechanism,
-            **{name: getattr(tel, name) for name in TELEMETRY_FIELDS},
-            "telemetry_error": tel.telemetry_error,
+            **(tel.summary() if tel else dict.fromkeys(TELEMETRY_FIELDS)),
+            "telemetry_status": tel.status if tel else "missing",
+            "telemetry_error": tel.telemetry_error if tel else None,
         }
         for run, tel in session.execute(stmt)
     ]

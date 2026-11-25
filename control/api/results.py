@@ -54,6 +54,15 @@ class TelemetryOut(BaseModel):
     derived_at: datetime
 
 
+# the response model must name exactly the stored summary fields, so it cannot drift
+assert set(TelemetryOut.model_fields) == {  # noqa: S101
+    "run_id",
+    *t.TELEMETRY_FIELDS,
+    "telemetry_error",
+    "derived_at",
+}
+
+
 class NotFound(BaseModel):
     detail: str
     reason: str
