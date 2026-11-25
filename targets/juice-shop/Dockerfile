@@ -76,6 +76,8 @@ COPY --from=juice-shop package.json package-lock.json /src/
 RUN npm ci --omit=dev --ignore-scripts \
  && npm rebuild sqlite3 \
  && node -e "require('sqlite3')" \
+ # the packages' own CI folders are not runtime code (one names a "canary" job)
+ && find node_modules -name .github -type d -prune -exec rm -rf {} + \
  && rm -rf /root/.npm /root/.cache \
  && if grep -rli diversion node_modules; then \
         echo 'deps: node_modules names the fork' >&2; exit 1; \
