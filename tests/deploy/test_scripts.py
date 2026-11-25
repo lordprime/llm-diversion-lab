@@ -2332,3 +2332,65 @@ def test_status_names_the_current_release_tag_for_compose() -> None:
 def test_no_control_container_gets_the_docker_socket() -> None:
     compose = (DEPLOY / "compose" / "control-plane.yml").read_text(encoding="utf-8")
     assert "docker.sock" not in compose
+
+
+# --------------------------------------------------------------------------- release self-test
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [((), "selftest"), (("full",), "selftest"), (("quick",), "selftest --quick")],
+)
+def test_the_release_self_test_is_full_unless_quick_is_asked(
+    lab_root: tuple[Path, dict[str, str]], args: tuple[str, ...], expected: str
+) -> None:
+    root, env = lab_root
+    bindir = Path(env["PATH"].split(":", 1)[0])
+    log = root.parent / "labctl.log"
+    labctl = bindir / "labctl"
+    labctl.write_text(f'#!/bin/sh\necho "$*" >> {log}\n', encoding="utf-8")
+    labctl.chmod(0o755)
+    result = _run(["bash", str(DEPLOY / "remote" / "release.sh"), "selftest", *args], env=env)
+    assert result.returncode == 0, result.stderr
+    assert log.read_text(encoding="utf-8").splitlines() == [expected]
+
+
+@pytest.mark.parametrize("mode", ["fast", "--quick", "FULL", ""])
+def test_the_release_self_test_refuses_an_unknown_mode(
+    lab_root: tuple[Path, dict[str, str]], mode: str
+) -> None:
+    root, env = lab_root
+    bindir = Path(env["PATH"].split(":", 1)[0])
+    log = root.parent / "labctl.log"
+    labctl = bindir / "labctl"
+    labctl.write_text(f'#!/bin/sh\necho "$*" >> {log}\n', encoding="utf-8")
+    labctl.chmod(0o755)
+    result = _run(["bash", str(DEPLOY / "remote" / "release.sh"), "selftest", mode], env=env)
+    if mode == "":  # an empty mode is the default
+        assert result.returncode == 0 and log.read_text().splitlines() == ["selftest"]
+    else:
+        assert result.returncode != 0 and "expected full or quick" in result.stderr
+        assert not log.exists()
+
+
+def test_the_release_self_test_without_labctl_exits_3(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    _, env = lab_root
+    env = {**env, "PATH": env["PATH"].split(":", 1)[0] + ":/usr/bin:/bin"}
+    result = _run(["bash", str(DEPLOY / "remote" / "release.sh"), "selftest"], env=env)
+    assert result.returncode == 3, (result.returncode, result.stderr)
+
+
+def test_release_runs_the_full_self_test_by_default() -> None:
+    text = (DEPLOY / "release.sh").read_text(encoding="utf-8")
+    assert "selftest_mode=full" in text
+    assert 'lab_remote release.sh selftest "$selftest_mode"' in text
+    assert "--quick-selftest) selftest_mode=quick ;;" in text
+    usage = _run(["bash", str(DEPLOY / "release.sh"), "--help"], env=_script_env())
+    assert usage.returncode == 0 and "--quick-selftest" in usage.stdout
+    # the flag parses (the run then stops at the missing tag, not at the option)
+    result = _run(
+        ["bash", str(DEPLOY / "release.sh"), "lab1", "--quick-selftest"], env=_script_env()
+    )
+    assert result.returncode != 0 and "unknown option" not in result.stderr

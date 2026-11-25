@@ -14,7 +14,8 @@
 #   migrate TAG                     stop the app services (db keeps running), pg_dump,
 #                                   then `run --rm --no-deps migrate` from the new release
 #   activate TAG [allow-build]      swap `current` to TAG and (re)start the control plane
-#   selftest                        `labctl selftest --quick` (exit 3 if labctl is absent)
+#   selftest [full|quick]           `labctl selftest` (full, the default: every target) or
+#                                   `labctl selftest --quick` (exit 3 if labctl is absent)
 #   rollback                        stop the app services, restore the pre-migration dump,
 #                                   swap `current` back, start the old release
 #   record TAG COMMIT WHO RESULT    append the deployment to deployments.jsonl
@@ -303,7 +304,11 @@ cmd_selftest() {
 		echo "labctl is not installed on this host yet" >&2
 		exit 3
 	fi
-	labctl selftest --quick
+	case ${1:-full} in
+	full) labctl selftest ;;
+	quick) labctl selftest --quick ;;
+	*) die "selftest: expected full or quick, not ${1}" ;;
+	esac
 }
 
 # State of a rollback in progress, printed on any failure so the operator knows
@@ -444,7 +449,7 @@ pull) cmd_pull "$@" ;;
 compose-pull) cmd_compose_pull "$@" ;;
 migrate) cmd_migrate "$@" ;;
 activate) cmd_activate "$@" ;;
-selftest) cmd_selftest ;;
+selftest) cmd_selftest "$@" ;;
 rollback) cmd_rollback ;;
 record) cmd_record "$@" ;;
 *) die "usage: release.sh preflight|begin|receive|labctl|pull|compose-pull|migrate|activate|selftest|rollback|record" ;;

@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 usage() {
 	cat <<'EOF'
-Usage: deploy/release.sh <host> --tag vX.Y.Z[-suffix] [--allow-build] [--skip-selftest]
+Usage: deploy/release.sh <host> --tag vX.Y.Z[-suffix] [--allow-build] [--quick-selftest | --skip-selftest]
 
 Deploys the git tag to /srv/lab/releases/<tag> on <host> and makes it current:
  1. refuse if this git tree is dirty or the tag does not exist;
@@ -17,7 +17,8 @@ Deploys the git tag to /srv/lab/releases/<tag> on <host> and makes it current:
  5. if the release has a `migrate` service: stop the app services (the database
     keeps running), pg_dump, then `compose run --rm --no-deps migrate`;
  6. swap the `current` symlink and restart the control plane (compose up --wait);
- 7. `labctl selftest --quick` if labctl is installed;
+ 7. `labctl selftest` (every target; `--quick-selftest`: DVGA only) if labctl
+    is installed;
  8. on any failure in 5-7: stop the app services, restore the dump, swap
     `current` back, start the previous release, exit non-zero;
  9. record the deployment in /srv/lab/deployments.jsonl.
@@ -29,13 +30,16 @@ Options:
   --tag TAG        the release tag (required)
   --allow-build    let compose build images on the host (fallback only: images
                    are normally built in CI and pulled)
-  --skip-selftest  do not run the quick self-test
+  --quick-selftest run the quick self-test (DVGA pair only) instead of the full
+                   one (every target; Juice Shop resets restart its container,
+                   so the full self-test takes several minutes)
+  --skip-selftest  do not run the self-test (emergencies only)
   --drain          not available in M0 (there is no queue to pause yet)
   -h, --help       show this help
 EOF
 }
 
-host="" tag="" allow_build=0 selftest=1
+host="" tag="" allow_build=0 selftest=1 selftest_mode=full
 while (($#)); do
 	case $1 in
 	-h | --help)
@@ -51,6 +55,7 @@ while (($#)); do
 		shift
 		;;
 	--allow-build) allow_build=1 ;;
+	--quick-selftest) selftest_mode=quick ;;
 	--skip-selftest) selftest=0 ;;
 	--drain)
 		printf 'ERROR: --drain is not available in M0: stop the runner by hand, then deploy\n' >&2
@@ -162,16 +167,16 @@ lab_remote release.sh activate "$tag" "${build_arg[@]}" || rollback "the control
 
 selftest_result="skipped"
 if ((selftest)); then
-	lab_step "Quick self-test on $host"
+	lab_step "Self-test ($selftest_mode) on $host"
 	rc=0
-	lab_remote release.sh selftest || rc=$?
+	lab_remote release.sh selftest "$selftest_mode" || rc=$?
 	case $rc in
-	0) selftest_result="passed" ;;
+	0) selftest_result="passed ($selftest_mode)" ;;
 	3)
-		lab_warn "labctl is not installed on $host; quick self-test skipped"
+		lab_warn "labctl is not installed on $host; self-test skipped"
 		selftest_result="not available"
 		;;
-	*) rollback "the quick self-test failed (exit $rc)" ;;
+	*) rollback "the $selftest_mode self-test failed (exit $rc)" ;;
 	esac
 fi
 

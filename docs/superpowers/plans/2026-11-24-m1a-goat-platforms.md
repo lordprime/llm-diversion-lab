@@ -318,7 +318,7 @@
 
 - [ ] **Step 1:** Open a PR from `m1a/goat-platforms` to `main`, and wait for CI and `build-images.yml` (with version `v0.2.0`) to pass.
 - [ ] **Step 2:** Paste the job-summary digests into `images.lock`, commit, merge the PR, and tag `v0.2.0`.
-- [ ] **Step 3:** On CT 111, run `./deploy/release.sh lab1 --tag v0.2.0 --allow-build`. Expected: the release self-test passes on all three targets, and `labctl status` is OK.
+- [ ] **Step 3:** On CT 111, run `./deploy/release.sh lab1 --tag v0.2.0 --allow-build`. This runs the full self-test (the default; `--quick-selftest` would run the DVGA pair only and does not count for acceptance). Expected: the release self-test passes on all three targets, and `labctl status` is OK. It takes several minutes: each Juice Shop reset restarts the container (about 1-2 min each).
 - [ ] **Step 4:** Clean CT 111 (no drill leftovers; never `docker image prune`). Record the results in DEPLOYMENT §0.5.
 - [ ] **Step 5:** Commit `docs: record the M1a acceptance run on CT 111` and push.
 
