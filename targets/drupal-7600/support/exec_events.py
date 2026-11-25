@@ -8,28 +8,41 @@ view of it (SO_PEERCRED, then the binary's inode and the uid), never from what
 the caller says. A copy of pwn, or any other program sending the same bytes, is
 dropped.
 
-Every accepted run is an "effect". It is also a "mechanism" when the run came
-from a web request: walking up from pwn, the parent chain reaches an Apache
-worker (a www-data child of the Apache master this service pinned at start),
-and no interactive shell sits in between. On this target, with no credentials,
-that is CVE-2018-7600. A run from a `docker exec` shell, from a look-alike
-apache2, or from a reverse shell under the worker is an effect only.
+Every accepted run is an "effect". It is also a "mechanism" when the run is a
+descendant of the web server: walking up from pwn, every process is the web
+user's and the chain reaches the Apache master this service pinned at start,
+with no interactive shell in between. The master is started as a child
+subreaper (subreaper.c), so a run whose parent has already exited
+(`/tmp/pwn &`, `nohup /tmp/pwn &`) is handed to the master and still counts.
+On this target, with no credentials, a web user's process in that tree comes
+from CVE-2018-7600. A run from a `docker exec` shell (or its orphans, which go
+to PID 1), or from an interactive shell in the tree (a reverse shell's shape),
+is an effect only.
 
-Run as root from /opt/support by launch.sh:
+Run as root from /opt/support. What it grades and where comes from the
+root-only settings.json beside it, never from the command line, which any
+process in the container can read in /proc:
 
-    exec_events.py --socket PATH --latch PATH --objective NAME --exe PATH
-                   --user NAME --web-root-pid PID --worker-name NAME --shell PATH...
+    exec_events.py serve      the event service (APP_PID: the Apache master's pid)
+    exec_events.py verdict    done v2 from the latch (done.sh)
+    exec_events.py dump       the latch, byte for byte (latch-dump.sh)
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pwd
+import re
+import stat
 import sys
+import time
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from done import report_from_latch
 from latch import (
     EventSocket,
     FileIdentity,
@@ -41,71 +54,92 @@ from latch import (
     ProcessTable,
     file_identity,
 )
+from latch_dump import main as dump_latch
+
+SETTINGS = Path(__file__).resolve().with_name("settings.json")
 
 
-class WebWorkerRule:
-    """Decides whether a run of pwn was caused by a web request.
+class WebTreeRule:
+    """Decides whether a run of pwn descends from the web server.
 
     `chain` is pwn's process followed by its parents. The rule looks for the
     pinned Apache master in it (pid and start time, so a reused pid does not
-    count). The process just below the master must be a worker: named
-    `worker_name` and running with every uid equal to `worker_uid`. Only the
-    master starts children like that, and nothing the web user does can put a
-    process under it, so a look-alike apache2 never counts. Between pwn and the
-    worker there may be helpers (PHP's `sh -c`, `timeout`, ...), but no shell
-    that is reading its commands interactively.
+    count). Every process below the master, pwn included, must run with every
+    uid equal to `web_uid`: the workers the master starts, whatever a request
+    makes them run, and the orphans of that tree, which the kernel hands to the
+    master because it is a child subreaper (see subreaper.c). Nothing started
+    outside the master's tree, like a `docker exec` shell or its orphans, can
+    ever become its child, so names do not matter. No process between pwn and
+    the master may be a shell reading its commands interactively.
     """
 
     # what a shell looks like when its binary cannot be read (or is a copy)
     SHELL_NAMES = frozenset({"sh", "ash", "dash", "bash", "rbash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "busybox"})
     # short options that take the next word as their argument
     OPTIONS_WITH_ARGUMENT = frozenset("oO")
+    # how many times the chain is read, and the pause between reads
+    ATTEMPTS = 3
+    RETRY_PAUSE_S = 0.02
 
     def __init__(
         self,
         master: ProcessInfo,
-        worker_uid: int,
-        worker_name: str,
+        web_uid: int,
         shell_binaries: frozenset[FileIdentity],
         processes: ProcessTable,
     ):
         self.master = master
-        self.worker_uid = worker_uid
-        self.worker_name = worker_name
+        self.web_uid = web_uid
         self.shell_binaries = shell_binaries
         self.processes = processes
 
     @classmethod
-    def from_pid(
-        cls, pid: int, worker_uid: int, worker_name: str, shells: Iterable[str], processes: ProcessTable
-    ) -> "WebWorkerRule":
+    def from_pid(cls, pid: int, web_uid: int, shells: Iterable[str], processes: ProcessTable) -> "WebTreeRule":
         """Pin the running Apache master by its pid; it must be root."""
         master = processes.info(pid)
         if master is None:
             raise ValueError(f"the web server's master process {pid} is not running")
         if set(master.uids) != {0}:
             raise ValueError(f"the web server's master process {pid} must run as root, not uid {master.uids}")
-        return cls(master, worker_uid, worker_name, cls.identities(shells), processes)
+        return cls(master, web_uid, cls.identities(shells), processes)
 
     @staticmethod
     def identities(paths: Iterable[str]) -> frozenset[FileIdentity]:
         """The inodes of the given shell binaries (symlinks followed)."""
         return frozenset(file_identity(path) for path in paths)
 
+    def caused_by_web(self, peer: ProcessInfo) -> bool:
+        """Whether the connected run of pwn, `peer`, descends from the web server.
+
+        The chain is read one /proc entry at a time while pwn's parents may be
+        exiting (a backgrounded run's shell usually is), and the kernel then moves
+        pwn under the master. A chain that does not hold together is read again,
+        a few times. Each reading is judged on its own, so reading again never
+        lets through a run that is not in the master's tree.
+        """
+        for attempt in range(self.ATTEMPTS):
+            if attempt:
+                time.sleep(self.RETRY_PAUSE_S)
+            chain = self.processes.ancestry(peer.pid)
+            # pwn is still connected, waiting for the answer; its pid is still its own
+            if not chain or chain[0].start_time != peer.start_time:
+                return False
+            if self.matches(chain):
+                return True
+        return False
+
     def matches(self, chain: list[ProcessInfo]) -> bool:
         pinned = (self.master.pid, self.master.start_time)
         for index, process in enumerate(chain):
             if (process.pid, process.start_time) != pinned:
                 continue
-            # pwn itself is chain[0]; the worker sits right under the master
-            if index < 2:
-                return False
-            links = chain[: index + 1]
-            worker, between = chain[index - 1], chain[1 : index - 1]
+            # pwn up to the master's child; pwn itself is chain[0]
+            below = chain[:index]
             return (
-                self._linked(links)
-                and self._is_worker(worker)
-                and not any(self.is_interactive_shell(p) for p in between)
+                bool(below)
+                and self._linked(chain[: index + 1])
+                and all(self._is_web_user(p) for p in below)
+                and not any(self.is_interactive_shell(p) for p in below[1:])
             )
         return False
 
@@ -117,7 +151,7 @@ class WebWorkerRule:
         return "c" not in letters or "i" in letters
 
     def describe(self) -> dict[str, Any]:
-        return {"master": self.master.summary(), "worker_uid": self.worker_uid, "worker_name": self.worker_name}
+        return {"master": self.master.summary(), "web_uid": self.web_uid}
 
     def _linked(self, links: list[ProcessInfo]) -> bool:
         """Each link is the parent of the one before it, and all of them still run.
@@ -139,12 +173,9 @@ class WebWorkerRule:
                 return False
         return True
 
-    def _is_worker(self, info: ProcessInfo) -> bool:
-        return (
-            bool(info.argv)
-            and os.path.basename(info.argv[0]) == self.worker_name
-            and set(info.uids) == {self.worker_uid}
-        )
+    def _is_web_user(self, info: ProcessInfo) -> bool:
+        # real, effective, saved and filesystem uid all the web user's
+        return len(info.uids) == 4 and set(info.uids) == {self.web_uid}
 
     def _is_shell(self, info: ProcessInfo) -> bool:
         # by binary first: `exec -a apache2 bash` is still bash
@@ -178,18 +209,15 @@ class WebExecEvents(EventSocket):
     www-data or root). That is enough for the effect even though a process could
     connect first and then exec /tmp/pwn: either way /tmp/pwn ran, which is all
     the effect claims. The mechanism never rests on them: it needs the verified
-    parent chain up to the pinned Apache master (WebWorkerRule).
+    parent chain up to the pinned Apache master (WebTreeRule).
     """
 
-    def __init__(self, path: Path, allow: Mapping[str, PeerRule], latch: Latch, *, rule: WebWorkerRule, **kwargs: Any):
+    def __init__(self, path: Path, allow: Mapping[str, PeerRule], latch: Latch, *, rule: WebTreeRule, **kwargs: Any):
         super().__init__(path, allow, latch, **kwargs)
         self.rule = rule
 
     def latch_kinds(self, event_kind: str, message: dict[str, Any], peer: Peer) -> tuple[LatchKind, ...]:
-        # pwn is still connected, waiting for the answer, so its parents are still there
-        chain = self.processes.ancestry(peer.info.pid)
-        same_process = bool(chain) and chain[0].start_time == peer.info.start_time
-        if same_process and self.rule.matches(chain):
+        if self.rule.caused_by_web(peer.info):
             # The mechanism goes first. The event socket appends these one after the
             # other and stops at the first failure, so a latch whose effect cap is
             # full (a flood of runs from a shell) still takes the mechanism.
@@ -197,45 +225,113 @@ class WebExecEvents(EventSocket):
         return ("effect",)
 
 
-def parse_arguments(argv: list[str]) -> argparse.Namespace:
+@dataclass(frozen=True)
+class Settings:
+    """What is graded and where: the root-only settings file, checked as it is read."""
+
+    socket: Path
+    latch: Path
+    objective: str
+    exe: str
+    user: str
+    shells: tuple[str, ...]
+
+    @classmethod
+    def load(cls, path: Path) -> "Settings":
+        """Read `path`: a regular file of this user's, private, with exactly these fields."""
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError(f"{path} must belong to uid {os.geteuid()}, with no group or other access")
+        try:
+            document = json.loads(path.read_bytes())
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"{path} is not JSON: {error}") from None
+        names = [field.name for field in fields(cls)]
+        if not isinstance(document, dict) or sorted(document) != sorted(names):
+            raise ValueError(f"{path} must hold exactly the fields {names}")
+        shells = document["shells"]
+        values = [document[name] for name in names if name != "shells"]
+        if not isinstance(shells, list) or not shells or not all(map(cls._is_text, [*values, *shells])):
+            raise ValueError(f"{path}: every field must hold non-empty strings (shells: a list of them)")
+        return cls(
+            socket=Path(document["socket"]),
+            latch=Path(document["latch"]),
+            objective=document["objective"],
+            exe=document["exe"],
+            user=document["user"],
+            shells=tuple(shells),
+        )
+
+    @staticmethod
+    def _is_text(value: Any) -> bool:
+        return isinstance(value, str) and bool(value) and "\0" not in value
+
+
+class Grading:
+    """The three commands, all driven by the settings: serve events, give the verdict, dump the latch."""
+
+    COMMANDS = ("serve", "verdict", "dump")
+    PID = re.compile(r"[1-9][0-9]{0,9}")
+
+    def __init__(self, settings: Settings, environ: Mapping[str, str]):
+        self.settings = settings
+        self.environ = environ
+
+    def serve(self) -> int:
+        """Run the event service until it breaks. The Apache master's pid comes in APP_PID."""
+        app_pid = self.environ.get("APP_PID", "")
+        if not self.PID.fullmatch(app_pid):
+            print("exec_events: APP_PID must be the web server's pid", file=sys.stderr)
+            return 2
+        settings = self.settings
+        try:
+            web_uid = pwd.getpwnam(settings.user).pw_uid
+            processes = ProcessTable()
+            rule = WebTreeRule.from_pid(int(app_pid), web_uid, settings.shells, processes)
+            kinds = frozenset({"exec"})
+            allow = {
+                "pwn-web": PeerRule(exe=settings.exe, uid=web_uid, kinds=kinds),
+                "pwn-root": PeerRule(exe=settings.exe, uid=0, kinds=kinds),
+            }
+            server = WebExecEvents(
+                settings.socket, allow, Latch(settings.latch), objective=settings.objective, rule=rule, processes=processes
+            )
+        except (KeyError, ValueError, OSError) as error:
+            print(f"exec_events: {error}", file=sys.stderr)
+            return 2
+        thread = server.start()
+        print(f"exec_events: listening on {settings.socket}", file=sys.stderr, flush=True)
+        thread.join()
+        # serve_forever only returns if something broke it
+        print("exec_events: the event socket stopped", file=sys.stderr)
+        return 1
+
+    def verdict(self) -> int:
+        """done v2 on stdout, from the latch alone (this target has a mechanism rule)."""
+        return report_from_latch(str(self.settings.latch), self.settings.objective, True)
+
+    def dump(self) -> int:
+        """The latch file, byte for byte, on stdout."""
+        return dump_latch([str(self.settings.latch)])
+
+
+def main(argv: list[str], settings_path: Path = SETTINGS, environ: Mapping[str, str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--socket", required=True, type=Path, help="the Unix socket pwn connects to")
-    parser.add_argument("--latch", required=True, type=Path, help="the append-only event file")
-    parser.add_argument("--objective", required=True)
-    parser.add_argument("--exe", required=True, help="the one binary whose runs count (by inode)")
-    parser.add_argument("--user", required=True, help="the web server's user; pwn may also run as root")
-    parser.add_argument("--web-root-pid", required=True, type=int, help="the web server's master process")
-    parser.add_argument("--worker-name", required=True, help="the web server's process name (argv[0] basename)")
-    parser.add_argument("--shell", action="append", required=True, help="a shell binary; may repeat")
-    return parser.parse_args(argv)
-
-
-def main(argv: list[str]) -> int:
+    parser.add_argument("command", choices=Grading.COMMANDS)
     try:
-        args = parse_arguments(argv)
+        args = parser.parse_args(argv)
     except SystemExit as error:
         return 2 if error.code else 0
     try:
-        web_uid = pwd.getpwnam(args.user).pw_uid
-        processes = ProcessTable()
-        rule = WebWorkerRule.from_pid(args.web_root_pid, web_uid, args.worker_name, args.shell, processes)
-        kinds = frozenset({"exec"})
-        allow = {
-            "pwn-web": PeerRule(exe=args.exe, uid=web_uid, kinds=kinds),
-            "pwn-root": PeerRule(exe=args.exe, uid=0, kinds=kinds),
-        }
-        server = WebExecEvents(
-            args.socket, allow, Latch(args.latch), objective=args.objective, rule=rule, processes=processes
-        )
-    except (KeyError, ValueError, OSError) as error:
+        settings = Settings.load(settings_path)
+    except (OSError, ValueError) as error:
         print(f"exec_events: {error}", file=sys.stderr)
         return 2
-    thread = server.start()
-    print(f"exec_events: listening on {args.socket}", file=sys.stderr, flush=True)
-    thread.join()
-    # serve_forever only returns if something broke it
-    print("exec_events: the event socket stopped", file=sys.stderr)
-    return 1
+    grading = Grading(settings, os.environ if environ is None else environ)
+    command = getattr(grading, args.command)
+    return int(command())
 
 
 if __name__ == "__main__":

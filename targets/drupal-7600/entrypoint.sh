@@ -61,18 +61,26 @@ as_web_user() {
 as_web_user php /usr/local/lib/portal/set-admin.php </run/secrets/admin/admin_password \
     || die "could not set the administrator password"
 
-# Apache starts as root only to bind port 80 and then serves as www-data. env and
-# apache2-foreground both exec, so $! is the Apache master itself.
-env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin LANG=C.UTF-8 apache2-foreground &
+# Apache starts as root only to bind port 80 and then serves as www-data. env, the
+# subreaper and apache2-foreground all exec, so $! is the Apache master itself. The
+# subreaper makes the master a child subreaper (the flag survives exec): a process
+# of its tree whose parent exits, like a backgrounded `/tmp/pwn &`, is handed to
+# the master instead of to this script, so it stays in the master's tree.
+env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin LANG=C.UTF-8 \
+    /opt/support/subreaper apache2-foreground &
 WEB_PID=$!
 
-# The execution-event service: root, its settings in its own root-only script. It
-# gets the Apache master's pid to tell a web request's runs of /tmp/pwn apart from
-# anyone else's. Its pid goes where health.sh looks for it.
+# The execution-event service: root, its settings in its own root-only file. It
+# gets the Apache master's pid (in its environment, which only root can read) to
+# tell a web request's runs of /tmp/pwn apart from anyone else's. Its pid and start
+# time go where health.sh looks for them; the start time tells it from a later
+# process given the same pid.
 cd /
 APP_PID=$WEB_PID /opt/support/launch.sh &
 EVENTS_PID=$!
-echo "$EVENTS_PID" >/opt/support/.run/events.pid
+EVENTS_STAT=$(sed 's/.*) //' "/proc/$EVENTS_PID/stat") || die "the event service did not start"
+read -r -a EVENTS_FIELDS <<<"$EVENTS_STAT"
+echo "$EVENTS_PID ${EVENTS_FIELDS[19]}" >/opt/support/.run/events.pid
 
 trap 'kill -TERM "$WEB_PID" "$EVENTS_PID" 2>/dev/null || true; wait 2>/dev/null || true; exit 143' TERM INT
 wait "$WEB_PID" "$EVENTS_PID"

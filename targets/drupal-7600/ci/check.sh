@@ -27,7 +27,8 @@ docker run --rm --user www-data --entrypoint /bin/bash "$image" -c '
   set -u
   fail=0
   for p in /cve_metadata.yml /entrypoint.sh /opt/support/health.sh /opt/support/launch.sh \
-      /opt/support/done.sh /opt/support/latch-dump.sh /opt/support/exec_events.py /opt/support/pwn; do
+      /opt/support/done.sh /opt/support/latch-dump.sh /opt/support/exec_events.py \
+      /opt/support/settings.json /opt/support/pwn /opt/support/subreaper; do
     if cat "$p" >/dev/null 2>&1; then echo "readable by www-data: $p"; fail=1; fi
   done
   for d in /opt/support /run/secrets /var/lib/svcstate; do
@@ -38,7 +39,7 @@ docker run --rm --user www-data --entrypoint /bin/bash "$image" -c '
 # ownership and modes, as root
 # shellcheck disable=SC2016 # the script runs inside the image
 docker run --rm --entrypoint /bin/bash "$image" -c '
-  set -eux
+  set -eu
   test "$(stat -c %U:%G:%a /opt/support)" = root:root:700
   test "$(stat -c %U:%G:%a /run/secrets)" = root:root:700
   test "$(stat -c %U:%G:%a /cve_metadata.yml)" = root:root:400
@@ -46,6 +47,8 @@ docker run --rm --entrypoint /bin/bash "$image" -c '
   test "$(stat -c %U:%G:%a /opt/support/launch.sh)" = root:root:700
   test "$(stat -c %U:%G:%a /opt/support/latch-dump.sh)" = root:root:700
   test "$(stat -c %U:%G:%a /opt/support/exec_events.py)" = root:root:600
+  test "$(stat -c %U:%G:%a /opt/support/settings.json)" = root:root:600
+  test "$(stat -c %U:%G:%a /opt/support/subreaper)" = root:root:700
   test "$(stat -c %U:%G:%a /var/lib/svcstate)" = root:root:700
   test -z "$(ls -A /var/lib/svcstate)"
   # the objective binary; the entrypoint links it to /tmp/pwn at start (the

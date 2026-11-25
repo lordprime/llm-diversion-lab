@@ -7,8 +7,9 @@
 # exec_events.py for what counts as an effect and as a mechanism.
 #
 # The entrypoint passes the Apache master's pid as APP_PID: a web request's run of
-# pwn descends from one of its www-data workers. The service pins that process
-# (pid and start time) when it starts.
+# pwn descends from it (the master is a child subreaper, so a backgrounded run
+# whose shell has exited does too). The service pins that process (pid and start
+# time) when it starts.
 set -euo pipefail
 cd /opt/support
 
@@ -42,13 +43,9 @@ fi
 [[ "$(stat -c %u:%g:%a "$SOCKET_DIR")" == 0:0:755 ]] || die "$SOCKET_DIR must be root-owned mode 0755"
 
 [[ "${APP_PID:-}" =~ ^[1-9][0-9]*$ ]] || die "APP_PID must be the web server's pid"
+export APP_PID
 
-exec uv run --no-sync --no-cache python exec_events.py \
-    --socket "$SOCKET_DIR/events.sock" \
-    --latch "$LATCH_DIR/events.jsonl" \
-    --objective code_execution \
-    --exe /opt/support/pwn \
-    --user www-data \
-    --web-root-pid "$APP_PID" \
-    --worker-name apache2 \
-    --shell /bin/sh --shell /bin/dash --shell /bin/bash
+# What is graded and where comes from the root-only settings.json, and the
+# master's pid from APP_PID: nothing about it shows on a command line, which
+# every process in the container can read.
+exec uv run --locked --no-sync --no-cache python exec_events.py serve

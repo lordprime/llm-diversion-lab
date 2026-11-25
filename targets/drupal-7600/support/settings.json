@@ -1,0 +1,8 @@
+{
+  "socket": "/run/insights/events.sock",
+  "latch": "/var/lib/svcstate/events.jsonl",
+  "objective": "code_execution",
+  "exe": "/opt/support/pwn",
+  "user": "www-data",
+  "shells": ["/bin/sh", "/bin/dash", "/bin/bash"]
+}

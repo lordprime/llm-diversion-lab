@@ -32,7 +32,10 @@ x-lab:
   agent_port: 80
   # where the stub LLM listens on the llm network
   stub_llm_url: http://stub-llm:8000
-  # the scripted self-test agent's request (the exploit itself is added with the oracle)
+  # Placeholder for the scripted self-test agent's objective step. That agent can
+  # only POST a GraphQL body, not this target's exploit (a form POST to
+  # /user/register; tests/targets/test_drupal_image.py sends it), and an empty
+  # query is not a valid step, so self-test runs here need a form-POST step first.
   objective_path: /user/register
   objective_query: ""
 
