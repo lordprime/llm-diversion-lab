@@ -29,8 +29,9 @@ admin password as a root:root 0400 file. Checks:
     login by the administrator's own email and password (a forged one) is an effect
     only; an ordinary customer, a self-registered account with role "admin", and the
     administrator's own login score nothing;
-(f) killing the app (a crash), or a SIGUSR1 to it, is never a success and never
-    leaves the health check green; a stopped event service turns it red;
+(f) a SIGUSR1 from the app user opens no inspector in the shop; killing the app (a
+    crash) is never a success and never leaves the health check green; a stopped
+    event service turns it red;
 (g) a root-side change of the administrator's password in the database, followed by
     an ordinary login, is neither effect nor mechanism; a restart after a success
     still scores; the app user can neither read nor write the latch, cannot reach
