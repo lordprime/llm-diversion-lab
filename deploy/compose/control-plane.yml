@@ -160,10 +160,10 @@ services:
     cap_drop: [ALL]
     # Sized from the gateway's caps (control/gateway/config.py): at most 8 large bodies
     # of up to 16 MiB plus 1 MiB for each of the other 56 open calls (about 184 MiB),
-    # two model checks parsing at once (each a decoded copy plus at most 200,000
-    # arrays and objects, under 100 MiB), the process itself, and headroom.
+    # four model checks parsing at once (each a decoded copy plus at most 100,000
+    # arrays and objects, under 60 MiB), the process itself, and headroom.
     mem_limit: 1g
-    # one process; the event loop, two parse threads, the DB threadpool and libpq
+    # one process; the event loop, four parse threads, the DB threadpool and libpq
     pids_limit: 128
     healthcheck:
       test:

@@ -17,10 +17,16 @@ forwarded:
   model, and LiteLLM-based clients drop their ``ollama/`` routing prefix themselves.
 
 The parse is bounded so it can run off the event loop without starving it: a body may
-hold at most :data:`MAX_JSON_CONTAINERS` arrays and objects (counted before parsing),
-and numbers go through a Python hook. CPython's JSON scanner keeps the GIL while it
-builds containers and numbers in C, so without these bounds a worker thread parsing a
-crafted body would still freeze the loop for a noticeable time.
+hold at most :data:`MAX_JSON_CONTAINERS` arrays and objects, and numbers go through a
+Python hook. CPython's JSON scanner keeps the GIL while it builds containers and
+numbers in C, so without these bounds a worker thread parsing a crafted body would
+still freeze the loop for a noticeable time. The containers are counted before
+parsing, in two steps: a raw count of ``[`` and ``{`` (milliseconds, and an
+over-count, because brackets inside strings count too), and only when that passes
+the cap, an exact count that skips strings and stops at the cap. Minified JavaScript
+that an agent fetched sits in its history as strings full of braces; it must pass.
+A body really over the cap raises :class:`BodyTooComplex`, which is not a model
+refusal.
 """
 
 from __future__ import annotations
@@ -29,11 +35,12 @@ import json
 import re
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Final
+from typing import Any, Final, cast
 
 __all__ = [
     "ALLOWED_ENDPOINTS",
     "MAX_JSON_CONTAINERS",
+    "BodyTooComplex",
     "Decision",
     "Endpoint",
     "EndpointPolicy",
@@ -136,10 +143,25 @@ class EndpointPolicy:
 # --------------------------------------------------------------------------- models
 
 
-#: The most arrays and objects a request body may hold. A real agent request, even
-#: a 16 MiB one with a long history and many tools, has a few thousand; each one costs
-#: the parser an allocation made while it holds the GIL.
-MAX_JSON_CONTAINERS: Final = 200_000
+#: The most arrays and objects a request body may hold. A real agent request has a
+#: few per message and tool: a 15 MiB history of fetched JavaScript has about 150,
+#: and a model's context window (128k tokens is about 0.5 MB of text) bounds a real
+#: history to thousands of messages at most. Each one costs the parser an allocation
+#: made while it holds the GIL, and the garbage collector a visit; at 100,000 a parse
+#: in a worker thread delays the event loop by about 100 ms at worst.
+MAX_JSON_CONTAINERS: Final = 100_000
+#: One step of the exact count, within a window of the body: any number of plain runs
+#: (no quote, no bracket) and whole strings, then one opening bracket (group 1), or the
+#: quote of a string that does not end inside the window (group 2). Possessive, so a
+#: failed match never backtracks.
+_STEP: Final = re.compile(rb'(?:[^"\[{]++|"(?:[^"\\]++|\\.)*+")*+(?:([\[{])|("))?', re.S)
+#: The inside of a string, up to its closing quote or the end of the window.
+_INSIDE: Final = re.compile(rb'(?:[^"\\]++|\\.)*+', re.S)
+#: How much of the body one regex call may scan. The regex engine keeps the GIL for a
+#: whole call, so this bounds how long the event loop can wait on the count (about a
+#: millisecond); a window is also what keeps a long or unterminated string linear.
+_WINDOW: Final = 64 << 10
+_QUOTE: Final = ord('"')
 
 #: The top-level body fields that select the model, per path. Ollama's /api/show
 #: still honours the deprecated ``name`` when ``model`` is empty.
@@ -155,6 +177,16 @@ class ModelRefused(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class BodyTooComplex(Exception):
+    """The body holds more arrays and objects than the gateway parses (not a model
+    refusal: the gateway answers it with 413)."""
+
+    def __init__(self, count: int) -> None:
+        super().__init__(f"more than {MAX_JSON_CONTAINERS} arrays and objects")
+        self.reason = f"body_too_complex: more than {MAX_JSON_CONTAINERS} arrays and objects"
+        self.count = count
 
 
 class _Pairs(list[tuple[str, Any]]):
@@ -191,6 +223,9 @@ class ModelPolicy:
     def check(self, body: bytes, path: str) -> str | None:
         """The model id, or ``None`` when the body names no model.
 
+        Raises :class:`BodyTooComplex` for a body with more arrays and objects than
+        :data:`MAX_JSON_CONTAINERS`.
+
         Raises :class:`ModelRefused` for a body that is not one JSON object, for a
         model field that is not a string, is spelt twice or in another case, and for
         any model outside the grant.
@@ -213,10 +248,39 @@ class ModelPolicy:
         return models[0]
 
     @staticmethod
+    def count_containers(body: bytes, cap: int = MAX_JSON_CONTAINERS) -> int:
+        """The arrays and objects in ``body`` outside strings, counted up to ``cap + 1``.
+
+        Strings are skipped whole, so brackets inside them do not count. The body is
+        read one window at a time, so each regex call is short and other threads (the
+        event loop) get the GIL in between; a flood of short strings takes one call per
+        window, not one per string. Linear: well under a second for 16 MiB.
+        """
+        count = pos = 0
+        end = len(body)
+        while pos < end:
+            # both patterns match at least the empty string, so never None
+            step = cast(re.Match[bytes], _STEP.match(body, pos, pos + _WINDOW))
+            pos = step.end()
+            if step.lastindex == 1:  # an opening bracket
+                count += 1
+                if count > cap:
+                    break
+            elif step.lastindex == 2:  # a string that runs past the window
+                while pos < end and body[pos] != _QUOTE:
+                    inside = cast(re.Match[bytes], _INSIDE.match(body, pos, pos + _WINDOW))
+                    if inside.end() == pos:
+                        break  # a backslash that ends the body
+                    pos = inside.end()
+                pos += 1  # past the closing quote
+        return count
+
+    @staticmethod
     def _parse(body: bytes) -> _Pairs:
-        # an over-count (brackets inside strings count too) only errs on the safe side
-        if body.count(b"[") + body.count(b"{") > MAX_JSON_CONTAINERS:
-            raise ModelRefused("the request body has too many arrays and objects")
+        if body.count(b"[") + body.count(b"{") > MAX_JSON_CONTAINERS:  # cheap over-count
+            count = ModelPolicy.count_containers(body)
+            if count > MAX_JSON_CONTAINERS:
+                raise BodyTooComplex(count)
         try:
             document = json.loads(
                 body.decode("utf-8"),

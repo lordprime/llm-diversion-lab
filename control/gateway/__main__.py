@@ -6,7 +6,8 @@ Configuration comes from the environment (:meth:`GatewayConfig.from_env`):
 (from lab.env) and the optional limits. Grants are mirrored to ``$DATABASE_URL`` and
 reloaded at start, so a restart keeps the running runs' grants. The redacted JSON
 logging is configured before anything else. Exit 2 on a bad configuration, 1 when the
-grant store cannot be read.
+grant store cannot be read or a server stopped other than by a signal, 0 after
+SIGTERM or SIGINT.
 """
 
 from __future__ import annotations
@@ -48,8 +49,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.exception("gateway: cannot read the grant store; refusing to start")
         return 1
     log.info("gateway: %d live grants reloaded", live)
-    Gateway(config, keys).run()
-    return 0
+    return Gateway(config, keys).run()
 
 
 if __name__ == "__main__":

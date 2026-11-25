@@ -44,6 +44,7 @@ from control.gateway.config import LARGE_BODY_BYTES, GatewayConfig
 from control.gateway.keys import RunGrant, RunKeys
 from control.gateway.limits import Call, CallLimits
 from control.gateway.policy import (
+    BodyTooComplex,
     Decision,
     Endpoint,
     EndpointPolicy,
@@ -85,8 +86,14 @@ HOP_BY_HOP: Final = frozenset(
 )
 #: The most a model list from Ollama may weigh.
 MAX_LISTING_BYTES: Final = 4 << 20
-#: Model checks of large bodies running at once, each in its own worker thread.
-PARSE_THREADS: Final = 2
+#: A body up to this size is checked on the event loop (well under a millisecond);
+#: a larger one in a worker thread. No body this small can need the exact container
+#: count, which only starts above MAX_JSON_CONTAINERS brackets.
+INLINE_CHECK_BYTES: Final = 64 << 10
+#: Model checks running at once in worker threads, and how many of them one run may
+#: take, so one run's slow worst cases never hold every parse thread.
+PARSE_THREADS: Final = 4
+PARSE_THREADS_PER_RUN: Final = 2
 #: Idle connections the pool to Ollama keeps for reuse.
 KEEPALIVE_CONNECTIONS: Final = 16
 
@@ -196,6 +203,7 @@ class ModelProxy:
         self._limits = CallLimits(config)
         self._client: httpx.AsyncClient | None = None
         self._parsers: anyio.CapacityLimiter | None = None
+        self._parse_shares: dict[str, anyio.CapacityLimiter] = {}
 
     async def startup(self) -> None:
         if self._client is None:
@@ -302,19 +310,37 @@ class ModelProxy:
             raise Refused(415, "compressed request bodies are not accepted")
 
     async def _check_model(self, grant: RunGrant, endpoint: Endpoint, body: bytes) -> None:
-        """The body names the run's model; a large body is checked off the event loop."""
+        """The body names the run's model; a larger body is checked off the event loop.
+
+        A body too complex to parse is 413, never 403: it is not a model refusal, and
+        must not read like a model swap.
+        """
         policy = ModelPolicy(grant.models)
         try:
-            if len(body) > LARGE_BODY_BYTES:
-                model = await anyio.to_thread.run_sync(
-                    policy.check, body, endpoint.path, limiter=self._parsers
-                )
+            if len(body) > INLINE_CHECK_BYTES:
+                model = await self._in_parse_thread(grant.run_id, policy, body, endpoint.path)
             else:
                 model = policy.check(body, endpoint.path)
+        except BodyTooComplex as complex_body:
+            raise Refused(413, complex_body.reason) from None
         except ModelRefused as refused:
             raise Refused(403, refused.reason) from None
         if model is None:
             raise Refused(403, "the request names no model")
+
+    async def _in_parse_thread(
+        self, run_id: str, policy: ModelPolicy, body: bytes, path: str
+    ) -> str | None:
+        """``policy.check`` in a worker thread, within the run's share of the threads."""
+        share = self._parse_shares.setdefault(run_id, anyio.CapacityLimiter(PARSE_THREADS_PER_RUN))
+        try:
+            async with share:
+                return await anyio.to_thread.run_sync(
+                    policy.check, body, path, limiter=self._parsers
+                )
+        finally:
+            if share.borrowed_tokens == 0 and share.statistics().tasks_waiting == 0:
+                self._parse_shares.pop(run_id, None)
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:

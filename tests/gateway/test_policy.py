@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import random
+import threading
+import time
 
 import pytest
 
+from control.gateway import policy as policy_module
 from control.gateway.policy import (
     ALLOWED_ENDPOINTS,
     MAX_JSON_CONTAINERS,
+    BodyTooComplex,
     Decision,
     EndpointPolicy,
     ModelPolicy,
@@ -150,6 +155,7 @@ def test_odd_query_strings_are_denied(query: str) -> None:
 # --------------------------------------------------------------------------- models
 
 
+count_containers = ModelPolicy.count_containers
 GRANT = ModelPolicy(frozenset({"qwen3:14b"}))
 
 
@@ -286,13 +292,158 @@ def test_a_refusal_reason_names_the_model_but_stays_short() -> None:
     "fill",
     [b"[]", b"{}", b'{"a":[]}', b"[[[]]]"],
 )
-def test_a_body_with_too_many_arrays_or_objects_is_refused(fill: bytes) -> None:
+def test_a_body_with_too_many_arrays_or_objects_is_too_complex(fill: bytes) -> None:
     # every container costs the parser an allocation the event loop's thread pays for
     # too (CPython's JSON scanner keeps the GIL); a body is bounded by their number
     count = MAX_JSON_CONTAINERS // fill.count(b"[" if b"[" in fill else b"{") + 10
     body = b'{"model": "qwen3:14b", "x": [' + b",".join([fill] * count) + b"]}"
-    with pytest.raises(ModelRefused, match="too many"):
+    with pytest.raises(BodyTooComplex) as info:
         GRANT.check(body, "/api/chat")
+    # not a model refusal: it must never read like a model swap
+    assert not isinstance(info.value, ModelRefused)
+    assert info.value.reason.startswith("body_too_complex")
+
+
+#: Minified JavaScript, as an agent fetching a single-page app's bundles gets it: about
+#: 95,000 ``[`` and ``{`` per MiB (real bundles hold 13,000 to 25,000).
+MINIFIED_JS = 'function(e,t){return{a:[e,t],b:{c:e.d,f:"x"}}};var n={k:[1,{z:2}]};'
+
+
+def js_history(target_bytes: int, model: str = "qwen3:14b") -> bytes:
+    """An agent request whose history is tool results full of minified JavaScript."""
+    script = MINIFIED_JS * 3_000
+    messages: list[dict[str, object]] = []
+    while sum(len(str(m["content"])) for m in messages) < target_bytes:
+        messages.append({"role": "tool", "content": script})
+        messages.append({"role": "assistant", "content": "ok", "tool_calls": []})
+    return json.dumps({"model": model, "messages": messages}).encode()
+
+
+def test_a_history_of_minified_javascript_passes() -> None:
+    body = js_history(15 << 20)
+    assert len(body) <= 16 << 20
+    assert body.count(b"[") + body.count(b"{") > 5 * MAX_JSON_CONTAINERS  # raw over-count
+    assert count_containers(body) < 1_000
+    assert GRANT.check(body, "/api/chat") == "qwen3:14b"
+
+
+def test_a_flood_of_strings_full_of_braces_passes() -> None:
+    body = b'{"model": "qwen3:14b", "x": [' + b'"{",' * 3_900_000 + b'"[[{"]}'
+    assert len(body) <= 16 << 20
+    assert count_containers(body) == 2
+    assert GRANT.check(body, "/api/chat") == "qwen3:14b"
+
+
+@pytest.mark.parametrize(
+    ("body", "count"),
+    [
+        (b'{"a":"{[\\"{","b":[{}]}', 3),
+        (b'"\\\\"[{', 2),  # an escaped backslash ends the string
+        (b'"\\\\"[[', 2),
+        (b'"\\"[[', 0),  # an escaped quote does not: the rest is one open string
+        (b'["' + b"x" * 5_000_000 + b'",[{]]', 3),  # a string longer than one window
+        (b'["' + b"\\n" * 3_000_000 + b'",{}]', 2),  # escapes beyond one window
+        # a window is 64 KiB from where a step starts: a short string across its edge,
+        # an escaped backslash split by it, and plain runs longer than a window
+        (b"[" + b"1," * 32_766 + b'"{[{[{[{",{', 2),
+        (b"[" + b"1," * 32_766 + b'"ab\\\\"[', 2),
+        (b"[" + b"1," * 32_766 + b'"ab\\"[",[', 2),
+        (b"[" + b"1," * 100_000 + b'"[",[', 2),
+        (b'["a\\', 1),  # a backslash ends the body inside a string
+        (b"", 0),
+        (b'"', 0),
+        (b"\\", 0),
+        (b"[\n{\t[", 3),
+    ],
+)
+def test_the_exact_count_skips_strings(body: bytes, count: int) -> None:
+    assert count_containers(body) == count
+
+
+def _count_byte_by_byte(body: bytes) -> int:
+    """The same count, the slow and obvious way."""
+    count, index, in_string = 0, 0, False
+    while index < len(body):
+        byte = body[index : index + 1]
+        if in_string and byte == b"\\":
+            index += 2
+            continue
+        if byte == b'"':
+            in_string = not in_string
+        elif not in_string and byte in (b"[", b"{"):
+            count += 1
+        index += 1
+    return count
+
+
+def test_the_exact_count_agrees_with_a_byte_by_byte_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # tiny windows, so random bodies cross a window's edge everywhere: inside strings,
+    # in escapes, on quotes and on brackets
+    monkeypatch.setattr(policy_module, "_WINDOW", 7)
+    rng = random.Random(20261126)  # noqa: S311 - reproducible test data, not secrets
+    for _ in range(20_000):
+        body = bytes(rng.choice(b'"\\[{a,]}\n') for _ in range(rng.randint(0, 50)))
+        assert count_containers(body, cap=10**9) == _count_byte_by_byte(body), body
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'"\\' * 5_000_000,  # quote, backslash: one unterminated string of escapes
+        b'"' + b'\\"' * 5_000_000,
+        b'"\\\n' * 4_000_000,
+        b'{"x":"' + b"\\n" * 7_000_000 + b'"}',
+        b'{"x":[' + b'"{",' * 4_000_000 + b'""]}',
+        b"[" + b'"",' * 5_000_000 + b"]",
+        b"[" + b'"\\n",' * 3_000_000 + b"]",
+        # nothing to find for 14 MiB: one search over it held the GIL for 3 s
+        b'{"s":"' + b"[" * (MAX_JSON_CONTAINERS + 5) + b'","x":[' + b"1," * 7_000_000 + b"1]}",
+    ],
+)
+def test_the_exact_count_is_linear_on_hostile_strings(body: bytes) -> None:
+    # an unbounded string pattern rescans to the end of the body from every quote of
+    # an unterminated string (quadratic, hours for 16 MiB), and one regex call per
+    # short string takes seconds for a flood of them; all of these take well under 1 s
+    started = time.perf_counter()
+    count_containers(body + b"[" * (MAX_JSON_CONTAINERS + 5))
+    assert time.perf_counter() - started < 2.5
+
+
+def test_the_exact_count_stops_past_the_cap() -> None:
+    body = b"[" + b"[]," * 5_000_000
+    assert count_containers(body) == MAX_JSON_CONTAINERS + 1
+
+
+_BRACKETS_IN_A_STRING = b'{"s":"' + b"[" * (MAX_JSON_CONTAINERS + 5) + b'",'
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _BRACKETS_IN_A_STRING + b'"x":[' + b"1," * 8_000_000 + b"1]}",  # nothing to skip
+        _BRACKETS_IN_A_STRING + b'"x":"' + b"y" * (16 << 20) + b'"}',  # one long string
+        _BRACKETS_IN_A_STRING + b'"x":"' + b"\\n" * (8 << 20) + b'"}',  # all escapes
+        _BRACKETS_IN_A_STRING + b'"x":[' + b'"{",' * 4_000_000 + b'""]}',
+    ],
+)
+def test_the_exact_count_lets_other_threads_run(body: bytes) -> None:
+    # The regex engine keeps the GIL for a whole call, and the count runs in a worker
+    # thread next to the event loop: no single call may scan much. (One search across
+    # 16 MiB with nothing to find held the GIL for about 0.13 s, far more on a busy
+    # host.) This thread asks for the GIL every millisecond.
+    worker = threading.Thread(target=count_containers, args=(body,))
+    gaps: list[float] = []
+    last = time.perf_counter()
+    worker.start()  # the worker may take the GIL at once: this is already a gap
+    while worker.is_alive():
+        time.sleep(0.001)
+        now = time.perf_counter()
+        gaps.append(now - last)
+        last = now
+    worker.join()
+    assert max(gaps) < 0.05, sorted(gaps)[-3:]
 
 
 def test_a_realistic_large_body_is_well_inside_the_container_cap() -> None:

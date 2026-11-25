@@ -88,8 +88,11 @@ class GatewayConfig:
     #: Calls the whole gateway may have open at once, which is also the size of the
     #: connection pool to Ollama, so the pool never queues; more get 503.
     max_upstream_connections: int = 64
-    #: Open connections on the cell-facing listener (idle ones included).
+    #: Open connections on the cell-facing listener (idle ones included), and per peer
+    #: address. Each cell's tap is one peer, so 256 holds 8 cells at their full 32;
+    #: one runner per host runs one cell at a time.
     max_connections: int = 256
+    max_connections_per_peer: int = 32
     #: A new or kept-alive connection must deliver a complete request head this fast.
     header_timeout_s: float = 10.0
     #: The request body must arrive within this time.
@@ -139,6 +142,9 @@ class GatewayConfig:
             raise GatewayConfigError("max_inflight_per_run exceeds max_upstream_connections")
         if self.max_large_bodies_per_run > min(self.max_large_bodies, self.max_inflight_per_run):
             raise GatewayConfigError("max_large_bodies_per_run exceeds the other caps")
+        if self.max_connections_per_peer > self.max_connections:
+            # one peer could then fill every slot again
+            raise GatewayConfigError("max_connections_per_peer exceeds max_connections")
 
     @classmethod
     def _limits(cls) -> list[Any]:

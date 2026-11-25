@@ -48,6 +48,9 @@ class BodyReader:
         self._timeout_s = timeout_s
         self._large = large if large is not None else limit
 
+    def _too_large(self) -> Refused:
+        return Refused(413, f"body_too_large: the request body is over {self._limit} bytes")
+
     async def read(self, request: Request, on_large: Callable[[], None] | None = None) -> bytes:
         declared = request.headers.get("content-length")
         flagged = False
@@ -55,7 +58,7 @@ class BodyReader:
             if not _CONTENT_LENGTH.fullmatch(declared):
                 raise Refused(400, "malformed content-length")
             if int(declared) > self._limit:
-                raise Refused(413, f"request body over {self._limit} bytes")
+                raise self._too_large()
             if int(declared) > self._large and on_large is not None:
                 on_large()
                 flagged = True
@@ -66,7 +69,7 @@ class BodyReader:
                 async for chunk in request.stream():
                     size += len(chunk)
                     if size > self._limit:
-                        raise Refused(413, f"request body over {self._limit} bytes")
+                        raise self._too_large()
                     if size > self._large and not flagged and on_large is not None:
                         on_large()
                         flagged = True

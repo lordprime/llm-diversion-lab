@@ -9,21 +9,28 @@ The proxy's server closes any connection that does not deliver a complete reques
 head within ``header_timeout_s`` of opening or of its previous response: idle or
 dripping sockets cannot hold its slots for long. (uvicorn's own keep-alive timeout is
 cancelled by the first byte that arrives, so it does not cover a head that drips.)
+It also caps the connections of each peer address (``max_connections_per_peer``):
+every cell's tap has its own address, so one cell that keeps reopening sockets fills
+only its own share, never the server's whole ``max_connections``. A connection over
+the cap gets the gateway's JSON 503 and is closed before any request is read.
 
 Both servers ignore signals themselves; :meth:`Gateway.serve` stops both on SIGTERM
-or SIGINT, and stops the other when one of them ends.
+or SIGINT, and stops the other when one of them ends. :meth:`Gateway.run` returns 0
+after such a stop and 1 when a server ended by itself.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import signal
 import socket
 import threading
+from collections import Counter
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, ClassVar
 
 import uvicorn
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -41,17 +48,50 @@ log = logging.getLogger(__name__)
 
 #: Open connections the admin listener takes: the runner needs a handful.
 ADMIN_MAX_CONNECTIONS = 32
+_PEER_BUSY_BODY = json.dumps(
+    {"error": {"type": "gateway_refused", "reason": "too many connections from this peer"}}
+).encode()
+#: The answer to a connection over its peer's cap, sent before any request is read.
+PEER_BUSY_RESPONSE = (
+    b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\n"
+    + f"content-length: {len(_PEER_BUSY_BODY)}\r\nconnection: close\r\n\r\n".encode()
+    + _PEER_BUSY_BODY
+)
 
 
 class HeadDeadlineProtocol(H11Protocol):
-    """uvicorn's h11 protocol, plus a deadline for receiving each request head."""
+    """uvicorn's h11 protocol, plus a deadline for receiving each request head and a
+    cap on each peer address's open connections.
+
+    :class:`Gateway` derives a class per server that sets the limits and its own
+    ``peers`` counter (all protocol instances of a server run on one event loop).
+    """
 
     head_timeout_s: float = 10.0
+    peer_cap: int = 32
+    peers: ClassVar[Counter[str]] = Counter()
+    refused: ClassVar[Counter[str]] = Counter()
 
     def connection_made(self, transport: asyncio.Transport) -> None:  # type: ignore[override]
         self._head_timer: asyncio.TimerHandle | None = None
         self._waiting_for: object = None
+        self._peer: str | None = None
         super().connection_made(transport)
+        peer = self.client[0] if self.client else ""
+        if self.peers[peer] >= self.peer_cap:
+            self.refused[peer] += 1
+            if str(self.refused[peer]).strip("0") == "1":  # the 1st, 10th, 100th...
+                log.warning(
+                    "gateway: peer %s is at its %d connections; refused %d so far",
+                    peer,
+                    self.peer_cap,
+                    self.refused[peer],
+                )
+            transport.write(PEER_BUSY_RESPONSE)
+            transport.close()
+            return
+        self._peer = peer
+        self.peers[peer] += 1
         self._arm()
 
     def _arm(self) -> None:
@@ -83,6 +123,11 @@ class HeadDeadlineProtocol(H11Protocol):
 
     def connection_lost(self, exc: Exception | None) -> None:
         self._disarm()
+        if self._peer is not None:
+            self.peers[self._peer] -= 1
+            if self.peers[self._peer] <= 0:
+                del self.peers[self._peer]
+            self._peer = None
         super().connection_lost(exc)
 
 
@@ -116,8 +161,16 @@ class Gateway:
     def __init__(self, config: GatewayConfig, keys: RunKeys) -> None:
         self._config = config
         protocol = type(
-            "ProxyProtocol", (HeadDeadlineProtocol,), {"head_timeout_s": config.header_timeout_s}
+            "ProxyProtocol",
+            (HeadDeadlineProtocol,),
+            {
+                "head_timeout_s": config.header_timeout_s,
+                "peer_cap": config.max_connections_per_peer,
+                "peers": Counter(),
+                "refused": Counter(),
+            },
         )
+        self._stopping = False
         self._servers = (
             self._server(
                 _Pinned(ModelProxy(config, keys), config.listen),
@@ -152,6 +205,8 @@ class Gateway:
         return all(server.started for server in self._servers)
 
     def stop(self) -> None:
+        """Stop both servers (a signal, or the caller): :meth:`run` then returns 0."""
+        self._stopping = True
         for server in self._servers:
             server.should_exit = True
 
@@ -162,7 +217,8 @@ class Gateway:
             for listener in (self._config.listen, self._config.admin_listen)
         ]
 
-    async def serve(self, sockets: list[socket.socket] | None = None) -> None:
+    async def serve(self, sockets: list[socket.socket] | None = None) -> int:
+        """Serve until stopped; 0 after :meth:`stop`, 1 when a server ended by itself."""
         proxy_socket, admin_socket = sockets if sockets is not None else self.sockets()
         if threading.current_thread() is threading.main_thread():
             loop = asyncio.get_running_loop()
@@ -181,9 +237,15 @@ class Gateway:
         ]
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            asked = self._stopping
         finally:
-            self.stop()  # one server ending (or failing) ends the other
+            for server in self._servers:  # one server ending (or failing) ends the other
+                server.should_exit = True
             await asyncio.gather(*tasks)
+        if not asked:
+            log.error("gateway: a server stopped by itself; shutting down")
+            return 1
+        return 0
 
-    def run(self, sockets: list[socket.socket] | None = None) -> None:
-        asyncio.run(self.serve(sockets))
+    def run(self, sockets: list[socket.socket] | None = None) -> int:
+        return asyncio.run(self.serve(sockets))

@@ -39,3 +39,34 @@ def test_an_unreadable_grant_store_exits_1(
     monkeypatch.delenv("DATABASE_URL", raising=False)
     assert entry.main([]) == 1
     assert ENV["LAB_GATEWAY_ADMIN_SECRET"] not in caplog.text
+
+
+@pytest.mark.parametrize("served", [0, 1])
+def test_the_exit_status_is_the_gateways(monkeypatch: pytest.MonkeyPatch, served: int) -> None:
+    # 0 after SIGTERM or SIGINT, 1 when a server stopped by itself: the container's
+    # restart policy and the operator must see the difference
+    class Store:
+        def __init__(self, engine: object) -> None:
+            pass
+
+    class Keys:
+        def __init__(self, store: object) -> None:
+            pass
+
+        def load(self) -> int:
+            return 0
+
+    class Served:
+        def __init__(self, config: object, keys: object) -> None:
+            pass
+
+        def run(self) -> int:
+            return served
+
+    for name, value in ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(entry, "create_db_engine", lambda **_: object())
+    monkeypatch.setattr(entry, "PostgresGrantStore", Store)
+    monkeypatch.setattr(entry, "RunKeys", Keys)
+    monkeypatch.setattr(entry, "Gateway", Served)
+    assert entry.main([]) == served
