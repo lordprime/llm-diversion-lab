@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import tomllib
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,8 @@ from control.core.selftest_status import SelftestResult, record_selftest_result
 from control.db import tables as t
 from control.db.engine import session_scope
 from control.db.repo import insert_events
+from control.runner.store import RunStore
+from control.telemetry.model import RunTelemetry
 from tests.db.test_repo import _events, _seed_injected_run, add_run, seed_experiment
 
 REPO = Path(__file__).resolve().parents[2]
@@ -369,3 +372,204 @@ def test_build_backend_is_pinned() -> None:
     project = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
     (requirement,) = project["build-system"]["requires"]
     assert re.fullmatch(r"hatchling==\d+\.\d+\.\d+", requirement)
+
+
+# --------------------------------------------------------------------- telemetry
+
+EXPORT_HEADER = (
+    "run_id,arm,target,agent,model,end_status,status,invalid_reason,effect,mechanism,calls,"
+    "agents,agents_source,peak_input_tokens,input_tokens,output_tokens,reasoning_chars,"
+    "calls_with_reasoning,single_call_threads,largest_thread_calls,branch_points,"
+    "persona_splits,telemetry_version,telemetry_status"
+)
+
+
+def _summary(run_id: str, **changes: Any) -> RunTelemetry:
+    return RunTelemetry.from_calls(run_id, []).model_copy(update=changes)
+
+
+def _telemetry_runs(engine: Engine) -> tuple[dict[str, str], list[str]]:
+    """Three runs stored in reverse schedule order, with telemetry; plus one queued run."""
+    ids = seed_experiment(engine)
+    run_ids = [
+        add_run(engine, ids, schedule_index=i, arm=arm, status=RunStatus.VALID)
+        for i, arm in ((2, Arm.INJECTED), (1, Arm.CONTROL), (0, Arm.INJECTED))
+    ]
+    ids["queued_run_id"] = add_run(engine, ids, schedule_index=3)  # nothing derived yet
+    with session_scope(engine) as s:
+        for run_id in run_ids:
+            s.execute(
+                update(t.Run)
+                .where(t.Run.run_id == run_id)
+                .values(end_status=EndStatus.COMPLETED, effect=True, outcome=True, mechanism=None)
+            )
+    store = RunStore(engine)
+    for n, run_id in enumerate(run_ids):
+        store.record_telemetry(
+            _summary(run_id, calls=10 + n, agents=2, peak_input_tokens=None if n == 1 else 900)
+        )
+    return ids, run_ids
+
+
+def test_run_telemetry_prints_the_stored_summary(
+    lab_db: Engine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, run_ids = _telemetry_runs(lab_db)
+    rc, out, _ = _run(capsys, "run", "telemetry", run_ids[0])
+    assert rc == 0
+    assert re.search(r"^calls\s+10$", out, re.M) and re.search(r"^agents\s+2$", out, re.M)
+    rc, out, _ = _run(capsys, "run", "telemetry", run_ids[0], "--json")
+    data = json.loads(out)
+    assert (rc, data["calls"], data["run_id"], data["telemetry_error"]) == (0, 10, run_ids[0], None)
+
+
+def test_run_telemetry_shows_a_recorded_error(
+    lab_db: Engine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_id = add_run(lab_db, seed_experiment(lab_db), schedule_index=0)
+    RunStore(lab_db).record_telemetry_error(run_id, "the tap folder is a symlink")
+    rc, out, _ = _run(capsys, "run", "telemetry", run_id)
+    assert rc == 0 and "telemetry_error" in out and "the tap folder is a symlink" in out
+
+
+def test_run_telemetry_for_an_unknown_run_or_one_without_it(
+    lab_db: Engine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, _, err = _run(capsys, "run", "telemetry", "run_doesnotexist")
+    assert rc == 1 and "no such run" in err
+    run_id = add_run(lab_db, seed_experiment(lab_db), schedule_index=0)
+    rc, _, err = _run(capsys, "run", "telemetry", run_id)
+    assert rc == 1 and "no telemetry" in err
+
+
+def test_export_csv_has_one_row_per_run_in_schedule_order(
+    lab_db: Engine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ids, run_ids = _telemetry_runs(lab_db)
+    experiment = ids["experiment_id"]
+    rc, out, _ = _run(capsys, "export", "telemetry", "--experiment", experiment, "--format", "csv")
+    assert rc == 0
+    lines = out.splitlines()
+    assert lines[0] == EXPORT_HEADER
+    # schedule index 0, 1, 2, then the queued run: every run of the experiment is a row
+    assert [line.split(",")[0] for line in lines[1:]] == [*run_ids[::-1], ids["queued_run_id"]]
+    first = lines[1].split(",")
+    assert first[1:11] == [
+        "injected", ids["target_id"], ids["agent_id"], ids["model_id"],
+        "completed", "valid", "", "true", "", "12",
+    ]  # fmt: skip
+    assert first[-1] == "ok"
+    assert lines[2].split(",")[13] == ""  # no peak input tokens reported: an empty cell
+    queued = lines[4].split(",")
+    assert queued[6] == "queued" and queued[10:23] == [""] * 13 and queued[-1] == "missing"
+    again = _run(capsys, "export", "telemetry", "--experiment", experiment, "--format", "csv")
+    assert again[1] == out  # deterministic
+
+
+def test_export_markdown_is_a_table(lab_db: Engine, capsys: pytest.CaptureFixture[str]) -> None:
+    ids, run_ids = _telemetry_runs(lab_db)
+    rc, out, _ = _run(
+        capsys, "export", "telemetry", "--experiment", ids["experiment_id"], "--format", "md"
+    )
+    lines = out.splitlines()
+    assert rc == 0 and len(lines) == 2 + len(run_ids) + 1
+    assert lines[0].startswith("| run_id | arm | target |") and set(lines[1]) <= set("|- ")
+    assert lines[2].split("|")[1].strip() == run_ids[-1]
+    assert all(line.count("|") == lines[0].count("|") for line in lines)
+
+
+def test_export_refuses_to_mix_telemetry_versions_without_the_flag(
+    lab_db: Engine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ids, run_ids = _telemetry_runs(lab_db)
+    with session_scope(lab_db) as s:
+        s.execute(
+            update(t.RunTelemetryRow)
+            .where(t.RunTelemetryRow.run_id == run_ids[0])
+            .values(telemetry_version="3")
+        )
+    args = ("export", "telemetry", "--experiment", ids["experiment_id"], "--format", "csv")
+    rc, out, err = _run(capsys, *args)
+    assert rc == 1 and out == "" and "3" in err and "--allow-mixed-versions" in err
+    rc, out, _ = _run(capsys, *args, "--allow-mixed-versions")
+    assert rc == 0 and len(out.splitlines()) == 5
+
+
+def test_export_keeps_a_run_whose_telemetry_failed_as_an_empty_row(
+    lab_db: Engine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ids = seed_experiment(lab_db)
+    ok = add_run(lab_db, ids, schedule_index=0)
+    failed = add_run(lab_db, ids, schedule_index=1)
+    RunStore(lab_db).record_telemetry(_summary(ok))
+    RunStore(lab_db).record_telemetry_error(failed, "boom")
+    rc, out, err = _run(
+        capsys, "export", "telemetry", "--experiment", ids["experiment_id"], "--format", "csv"
+    )
+    assert rc == 0 and "1 run" in err and failed in err
+    row = out.splitlines()[2].split(",")
+    assert row[0] == failed and row[10:23] == [""] * 13 and row[23] == "error"
+
+
+def test_export_with_no_telemetry_is_just_the_header(
+    lab_db: Engine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ids = seed_experiment(lab_db)
+    rc, out, _ = _run(
+        capsys, "export", "telemetry", "--experiment", ids["experiment_id"], "--format", "csv"
+    )
+    assert (rc, out.strip()) == (0, EXPORT_HEADER)
+
+
+def test_export_for_an_unknown_experiment_fails(
+    lab_db: Engine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, out, err = _run(capsys, "export", "telemetry", "--experiment", "exp_nope", "--format", "md")
+    assert rc == 1 and out == "" and "no such experiment" in err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["export"],
+        ["export", "telemetry"],
+        ["export", "telemetry", "--experiment", "e"],
+        ["export", "telemetry", "--experiment", "e", "--format", "xlsx"],
+        ["run", "telemetry"],
+    ],
+)
+def test_telemetry_usage_errors_exit_2(argv: list[str]) -> None:
+    assert main(argv) == 2
+
+
+def test_export_counts_every_status_and_every_non_valid_run_on_stderr(
+    lab_db: Engine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ids = seed_experiment(lab_db)
+    ok = add_run(lab_db, ids, schedule_index=0, status=RunStatus.VALID)
+    bad = add_run(lab_db, ids, schedule_index=1, status=RunStatus.INVALID)
+    failed = add_run(lab_db, ids, schedule_index=2, status=RunStatus.VALID)
+    add_run(lab_db, ids, schedule_index=3)  # queued, no telemetry record
+    RunStore(lab_db).record_telemetry(_summary(ok))
+    RunStore(lab_db).record_telemetry_error(failed, "boom")
+    rc, out, err = _run(
+        capsys, "export", "telemetry", "--experiment", ids["experiment_id"], "--format", "csv"
+    )
+    assert rc == 0 and len(out.splitlines()) == 5
+    assert "telemetry: ok 1, error 1, missing 2" in err
+    assert "2 of 4 run(s) are not valid" in err
+    row = next(line for line in out.splitlines() if line.startswith(bad)).split(",")
+    assert row[6:8] == ["invalid", "internal"] and row[-1] == "missing"
+
+
+def test_a_summary_replacing_an_error_gets_a_fresh_derived_time(engine: Engine) -> None:
+    run_id = add_run(engine, seed_experiment(engine), schedule_index=0)
+    store = RunStore(engine)
+    store.record_telemetry_error(run_id, "first try")
+    with session_scope(engine) as s:
+        before = s.get(t.RunTelemetryRow, run_id).created_at  # type: ignore[union-attr]
+        s.execute(update(t.RunTelemetryRow).values(created_at=before - timedelta(days=1)))
+        stale = s.get(t.RunTelemetryRow, run_id).created_at  # type: ignore[union-attr]
+    store.record_telemetry(_summary(run_id))
+    with session_scope(engine) as s:
+        assert s.get(t.RunTelemetryRow, run_id).created_at > stale  # type: ignore[union-attr]

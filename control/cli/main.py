@@ -6,6 +6,10 @@ Commands (each takes ``--json`` for scripting):
 * ``labctl status``: release, runs by status, experiments, last self-test, disk.
 * ``labctl runs ls [-n N] [--status S] [--experiment ID]``: runs, newest first.
 * ``labctl run show RUN_ID``: one run with its evidence counts.
+* ``labctl run telemetry RUN_ID``: the run's derived telemetry summary (or its error).
+* ``labctl export telemetry --experiment ID --format csv|md``: one row per run, in
+  schedule order (:mod:`control.cli.export`); refuses to mix telemetry versions unless
+  ``--allow-mixed-versions``.
 * ``labctl selftest [--quick] [--json]``: the instrumentation self-test
   (:mod:`control.runner.selftest`): one injected and one control DVGA cell with the
   scripted agent and the stub LLM, a containment probe, and the checks; the result is
@@ -44,6 +48,7 @@ from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from control.cli import doctor, queries
+from control.cli.export import FORMATS, MixedVersionsError, TelemetryTable
 from control.cli.settings import ConfigError, LabSettings, read_env_file
 from control.core.logging import configure_logging, redact_text
 from control.core.models import RunStatus
@@ -283,6 +288,53 @@ def _cmd_run_show(args: argparse.Namespace, settings: LabSettings) -> int:
     return EXIT_OK
 
 
+# --------------------------------------------------------------------- telemetry
+
+
+def _cmd_run_telemetry(args: argparse.Namespace, settings: LabSettings) -> int:
+    def read(session: Session) -> dict[str, Any] | None:
+        found = queries.get_run_telemetry(session, args.run_id)
+        if found is None and not queries.run_exists(session, args.run_id):
+            raise _Failure(f"no such run: {args.run_id}")
+        return found
+
+    data = _with_db(settings, read)
+    if data is None:
+        raise _Failure(f"no telemetry derived for run {args.run_id}")
+    if args.json:
+        _json(data)
+        return EXIT_OK
+    width = max(map(len, data))
+    for key, value in data.items():
+        _out(f"{key.ljust(width)}  {'-' if value is None else value}")
+    return EXIT_OK
+
+
+def _cmd_export_telemetry(args: argparse.Namespace, settings: LabSettings) -> int:
+    rows = _with_db(settings, lambda s: queries.telemetry_export_rows(s, args.experiment))
+    if rows is None:
+        raise _Failure(f"no such experiment: {args.experiment}")
+    table = TelemetryTable(rows)
+    try:
+        table.check_versions(allow_mixed=args.allow_mixed_versions)
+    except MixedVersionsError as exc:
+        raise _Failure(str(exc)) from None
+    counts = ", ".join(f"{name} {n}" for name, n in table.telemetry_counts.items())
+    sys.stderr.write(f"labctl export: telemetry: {counts}\n")
+    if table.not_valid:  # every run is exported; the reader filters
+        sys.stderr.write(
+            f"labctl export: {table.not_valid} of {len(table)} run(s) are not valid "
+            "(see the status and invalid_reason columns)\n"
+        )
+    if table.failed:  # their cells are empty; say so rather than hide it
+        sys.stderr.write(
+            f"labctl export: {len(table.failed)} run(s) have no telemetry (derivation failed): "
+            f"{', '.join(table.failed)}\n"
+        )
+    sys.stdout.write(table.render(args.format))
+    return EXIT_OK
+
+
 # --------------------------------------------------------------------- selftest
 
 
@@ -439,6 +491,26 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("show", "show one run and its evidence counts", _cmd_run_show, parent=run_sub)
     p.add_argument("run_id", metavar="RUN_ID")
     p.add_argument("--json", action="store_true", help="JSON output")
+
+    p = add("telemetry", "show a run's derived telemetry", _cmd_run_telemetry, parent=run_sub)
+    p.add_argument("run_id", metavar="RUN_ID")
+    p.add_argument("--json", action="store_true", help="JSON output")
+
+    export = sub.add_parser("export", help="export tables", description="export tables")
+    export_sub = export.add_subparsers(dest="export_command", metavar="COMMAND", required=True)
+    p = add(
+        "telemetry",
+        "one row per run of an experiment: verdict and telemetry headline columns",
+        _cmd_export_telemetry,
+        parent=export_sub,
+    )
+    p.add_argument("--experiment", metavar="ID", required=True, help="the experiment to export")
+    p.add_argument("--format", choices=FORMATS, required=True, help="csv or md (a Markdown table)")
+    p.add_argument(
+        "--allow-mixed-versions",
+        action="store_true",
+        help="export runs of different telemetry versions together",
+    )
 
     p = add(
         "selftest",

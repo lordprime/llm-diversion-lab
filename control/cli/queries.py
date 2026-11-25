@@ -1,4 +1,5 @@
-"""Read-only queries behind ``labctl status``, ``runs ls`` and ``run show``.
+"""Read-only queries behind ``labctl status``, ``runs ls``, ``run show`` and the
+telemetry commands.
 
 Everything runs in :func:`read_only_session`: one ``SET TRANSACTION READ ONLY``
 transaction (Postgres refuses any write in it) with a statement timeout, on the
@@ -19,6 +20,7 @@ from sqlalchemy.orm import Session
 from control.core.logging import redact_text
 from control.core.models import RunStatus
 from control.db.tables import (
+    TELEMETRY_FIELDS,
     Artifact,
     EventKeyEntry,
     Experiment,
@@ -27,20 +29,43 @@ from control.db.tables import (
     RejectedBatch,
     Run,
     RunHeartbeatRow,
+    RunTelemetryRow,
 )
 
 __all__ = [
+    "EXPORT_COLUMNS",
     "QUERY_TIMEOUT_MS",
     "RunDetail",
     "RunSummary",
     "experiment_count",
     "get_run",
+    "get_run_telemetry",
     "list_runs",
     "read_only_session",
+    "run_exists",
     "run_status_counts",
+    "telemetry_export_rows",
 ]
 
 QUERY_TIMEOUT_MS: Final = 15_000
+
+#: The columns of ``labctl export telemetry``, in order: the run's identity and verdict,
+#: then the summary (``telemetry_version`` last).
+EXPORT_COLUMNS: Final = (
+    "run_id",
+    "arm",
+    "target",
+    "agent",
+    "model",
+    "end_status",
+    "status",
+    "invalid_reason",
+    "effect",
+    "mechanism",
+    *(f for f in TELEMETRY_FIELDS if f != "telemetry_version"),
+    "telemetry_version",
+    "telemetry_status",
+)
 
 
 @contextmanager
@@ -251,3 +276,54 @@ def get_run(session: Session, run_id: str) -> RunDetail | None:
             "ts": heartbeat.ts.isoformat(),
         },
     )
+
+
+def run_exists(session: Session, run_id: str) -> bool:
+    return session.get(Run, run_id) is not None
+
+
+def get_run_telemetry(session: Session, run_id: str) -> dict[str, Any] | None:
+    """A run's stored telemetry (summary fields plus ``telemetry_error``), or ``None``
+    when none was derived (or the run is unknown)."""
+    row = session.get(RunTelemetryRow, run_id)
+    if row is None:
+        return None
+    return {
+        "run_id": run_id,
+        **row.summary(),
+        "telemetry_error": row.telemetry_error,
+        "derived_at": row.created_at.isoformat(),
+    }
+
+
+def telemetry_export_rows(session: Session, experiment_id: str) -> list[dict[str, Any]] | None:
+    """One row for every run of the experiment, keyed by :data:`EXPORT_COLUMNS` plus
+    ``telemetry_error``; ordered by schedule index, attempt and run id. Nothing is left
+    out: a run without a telemetry record has ``telemetry_status`` ``missing`` and empty
+    summary cells. ``None`` for an unknown experiment."""
+    if session.get(Experiment, experiment_id) is None:
+        return None
+    stmt = (
+        select(Run, RunTelemetryRow)
+        .outerjoin(RunTelemetryRow, RunTelemetryRow.run_id == Run.run_id)
+        .where(Run.experiment_id == experiment_id)
+        .order_by(Run.schedule_index, Run.attempt, Run.run_id)
+    )
+    return [
+        {
+            "run_id": run.run_id,
+            "arm": _value(run.arm),
+            "target": run.target_id,
+            "agent": run.agent_id,
+            "model": run.model_id,
+            "end_status": _value(run.end_status),
+            "status": _value(run.status),
+            "invalid_reason": _value(run.invalid_reason),
+            "effect": run.effect,
+            "mechanism": run.mechanism,
+            **(tel.summary() if tel else dict.fromkeys(TELEMETRY_FIELDS)),
+            "telemetry_status": tel.status if tel else "missing",
+            "telemetry_error": tel.telemetry_error if tel else None,
+        }
+        for run, tel in session.execute(stmt)
+    ]

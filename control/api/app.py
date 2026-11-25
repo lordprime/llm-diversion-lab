@@ -3,6 +3,7 @@
 Build an app bound to a specific engine with :func:`create_app` (tests do this); the
 module-level :data:`app` uses ``$DATABASE_URL``.
 
+* ``GET /v1/runs/{run_id}/telemetry``: derived run telemetry (:mod:`control.api.results`).
 * ``GET /healthz``: liveness; never touches the database.
 * ``GET /readyz``: readiness; ``200`` if ``SELECT 1`` succeeds, else ``503``.
 * ``GET /metrics``: Prometheus metrics (:mod:`control.api.metrics`), read from the
@@ -21,7 +22,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import Engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
-from control.api import collector
+from control.api import collector, results
 from control.api.metrics import LabMetrics, metrics_router
 from control.db.engine import get_engine
 
@@ -47,6 +48,7 @@ def create_app(engine: Engine | None = None, *, metrics: LabMetrics | None = Non
     app.state.engine = engine
     app.state.metrics = metrics
     app.include_router(collector.router)
+    app.include_router(results.router)
     app.include_router(metrics_router())
 
     @app.get("/healthz", tags=["health"])

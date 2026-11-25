@@ -38,6 +38,7 @@ EXPECTED_TABLES = {
     "artifacts",
     "run_heartbeats",
     "rejected_batches",
+    "run_telemetry",
 }
 
 EVENT_TABLES = {
@@ -264,3 +265,33 @@ def test_dual_verdict_migration_backfills_effect_and_downgrades(db_url: str) -> 
     assert (rows[done_false]["outcome"], rows[done_false]["effect"]) == (False, False)
     assert (rows[queued]["outcome"], rows[queued]["effect"]) == (None, None)
     assert {r["mechanism"] for r in rows.values()} == {None}
+
+
+def test_run_telemetry_holds_a_summary_or_an_error_never_both_or_neither(db_url: str) -> None:
+    command.upgrade(alembic_config(db_url), "head")
+    eng = create_db_engine(db_url)
+    try:
+        run_id = add_run(eng, seed_experiment(eng), schedule_index=0)
+        summary = dict.fromkeys(t.TELEMETRY_FIELDS, 1) | {"agents_source": "inferred"}
+        summary["telemetry_version"] = "4"
+        bad = [
+            {"run_id": run_id},  # neither
+            {"run_id": run_id, **summary, "telemetry_error": "and an error"},  # both
+            {"run_id": run_id, **summary, "calls": None},  # an incomplete summary
+        ]
+        for row in bad:
+            with pytest.raises(IntegrityError), session_scope(eng) as s:
+                s.add(t.RunTelemetryRow(**row))
+        with session_scope(eng) as s:
+            s.add(t.RunTelemetryRow(run_id=run_id, **(summary | {"peak_input_tokens": None})))
+    finally:
+        eng.dispose()
+
+
+def test_telemetry_migration_downgrades_to_its_parent(db_url: str) -> None:
+    cfg = alembic_config(db_url)
+    command.upgrade(cfg, "head")
+    command.downgrade(cfg, "0009")
+    assert "run_telemetry" not in _tables(db_url)
+    command.upgrade(cfg, "head")
+    assert "run_telemetry" in _tables(db_url)
