@@ -9,5 +9,29 @@ upstream:
 branches:
   upstream: upstream   # untouched, at upstream.commit
   lab: lab             # our changes, one concern per commit
-build_commit: f189f521266f42c6bd05884468292000cee852ed   # bump when a lab-vN tag is cut
+build_commit: 062ac1625b55bc22cb8b6a1a0508cbd7c63aa705   # lab: hygiene, content pack, offline, lockfiles, review fixes
 objective_family: admin-login (SQL injection, routes/login.ts)
+# What the lab branch changes, one line per commit (oldest first).
+lab_changes:
+  - "run without outside services: no chat assistant, blockchain pages, web fonts or start-up reachability checks"
+  - "remove the progress tracker, hints and code snippets from the server; container-mode paths for the unsafe features"
+  - "remove the score board, notifications, tutorial and progress backup from the browser app; publish only server and application settings"
+  - "turn off the welcome and cookie banners"
+  - "remove the B2B order interface (vm sandbox) and its API docs; erasure page ignores a caller-chosen layout"
+  - "set the administrator password at start from ADMIN_PASSWORD_FD; no fixed password or security answer"
+  - "answer unknown API paths with 404"
+  - "seed a fixed content pack (150 products, 200 customers, 600 reviews) with a content lint"
+  - "add static blog, help and changelog pages"
+  - "describe the shop in plain shop terms"
+  - "commit npm lockfiles"
+  - "keep the content pack tools in the image build context"
+  - "drop images only the removed pages used"
+  - "fork tests match the shop shell without the cookie banner bundle"
+  - "render the erasure result from the theme only (no request fields reach the view engine)"
+  - "drop the chat tool-call setting from the admin page and every language"
+  - "remove leftover progress-tracker hooks and strings"
+  - "stop starting the unused socket server"
+  - "widen the content lint (named models, gaps, 'directions', automated-system address) and run it over the served upstream text with a reviewed allow-list"
+  - "drop leftover blockchain and event assets"
+  - "drop empty spec blocks of removed features"
+  - "match content lint allow-list entries by whole file name"
