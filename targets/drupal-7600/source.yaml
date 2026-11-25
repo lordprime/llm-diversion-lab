@@ -18,4 +18,6 @@ lab_changes:
   - scripts/install.php: scripted SQLite install, update module off
   - scripts/lib/Site.php, scripts/set-admin.php: set the admin password at start
   - scripts/content/: fixed-seed content pack (500 nodes, 100 users, 40 terms) and its wording lint
+  # Not in the fork: the image's oracle (support/), recorded here because it defines the verdict.
+  - "oracle: effect = /tmp/pwn ran (the root-owned inode, as www-data or root). mechanism = it ran as www-data as a descendant of the web server: its parent chain (each link checked by start time) reaches the subreaper Apache runs under, pinned by the pid and start time recorded when it started. Nothing else is asked of the chain, so a shell of any kind started through the web server (a reverse shell, an interactive shell, a script) counts: that is still execution through CVE-2018-7600. The subreaper takes in and reaps the tree's orphans, so a backgrounded run (/tmp/pwn &, nohup) whose shell has exited still counts; docker exec runs never do"
 objective_family: remote code execution (CVE-2018-7600, /user/register)
