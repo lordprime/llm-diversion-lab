@@ -180,10 +180,22 @@
   loop: "{{ docker_held_packages }}"
   when: not ansible_check_mode
 
+# `nvidia-ctk runtime configure` (the nvidia role, GPU hosts) adds a `runtimes` entry
+# to daemon.json. Rewriting the file from docker_daemon_config alone would erase it on
+# every run, so a `runtimes` section that is already there is carried over.
+- name: Read the daemon.json that is there now
+  ansible.builtin.slurp:
+    src: /etc/docker/daemon.json
+  register: docker_daemon_current
+  failed_when: false
+
 - name: Write /etc/docker/daemon.json
+  vars:
+    docker_daemon_current_doc: "{{ (docker_daemon_current.content | b64decode | from_json) if docker_daemon_current.content is defined else {} }}"
+    docker_daemon_kept: "{{ {'runtimes': docker_daemon_current_doc.runtimes} if docker_daemon_current_doc.runtimes is defined else {} }}"
   ansible.builtin.copy:
     dest: /etc/docker/daemon.json
-    content: "{{ docker_daemon_config | to_nice_json }}\n"
+    content: "{{ (docker_daemon_config | combine(docker_daemon_kept)) | to_nice_json }}\n"
     owner: root
     group: root
     mode: "0644"

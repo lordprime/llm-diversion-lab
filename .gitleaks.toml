@@ -14,4 +14,7 @@ regexes = [
   # AWS's own documentation example secret key, used by the log-redaction tests.
   '''wJalrXUtnFEMI/K7MDENG/''',
   '''bPxRfiCYEXAMPLEKEY''',
+  # The public fingerprint of NVIDIA's apt signing key (deploy/ansible/roles/nvidia):
+  # it identifies a public key, it is not a credential.
+  '''C95B321B61E88C1809C4F759DDCAE044F796ECB0''',
 ]

@@ -101,6 +101,7 @@ import subprocess
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Final, Protocol
 
@@ -110,6 +111,7 @@ from dnslib import DNSRecord  # type: ignore[import-untyped]
 from sqlalchemy import Engine, func, select, update
 
 from cell.probe.containment import HOST_PORTS, LAN_PORTS
+from control.cli.models import OLLAMA_PORT, OLLAMA_SERVICE, OllamaService
 from control.core.ids import new_id
 from control.core.models import (
     Arm,
@@ -593,6 +595,7 @@ class DockerContainmentProbe:
         extra_destinations: Sequence[str] = (),
         is_local: Callable[[str], bool] = is_local_address,
         timeout_s: float = PROBE_TIMEOUT_S,
+        ollama_problems: Callable[[], list[str]] | None = None,
     ) -> None:
         if not lan:
             raise SelftestConfigError("the containment probe needs a LAN address")
@@ -604,6 +607,7 @@ class DockerContainmentProbe:
         self._extra = tuple(dict.fromkeys(extra_destinations))
         self._is_local = is_local
         self._timeout_s = timeout_s
+        self._ollama_problems = ollama_problems
 
     def argv(self, cell: CellHandle) -> list[str]:
         layout = cell_layout(cell.project)
@@ -662,6 +666,21 @@ class DockerContainmentProbe:
             argv = self.argv(cell)
         except CellError as exc:
             return ProbeRecord(run_id, False, None, (f"probe not run: {exc}",))
+        if self._ollama_problems is not None:
+            # On a GPU host no run starts while Ollama is attached to anything but the
+            # models network (a pull's uplink left behind, a published port, ...).
+            try:
+                problems = self._ollama_problems()
+            except Exception as exc:  # unreadable is not proven isolated
+                problems = [f"could not be checked ({type(exc).__name__}: {exc})"]
+            if problems:
+                return ProbeRecord(
+                    run_id,
+                    False,
+                    None,
+                    ("the ollama container " + "; ".join(problems),),
+                    breach=True,
+                )
         gateway = self._host_gateway or layout.gateway
         if not self._is_local(gateway):
             return ProbeRecord(
@@ -714,8 +733,11 @@ class DockerContainmentProbe:
                 label = item.get("label") if isinstance(item, dict) else item
                 outcome = item.get("outcome") if isinstance(item, dict) else "?"
                 problems.append(f"{label} {outcome}")
+        # a DNS destination has a name and no port
         tried = {
-            f"{item.get('target')}:{item.get('port')}" for item in results if isinstance(item, dict)
+            f"{item.get('target')}" + ("" if item.get("port") is None else f":{item.get('port')}")
+            for item in results
+            if isinstance(item, dict)
         }
         reached = {
             f"{item.get('target')}:{item.get('port')}"
@@ -817,6 +839,56 @@ class ContainmentGate:
 # --------------------------------------------------------------------------- control plane
 
 
+def _service_addresses(
+    run: CommandRunner,
+    docker: str,
+    project: str,
+    service: str,
+    subnets: Sequence[ipaddress.IPv4Network | ipaddress.IPv6Network] = (),
+) -> list[str]:
+    """The container addresses of a compose service, from the engine.
+
+    With ``subnets``, only addresses inside one of them (the control network, not the
+    default bridge). Raises :class:`SelftestConfigError` if the service is not running
+    or has no such address.
+    """
+    listing = run(
+        [
+            docker,
+            "ps",
+            "-q",
+            "--filter",
+            f"label=com.docker.compose.project={project}",
+            "--filter",
+            f"label=com.docker.compose.service={service}",
+        ]
+    )
+    ids = listing.text.split()
+    if listing.returncode != 0 or not ids:
+        raise SelftestConfigError(
+            f"the control plane's {service} is not running (compose project {project})"
+        )
+    inspected = run([docker, "inspect", *ids])
+    try:
+        containers = json.loads(inspected.stdout or b"[]")
+    except ValueError:
+        containers = []
+    addresses = sorted(
+        {
+            str(ep.get("IPAddress"))
+            for c in containers
+            for ep in ((c.get("NetworkSettings") or {}).get("Networks") or {}).values()
+            if ep.get("IPAddress")
+            and (
+                not subnets or any(ipaddress.ip_address(ep["IPAddress"]) in net for net in subnets)
+            )
+        }
+    )
+    if inspected.returncode != 0 or not addresses:
+        raise SelftestConfigError(f"no address of the control plane's {service} found")
+    return addresses
+
+
 def control_plane_destinations(
     run: CommandRunner,
     compose_file: Path,
@@ -858,40 +930,28 @@ def control_plane_destinations(
             for host_port, _ in ports
         ]
     for service, ports in sorted(published.items()):
-        listing = run(
-            [
-                docker,
-                "ps",
-                "-q",
-                "--filter",
-                f"label=com.docker.compose.project={project}",
-                "--filter",
-                f"label=com.docker.compose.service={service}",
-            ]
-        )
-        ids = listing.text.split()
-        if listing.returncode != 0 or not ids:
-            raise SelftestConfigError(
-                f"the control plane's {service} is not running (compose project {project})"
-            )
-        inspected = run([docker, "inspect", *ids])
-        try:
-            containers = json.loads(inspected.stdout or b"[]")
-        except ValueError:
-            containers = []
-        addresses = sorted(
-            {
-                str(ep.get("IPAddress"))
-                for c in containers
-                for ep in ((c.get("NetworkSettings") or {}).get("Networks") or {}).values()
-                if ep.get("IPAddress")
-                and any(ipaddress.ip_address(ep["IPAddress"]) in net for net in subnets)
-            }
-        )
-        if inspected.returncode != 0 or not addresses:
-            raise SelftestConfigError(f"no address of the control plane's {service} found")
+        addresses = _service_addresses(run, docker, project, service, subnets)
         dests += [f"host:tcp:{addr}:{port}" for addr in addresses for _, port in ports]
     return list(dict.fromkeys(dests))
+
+
+def ollama_destinations(
+    run: CommandRunner,
+    *,
+    docker: str = "docker",
+    project: str = CONTROL_PLANE_PROJECT,
+    service: str = OLLAMA_SERVICE,
+    port: int = OLLAMA_PORT,
+) -> list[str]:
+    """Must-fail probe destinations for Ollama on a GPU host.
+
+    The service name, which a cell must not resolve, and each of the container's
+    addresses on the Ollama port, which a cell must not reach: a cell reaches models
+    only through its tap and the gateway. Raises :class:`SelftestConfigError` if Ollama
+    is not running (the probe would then test nothing).
+    """
+    addresses = _service_addresses(run, docker, project, service)
+    return [f"host:dns:{service}", *(f"host:tcp:{addr}:{port}" for addr in addresses)]
 
 
 # --------------------------------------------------------------------------- cell resources
@@ -1421,20 +1481,24 @@ def _release_tree(lab_root: Path, environ: Mapping[str, str]) -> Path:
     return REPO_ROOT.resolve()  # a development checkout
 
 
+def _profile_value(environ: Mapping[str, str], settings: CellSettings, key: str) -> tuple[str, str]:
+    """``(value, where)`` of a host-profile key: from the profile in production (the
+    environment is ignored there), from the environment in development."""
+    if settings.dev:
+        return environ.get(key, ""), "the environment (LAB_DEV=1)"
+    path = Path(environ.get("LAB_HOST_ENV") or HOST_ENV_FILE)
+    try:
+        raw = read_host_env(path).get(key, "")
+    except (OSError, CellError) as exc:
+        raise SelftestConfigError(f"cannot read the host profile {path}: {exc}") from exc
+    if environ.get(key) not in (None, raw):
+        log.warning("selftest: %s in the environment is ignored (production)", key)
+    return raw, str(path)
+
+
 def _probe_lan(environ: Mapping[str, str], settings: CellSettings) -> list[str]:
     """``LAB_PROBE_LAN``: from the host profile in production, the environment in dev."""
-    if settings.dev:
-        raw = environ.get("LAB_PROBE_LAN", "")
-        where = "the environment (LAB_DEV=1)"
-    else:
-        path = Path(environ.get("LAB_HOST_ENV") or HOST_ENV_FILE)
-        try:
-            raw = read_host_env(path).get("LAB_PROBE_LAN", "")
-        except (OSError, CellError) as exc:
-            raise SelftestConfigError(f"cannot read the host profile {path}: {exc}") from exc
-        where = str(path)
-        if environ.get("LAB_PROBE_LAN") not in (None, raw):
-            log.warning("selftest: LAB_PROBE_LAN in the environment is ignored (production)")
+    raw, where = _profile_value(environ, settings, "LAB_PROBE_LAN")
     lan = [part.strip() for part in raw.split(",") if part.strip()]
     if not lan:
         raise SelftestConfigError(
@@ -1511,6 +1575,16 @@ def _lab_deps(context: LabContext) -> Iterator[SelftestDeps]:
         if not settings.dev:
             raise
         log.warning("selftest: development: no control-plane destinations (%s)", exc)
+    ollama_problems: Callable[[], list[str]] | None = None
+    if _profile_value(environ, settings, "LAB_GPU")[0] == "true":
+        ollama_problems = partial(OllamaService(commands).exposure, settings.cell_networks)
+        # a GPU host runs Ollama: a cell must reach it by neither name nor address
+        try:
+            extra += ollama_destinations(commands)
+        except SelftestConfigError as exc:
+            if not settings.dev:
+                raise
+            log.warning("selftest: development: no Ollama destinations (%s)", exc)
     own = own_address_towards(lan[0])
     if own is None or not context.is_local(own):
         raise SelftestConfigError(f"cannot find this host's own address towards {lan[0]}")
@@ -1528,6 +1602,7 @@ def _lab_deps(context: LabContext) -> Iterator[SelftestDeps]:
                 host_gateway=host_gateway,
                 extra_destinations=extra,
                 is_local=context.is_local,
+                ollama_problems=ollama_problems,
             ),
             resources=DockerLeftovers(commands),
             settings=settings,

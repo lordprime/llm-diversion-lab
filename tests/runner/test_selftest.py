@@ -55,6 +55,7 @@ from control.runner.selftest import (
     SelftestReport,
     cell_layout,
     derive_experiment,
+    failed_report,
     run_selftest,
 )
 from control.runner.ship import CollectorClient
@@ -1332,3 +1333,252 @@ def test_labctl_turns_sigterm_and_sighup_into_system_exit() -> None:
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+
+
+# --------------------------------------------------------------------------- Ollama containment
+
+OLLAMA_ADDR = "172.31.232.2"
+OLLAMA_DESTS = ["host:dns:ollama", f"host:tcp:{OLLAMA_ADDR}:11434"]
+
+
+def _ollama_engine(
+    *, running: bool = True, addresses: Sequence[str] = (OLLAMA_ADDR,)
+) -> Callable[..., CommandResult]:
+    def engine_cli(
+        argv: Sequence[str], *, stdin: bytes | None = None, timeout: float | None = None
+    ) -> CommandResult:
+        if argv[1] == "ps":
+            return CommandResult(tuple(argv), 0, b"id-ollama\n" if running else b"")
+        networks = {f"net{i}": {"IPAddress": a} for i, a in enumerate(addresses)}
+        networks["empty"] = {"IPAddress": ""}  # a network the container left
+        doc = [{"NetworkSettings": {"Networks": networks}}]
+        return CommandResult(tuple(argv), 0, json.dumps(doc).encode())
+
+    return engine_cli
+
+
+def test_ollama_destinations_are_its_name_and_every_address_on_its_port() -> None:
+    dests = selftest.ollama_destinations(_ollama_engine(addresses=[OLLAMA_ADDR, "172.31.233.9"]))
+    assert dests == [
+        "host:dns:ollama",
+        f"host:tcp:{OLLAMA_ADDR}:11434",
+        "host:tcp:172.31.233.9:11434",
+    ]
+
+
+def test_ollama_destinations_need_a_running_ollama() -> None:
+    with pytest.raises(selftest.SelftestConfigError, match="ollama is not running"):
+        selftest.ollama_destinations(_ollama_engine(running=False))
+    with pytest.raises(selftest.SelftestConfigError, match="no address"):
+        selftest.ollama_destinations(_ollama_engine(addresses=[]))
+
+
+def test_a_cell_that_cannot_resolve_or_reach_ollama_passes(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    probe_engine = ProbeEngine()
+    report = run_selftest(
+        _deps(
+            engine, collector, tmp_path, probe_engine=probe_engine, extra_destinations=OLLAMA_DESTS
+        ),
+        quick=True,
+    )
+    assert report.passed, _failed(report)
+    argv = next(a for a in probe_engine.argvs if a[:2] == ["docker", "run"])
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--dest"] == OLLAMA_DESTS
+    labels = {r["label"] for r in report.probes[0].report["results"]}
+    assert "host:dns:ollama" in labels and f"host:tcp:{OLLAMA_ADDR}:11434" in labels
+
+
+def test_the_self_test_fails_when_a_probe_reaches_ollama(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    probe_engine = ProbeEngine(reachable=lambda host, port: (host, port) == (OLLAMA_ADDR, 11434))
+    report = run_selftest(
+        _deps(
+            engine, collector, tmp_path, probe_engine=probe_engine, extra_destinations=OLLAMA_DESTS
+        ),
+        quick=True,
+    )
+    detail = next(d for n, d in _failed(report).items() if n.endswith("contained"))
+    assert f"host:tcp:{OLLAMA_ADDR}:11434" in detail
+    assert report.critical and not report.passed
+
+
+def test_the_self_test_fails_when_a_cell_can_resolve_the_ollama_name(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    probe_engine = ProbeEngine()
+
+    def resolves(name: str, timeout: float) -> list[str]:
+        return [OLLAMA_ADDR] if name == "ollama" else probe_engine.resolve(name, timeout)
+
+    probe_engine.resolve = resolves  # a cell network that shares Ollama's DNS
+    report = run_selftest(
+        _deps(
+            engine, collector, tmp_path, probe_engine=probe_engine, extra_destinations=OLLAMA_DESTS
+        ),
+        quick=True,
+    )
+    detail = next(d for n, d in _failed(report).items() if n.endswith("contained"))
+    assert "host:dns:ollama" in detail
+    assert report.critical
+
+
+def test_a_probe_that_skips_the_ollama_name_is_not_a_pass(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    real = containment.main
+
+    def drop_dests(argv: Sequence[str] | None = None, **kw: Any) -> int:
+        args = list(argv or [])
+        while "--dest" in args:
+            i = args.index("--dest")
+            del args[i : i + 2]
+        return real(args, **kw)
+
+    import unittest.mock
+
+    with unittest.mock.patch.object(containment, "main", drop_dests):
+        report = run_selftest(
+            _deps(engine, collector, tmp_path, extra_destinations=OLLAMA_DESTS), quick=True
+        )
+    detail = next(d for n, d in _failed(report).items() if n.endswith("contained"))
+    assert "host:dns:ollama was not probed" in detail
+
+
+def _capture_probe_destinations(
+    monkeypatch: pytest.MonkeyPatch, engine: Engine, tmp_path: Path, env: dict[str, str]
+) -> list[str] | None:
+    """Run the lab wiring up to the self-test itself and return the probe's extra dests."""
+    seen: list[list[str]] = []
+
+    def fake_run(deps: selftest.SelftestDeps, *, quick: bool) -> SelftestReport:
+        seen.append(list(deps.probe._extra))  # type: ignore[attr-defined]
+        return failed_report(quick, "stub", "stopped after wiring")
+
+    monkeypatch.setattr(selftest, "run_selftest", fake_run)
+    monkeypatch.setattr(
+        selftest, "control_plane_destinations", lambda *_a, **_k: ["host:tcp:1.1.1.1:1"]
+    )
+    monkeypatch.setattr(selftest, "ollama_destinations", lambda *_a, **_k: list(OLLAMA_DESTS))
+    selftest.run_lab_selftest(_context(engine, tmp_path, env), quick=True)
+    return seen[0] if seen else None
+
+
+def test_a_gpu_host_probes_ollama_and_a_cpu_host_does_not(
+    monkeypatch: pytest.MonkeyPatch, engine: Engine, tmp_path: Path
+) -> None:
+    base = f"LAB_CELL_NETWORKS=10.231.0.0/16\nLAB_LLM_GATEWAY=\nLAB_PROBE_LAN={LAN}\n"
+    gpu = _capture_probe_destinations(
+        monkeypatch,
+        engine,
+        tmp_path / "gpu",
+        _production(tmp_path / "gpu", base + "LAB_GPU=true\n"),
+    )
+    assert gpu is not None and set(OLLAMA_DESTS) <= set(gpu)
+    cpu = _capture_probe_destinations(
+        monkeypatch,
+        engine,
+        tmp_path / "cpu",
+        _production(tmp_path / "cpu", base + "LAB_GPU=false\n"),
+    )
+    assert cpu is not None and not set(OLLAMA_DESTS) & set(cpu)
+
+
+def test_the_environment_cannot_switch_the_ollama_probe_off_in_production(
+    monkeypatch: pytest.MonkeyPatch, engine: Engine, tmp_path: Path
+) -> None:
+    base = f"LAB_CELL_NETWORKS=10.231.0.0/16\nLAB_LLM_GATEWAY=\nLAB_PROBE_LAN={LAN}\nLAB_GPU=true\n"
+    env = {**_production(tmp_path, base), "LAB_GPU": "false"}
+    dests = _capture_probe_destinations(monkeypatch, engine, tmp_path, env)
+    assert dests is not None and set(OLLAMA_DESTS) <= set(dests)
+
+
+def test_a_gpu_host_whose_ollama_is_down_fails_the_self_test_in_production(
+    monkeypatch: pytest.MonkeyPatch, engine: Engine, tmp_path: Path
+) -> None:
+    def down(*_a: Any, **_k: Any) -> list[str]:
+        raise selftest.SelftestConfigError("the ollama is not running (compose project lab)")
+
+    monkeypatch.setattr(selftest, "control_plane_destinations", lambda *_a, **_k: [])
+    monkeypatch.setattr(selftest, "ollama_destinations", down)
+    base = f"LAB_CELL_NETWORKS=10.231.0.0/16\nLAB_LLM_GATEWAY=\nLAB_PROBE_LAN={LAN}\nLAB_GPU=true\n"
+    report = selftest.run_lab_selftest(
+        _context(engine, tmp_path, _production(tmp_path, base)), quick=True
+    )
+    assert "ollama is not running" in _failed(report)["configuration"]
+
+
+def _gated_deps(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, backend: Any, problems: list[str]
+) -> SelftestDeps:
+    deps = _deps(engine, collector, tmp_path, backend)
+    deps.probe = DockerContainmentProbe(
+        ProbeEngine(),
+        image=IMAGES["lab-cell"],
+        lan=[LAN],
+        is_local=lambda _a: True,
+        ollama_problems=lambda: problems,
+    )
+    return deps
+
+
+def test_no_run_starts_while_ollama_is_attached_to_another_network(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    # e.g. an uplink left behind by an interrupted pull
+    backend = SelftestBackend()
+    problems = ["is on more than the models network lab_models (lab-ollama-uplink)"]
+    report = run_selftest(_gated_deps(engine, collector, tmp_path, backend, problems), quick=True)
+    detail = next(d for n, d in _failed(report).items() if n.endswith("contained"))
+    assert "lab-ollama-uplink" in detail
+    assert report.critical and not report.passed
+    assert not any(c == "start_agent" for c, _ in backend.calls)
+
+
+def test_a_clean_ollama_lets_the_probe_run(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    report = run_selftest(
+        _gated_deps(engine, collector, tmp_path, SelftestBackend(), []), quick=True
+    )
+    assert report.passed, _failed(report)
+
+
+def test_an_ollama_that_cannot_be_checked_is_not_proven_isolated(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    def boom() -> list[str]:
+        raise RuntimeError("docker gone")
+
+    deps = _deps(engine, collector, tmp_path)
+    deps.probe = DockerContainmentProbe(
+        ProbeEngine(), image=IMAGES["lab-cell"], lan=[LAN], ollama_problems=boom
+    )
+    report = run_selftest(deps, quick=True)
+    assert report.critical
+    assert "could not be checked" in next(
+        d for n, d in _failed(report).items() if n.endswith("contained")
+    )
+
+
+def test_a_gpu_host_wires_the_ollama_exposure_check_into_the_probe(
+    monkeypatch: pytest.MonkeyPatch, engine: Engine, tmp_path: Path
+) -> None:
+    seen: list[Any] = []
+
+    def fake_run(deps: selftest.SelftestDeps, *, quick: bool) -> SelftestReport:
+        seen.append(deps.probe._ollama_problems)  # type: ignore[attr-defined]
+        return failed_report(quick, "stub", "stopped after wiring")
+
+    monkeypatch.setattr(selftest, "run_selftest", fake_run)
+    monkeypatch.setattr(selftest, "control_plane_destinations", lambda *_a, **_k: [])
+    monkeypatch.setattr(selftest, "ollama_destinations", lambda *_a, **_k: [])
+    base = f"LAB_CELL_NETWORKS=10.231.0.0/16\nLAB_LLM_GATEWAY=\nLAB_PROBE_LAN={LAN}\n"
+    for flag in ("true", "false"):
+        root = tmp_path / flag
+        selftest.run_lab_selftest(
+            _context(engine, root, _production(root, base + f"LAB_GPU={flag}\n")), quick=True
+        )
+    assert seen[0] is not None and seen[1] is None

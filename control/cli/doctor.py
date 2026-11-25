@@ -19,6 +19,12 @@ failed (skips allowed), 1 when any check failed, 2 for a usage error.
 * ``firewall``: on the lab host, ``lab-cell-egress check`` (both firewall layers
   loaded and as expected) must pass. Off the host (neither host.env nor the tool
   present) it is skipped with a message. On the host a missing tool is a failure.
+* ``gpu``, ``models``, ``ollama_isolation``: only on a GPU host (``LAB_GPU=true`` in
+  host.env; skipped everywhere else). ``gpu``: ``nvidia-smi`` inside the running
+  Ollama container lists a GPU. ``models``: the pulled models with their full digests
+  (what an experiment file pins). ``ollama_isolation``: the container publishes no
+  port, sits on one internal network that overlaps no cell network, and shares it
+  only with the gateway, so no cell network has a path to Ollama.
 
 Error details pass through :func:`~control.core.logging.redact_text`, so a database
 URL in an exception never prints its password.
@@ -45,9 +51,11 @@ from sqlalchemy import pool
 from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 
 from control.cli.migrations import current_revisions, head_revisions
+from control.cli.models import ModelsError, OllamaService
 from control.cli.settings import ConfigError, LabSettings, read_env_file
 from control.core.logging import redact_text
 from control.db.engine import create_db_engine
+from control.runner.compose_backend import CommandRunner, SubprocessRunner
 
 __all__ = [
     "CHECK_NAMES",
@@ -55,6 +63,7 @@ __all__ = [
     "DEFAULT_DOCKER_SOCKET",
     "DEFAULT_EGRESS_COMMAND",
     "DEFAULT_SECRETS_OWNERS",
+    "GPU_CHECKS",
     "CheckResult",
     "DoctorConfig",
     "Status",
@@ -101,10 +110,24 @@ class DoctorConfig:
     database_url: str | None = None
     timeout: float = TIMEOUT_S
     secrets_owners: frozenset[str] = DEFAULT_SECRETS_OWNERS
+    #: runs the ``docker`` CLI for the Ollama checks; ``None`` runs it for real
+    runner: CommandRunner | None = None
 
     @property
     def on_lab_host(self) -> bool:
         return self.settings.host_env_file.exists() or self.egress_command.exists()
+
+    @property
+    def gpu_host(self) -> bool:
+        """The host profile says this host runs Ollama (``LAB_GPU=true``)."""
+        try:
+            return read_env_file(self.settings.host_env_file).get("LAB_GPU") == "true"
+        except (OSError, UnicodeDecodeError):
+            return False
+
+    @property
+    def ollama(self) -> OllamaService:
+        return OllamaService(self.runner or SubprocessRunner())
 
 
 def _detail(text: str) -> str:
@@ -353,6 +376,56 @@ def check_firewall(cfg: DoctorConfig) -> CheckResult:
     return CheckResult(name, Status.OK, f"{tool} check passed" + (f": {output}" if output else ""))
 
 
+# --------------------------------------------------------------------- Ollama (GPU hosts)
+
+NOT_GPU_HOST: Final = "not a GPU host (LAB_GPU is not true in host.env)"
+
+
+def check_gpu(cfg: DoctorConfig) -> CheckResult:
+    name = "gpu"
+    if not cfg.gpu_host:
+        return CheckResult(name, Status.SKIP, NOT_GPU_HOST)
+    try:
+        return CheckResult(name, Status.OK, "visible in the ollama container: " + cfg.ollama.gpu())
+    except ModelsError as exc:
+        return CheckResult(name, Status.FAIL, _detail(str(exc)))
+
+
+def check_models(cfg: DoctorConfig) -> CheckResult:
+    name = "models"
+    if not cfg.gpu_host:
+        return CheckResult(name, Status.SKIP, NOT_GPU_HOST)
+    try:
+        models = cfg.ollama.models()
+    except ModelsError as exc:
+        return CheckResult(name, Status.FAIL, _detail(str(exc)))
+    if not models:
+        return CheckResult(name, Status.OK, "no models pulled yet (labctl models pull ID)")
+    listing = ", ".join(f"{m.name} {m.digest}" for m in models)
+    return CheckResult(name, Status.OK, f"{len(models)} pulled: {listing}")
+
+
+def check_ollama_isolation(cfg: DoctorConfig) -> CheckResult:
+    name = "ollama_isolation"
+    if not cfg.gpu_host:
+        return CheckResult(name, Status.SKIP, NOT_GPU_HOST)
+    try:
+        raw = read_env_file(cfg.settings.host_env_file).get("LAB_CELL_NETWORKS", "")
+        problems = cfg.ollama.exposure(parse_cell_networks(raw, cfg.cell_range))
+    except (ModelsError, ValueError) as exc:
+        return CheckResult(name, Status.FAIL, _detail(str(exc)))
+    if problems:
+        return CheckResult(
+            name, Status.FAIL, _detail("the ollama container " + "; ".join(problems))
+        )
+    return CheckResult(
+        name,
+        Status.OK,
+        "no published port, one internal network, shared only with the gateway, "
+        "clear of every cell network",
+    )
+
+
 # --------------------------------------------------------------------- the whole run
 
 _CHECKS: Final[tuple[tuple[str, str], ...]] = (
@@ -363,8 +436,13 @@ _CHECKS: Final[tuple[tuple[str, str], ...]] = (
     ("host_env", "check_host_env"),
     ("secrets", "check_secrets"),
     ("firewall", "check_firewall"),
+    ("gpu", "check_gpu"),
+    ("models", "check_models"),
+    ("ollama_isolation", "check_ollama_isolation"),
 )
 CHECK_NAMES: Final[tuple[str, ...]] = tuple(name for name, _ in _CHECKS)
+#: The checks that apply only on a GPU host.
+GPU_CHECKS: Final[tuple[str, ...]] = ("gpu", "models", "ollama_isolation")
 
 
 def run_doctor(cfg: DoctorConfig) -> list[CheckResult]:

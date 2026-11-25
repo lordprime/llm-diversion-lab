@@ -1,0 +1,27 @@
+---
+# The NVIDIA Container Toolkit and the host config for the model server (isolation:
+# sysbox, gpu: true; DEPLOYMENT §0.6). The GPU driver is NOT installed here: on a VM
+# with a passed-through GPU that is the operator's decision. The role refuses, with a
+# message, when `nvidia-smi` does not work.
+
+# NVIDIA Container Toolkit, one version for all four packages (the stable apt
+# repository carries 1.19.x and 1.20.x; checked 25 Nov 2026). The newest patch of the
+# previous minor is chosen on purpose: it has had time to age. Changed only in a
+# reviewed commit.
+nvidia_toolkit_version: "1.20.1-1"
+nvidia_toolkit_packages:
+  - nvidia-container-toolkit
+  - nvidia-container-toolkit-base
+  - libnvidia-container1
+  - libnvidia-container-tools
+
+nvidia_apt_key_url: https://nvidia.github.io/libnvidia-container/gpgkey
+# The primary key of the repository's keyring (NVIDIA CORPORATION, Open Source Projects).
+nvidia_apt_key_fingerprint: C95B321B61E88C1809C4F759DDCAE044F796ECB0
+# Where the downloaded key waits until its fingerprint is checked.
+nvidia_apt_key_candidate: /var/cache/lab-nvidia-apt-key.asc
+nvidia_apt_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}"
+
+# Host config for the model server (ollama_num_parallel, ollama_context_length and
+# ollama_models_volume) is shared with compose, not with this role alone: its defaults
+# are in deploy/ansible/group_vars/all.yml.

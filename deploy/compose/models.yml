@@ -1,0 +1,75 @@
+# LLM Diversion Lab model server: Ollama on the NVIDIA runtime, GPU hosts only.
+#
+# Used together with deploy/compose/control-plane.yml, as ONE compose project (deploy/
+# remote/release.sh adds `-f models.yml` and `--env-file /srv/lab/models.env` when
+# host.env says LAB_GPU=true):
+#   docker compose --project-name lab --env-file /srv/lab/secrets/lab.env \
+#     --env-file /srv/lab/models.env -f control-plane.yml -f models.yml ...
+#
+# Contract (tests/deploy/test_models_stack.py):
+# * Only `ollama` is defined here. The gateway (control/gateway) lives in
+#   control-plane.yml and joins the `models` network; nothing else may.
+# * `ollama` is pinned by the digest in deploy/images.lock (OLLAMA_IMAGE may replace it
+#   with another digest; release.sh refuses an unpinned image). It runs on the `nvidia`
+#   runtime (the nvidia Ansible role registers it) and sees every GPU.
+# * It has NO published ports and sits on the `models` network only. That network is
+#   internal: no route to the internet or to any other network. (An internal bridge
+#   still has a host-side gateway address, so `gateway_mode_ipv4: isolated` below drops
+#   it, which needs Docker 28 or later; the docker role pins 29.8.) So no cell can
+#   resolve or reach it; cells get models only through tap -> gateway. `labctl doctor`
+#   and the self-test check this on the running host.
+# * Pulling needs the registry, which the internal network cannot reach: `labctl models
+#   pull` attaches the container to a throwaway uplink network for the pull only.
+# * OLLAMA_KEEP_ALIVE=-1 keeps the one campaign model loaded. OLLAMA_NUM_PARALLEL and
+#   OLLAMA_CONTEXT_LENGTH come from the host's hosts.yml (the nvidia role writes
+#   /srv/lab/models.env); the defaults here are for a host that sets nothing.
+# * Models live on a named volume, so they survive a release. The host may name it
+#   (OLLAMA_MODELS_VOLUME, hosts.yml `ollama_models_volume`) to put it on a data disk.
+# * The models network has an explicit subnet outside the run-cell range 10.231.0.0/16,
+#   Docker's default pools (172.20.0.0/14), the home LAN, CGNAT and the control network
+#   (172.31.231.0/24).
+
+name: lab
+
+services:
+  ollama:
+    # ollama/ollama 0.40.17 (multi-arch index digest), resolved 25 Nov 2026 from the
+    # Docker Hub registry API (see the note in deploy/images.lock).
+    image: ${OLLAMA_IMAGE:-docker.io/ollama/ollama@sha256:ccc42bcd3d5fcf7ab0d532b300382154e1a4da56fc666bdb313b78ebdd912754}
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # Listens on every address of its own (internal) network, which only the gateway
+      # joins. Nothing publishes it.
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_KEEP_ALIVE: "-1"
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-1}
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-65536}
+    volumes:
+      - ollama_models:/root/.ollama
+    networks: [models]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+networks:
+  models:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config:
+        - subnet: 172.31.232.0/24
+
+volumes:
+  ollama_models:
+    name: ${OLLAMA_MODELS_VOLUME:-lab_ollama_models}

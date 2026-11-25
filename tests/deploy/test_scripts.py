@@ -940,7 +940,9 @@ printf '%s [tag=%s]\\n' "$*" "${LAB_RELEASE_TAG-unset}" >>"$FAKE_DOCKER_LOG"
 case "$*" in
 *"config --services"*)
     [[ ${FAKE_CONFIG_FAIL:-0} == 1 ]] && exit 1
-    printf 'db\\napi\\nworker\\nmigrate\\n' ;;
+    printf 'db\\napi\\nworker\\nmigrate\\n'
+    [[ -z ${FAKE_EXTRA_SERVICE-} ]] || printf '%s\\n' "$FAKE_EXTRA_SERVICE" ;;
+*"info --format"*) printf '%s\\n' "${FAKE_RUNTIMES:-none}" ;;
 *"config --images"*) printf '%s\\n' $FAKE_IMAGES ;;
 *"config --format json"*) printf '%s\\n' "$FAKE_CONFIG_JSON" ;;
 *"ps --status running --services"*) [[ ${FAKE_DB_DOWN:-0} == 1 ]] || echo db ;;
@@ -2332,3 +2334,160 @@ def test_status_names_the_current_release_tag_for_compose() -> None:
 def test_no_control_container_gets_the_docker_socket() -> None:
     compose = (DEPLOY / "compose" / "control-plane.yml").read_text(encoding="utf-8")
     assert "docker.sock" not in compose
+
+
+# ------------------------------------------------------- GPU hosts: the models stack
+
+
+def _gpu_host(root: Path, *, models_yml: bool = True) -> None:
+    """Make the fake host a GPU host, with models.yml in every release tree."""
+    (root / "host.env").write_text("LAB_GPU=true\n", encoding="utf-8")
+    (root / "models.env").write_text("OLLAMA_NUM_PARALLEL=2\n", encoding="utf-8")
+    if models_yml:
+        for tree in (root / "releases").glob("v*"):
+            (tree / "deploy" / "compose" / "models.yml").write_text(
+                "services: {}\n", encoding="utf-8"
+            )
+
+
+def _activate(env: Mapping[str, str]) -> subprocess.CompletedProcess[str]:
+    return _run(["bash", str(DEPLOY / "remote" / "release.sh"), "activate", "v0.1.0"], env=env)
+
+
+def test_a_gpu_host_starts_the_models_file_with_the_control_plane(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    root, env = lab_root
+    _gpu_host(root)
+    result = _activate(env)
+    assert result.returncode == 0, result.stderr
+    up = next(line for line in _docker_log(env) if " up -d" in line)
+    tree = f"{root}/current/deploy/compose"
+    assert f"-f {tree}/control-plane.yml -f {tree}/models.yml" in up
+    assert f"--env-file {root}/models.env" in up
+
+
+def test_a_host_without_a_gpu_never_gets_the_models_file(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    root, env = lab_root
+    _gpu_host(root)
+    (root / "host.env").write_text("LAB_GPU=false\n", encoding="utf-8")
+    assert _activate(env).returncode == 0
+    up = next(line for line in _docker_log(env) if " up -d" in line)
+    assert "models.yml" not in up and "models.env" not in up
+
+
+def test_a_release_without_models_yml_still_deploys_on_a_gpu_host(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    # an older release (a rollback target) has no models.yml: it must still start
+    root, env = lab_root
+    _gpu_host(root, models_yml=False)
+    assert _activate(env).returncode == 0
+    assert "models.yml" not in next(line for line in _docker_log(env) if " up -d" in line)
+
+
+def test_stopping_the_writers_leaves_ollama_and_its_loaded_model_alone(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    root, env = lab_root
+    _gpu_host(root)
+    env = {**env, "FAKE_EXTRA_SERVICE": "ollama"}
+    result = _run(["bash", str(DEPLOY / "remote" / "release.sh"), "migrate", "v0.1.0"], env=env)
+    assert result.returncode == 0, result.stderr
+    stops = [line for line in _docker_log(env) if " stop " in line]
+    assert stops
+    assert all("ollama" not in line for line in stops)
+
+
+def test_preflight_refuses_a_gpu_host_whose_docker_has_no_nvidia_runtime(
+    lab_root: tuple[Path, dict[str, str]],
+) -> None:
+    root, env = lab_root
+    _gpu_host(root)
+    (root / "secrets" / "lab.env").write_text(
+        "LAB_DB_PASSWORD=" + "p" * 40 + "\n", encoding="utf-8"
+    )
+    refused = _preflight({**env, "FAKE_RUNTIMES": '{"runc":{}}'})
+    assert refused.returncode != 0
+    assert "nvidia" in refused.stderr
+    ready = _preflight({**env, "FAKE_RUNTIMES": '{"runc":{},"nvidia":{}}'})
+    assert ready.returncode == 0, ready.stderr
+
+
+def test_release_checks_the_tag_ships_models_yml_for_a_gpu_host() -> None:
+    text = (DEPLOY / "release.sh").read_text(encoding="utf-8")
+    assert "HOST_GPU" in text and "deploy/compose/models.yml" in text
+
+
+# ------------------------------- the docker role's daemon.json merge, run for real
+
+MERGE_PLAY = """\
+- hosts: localhost
+  gather_facts: false
+  vars:
+    docker_daemon_config: {{storage-driver: overlay2, live-restore: true}}
+  tasks:
+    - name: Read
+      ansible.builtin.slurp:
+        src: "{current}"
+      register: docker_daemon_current
+      failed_when: false
+    - name: Render
+      vars: {vars}
+      ansible.builtin.copy:
+        dest: "{out}"
+        content: {content}
+        mode: "0644"
+"""
+
+
+def _merged_daemon_json(tmp_path: Path, current: dict[str, Any] | None) -> dict[str, Any]:
+    """Run the docker role's own read and write tasks against a daemon.json fixture."""
+    tasks = _load_yaml(ANSIBLE / "roles" / "docker" / "tasks" / "main.yml")
+    write = next(t for t in tasks if t.get("name") == "Write /etc/docker/daemon.json")
+    src = tmp_path / "current.json"
+    if current is not None:
+        src.write_text(json.dumps(current), encoding="utf-8")
+    out = tmp_path / "out.json"
+    play = tmp_path / "merge.yml"
+    play.write_text(
+        MERGE_PLAY.format(
+            current=src,
+            out=out,
+            vars=json.dumps(write["vars"]),
+            content=json.dumps(write["ansible.builtin.copy"]["content"]),
+        ),
+        encoding="utf-8",
+    )
+    playbook = _require_tool("ansible-playbook", ANSIBLE_CORE)
+    env = dict(os.environ, ANSIBLE_NOCOLOR="1", ANSIBLE_LOCALHOST_WARNING="False")
+    result = _run([*playbook, "-i", "localhost,", "-c", "local", str(play)], env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    merged: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+    return merged
+
+
+RUNTIMES = {
+    "nvidia": {"path": "nvidia-container-runtime", "args": []},
+    "sysbox-runc": {"path": "/usr/bin/sysbox-runc"},
+}
+
+
+def test_daemon_json_merge_keeps_sysbox_and_nvidia_runtimes(tmp_path: Path) -> None:
+    merged = _merged_daemon_json(tmp_path, {"runtimes": RUNTIMES, "storage-driver": "old"})
+    assert merged["runtimes"] == RUNTIMES
+    assert merged["storage-driver"] == "overlay2"  # the role's own settings still win
+
+
+def test_daemon_json_merge_with_no_file_writes_only_the_role_config(tmp_path: Path) -> None:
+    assert _merged_daemon_json(tmp_path, None) == {
+        "storage-driver": "overlay2",
+        "live-restore": True,
+    }
+
+
+def test_daemon_json_merge_with_a_file_without_runtimes(tmp_path: Path) -> None:
+    merged = _merged_daemon_json(tmp_path, {"debug": True})
+    assert "runtimes" not in merged and "debug" not in merged

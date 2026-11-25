@@ -4,7 +4,10 @@
 #
 # isolation: lxc (current, CT 111): one Docker daemon inside an unprivileged LXC;
 # Sysbox is skipped. isolation: sysbox (VM or bare metal) is the upgrade path; its
-# disk formatting and host sysctls are not built in M0.
+# disk formatting and host sysctls are not built in M0. gpu: true (sysbox profile
+# only) adds the nvidia role: the NVIDIA Container Toolkit and the `nvidia` Docker
+# runtime for the model server (deploy/compose/models.yml). The GPU driver itself is
+# the operator's to install; the role refuses without a working `nvidia-smi`.
 #
 # Optional roles from the docs that are NOT here yet: registry (the LXC pulls from
 # GHCR), ops (Prometheus/Grafana/Loki), lab (systemd units and timers: reaper,
@@ -23,6 +26,7 @@
           - max_parallel_cells | int >= 1
           - allow_containerd_pin is boolean
           - cloudflare_tunnel is boolean
+          - gpu is boolean
         fail_msg: deploy/hosts.yml has an invalid host profile (see hosts.example.yml)
         quiet: true
 
@@ -35,6 +39,15 @@
         fail_msg: >-
           isolation: sysbox provisions as a non-root sudo user (ssh_user: admin in
           hosts.example.yml); root SSH login is allowed only for the LXC profile.
+        quiet: true
+
+    # A GPU host is a VM with the GPU passed through; the model server is not built
+    # for the LXC profile.
+    - name: Check a GPU host uses the sysbox (VM) profile
+      ansible.builtin.assert:
+        that:
+          - not gpu | bool or isolation == 'sysbox'
+        fail_msg: gpu true needs isolation sysbox (a VM or bare metal with the GPU passed through).
         quiet: true
 
     - name: Check the host runs Ubuntu 24.04
@@ -68,6 +81,8 @@
     - role: docker
     - role: sysbox
       when: isolation == 'sysbox'
+    - role: nvidia
+      when: gpu | bool
     - role: access
     - role: caddy
     - role: cloudflared

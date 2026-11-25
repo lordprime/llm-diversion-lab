@@ -19,10 +19,18 @@
 #   cloudflare_tunnel     public website/Grafana behind Cloudflare Access (later; the
 #                         cloudflared role is a stub that refuses to run in M0)
 #   max_parallel_cells    hard cap on concurrent run cells on this host (§0.5: 1 on CT 111)
+#   gpu                   true on a VM with a GPU passed through (sysbox profile): runs the
+#                         nvidia role (NVIDIA Container Toolkit, `nvidia` Docker runtime)
+#                         and the model server, Ollama (deploy/compose/models.yml).
+#                         Default false. The driver is NOT installed by the scripts:
+#                         bootstrap.sh stops with a message if `nvidia-smi` does not work.
 #   backup_repo           restic repository URL; accepted, but backups are not built in
 #                         M0 (the scripts warn that it is unused)
 #   vars                  optional mapping of extra Ansible variables for this host,
-#                         e.g. lab_llm_gateway_address / lab_llm_gateway_port
+#                         e.g. lab_llm_gateway_address / lab_llm_gateway_port; on a GPU
+#                         host also ollama_num_parallel (default 1), ollama_context_length
+#                         (default 65536) and ollama_models_volume (the Docker volume
+#                         that holds the models, default lab_ollama_models)
 #
 # Not accepted yet (sysbox-profile disk formatting is not built): data_disk,
 # artifact_disk.
@@ -35,6 +43,7 @@ lab1:
   allow_containerd_pin: false
   cloudflare_tunnel: false
   max_parallel_cells: 1
+  gpu: false
   vars:
     # Docker's upstream DNS: the LXC's gateway, never a loopback resolver (§0.2).
     lab_upstream_dns: [192.168.1.1]
@@ -49,6 +58,10 @@ lab1:
 #   allow_containerd_pin: false
 #   cloudflare_tunnel: false
 #   max_parallel_cells: 4
+#   gpu: true                    # an H100 80 GB at worst, an H200 141 GB likely
 #   vars:
 #     lab_upstream_dns: [192.0.2.1]   # placeholder: a non-loopback resolver
+#     ollama_num_parallel: 2
+#     ollama_context_length: 65536
+#     ollama_models_volume: lab_ollama_models
 #     sysbox_deb_sha256: "<published SHA-256 of sysbox-ce 0.7.1>"

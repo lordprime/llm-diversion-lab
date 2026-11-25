@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Runs ON THE LAB HOST as root, shipped by lab_remote (deploy/lib.sh) for release.sh.
 #
-#   preflight                       bootstrap + secrets done, Docker up, no cells running (exit 4)
+#   preflight                       bootstrap + secrets done, Docker up (with the nvidia
+#                                   runtime on a GPU host), no cells running (exit 4)
 #   receive TAG SHA256 COMMIT WHO   read a `git archive` tar on stdin into releases/TAG
 #   begin TAG                       remember the current release as the rollback target
 #   labctl TAG                      install labctl for TAG into releases/TAG/.venv (host
@@ -27,6 +28,10 @@ REL=$LAB/releases
 STATE=$REL/.state
 ENV_FILE=$LAB/secrets/lab.env
 COMPOSE_REL=deploy/compose/control-plane.yml
+# The model server (Ollama), part of the same compose project on GPU hosts only.
+MODELS_REL=deploy/compose/models.yml
+MODELS_ENV=$LAB/models.env
+HOST_ENV=$LAB/host.env
 WAIT=(--wait --wait-timeout 300)
 # labctl's interpreter: installed by the base role with the host's pinned uv, the
 # control-plane image's Python minor (tests check the role, this and the image agree).
@@ -49,15 +54,26 @@ release_tag_of() {
 	printf '%s\n' "$real"
 }
 
-# compose TREE ARG...: docker compose for the control plane of one release tree.
+# gpu_host: host.env says this host runs the model server (the nvidia role writes it).
+gpu_host() {
+	grep -qx 'LAB_GPU=true' "$HOST_ENV" 2>/dev/null
+}
+
+# compose TREE ARG...: docker compose for the control plane of one release tree, plus
+# the model server (models.yml, models.env) on a GPU host whose release has it: an
+# older release (a rollback target) without models.yml starts without it.
 # LAB_RELEASE_TAG is that tree's tag: the control-plane image is lab/control:<tag>,
 # so every release (and every rollback) runs its own image, never another's.
 compose() {
-	local tree=$1 tag
+	local tree=$1 tag files=() envs=(--env-file "$ENV_FILE")
 	shift
 	tag=$(release_tag_of "$tree") || return 1
-	LAB_RELEASE_TAG=$tag docker compose --project-name lab --env-file "$ENV_FILE" \
-		-f "$tree/$COMPOSE_REL" "$@"
+	files=(-f "$tree/$COMPOSE_REL")
+	if gpu_host && [[ -f $tree/$MODELS_REL ]]; then
+		files+=(-f "$tree/$MODELS_REL")
+		[[ ! -f $MODELS_ENV ]] || envs+=(--env-file "$MODELS_ENV")
+	fi
+	LAB_RELEASE_TAG=$tag docker compose --project-name lab "${envs[@]}" "${files[@]}" "$@"
 }
 
 # ensure_pgdata: the Postgres data directory, mounted as the db container's data
@@ -89,6 +105,10 @@ cmd_preflight() {
 	grep -Eq '^LAB_DB_PASSWORD=.+' "$ENV_FILE" ||
 		die "LAB_DB_PASSWORD is missing from $ENV_FILE: run bootstrap.sh (it generates it once)"
 	docker info >/dev/null 2>&1 || die "Docker is not running"
+	if gpu_host; then
+		docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"' ||
+			die "this is a GPU host (LAB_GPU=true) but Docker has no nvidia runtime: run bootstrap.sh (nvidia role)"
+	fi
 	cells=$(docker ps --quiet --filter label=lab.run_id | wc -l)
 	if ((cells > 0)); then
 		echo "$cells run-cell container(s) are running (label lab.run_id)" >&2
@@ -196,7 +216,8 @@ for service in json.load(sys.stdin)["services"].values():
 }
 
 # stop_writers: stop the running release's app services (everything except the
-# database and the one-shot migrate); the database keeps running. Fails closed: if
+# database, the one-shot migrate and the model server, whose loaded model stays warm);
+# the database keeps running. Fails closed: if
 # the service list cannot be read, nothing is assumed stopped.
 stop_writers() {
 	local all service services=()
@@ -206,7 +227,8 @@ stop_writers() {
 		return 1
 	}
 	while IFS= read -r service; do
-		[[ -z $service || $service == db || $service == migrate ]] || services+=("$service")
+		[[ -z $service || $service == db || $service == migrate || $service == ollama ]] ||
+			services+=("$service")
 	done <<<"$all"
 	((${#services[@]} > 0)) || return 0
 	echo "stopping app services: ${services[*]}"
