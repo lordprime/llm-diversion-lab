@@ -39,9 +39,16 @@ admin_password=$(<"$ADMIN_PASSWORD_FILE")
 # The event socket's directory: root, group insights, 0750. Only the shop process is
 # started with that group (below), so it alone of the app user's processes can reach
 # the socket; a `docker exec --user juice` shell cannot.
+# Root here holds no CAP_CHOWN, so it cannot hand a directory to another group; it
+# makes the directory with insights as its own group instead (a new directory takes
+# its maker's group), then sets the mode as its owner.
 SOCKET_DIR=/run/insights
 [[ ! -L "$SOCKET_DIR" ]] || die "$SOCKET_DIR must not be a symlink"
-install -d -o root -g insights -m 0750 "$SOCKET_DIR" || die "cannot make $SOCKET_DIR"
+if [[ ! -e "$SOCKET_DIR" ]]; then
+	setpriv --regid=insights --clear-groups -- mkdir -m 0750 "$SOCKET_DIR" ||
+		die "cannot make $SOCKET_DIR"
+fi
+chmod 0750 "$SOCKET_DIR" || die "cannot set the mode of $SOCKET_DIR"
 [[ "$(stat -c %U:%G:%a "$SOCKET_DIR")" == root:insights:750 ]] ||
 	die "$SOCKET_DIR must be root:insights mode 0750"
 
