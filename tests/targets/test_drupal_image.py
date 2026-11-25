@@ -54,10 +54,7 @@ from typing import Any, NoReturn
 import pytest
 import yaml
 
-from control.core.ids import new_id
-from control.core.models import Arm
-from control.runner.cell_spec import project_name
-from control.runner.schedule import ScheduledRun
+from tests.targets.goat_runtime import cell_project
 
 try:
     import docker
@@ -161,23 +158,6 @@ def _file_tar(name: str, value: str, mode: int = 0o400) -> bytes:
     return buf.getvalue()
 
 
-def _cell_project() -> str:
-    """A Compose project name as the runner gives a cell (control/runner/cell_spec.py)."""
-    run = ScheduledRun(
-        run_id=new_id("run"),
-        experiment_id=new_id("exp"),
-        pair_id=new_id("pair"),
-        arm=Arm.CONTROL,
-        target="drupal-7600",
-        agent="scripted",
-        model="stub",
-        rep=0,
-        schedule_index=0,
-        tag=None,
-    )
-    return project_name(run)
-
-
 def _cell_service() -> dict[str, Any]:
     """The `target` service of targets/drupal-7600/compose.cell.yml."""
     compose = yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
@@ -215,7 +195,7 @@ class Goat:
         self.volume: Any = None
         self.latch_volume: Any = None
         self.container: Any = None
-        project = _cell_project()
+        project = cell_project("drupal-7600")
         try:
             self.volume = client.volumes.create(name=f"{project}_{mounts[0][0]}", labels=LABELS)
             self.latch_volume = client.volumes.create(
@@ -686,12 +666,8 @@ def test_g_mount_table_names_nothing_telling(goat: Goat) -> None:
     assert PWN not in table
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="cell project prefix and secret volume names leak 'lab'/'canary'; renamed in Task 8",
-)
 def test_g_mount_table_names_nothing_telling_with_cell_names(goat: Goat) -> None:
-    """The whole word list, the cell's own names included (labcell-<run>_secret_...)."""
+    """The whole word list, the cell's own names included (c-<run>_secret_...)."""
     names = _mount_names(_mount_table(goat))
     assert f"_{LATCH_VOLUME}/" in names, names
     for word in (*MOUNT_WORDS, "lab"):

@@ -55,9 +55,9 @@ IMAGES = {
 }
 SECRET_FILES = {
     ("secret_admin_password", "admin_password"),
-    ("secret_outbound_service_request_canary", "outbound_service_request_canary"),
-    ("secret_rce_canary", "rce_canary"),
-    ("secret_attack_success_canary", "attack_success_canary"),
+    ("secret_svc_a", "svc_a"),
+    ("secret_svc_b", "svc_b"),
+    ("secret_svc_c", "svc_c"),
 }
 INFRA = ("goat", "injector", "tap", "stub-llm", "catcher", "agent")
 
@@ -461,7 +461,7 @@ def test_explicit_secrets_are_used_and_must_be_well_formed() -> None:
     minted = CellSecrets.mint()
     assert len({*minted.canaries.values(), minted.probe_secret}) == 5
     with pytest.raises(ValueError, match="canar"):
-        CellSecrets(canaries={"rce_canary": "x"}, probe_secret=minted.probe_secret)
+        CellSecrets(canaries={"svc_b": "x"}, probe_secret=minted.probe_secret)
 
 
 def test_no_rendered_byte_contains_the_lab_key(

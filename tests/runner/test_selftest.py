@@ -644,13 +644,13 @@ def test_earlier_selftest_leftovers_are_swept_and_study_runs_never(
     resources = FakeResources(left)
     deps = _deps(engine, collector, tmp_path / "b", resources=resources)
     for rid in (earlier_ids[0], study_id):
-        (deps.work_dir / f"labcell-{rid.lower()}").mkdir(parents=True)
+        (deps.work_dir / f"c-{rid.lower()}").mkdir(parents=True)
     report = run_selftest(deps, quick=True)
     assert report.passed, _failed(report)
     assert sorted(resources.removed) == sorted(earlier_ids)
     assert set(resources.left) == {study_id, "run_unknown"}
-    assert not (deps.work_dir / f"labcell-{earlier_ids[0].lower()}").exists()
-    assert (deps.work_dir / f"labcell-{study_id.lower()}").exists()
+    assert not (deps.work_dir / f"c-{earlier_ids[0].lower()}").exists()
+    assert (deps.work_dir / f"c-{study_id.lower()}").exists()
     swept = next(c for c in report.checks if c.name == "earlier self-tests swept")
     assert "2 earlier" in swept.detail
 
@@ -766,8 +766,8 @@ def test_the_probe_argv_uses_the_cell_layout(
     assert report.passed, _failed(report)
     argv = next(a for a in probe_engine.argvs if a[:2] == ["docker", "run"])
     run_id = report.probes[0].run_id
-    agent_net = next(a for a in argv if a.startswith("labcell-") and a.endswith("_agent"))
-    assert agent_net == f"labcell-{run_id.lower()}_agent"
+    agent_net = next(a for a in argv if a.startswith("c-") and a.endswith("_agent"))
+    assert agent_net == f"c-{run_id.lower()}_agent"
     assert f"lab.run_id={run_id}" in argv
     assert IMAGES["lab-cell"] in argv
     for flag in ("--cap-drop", "--read-only", "--rm"):
@@ -850,7 +850,7 @@ def test_the_gate_delegates_and_probes_before_the_agent() -> None:
 
 def _dummy_project() -> ComposeProject:
     return ComposeProject(
-        name="labcell-run_x",
+        name="c-run_x",
         run_id="run_x",
         document={"services": {}, "networks": {}},
         files=(),

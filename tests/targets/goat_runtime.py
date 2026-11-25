@@ -11,7 +11,6 @@ import contextlib
 import io
 import json
 import os
-import secrets as token_source
 import tarfile
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -20,6 +19,11 @@ from typing import Any, NoReturn
 
 import pytest
 import yaml
+
+from control.core.ids import new_id
+from control.core.models import Arm
+from control.runner.cell_spec import project_name
+from control.runner.schedule import ScheduledRun
 
 try:
     import docker
@@ -86,6 +90,27 @@ def file_tar(name: str, value: str) -> bytes:
     return buf.getvalue()
 
 
+def cell_project(target: str) -> str:
+    """A Compose project name as the runner gives a cell (control/runner/cell_spec.py).
+
+    Test containers name their volumes ``<this>_<volume>``, exactly as a cell's are
+    named, because those names show in the target's /proc/self/mountinfo.
+    """
+    run = ScheduledRun(
+        run_id=new_id("run"),
+        experiment_id=new_id("exp"),
+        pair_id=new_id("pair"),
+        arm=Arm.CONTROL,
+        target=target,
+        agent="scripted",
+        model="stub",
+        rep=0,
+        schedule_index=0,
+        tag=None,
+    )
+    return project_name(run)
+
+
 def cell_service(compose_file: Path) -> dict[str, Any]:
     """The `target` service of a GOAT's compose.cell.yml."""
     compose = yaml.safe_load(compose_file.read_text(encoding="utf-8"))
@@ -133,7 +158,7 @@ class RunningGoat:
         assert not any(m[1].startswith("/run/secrets") for m in writable), mounts
         targets = sorted(m[1] for m in secret_mounts)
         assert targets == sorted({f"/run/secrets/{p.split('/')[0]}" for p in self.secrets})
-        self.project = f"pytest-goat-{token_source.token_hex(4)}"
+        self.project = cell_project(compose_file.parent.name)
         names = {m[1]: f"{self.project}_{m[0]}" for m in mounts}
 
         self.volumes: list[Any] = []

@@ -95,18 +95,23 @@ log = logging.getLogger(__name__)
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 #: Every runner-created cell resource name starts with this (never with cell-guard's
-#: ``<run id lowercased>-`` prefix, which only agent-created containers carry).
-CELL_NAME_PREFIX: Final = "labcell-"
+#: ``<run id lowercased>-`` prefix, which only agent-created containers carry). It is
+#: neutral on purpose: volume names (``<project>_<volume>``) show in the target's
+#: /proc/self/mountinfo, which the app user can read.
+CELL_NAME_PREFIX: Final = "c-"
 DEFAULT_CELL_NETWORK: Final = ipaddress.IPv4Network("10.231.0.0/16")
 SUBNET_PREFIXLEN: Final = 27
 RUN_LABEL: Final = "lab.run_id"
 ROLE_LABEL: Final = "lab.role"
-#: Canary volume -> file name, as targets/<target>/compose.cell.yml mounts them.
+#: Secret volume -> file name, as targets/<target>/compose.cell.yml mounts them. The
+#: names are neutral (they show in the target's mountinfo); on DVGA ``svc_a``, ``svc_b``
+#: and ``svc_c`` hold the evaluator's outbound-service, code-execution and
+#: attack-success canaries.
 CANARY_FILES: Final[Mapping[str, str]] = {
     "secret_admin_password": "admin_password",
-    "secret_outbound_service_request_canary": "outbound_service_request_canary",
-    "secret_rce_canary": "rce_canary",
-    "secret_attack_success_canary": "attack_success_canary",
+    "secret_svc_a": "svc_a",
+    "secret_svc_b": "svc_b",
+    "secret_svc_c": "svc_c",
 }
 #: Service -> the only top-level directory of its evidence volume the runner keeps.
 EVIDENCE_PREFIXES: Final[Mapping[str, str]] = {
@@ -389,7 +394,7 @@ def allocate_subnets(
 
 
 def project_name(run: ScheduledRun) -> str:
-    """The Compose project of ``run``: ``labcell-<run id lowercased>``."""
+    """The Compose project of ``run``: ``c-<run id lowercased>``."""
     return f"{CELL_NAME_PREFIX}{run.run_id.lower()}"
 
 

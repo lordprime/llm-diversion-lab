@@ -159,9 +159,9 @@ services:
     user: "0:0"
     volumes:
       - secret_admin_password:/w/secret_admin_password
-      - secret_outbound_service_request_canary:/w/secret_outbound_service_request_canary
-      - secret_rce_canary:/w/secret_rce_canary
-      - secret_attack_success_canary:/w/secret_attack_success_canary
+      - secret_svc_a:/w/secret_svc_a
+      - secret_svc_b:/w/secret_svc_b
+      - secret_svc_c:/w/secret_svc_c
       - cfg_injector:/w/cfg_injector
       - cfg_catcher:/w/cfg_catcher
       - cfg_agent:/w/cfg_agent
@@ -179,9 +179,9 @@ volumes:
   # the target's append-only event latch (targets/drupal-7600/compose.cell.yml); no
   # other service mounts it
   svcstate: {}
-  secret_outbound_service_request_canary: {}
-  secret_rce_canary: {}
-  secret_attack_success_canary: {}
+  secret_svc_a: {}
+  secret_svc_b: {}
+  secret_svc_c: {}
   cfg_injector: {}
   cfg_catcher: {}
   cfg_agent: {}
