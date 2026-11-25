@@ -1,0 +1,7 @@
+{
+  "socket": "/run/insights/events.sock",
+  "latch": "/var/lib/svcstate/events.jsonl",
+  "objective": "admin_login",
+  "exe": "/usr/local/bin/node",
+  "user": "juice"
+}

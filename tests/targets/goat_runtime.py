@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
+import secrets as token_source
 import tarfile
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -99,8 +101,15 @@ class RunningGoat:
     limit, and mounts one fresh volume per secret mount it declares (read-only),
     filled by a root writer -- a created, never started container of the same image
     -- through the archive API, as root:root 0400 files. ``secrets`` maps
-    ``<directory>/<file>`` under /run/secrets to its value.
+    ``<directory>/<file>`` under /run/secrets to its value. A writable mount (the
+    GOAT's latch volume) gets a fresh, empty volume.
+
+    Every volume is named as Compose names a project's (``<project>_<volume>``),
+    since the names show in the target's /proc/self/mountinfo, which its app user
+    can read.
     """
+
+    SUPPORT = "/opt/support"
 
     def __init__(
         self,
@@ -116,18 +125,30 @@ class RunningGoat:
         self.secrets = dict(secrets)
         service = cell_service(compose_file)
         mounts = [str(v).split(":") for v in service["volumes"]]
-        assert all(len(m) == 3 and m[2] == "ro" for m in mounts), mounts
-        targets = sorted(m[1] for m in mounts)
+        # every secret read-only under /run/secrets; anything else writable
+        secret_mounts = [m for m in mounts if len(m) == 3]
+        writable = [m for m in mounts if len(m) == 2]
+        assert len(secret_mounts) + len(writable) == len(mounts), mounts
+        assert all(m[2] == "ro" and m[1].startswith("/run/secrets/") for m in secret_mounts)
+        assert not any(m[1].startswith("/run/secrets") for m in writable), mounts
+        targets = sorted(m[1] for m in secret_mounts)
         assert targets == sorted({f"/run/secrets/{p.split('/')[0]}" for p in self.secrets})
+        self.project = f"pytest-goat-{token_source.token_hex(4)}"
+        names = {m[1]: f"{self.project}_{m[0]}" for m in mounts}
 
         self.volumes: list[Any] = []
         self.container: Any = None
         try:
             by_target = {}
             for target in targets:
-                volume = client.volumes.create(labels=dict(labels))
+                volume = client.volumes.create(name=names[target], labels=dict(labels))
                 self.volumes.append(volume)
                 by_target[target] = volume.name
+            writable_volumes = {}
+            for _, target in writable:
+                volume = client.volumes.create(name=names[target], labels=dict(labels))
+                self.volumes.append(volume)
+                writable_volumes[volume.name] = {"bind": target, "mode": "rw"}
             writer = client.containers.create(
                 image,
                 entrypoint=["/bin/true"],
@@ -147,7 +168,8 @@ class RunningGoat:
                 image,
                 detach=True,
                 volumes={
-                    name: {"bind": target, "mode": "ro"} for target, name in by_target.items()
+                    **{name: {"bind": target, "mode": "ro"} for target, name in by_target.items()},
+                    **writable_volumes,
                 },
                 cap_drop=service["cap_drop"],
                 cap_add=service["cap_add"],
@@ -165,6 +187,27 @@ class RunningGoat:
         """Run ``script`` with bash inside the container; (exit code, combined output)."""
         code, out = self.container.exec_run(["/bin/bash", "-c", script], user=user)
         return code, out.decode(errors="replace")
+
+    def done(self) -> dict[str, Any]:
+        """The done v2 verdict, as the runner reads it (``done.sh``, stdout only)."""
+        code, out = self.sh(f"{self.SUPPORT}/done.sh 2>/dev/null")
+        assert code == 0, out
+        verdict = json.loads(out.strip().splitlines()[-1])
+        assert isinstance(verdict, dict)
+        return verdict
+
+    def diagnostics(self) -> list[str]:
+        """The lines done.sh relays from the evaluator's error log (rejected peers among
+        them). The log keeps only its latest records, so compare lines, never counts."""
+        code, out = self.sh(f"{self.SUPPORT}/done.sh 2>&1 >/dev/null")
+        assert code == 0, out
+        return out.splitlines()
+
+    def latch(self) -> list[dict[str, Any]]:
+        """The latch's events, through latch-dump.sh (as the runner collects them)."""
+        code, out = self.sh(f"{self.SUPPORT}/latch-dump.sh 2>/dev/null")
+        assert code == 0, out
+        return [json.loads(line) for line in out.splitlines()]
 
     def wait_healthy(self, health_cmd: str, timeout_s: float) -> None:
         deadline = time.monotonic() + timeout_s
