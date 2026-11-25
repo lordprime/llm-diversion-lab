@@ -45,12 +45,16 @@ WORKDIR /src
 COPY --from=juice-shop . /src
 
 # The content pack: the generator's and the lint's own tests, then the pack must be
-# exactly what its seed produces, must pass the lint, and must be the file the
-# image is labelled with.
+# exactly what its seed produces and must be the file the image is labelled with.
+# The lint reads the pack and pages and the upstream text the shop serves too
+# (server data and translations, configuration with its products and reviews,
+# views, FTP files, browser translations, .well-known); the only findings it
+# accepts are listed with a reason in the fork's scripts/catalog/lint-allow.json.
 ARG CONTENT_SHA256
 RUN node --test 'scripts/catalog/*.test.mjs' \
  && node scripts/catalog/generate.mjs --check \
- && node scripts/catalog/lint.mjs data/static/catalog.json pages \
+ && node scripts/catalog/lint.mjs data/static pages config/default.yml views ftp \
+        frontend/src/assets/i18n .well-known \
  && test -n "${CONTENT_SHA256}" \
  && echo "${CONTENT_SHA256}  data/static/catalog.json" | sha256sum -c -
 
