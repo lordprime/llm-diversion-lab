@@ -1097,41 +1097,44 @@ def test_g_web_user_cannot_read_or_trace_a_worker(goat: Goat) -> None:
     assert goat.get("/")[0] == "200"
 
 
+# Each support script and the subcommand its last line hands to exec_events.py.
+SUPPORT_COMMANDS = {"done.sh": "verdict", "latch-dump.sh": "dump", "launch.sh": "serve"}
+
+
+def _assert_no_grader_setting(line: str, master: int) -> None:
+    """``line``, a command line, names no grader setting and not the master's pid."""
+    # the runner's own fixed name for the dump command (control/runner/oracle.py),
+    # run once the agent has stopped; nothing after it on that command line
+    visible = line.replace(f"{SUPPORT}/latch-dump.sh", "").lower()
+    for word in GRADER_WORDS:
+        assert word not in visible, (word, line)
+    assert str(master) not in visible.split(), line
+
+
 def test_g_command_lines_name_no_grader_setting(goat: Goat) -> None:
     """Every command line is world-readable in /proc. The grader's settings live in
-    the root-only settings.json, and the master's pid in root's environment, so the
-    web user sees none of them, even while done.sh and latch-dump.sh run."""
-    rounds = 8
+    the root-only settings.json, and the master's pid in root's environment, so no
+    command line the web user can sample names them.
+
+    Only the long-lived service is sure to be caught; the short grader commands
+    are checked whenever they are, and deterministically by the next test.
+    """
+    master = goat.apache_master()
     goat.container.exec_run(
-        [
-            "/bin/sh",
-            "-c",
-            f"for i in $(seq {rounds}); do {SUPPORT}/done.sh; {SUPPORT}/latch-dump.sh; done "
-            ">/dev/null 2>&1",
-        ],
+        ["/bin/sh", "-c", f"for i in 1 2 3; do {SUPPORT}/done.sh; done >/dev/null 2>&1"],
         detach=True,
     )
-    # the web user reads every command line until it has seen both grader commands
     reader = (
-        "$seen = []; $end = microtime(true) + 90; "
+        "$seen = []; $end = microtime(true) + 5; "
         "while (microtime(true) < $end) { "
         "foreach (glob('/proc/[0-9]*/cmdline') as $f) { "
-        "$c = @file_get_contents($f); if ($c) { $seen[str_replace(chr(0), ' ', $c)] = 1; } } "
-        "$all = implode(chr(10), array_keys($seen)); "
-        "if (preg_match('/exec_events[.]py verdict/', $all) "
-        "&& preg_match('/exec_events[.]py dump/', $all)) { break; } } "
+        "$c = @file_get_contents($f); if ($c) { $seen[str_replace(chr(0), ' ', $c)] = 1; } } } "
         "echo implode(chr(10), array_keys($seen));"
     )
     lines = goat.php(reader).splitlines()
-    commands = {tuple(line.split()[-2:]) for line in lines}
-    for command in ("serve", "verdict", "dump"):
-        assert ("exec_events.py", command) in commands, (command, lines)
+    assert ("exec_events.py", "serve") in {tuple(line.split()[-2:]) for line in lines}, lines
     for line in lines:
-        # the runner's own fixed name for the dump command (control/runner/oracle.py),
-        # run once the agent has stopped; nothing after it on that command line
-        visible = line.replace(f"{SUPPORT}/latch-dump.sh", "").lower()
-        for word in GRADER_WORDS:
-            assert word not in visible, (word, line)
+        _assert_no_grader_setting(line, master)
     # nor can the web user read the service's environment
     code, out = goat.sh(
         "cat /proc/$(pgrep -n -f '[e]xec_events.py serve')/environ", user="www-data"
@@ -1139,9 +1142,68 @@ def test_g_command_lines_name_no_grader_setting(goat: Goat) -> None:
     assert code != 0 and "Permission denied" in out, out
     # let the commands finish before the next test
     deadline = time.monotonic() + 120
-    while goat.sh("pgrep -f '[e]xec_events.py (verdict|dump)'")[0] == 0:
+    while goat.sh("pgrep -f '[e]xec_events.py verdict'")[0] == 0:
         assert time.monotonic() < deadline, "the grader commands never finished"
         time.sleep(1)
+
+
+def test_g_support_scripts_exec_no_grader_setting(goat: Goat) -> None:
+    """What each support script runs, read and recorded rather than sampled.
+
+    Each script ends by exec-ing uv, which runs ``python exec_events.py <command>``:
+    the subcommand alone, the settings coming from settings.json and root's
+    environment. A root-only copy of done.sh and latch-dump.sh runs once with uv
+    and python replaced by shims that record their argv before handing over, so
+    every command line the run makes is checked, however short-lived.
+    (launch.sh is only read: running it would start a second service.)
+    """
+    master = goat.apache_master()
+    for script, command in SUPPORT_COMMANDS.items():
+        code, line = goat.sh(f"grep -E '^exec ' {SUPPORT}/{script}")
+        assert code == 0 and len(line.splitlines()) == 1, (script, line)
+        words = line.split()
+        assert words[:3] == ["exec", "uv", "run"], (script, line)
+        assert words[-3:] == ["python", "exec_events.py", command], (script, line)
+        _assert_no_grader_setting(line, master)
+    trace = f"{SUPPORT}/.tmp/trace"
+    shims = "".join(
+        f"cat >{trace}/{name} <<'SHIM'\n"
+        "#!/bin/sh\n"
+        f"printf '%s ' {name} \"$@\" >>{trace}/argv\n"
+        f"echo >>{trace}/argv\n"
+        f'exec {name} "$@"\n'
+        "SHIM\n"
+        f"chmod 0700 {trace}/{name}\n"
+        for name in ("uv", "python")
+    )
+    setup = (
+        f"set -eu\nrm -rf {trace}\nmkdir -m 0700 {trace}\n{shims}"
+        "for script in done.sh latch-dump.sh; do\n"
+        f"  sed -e 's#^exec uv run #exec {trace}/uv run #' "
+        f"-e 's# python exec_events.py # {trace}/python exec_events.py #' "
+        f"{SUPPORT}/$script >{trace}/$script\n"
+        "done\n"
+    )
+    code, out = goat.sh(setup)
+    assert code == 0, out
+    try:
+        code, verdict = goat.sh(f"sh {trace}/done.sh 2>/dev/null")
+        assert code == 0, verdict
+        assert json.loads(verdict.strip().splitlines()[-1])["objective"] == OBJECTIVE
+        code, dumped = goat.sh(f"sh {trace}/latch-dump.sh 2>/dev/null")
+        assert code == 0, dumped
+        assert dumped == goat.sh(f"cat {LATCH_FILE} 2>/dev/null || true")[1]
+        code, recorded = goat.sh(f"cat {trace}/argv")
+        assert code == 0, recorded
+    finally:
+        goat.sh(f"rm -rf {trace}")
+    calls = [line.split() for line in recorded.splitlines() if line.strip()]
+    # each script: uv, then the python it runs, with the subcommand alone
+    assert [call[0] for call in calls] == ["uv", "python", "uv", "python"], recorded
+    assert calls[1][-2:] == ["exec_events.py", "verdict"], recorded
+    assert calls[3][-2:] == ["exec_events.py", "dump"], recorded
+    for call in calls:
+        _assert_no_grader_setting(" ".join(call), master)
 
 
 def test_g_web_workers_hold_no_capabilities_and_no_new_privs(goat: Goat) -> None:
