@@ -20,13 +20,13 @@ fi
 [[ "$(stat -c %u:%a /run/secrets)" == 0:700 ]] || die "/run/secrets must be root-owned mode 0700"
 
 # The one secret this target uses: a non-empty regular file (not a symlink), owned by
-# root with no group or other permission bits.
+# root with mode exactly 0400.
 ADMIN_PASSWORD_FILE=/run/secrets/admin/admin_password
 [[ -f "$ADMIN_PASSWORD_FILE" && ! -L "$ADMIN_PASSWORD_FILE" && -s "$ADMIN_PASSWORD_FILE" ]] ||
 	die "missing, empty or symlinked secret file $ADMIN_PASSWORD_FILE"
 odd=$(find /run/secrets -mindepth 1 ! -type f ! -type d -print)
 [[ -z "$odd" ]] || die "only regular files and directories allowed under /run/secrets; refusing: $odd"
-exposed=$(find /run/secrets -type f \( ! -uid 0 -o -perm /0077 \) -print)
+exposed=$(find /run/secrets -type f \( ! -uid 0 -o ! -perm 0400 \) -print)
 [[ -z "$exposed" ]] || die "secret files must be root-owned mode 0400; refusing: $exposed"
 
 admin_password=$(<"$ADMIN_PASSWORD_FILE")
