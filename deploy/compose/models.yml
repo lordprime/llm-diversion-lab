@@ -13,7 +13,9 @@
 #   with another digest; release.sh refuses an unpinned image). It runs on the `nvidia`
 #   runtime (the nvidia Ansible role registers it) and sees every GPU.
 # * It has NO published ports and sits on the `models` network only. That network is
-#   internal: no route to the internet, the host or any cell network. So no cell can
+#   internal: no route to the internet or to any other network. (An internal bridge
+#   still has a host-side gateway address, so `gateway_mode_ipv4: isolated` below drops
+#   it, which needs Docker 28 or later; the docker role pins 29.8.) So no cell can
 #   resolve or reach it; cells get models only through tap -> gateway. `labctl doctor`
 #   and the self-test check this on the running host.
 # * Pulling needs the registry, which the internal network cannot reach: `labctl models
@@ -62,6 +64,8 @@ networks:
   models:
     driver: bridge
     internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
     ipam:
       config:
         - subnet: 172.31.232.0/24

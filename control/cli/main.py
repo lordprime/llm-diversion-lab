@@ -415,11 +415,17 @@ def _cmd_models_list(args: argparse.Namespace, settings: LabSettings) -> int:
 
 def _cmd_models_pull(args: argparse.Namespace, settings: LabSettings) -> int:
     admin = _ollama_admin(settings)
+    # SIGTERM and SIGHUP (a dropped SSH session, a stopped service) end the pull through
+    # SystemExit, so the uplink is closed again whatever happens
+    previous = _exit_on_signals()
     try:
         admin.pull(args.model)
         models = admin.models()
     except ModelsError as exc:
         raise _Failure(str(exc)) from None
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
     # Ollama names an untagged model `:latest`
     name = args.model if ":" in args.model.rpartition("/")[2] else f"{args.model}:latest"
     pulled = next((m for m in models if m.name == name), None)

@@ -23,6 +23,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from ipaddress import IPv4Network, ip_network
@@ -36,6 +38,7 @@ __all__ = [
     "MODEL_ID_PATTERN",
     "OLLAMA_PORT",
     "OLLAMA_SERVICE",
+    "UPLINK_LABEL",
     "UPLINK_NETWORK",
     "ModelsError",
     "OllamaAdmin",
@@ -50,6 +53,7 @@ OLLAMA_PORT: Final = 11434
 NETWORK_MEMBERS: Final = frozenset({"ollama", "gateway"})
 #: The throwaway network a pull attaches Ollama to, so it can reach the registry.
 UPLINK_NETWORK: Final = "lab-ollama-uplink"
+UPLINK_LABEL: Final = "lab.role=ollama-uplink"
 #: Files that exist only inside a container (Docker, Podman).
 CONTAINER_MARKERS: Final = (Path("/.dockerenv"), Path("/run/.containerenv"))
 #: ``name[:tag]`` as the Ollama registry writes it; ``/`` and ``.`` allow namespaces
@@ -65,7 +69,6 @@ _TAGS_SCRIPT: Final = (
     f"exec 3<>/dev/tcp/127.0.0.1/{OLLAMA_PORT} && "
     "printf 'GET /api/tags HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && cat <&3"
 )
-_PULL_TIMEOUT_S: Final = 4 * 3600.0
 _QUICK_TIMEOUT_S: Final = 60.0
 
 
@@ -102,8 +105,8 @@ class OllamaService:
     def _docker_run(self, *argv: str, timeout: float = _QUICK_TIMEOUT_S) -> CommandResult:
         return self._run([self._docker, *argv], timeout=timeout)
 
-    def _containers(self, *filters: str) -> list[str]:
-        argv = ["ps", "-q"]
+    def _containers(self, *filters: str, include_stopped: bool = False) -> list[str]:
+        argv = ["ps", "-a", "-q"] if include_stopped else ["ps", "-q"]
         for item in filters:
             argv += ["--filter", item]
         result = self._docker_run(*argv)
@@ -172,8 +175,12 @@ class OllamaService:
         if published:
             problems.append(f"has a published port ({', '.join(sorted(published))}) on the host")
         networks = sorted(settings.get("Networks") or {})
-        if len(networks) != 1:
-            problems.append(f"is on more than the models network ({', '.join(networks) or 'none'})")
+        models_network = f"{self._project}_models"
+        if networks != [models_network]:
+            problems.append(
+                f"is on more than the models network {models_network} "
+                f"({', '.join(networks) or 'none'})"
+            )
         for name in networks:
             info = self._json("network", "inspect", name)
             if info.get("Internal") is not True:
@@ -212,6 +219,11 @@ class OllamaService:
         return item
 
 
+def _stream_to_terminal(argv: Sequence[str]) -> int:
+    """Run a command with the terminal as its output and no time limit."""
+    return subprocess.run(list(argv), check=False).returncode  # noqa: S603 -- fixed argv
+
+
 def _digest(value: Any) -> str:
     match = _DIGEST.fullmatch(str(value))
     if match is None:
@@ -231,8 +243,11 @@ class OllamaAdmin(OllamaService):
         environ: Mapping[str, str] | None = None,
         geteuid: Callable[[], int] = os.geteuid,
         container_markers: Sequence[Path] = CONTAINER_MARKERS,
+        stream: Callable[[Sequence[str]], int] | None = None,
     ) -> None:
         super().__init__(run, docker=docker, project=project)
+        # runs a command with its output on the terminal (a pull shows its progress)
+        self._stream = stream or _stream_to_terminal
         self._environ = os.environ if environ is None else environ
         self._geteuid = geteuid
         self._markers = tuple(container_markers)
@@ -258,19 +273,39 @@ class OllamaAdmin(OllamaService):
         self.require_admin()
         return super().models()
 
+    def _require_no_cells(self, what: str) -> None:
+        """Refuse while any cell exists: a running, created or exited container, or a
+        cell network left behind. A run could otherwise start while Ollama is changed."""
+        if self._containers("label=lab.run_id", include_stopped=True) or self._run_text(
+            "network", "ls", "-q", "--filter", "label=lab.run_id"
+        ):
+            raise ModelsError(
+                f"refused: run cell(s) exist (containers or networks labelled lab.run_id); "
+                f"{what} is never part of a run"
+            )
+
+    def _run_text(self, *argv: str) -> str:
+        result = self._docker_run(*argv)
+        if result.returncode != 0:
+            raise ModelsError(f"docker {' '.join(argv[:2])} failed: {_text(result)}")
+        return result.text.strip()
+
     def pull(self, model: str) -> None:
-        """Pull ``model`` into the models volume; never while a run cell is in flight."""
+        """Pull ``model`` into the models volume; never while a run cell exists.
+
+        The uplink is always closed again: on a failure, on Ctrl-C and when the process
+        is ended (labctl turns SIGTERM and SIGHUP into ``SystemExit``).
+        """
         self.require_admin()
         self._check_id(model)
-        if self._containers("label=lab.run_id"):
-            raise ModelsError("refused: run cell(s) are in flight; pulls are never part of a run")
+        self._require_no_cells("a pull")
         cid = self.container()
-        self._open_uplink(cid)
         failure: str | None = None
         try:
-            result = self._docker_run("exec", cid, "ollama", "pull", model, timeout=_PULL_TIMEOUT_S)
-            if result.returncode != 0:
-                failure = f"ollama pull {model} failed: {_text(result)}"
+            self._open_uplink(cid)
+            code = self._stream([self._docker, "exec", cid, "ollama", "pull", model])
+            if code != 0:
+                failure = f"ollama pull {model} failed (exit {code}, see its output above)"
         finally:
             leftover = self._close_uplink(cid)
         if leftover:
@@ -281,25 +316,55 @@ class OllamaAdmin(OllamaService):
     def remove(self, model: str) -> None:
         self.require_admin()
         self._check_id(model)
+        self._require_no_cells("removing a model")
         result = self._docker_run("exec", self.container(), "ollama", "rm", model)
         if result.returncode != 0:
             raise ModelsError(f"ollama rm {model} failed: {_text(result)}")
 
     def _open_uplink(self, cid: str) -> None:
+        """Create the uplink (no container-to-container traffic on it) and attach Ollama.
+
+        A network left by a crashed pull is reused only if it carries our label and
+        holds nothing but Ollama.
+        """
         created = self._docker_run(
-            "network", "create", "--label", "lab.role=ollama-uplink", UPLINK_NETWORK
+            "network",
+            "create",
+            "--label",
+            f"{UPLINK_LABEL}",
+            "-o",
+            "com.docker.network.bridge.enable_icc=false",
+            UPLINK_NETWORK,
         )
-        if created.returncode != 0 and "already exists" not in created.stderr.decode(
-            "utf-8", "replace"
-        ):
-            raise ModelsError(f"could not create the uplink network: {_text(created)}")
+        if created.returncode != 0:
+            if "already exists" not in created.stderr.decode("utf-8", "replace"):
+                raise ModelsError(f"could not create the uplink network: {_text(created)}")
+            info = self._json("network", "inspect", UPLINK_NETWORK)
+            stray = [c for c in (info.get("Containers") or {}) if not cid.startswith(c[:12])]
+            if (info.get("Labels") or {}).get("lab.role") != "ollama-uplink" or stray:
+                raise ModelsError(
+                    f"refused: a network called {UPLINK_NETWORK} exists but is not the Ollama "
+                    "uplink (wrong label) or has other containers attached; remove it by hand"
+                )
         connected = self._docker_run("network", "connect", UPLINK_NETWORK, cid)
         if connected.returncode != 0:
-            self._close_uplink(cid)
             raise ModelsError(f"could not attach Ollama to the uplink: {_text(connected)}")
 
     def _close_uplink(self, cid: str) -> str | None:
-        """Detach Ollama and drop the uplink; the problem as text, or ``None``."""
+        """Detach Ollama and drop the uplink; the problem as text, or ``None``.
+
+        Ctrl-C is ignored meanwhile, so a second one cannot leave the uplink open.
+        """
+        try:
+            previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except ValueError:  # not the main thread
+            return self._detach(cid)
+        try:
+            return self._detach(cid)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+
+    def _detach(self, cid: str) -> str | None:
         left = self._docker_run("network", "disconnect", "--force", UPLINK_NETWORK, cid)
         if left.returncode != 0 and "is not connected" not in _text(left):
             return (

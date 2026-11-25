@@ -673,3 +673,11 @@ def test_all_gpu_checks_pass_end_to_end(
     cfg.http_client = collector_client
     results = run_doctor(cfg)
     assert {r.name: r.status for r in results} == dict.fromkeys(CHECK_NAMES, Status.OK)
+
+
+def test_the_one_network_must_be_the_projects_models_network(tmp_path: Path) -> None:
+    engine = FakeEngine()
+    engine.networks = {"lab_lab-ollama-uplink": {}}  # one network, but the wrong one
+    result = doctor.check_ollama_isolation(_gpu_config(tmp_path, engine))
+    assert result.status is Status.FAIL
+    assert "lab_models" in result.detail

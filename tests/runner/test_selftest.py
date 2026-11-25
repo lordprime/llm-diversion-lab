@@ -1508,3 +1508,77 @@ def test_a_gpu_host_whose_ollama_is_down_fails_the_self_test_in_production(
         _context(engine, tmp_path, _production(tmp_path, base)), quick=True
     )
     assert "ollama is not running" in _failed(report)["configuration"]
+
+
+def _gated_deps(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, backend: Any, problems: list[str]
+) -> SelftestDeps:
+    deps = _deps(engine, collector, tmp_path, backend)
+    deps.probe = DockerContainmentProbe(
+        ProbeEngine(),
+        image=IMAGES["lab-cell"],
+        lan=[LAN],
+        is_local=lambda _a: True,
+        ollama_problems=lambda: problems,
+    )
+    return deps
+
+
+def test_no_run_starts_while_ollama_is_attached_to_another_network(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    # e.g. an uplink left behind by an interrupted pull
+    backend = SelftestBackend()
+    problems = ["is on more than the models network lab_models (lab-ollama-uplink)"]
+    report = run_selftest(_gated_deps(engine, collector, tmp_path, backend, problems), quick=True)
+    detail = next(d for n, d in _failed(report).items() if n.endswith("contained"))
+    assert "lab-ollama-uplink" in detail
+    assert report.critical and not report.passed
+    assert not any(c == "start_agent" for c, _ in backend.calls)
+
+
+def test_a_clean_ollama_lets_the_probe_run(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    report = run_selftest(
+        _gated_deps(engine, collector, tmp_path, SelftestBackend(), []), quick=True
+    )
+    assert report.passed, _failed(report)
+
+
+def test_an_ollama_that_cannot_be_checked_is_not_proven_isolated(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    def boom() -> list[str]:
+        raise RuntimeError("docker gone")
+
+    deps = _deps(engine, collector, tmp_path)
+    deps.probe = DockerContainmentProbe(
+        ProbeEngine(), image=IMAGES["lab-cell"], lan=[LAN], ollama_problems=boom
+    )
+    report = run_selftest(deps, quick=True)
+    assert report.critical
+    assert "could not be checked" in next(
+        d for n, d in _failed(report).items() if n.endswith("contained")
+    )
+
+
+def test_a_gpu_host_wires_the_ollama_exposure_check_into_the_probe(
+    monkeypatch: pytest.MonkeyPatch, engine: Engine, tmp_path: Path
+) -> None:
+    seen: list[Any] = []
+
+    def fake_run(deps: selftest.SelftestDeps, *, quick: bool) -> SelftestReport:
+        seen.append(deps.probe._ollama_problems)  # type: ignore[attr-defined]
+        return failed_report(quick, "stub", "stopped after wiring")
+
+    monkeypatch.setattr(selftest, "run_selftest", fake_run)
+    monkeypatch.setattr(selftest, "control_plane_destinations", lambda *_a, **_k: [])
+    monkeypatch.setattr(selftest, "ollama_destinations", lambda *_a, **_k: [])
+    base = f"LAB_CELL_NETWORKS=10.231.0.0/16\nLAB_LLM_GATEWAY=\nLAB_PROBE_LAN={LAN}\n"
+    for flag in ("true", "false"):
+        root = tmp_path / flag
+        selftest.run_lab_selftest(
+            _context(engine, root, _production(root, base + f"LAB_GPU={flag}\n")), quick=True
+        )
+    assert seen[0] is not None and seen[1] is None

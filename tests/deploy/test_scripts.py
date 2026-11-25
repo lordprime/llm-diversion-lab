@@ -2419,3 +2419,75 @@ def test_preflight_refuses_a_gpu_host_whose_docker_has_no_nvidia_runtime(
 def test_release_checks_the_tag_ships_models_yml_for_a_gpu_host() -> None:
     text = (DEPLOY / "release.sh").read_text(encoding="utf-8")
     assert "HOST_GPU" in text and "deploy/compose/models.yml" in text
+
+
+# ------------------------------- the docker role's daemon.json merge, run for real
+
+MERGE_PLAY = """\
+- hosts: localhost
+  gather_facts: false
+  vars:
+    docker_daemon_config: {{storage-driver: overlay2, live-restore: true}}
+  tasks:
+    - name: Read
+      ansible.builtin.slurp:
+        src: "{current}"
+      register: docker_daemon_current
+      failed_when: false
+    - name: Render
+      vars: {vars}
+      ansible.builtin.copy:
+        dest: "{out}"
+        content: {content}
+        mode: "0644"
+"""
+
+
+def _merged_daemon_json(tmp_path: Path, current: dict[str, Any] | None) -> dict[str, Any]:
+    """Run the docker role's own read and write tasks against a daemon.json fixture."""
+    tasks = _load_yaml(ANSIBLE / "roles" / "docker" / "tasks" / "main.yml")
+    write = next(t for t in tasks if t.get("name") == "Write /etc/docker/daemon.json")
+    src = tmp_path / "current.json"
+    if current is not None:
+        src.write_text(json.dumps(current), encoding="utf-8")
+    out = tmp_path / "out.json"
+    play = tmp_path / "merge.yml"
+    play.write_text(
+        MERGE_PLAY.format(
+            current=src,
+            out=out,
+            vars=json.dumps(write["vars"]),
+            content=json.dumps(write["ansible.builtin.copy"]["content"]),
+        ),
+        encoding="utf-8",
+    )
+    playbook = _require_tool("ansible-playbook", ANSIBLE_CORE)
+    env = dict(os.environ, ANSIBLE_NOCOLOR="1", ANSIBLE_LOCALHOST_WARNING="False")
+    result = _run([*playbook, "-i", "localhost,", "-c", "local", str(play)], env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    merged: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+    return merged
+
+
+RUNTIMES = {
+    "nvidia": {"path": "nvidia-container-runtime", "args": []},
+    "sysbox-runc": {"path": "/usr/bin/sysbox-runc"},
+}
+
+
+def test_daemon_json_merge_keeps_sysbox_and_nvidia_runtimes(tmp_path: Path) -> None:
+    merged = _merged_daemon_json(tmp_path, {"runtimes": RUNTIMES, "storage-driver": "old"})
+    assert merged["runtimes"] == RUNTIMES
+    assert merged["storage-driver"] == "overlay2"  # the role's own settings still win
+
+
+def test_daemon_json_merge_with_no_file_writes_only_the_role_config(tmp_path: Path) -> None:
+    assert _merged_daemon_json(tmp_path, None) == {
+        "storage-driver": "overlay2",
+        "live-restore": True,
+    }
+
+
+def test_daemon_json_merge_with_a_file_without_runtimes(tmp_path: Path) -> None:
+    merged = _merged_daemon_json(tmp_path, {"debug": True})
+    assert "runtimes" not in merged and "debug" not in merged

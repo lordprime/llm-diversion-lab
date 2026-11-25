@@ -427,3 +427,18 @@ def test_host_env_records_the_gpu_flag_for_labctl_and_release() -> None:
         encoding="utf-8"
     )
     assert "LAB_GPU={{ 'true' if gpu | bool else 'false' }}" in template
+
+
+def test_the_models_bridge_has_no_host_side_gateway_address() -> None:
+    # Docker 28+; the docker role pins 29.8 (checked against a local 29.9 daemon: a
+    # second container on the network still reaches Ollama's name and port)
+    opts = _load(COMPOSE)["networks"]["models"]["driver_opts"]
+    assert opts["com.docker.network.bridge.gateway_mode_ipv4"] == "isolated"
+    assert int(_load(DOCKER_ROLE / "defaults" / "main.yml")["docker_ce_minor"].split(".")[0]) >= 28
+
+
+def test_release_pulls_the_ollama_image_only_for_a_gpu_host() -> None:
+    text = (ROOT / "deploy" / "release.sh").read_text(encoding="utf-8")
+    filter_at = text.index("docker.io/ollama/ollama@")
+    assert text.index("$HOST_GPU != true") < filter_at < text.index("release.sh pull")
+    assert filter_at > text.index('lab_load_host "$host"')

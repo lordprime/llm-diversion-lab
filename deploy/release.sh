@@ -122,6 +122,15 @@ if [[ $HOST_GPU == true ]]; then
 		lab_fail "$host is a GPU host (gpu: true) but $tag has no deploy/compose/models.yml"
 fi
 
+# The model server image is pulled only where it runs (a GPU host), not on CT 111.
+if [[ $HOST_GPU != true ]]; then
+	kept=()
+	for ref in "${image_refs[@]}"; do
+		[[ $ref == docker.io/ollama/ollama@* ]] || kept+=("$ref")
+	done
+	image_refs=("${kept[@]}")
+fi
+
 lab_step "Preflight on $host"
 rc=0
 lab_remote release.sh preflight || rc=$?

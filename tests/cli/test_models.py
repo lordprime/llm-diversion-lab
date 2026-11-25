@@ -11,6 +11,7 @@ import json
 import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -35,12 +36,30 @@ def _http(body: str, status: str = "200 OK") -> bytes:
 class FakeDocker:
     """Answers docker calls from a script; every argv is kept in :attr:`calls`."""
 
-    def __init__(self, *, ollama: Sequence[str] = (CID,), cells: Sequence[str] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        ollama: Sequence[str] = (CID,),
+        cells: Sequence[str] = (),
+        stopped_cells: Sequence[str] = (),
+        cell_networks: Sequence[str] = (),
+    ) -> None:
         self.calls: list[list[str]] = []
         self.ollama = list(ollama)
-        self.cells = list(cells)
+        self.cells = list(cells)  # running cell containers
+        self.stopped_cells = list(stopped_cells)  # created or exited ones: only `ps -a`
+        self.cell_networks = list(cell_networks)
+        self.uplink: dict[str, Any] = {"Labels": {"lab.role": "ollama-uplink"}, "Containers": {}}
         self.tags: bytes = _http(json.dumps(TAGS_BODY))
         self.fail: dict[str, CommandResult] = {}
+
+    def stream(self, argv: Sequence[str]) -> int:
+        """The terminal-streaming runner (a pull): only its exit status comes back."""
+        self.calls.append(list(argv))
+        for key, result in self.fail.items():
+            if key in " ".join(argv):
+                return result.returncode
+        return 0
 
     def __call__(
         self, argv: Sequence[str], *, stdin: bytes | None = None, timeout: float | None = None
@@ -53,8 +72,15 @@ class FakeDocker:
         out = b""
         if a[1:2] == ["ps"]:
             joined = " ".join(a)
-            ids = self.cells if "label=lab.run_id" in joined else self.ollama
+            if "label=lab.run_id" in joined:
+                ids = self.cells + (self.stopped_cells if "-a" in a else [])
+            else:
+                ids = self.ollama
             out = "".join(f"{i}\n" for i in ids).encode()
+        elif a[1:3] == ["network", "ls"]:
+            out = "".join(f"{n}\n" for n in self.cell_networks).encode()
+        elif a[1:3] == ["network", "inspect"]:
+            out = json.dumps([self.uplink]).encode()
         elif a[1:2] == ["exec"] and "bash" in a:
             out = self.tags
         elif a[1:2] == ["exec"]:
@@ -82,7 +108,11 @@ def _admin(
     environ: dict[str, str] | None = None,
 ) -> OllamaAdmin:
     return OllamaAdmin(
-        docker, geteuid=lambda: euid, container_markers=tuple(markers), environ=environ or {}
+        docker,
+        geteuid=lambda: euid,
+        container_markers=tuple(markers),
+        environ=environ or {},
+        stream=docker.stream,
     )
 
 
@@ -240,7 +270,8 @@ def test_pull_opens_the_uplink_only_around_the_pull() -> None:
     docker = FakeDocker()
     _admin(docker).pull("qwen3:32b")
     assert docker.verbs() == [
-        "ps",  # run cells in flight?
+        "ps",  # any run cell container, running or not?
+        "network:ls",  # any cell network?
         "ps",  # the ollama container
         "network:create",
         "network:connect",
@@ -254,17 +285,139 @@ def test_pull_opens_the_uplink_only_around_the_pull() -> None:
     assert connect[-1] == CID
 
 
-def test_pull_never_runs_with_cells_in_flight() -> None:
-    docker = FakeDocker(cells=("deadbeef",))
-    with pytest.raises(ModelsError, match="run cell"):
-        _admin(docker).pull("qwen3:32b")
-    assert not any(c[1] == "network" for c in docker.calls)
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"cells": ("deadbeef",)},
+        {"stopped_cells": ("created01",)},  # created or exited: only `ps -a` sees it
+        {"cell_networks": ("labcell-x_agent",)},  # a cell network left behind
+    ],
+)
+def test_pull_and_rm_never_run_while_any_cell_exists(kwargs: dict[str, Any]) -> None:
+    for action in (lambda a: a.pull("qwen3:32b"), lambda a: a.remove("qwen3:32b")):
+        docker = FakeDocker(**kwargs)
+        with pytest.raises(ModelsError, match="run cell"):
+            action(_admin(docker))
+        assert not any(c[1] == "network" and c[2] != "ls" for c in docker.calls)
+        assert not any(c[1] == "exec" for c in docker.calls)
+    assert any(c[1:3] == ["ps", "-a"] for c in docker.calls)
+
+
+def test_the_uplink_is_created_without_container_to_container_traffic() -> None:
+    docker = FakeDocker()
+    _admin(docker).pull("qwen3:32b")
+    create = next(c for c in docker.calls if c[1:3] == ["network", "create"])
+    assert "com.docker.network.bridge.enable_icc=false" in create
+    assert "lab.role=ollama-uplink" in create
+
+
+def test_a_leftover_network_with_the_wrong_label_or_strangers_is_refused() -> None:
+    for uplink in (
+        {"Labels": {}, "Containers": {}},
+        {"Labels": {"lab.role": "ollama-uplink"}, "Containers": {"f" * 64: {}}},
+    ):
+        docker = FakeDocker()
+        docker.fail["network create"] = CommandResult(("d",), 1, b"", b"already exists")
+        docker.uplink = uplink
+        with pytest.raises(ModelsError, match="not the Ollama uplink"):
+            _admin(docker).pull("qwen3:32b")
+        assert not any(c[1:3] == ["network", "connect"] for c in docker.calls)
+
+
+class Interrupt(BaseException):
+    """Stands for KeyboardInterrupt and SystemExit without ending the test run."""
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("where", ["network create", "network connect", "ollama pull"])
+def test_an_interrupt_anywhere_in_a_pull_still_detaches_the_uplink(
+    exc: type[BaseException], where: str
+) -> None:
+    docker = FakeDocker()
+    real_call, real_stream = docker.__call__, docker.stream
+
+    def call(argv: Sequence[str], **kw: Any) -> CommandResult:
+        if where in " ".join(argv):
+            docker.calls.append(list(argv))
+            raise exc()
+        return real_call(argv, **kw)
+
+    def stream(argv: Sequence[str]) -> int:
+        if where in " ".join(argv):
+            docker.calls.append(list(argv))
+            raise exc()
+        return real_stream(argv)
+
+    admin = OllamaAdmin(call, geteuid=lambda: 0, container_markers=(), environ={}, stream=stream)
+    with pytest.raises(exc):
+        admin.pull("qwen3:32b")
+    assert docker.verbs()[-2:] == ["network:disconnect", "network:rm"]
+
+
+def test_sigint_is_ignored_while_the_uplink_closes() -> None:
+    import signal
+
+    docker = FakeDocker()
+    seen: list[Any] = []
+    real_call = docker.__call__
+
+    def call(argv: Sequence[str], **kw: Any) -> CommandResult:
+        if argv[1:3] == ["network", "disconnect"]:
+            seen.append(signal.getsignal(signal.SIGINT))
+        return real_call(argv, **kw)
+
+    admin = OllamaAdmin(
+        call, geteuid=lambda: 0, container_markers=(), environ={}, stream=docker.stream
+    )
+    before = signal.getsignal(signal.SIGINT)
+    admin.pull("qwen3:32b")
+    assert seen == [signal.SIG_IGN]
+    assert signal.getsignal(signal.SIGINT) == before
+
+
+def test_the_pull_streams_its_output_instead_of_capturing_it() -> None:
+    docker = FakeDocker()
+    streamed: list[list[str]] = []
+
+    def stream(argv: Sequence[str]) -> int:
+        streamed.append(list(argv))
+        return 0
+
+    OllamaAdmin(docker, geteuid=lambda: 0, container_markers=(), environ={}, stream=stream).pull(
+        "qwen3:32b"
+    )
+    assert [a[-3:] for a in streamed] == [["ollama", "pull", "qwen3:32b"]]
+    assert not any(c[-3:] == ["ollama", "pull", "qwen3:32b"] for c in docker.calls)
+
+
+def test_cli_pull_turns_sigterm_and_sighup_into_system_exit(
+    cli_admin: Callable[[OllamaAdmin], None],
+) -> None:
+    import signal
+
+    seen: dict[str, Any] = {}
+    docker = FakeDocker()
+
+    def stream(argv: Sequence[str]) -> int:
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            with pytest.raises(SystemExit):
+                signal.raise_signal(sig)
+        seen["done"] = True
+        return 0
+
+    before = signal.getsignal(signal.SIGTERM)
+    cli_admin(
+        OllamaAdmin(docker, geteuid=lambda: 0, container_markers=(), environ={}, stream=stream)
+    )
+    assert labctl.main(["models", "pull", "qwen3:32b"]) == 0
+    assert seen == {"done": True}
+    assert signal.getsignal(signal.SIGTERM) == before
 
 
 def test_a_failed_pull_still_closes_the_uplink() -> None:
     docker = FakeDocker()
-    docker.fail["ollama pull"] = CommandResult(("docker",), 1, b"", b"pull model manifest: 404")
-    with pytest.raises(ModelsError, match="404"):
+    docker.fail["ollama pull"] = CommandResult(("docker",), 1)
+    with pytest.raises(ModelsError, match="exit 1"):
         _admin(docker).pull("nope:1b")
     assert docker.verbs()[-2:] == ["network:disconnect", "network:rm"]
 
@@ -280,11 +433,11 @@ def test_an_uplink_that_will_not_close_is_reported_loudly() -> None:
 
 def test_a_failed_pull_and_a_failed_cleanup_report_both() -> None:
     docker = FakeDocker()
-    docker.fail["ollama pull"] = CommandResult(("docker",), 1, b"", b"disk full")
+    docker.fail["ollama pull"] = CommandResult(("docker",), 1)
     docker.fail["network disconnect"] = CommandResult(("docker",), 1, b"", b"busy")
     with pytest.raises(ModelsError) as info:
         _admin(docker).pull("qwen3:32b")
-    assert "disk full" in str(info.value)
+    assert "exit 1" in str(info.value)
     assert "docker network disconnect" in str(info.value)
 
 
@@ -313,7 +466,8 @@ def test_rm_removes_one_model_inside_the_container() -> None:
     _admin(docker).remove("qwen3:32b")
     last = docker.calls[-1]
     assert last[1] == "exec" and last[-3:] == ["ollama", "rm", "qwen3:32b"]
-    assert not any(c[1] == "network" for c in docker.calls)  # rm needs no internet
+    # rm needs no internet: no uplink
+    assert not any(c[1] == "network" and c[2] != "ls" for c in docker.calls)
 
 
 def test_rm_of_a_model_that_is_not_there_says_so() -> None:

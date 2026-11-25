@@ -101,6 +101,7 @@ import subprocess
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Final, Protocol
 
@@ -110,7 +111,7 @@ from dnslib import DNSRecord  # type: ignore[import-untyped]
 from sqlalchemy import Engine, func, select, update
 
 from cell.probe.containment import HOST_PORTS, LAN_PORTS
-from control.cli.models import OLLAMA_PORT, OLLAMA_SERVICE
+from control.cli.models import OLLAMA_PORT, OLLAMA_SERVICE, OllamaService
 from control.core.ids import new_id
 from control.core.models import (
     Arm,
@@ -594,6 +595,7 @@ class DockerContainmentProbe:
         extra_destinations: Sequence[str] = (),
         is_local: Callable[[str], bool] = is_local_address,
         timeout_s: float = PROBE_TIMEOUT_S,
+        ollama_problems: Callable[[], list[str]] | None = None,
     ) -> None:
         if not lan:
             raise SelftestConfigError("the containment probe needs a LAN address")
@@ -605,6 +607,7 @@ class DockerContainmentProbe:
         self._extra = tuple(dict.fromkeys(extra_destinations))
         self._is_local = is_local
         self._timeout_s = timeout_s
+        self._ollama_problems = ollama_problems
 
     def argv(self, cell: CellHandle) -> list[str]:
         layout = cell_layout(cell.project)
@@ -663,6 +666,21 @@ class DockerContainmentProbe:
             argv = self.argv(cell)
         except CellError as exc:
             return ProbeRecord(run_id, False, None, (f"probe not run: {exc}",))
+        if self._ollama_problems is not None:
+            # On a GPU host no run starts while Ollama is attached to anything but the
+            # models network (a pull's uplink left behind, a published port, ...).
+            try:
+                problems = self._ollama_problems()
+            except Exception as exc:  # unreadable is not proven isolated
+                problems = [f"could not be checked ({type(exc).__name__}: {exc})"]
+            if problems:
+                return ProbeRecord(
+                    run_id,
+                    False,
+                    None,
+                    ("the ollama container " + "; ".join(problems),),
+                    breach=True,
+                )
         gateway = self._host_gateway or layout.gateway
         if not self._is_local(gateway):
             return ProbeRecord(
@@ -1557,7 +1575,9 @@ def _lab_deps(context: LabContext) -> Iterator[SelftestDeps]:
         if not settings.dev:
             raise
         log.warning("selftest: development: no control-plane destinations (%s)", exc)
+    ollama_problems: Callable[[], list[str]] | None = None
     if _profile_value(environ, settings, "LAB_GPU")[0] == "true":
+        ollama_problems = partial(OllamaService(commands).exposure, settings.cell_networks)
         # a GPU host runs Ollama: a cell must reach it by neither name nor address
         try:
             extra += ollama_destinations(commands)
@@ -1582,6 +1602,7 @@ def _lab_deps(context: LabContext) -> Iterator[SelftestDeps]:
                 host_gateway=host_gateway,
                 extra_destinations=extra,
                 is_local=context.is_local,
+                ollama_problems=ollama_problems,
             ),
             resources=DockerLeftovers(commands),
             settings=settings,
