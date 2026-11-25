@@ -40,6 +40,7 @@ TAGS = {
         {"name": "qwen3:14b", "model": "qwen3:14b", "digest": "a" * 64, "size": 1},
         {"name": "qwen3:32b", "model": "qwen3:32b", "digest": "b" * 64, "size": 2},
         {"name": "llama3:8b", "model": "llama3:8b", "digest": "c" * 64, "size": 3},
+        {"name": "qwen3:latest", "model": "qwen3:latest", "digest": "d" * 64, "size": 4},
     ]
 }
 OPENAI_MODELS = {
@@ -48,6 +49,7 @@ OPENAI_MODELS = {
         {"id": "qwen3:14b", "object": "model", "owned_by": "library"},
         {"id": "qwen3:32b", "object": "model", "owned_by": "library"},
         {"id": "llama3:8b", "object": "model", "owned_by": "library"},
+        {"id": "qwen3:latest", "object": "model", "owned_by": "library"},
     ],
 }
 SHOW = b'{"modelfile":"FROM qwen3:14b","details":{"family":"qwen3"},"model_info":{}}'
@@ -73,7 +75,9 @@ class FakeOllama:
 
     ``mode``: ``normal`` streams ``chunks``; ``gate`` sends the first chunk and holds
     the rest until ``release`` is set; ``drip`` sends one byte every 50 ms forever;
-    ``hang`` never answers; ``error`` answers 404 like Ollama for an unknown model.
+    ``hang`` never answers; ``prefill`` holds its headers like a long prompt being
+    read, and sets ``closed`` when the gateway hangs up meanwhile; ``error`` answers
+    404 like Ollama for an unknown model.
     ``closed`` is set when a stream ended before it sent everything.
     """
 
@@ -129,6 +133,13 @@ class FakeOllama:
             return JSONResponse(OPENAI_MODELS)
         if path == "/api/show":
             return Response(SHOW, media_type="application/json")
+        if self.mode == "prefill":
+            while not self.stop.is_set():
+                if await request.is_disconnected():
+                    self.closed.set()
+                    return Response(b"")
+                await asyncio.sleep(0.02)
+            return Response(b"too late")
         if self.mode == "hang":
             await self._wait(threading.Event())
             return Response(b"too late")

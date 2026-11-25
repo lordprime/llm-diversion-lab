@@ -21,6 +21,7 @@ from control.gateway.admin import AdminApi
 from control.gateway.app import ModelProxy
 from control.gateway.config import GatewayConfig, GatewayConfigError, Listener
 from control.gateway.keys import RunKeys, key_sha256
+from control.gateway.policy import MAX_JSON_CONTAINERS
 from control.gateway.server import Gateway
 from tests.gateway.conftest import (
     NDJSON_CHUNKS,
@@ -211,13 +212,15 @@ def test_an_unauthenticated_client_learns_nothing_about_endpoints(gw: Running) -
 # --------------------------------------------------------------------------- models
 
 
-@pytest.mark.parametrize("model", [MODEL, "ollama/" + MODEL, "ollama_chat/" + MODEL])
-def test_the_granted_model_passes_in_every_spelling(
-    gw: Running, fake: FakeOllama, model: str
-) -> None:
-    body = json.dumps({"model": model, "messages": []}).encode()
+def test_only_the_exact_granted_model_passes(gw: Running, fake: FakeOllama) -> None:
+    body = json.dumps({"model": MODEL, "messages": []}).encode()
     assert httpx.post(gw.proxy + "/api/chat", headers=_auth(), content=body).status_code == 200
-    assert fake.seen[0].body == body  # forwarded as sent, prefix and all
+    assert fake.seen[0].body == body
+    for model in ("ollama/" + MODEL, "ollama_chat/" + MODEL):
+        body = json.dumps({"model": model, "messages": []}).encode()
+        response = httpx.post(gw.proxy + "/api/chat", headers=_auth(), content=body)
+        assert response.status_code == 403, model
+    assert len(fake.seen) == 1
 
 
 @pytest.mark.parametrize(
@@ -663,6 +666,14 @@ def test_refuses_to_start_when_both_listeners_share_address_and_port() -> None:
         {"max_body_bytes": 0},
         {"max_request_s": 0},
         {"read_timeout_s": -1},
+        {"read_timeout_s": float("nan")},
+        {"max_request_s": float("inf")},
+        {"header_timeout_s": float("nan")},
+        {"body_timeout_s": float("-inf")},
+        {"max_inflight_per_run": 0},
+        {"max_inflight_per_run": 65, "max_upstream_connections": 64},
+        {"max_large_bodies_per_run": 0},
+        {"max_connections": 0},
     ],
 )
 def test_unsafe_configurations_are_refused(overrides: dict[str, Any]) -> None:
@@ -692,6 +703,17 @@ def test_config_from_env() -> None:
             GatewayConfig.from_env({**env, "LAB_GATEWAY_LISTEN": bad})
     with pytest.raises(GatewayConfigError):
         GatewayConfig.from_env({**env, "LAB_GATEWAY_MAX_BODY_BYTES": "lots"})
+    for name in ("LAB_GATEWAY_READ_TIMEOUT_S", "LAB_GATEWAY_HEADER_TIMEOUT_S"):
+        for bad in ("nan", "inf", "-inf"):
+            with pytest.raises(GatewayConfigError):
+                GatewayConfig.from_env({**env, name: bad})
+    tuned = GatewayConfig.from_env({**env, "LAB_GATEWAY_MAX_INFLIGHT_PER_RUN": "4"})
+    assert tuned.max_inflight_per_run == 4
+    assert GatewayConfig.from_env(env).max_body_bytes == 2048
+    assert (
+        GatewayConfig.from_env({k: v for k, v in env.items() if "BODY" not in k}).max_body_bytes
+        == 16 << 20
+    )
 
 
 def test_the_run_key_never_reaches_the_logs(
@@ -707,26 +729,44 @@ def test_the_run_key_never_reaches_the_logs(
     assert KEY not in text and SECRET not in text  # ... without any secret
 
 
-def test_one_server_routes_each_listener_to_its_own_app(fake: FakeOllama) -> None:
+@contextlib.contextmanager
+def full_gateway(upstream: str, keys: RunKeys, **overrides: Any) -> Iterator[GatewayConfig]:
+    """The whole gateway process (both listeners) on 127.0.0.1 and 127.0.0.2."""
     proxy_sock = socket.create_server(("127.0.0.1", 0))
     admin_sock = socket.create_server(("127.0.0.2", 0))
     config = _config(
-        fake.url,
+        upstream,
         listen=Listener("127.0.0.1", proxy_sock.getsockname()[1]),
         admin_listen=Listener("127.0.0.2", admin_sock.getsockname()[1]),
+        **overrides,
     )
-    keys = RunKeys()
     gateway = Gateway(config, keys)
-    server = gateway.server()
     thread = threading.Thread(
-        target=server.run, kwargs={"sockets": [proxy_sock, admin_sock]}, daemon=True
+        target=gateway.run, kwargs={"sockets": [proxy_sock, admin_sock]}, daemon=True
     )
     thread.start()
     try:
         deadline = time.monotonic() + 10
-        while not server.started:
+        while not gateway.started:
             assert time.monotonic() < deadline and thread.is_alive()
             time.sleep(0.01)
+        yield config
+    finally:
+        gateway.stop()
+        thread.join(15)
+        proxy_sock.close()
+        admin_sock.close()
+
+
+def _keys(*runs: tuple[str, str, str]) -> RunKeys:
+    keys = RunKeys()
+    for run_id, key, model in runs:
+        keys.register(run_id, key_sha256(key), [model], datetime.now(UTC) + timedelta(hours=1))
+    return keys
+
+
+def test_each_listener_serves_only_its_own_app(fake: FakeOllama) -> None:
+    with full_gateway(fake.url, RunKeys()) as config:
         proxy, admin = f"http://{config.listen}", f"http://{config.admin_listen}"
         key = secrets.token_urlsafe(32)
         grant = _grant(key_sha256(key), run_id="run_c")
@@ -737,8 +777,213 @@ def test_one_server_routes_each_listener_to_its_own_app(fake: FakeOllama) -> Non
         assert response.status_code == 200
         assert response.content == b"".join(NDJSON_CHUNKS)
         assert fake.paths() == ["/api/chat"]
-    finally:
-        server.should_exit = True
-        thread.join(10)
-        proxy_sock.close()
-        admin_sock.close()
+
+
+# --------------------------------------------------------------------------- availability
+
+
+def test_idle_sockets_on_the_proxy_never_reach_the_admin_api(fake: FakeOllama) -> None:
+    with full_gateway(
+        fake.url, _keys(("run_a", KEY, MODEL)), max_connections=20, header_timeout_s=1
+    ) as config:
+        proxy, admin = f"http://{config.listen}", f"http://{config.admin_listen}"
+        idle = [
+            socket.create_connection((config.listen.host, config.listen.port)) for _ in range(60)
+        ]
+        try:
+            time.sleep(0.3)
+            # the proxy is saturated, the admin API is not
+            assert httpx.get(admin + "/healthz", timeout=3).status_code == 200
+            grant = _grant(key_sha256(secrets.token_urlsafe(32)), run_id="run_d")
+            response = httpx.post(admin + "/admin/grants", headers=_admin(), json=grant, timeout=3)
+            assert response.status_code == 201
+            assert (
+                httpx.delete(admin + "/admin/grants/run_d", headers=_admin(), timeout=3).status_code
+                == 204
+            )
+            # a connection that sends no request head is closed at the head deadline
+            for sock in idle[:5]:
+                sock.settimeout(5)
+                assert sock.recv(1024) == b""
+            # half a request head, dripped, is no better
+            slow = socket.create_connection((config.listen.host, config.listen.port))
+            slow.settimeout(5)
+            slow.sendall(b"POST /api/chat HTTP/1.1\r\nhost: x\r\n")
+            started = time.monotonic()
+            with contextlib.suppress(OSError):
+                for _ in range(20):
+                    time.sleep(0.2)
+                    slow.sendall(b"x-drip: 1\r\n")
+            with contextlib.suppress(OSError):
+                data = slow.recv(1024)
+                assert data == b"" or data.startswith(b"HTTP/1.1 4")
+            assert time.monotonic() - started < 4
+            slow.close()
+        finally:
+            for sock in idle:
+                sock.close()
+        time.sleep(0.2)
+        response = httpx.post(proxy + "/api/chat", headers=_auth(), content=CHAT, timeout=5)
+        assert response.status_code == 200
+
+
+def test_one_run_at_its_cap_does_not_affect_another_run(fake: FakeOllama) -> None:
+    other = secrets.token_urlsafe(32)
+    fake.mode = "gate"
+    keys = _keys(("run_a", KEY, MODEL), ("run_b", other, MODEL))
+    with (
+        full_gateway(fake.url, keys, max_inflight_per_run=2) as config,
+        contextlib.ExitStack() as held,
+    ):
+        proxy = f"http://{config.listen}"
+        client = held.enter_context(httpx.Client(timeout=5))
+        for _ in range(2):
+            stream = held.enter_context(
+                client.stream("POST", proxy + "/api/chat", headers=_auth(), content=CHAT)
+            )
+            assert stream.status_code == 200
+        refused = httpx.post(proxy + "/api/chat", headers=_auth(), content=CHAT, timeout=5)
+        assert refused.status_code == 429
+        assert refused.json() == {
+            "error": {"type": "gateway_refused", "reason": refused.json()["error"]["reason"]}
+        }
+        assert "in flight" in refused.json()["error"]["reason"]
+        # run_b is not held back by run_a's full quota
+        with client.stream("POST", proxy + "/api/chat", headers=_auth(other), content=CHAT) as b:
+            assert b.status_code == 200
+            assert next(b.iter_raw()) == NDJSON_CHUNKS[0]
+        fake.release.set()
+    assert len(fake.seen) == 3  # the refused call never reached Ollama
+
+
+def test_the_gateway_wide_cap_is_a_503(fake: FakeOllama) -> None:
+    fake.mode = "gate"
+    runs = [(f"run_{i}", secrets.token_urlsafe(32), MODEL) for i in range(3)]
+    with (
+        full_gateway(
+            fake.url, _keys(*runs), max_inflight_per_run=2, max_upstream_connections=2
+        ) as config,
+        contextlib.ExitStack() as held,
+    ):
+        proxy = f"http://{config.listen}"
+        client = held.enter_context(httpx.Client(timeout=5))
+        for _, key, _ in runs[:2]:
+            held.enter_context(
+                client.stream("POST", proxy + "/api/chat", headers=_auth(key), content=CHAT)
+            )
+        busy = httpx.post(proxy + "/api/chat", headers=_auth(runs[2][1]), content=CHAT, timeout=5)
+        assert busy.status_code == 503
+        assert busy.json()["error"]["type"] == "gateway_refused"
+        fake.release.set()
+
+
+def test_too_many_large_bodies_from_one_run_are_refused(fake: FakeOllama) -> None:
+    fake.mode = "gate"
+    large = json.dumps({"model": MODEL, "prompt": "x" * (2 << 20)}).encode()
+    with (
+        full_gateway(fake.url, _keys(("run_a", KEY, MODEL)), max_large_bodies_per_run=1) as config,
+        contextlib.ExitStack() as held,
+    ):
+        proxy = f"http://{config.listen}"
+        client = held.enter_context(httpx.Client(timeout=10))
+        held.enter_context(
+            client.stream("POST", proxy + "/api/generate", headers=_auth(), content=large)
+        )
+        response = httpx.post(proxy + "/api/generate", headers=_auth(), content=large, timeout=10)
+        assert response.status_code == 429
+        assert "large" in response.json()["error"]["reason"]
+        # small calls of the same run still pass
+        with client.stream("POST", proxy + "/api/chat", headers=_auth(), content=CHAT) as small:
+            assert small.status_code == 200
+        fake.release.set()
+
+
+def test_a_large_body_blocks_neither_other_streams_nor_the_admin_api(fake: FakeOllama) -> None:
+    fake.mode = "drip"
+    other = secrets.token_urlsafe(32)
+    keys = _keys(("run_a", KEY, MODEL), ("run_b", other, MODEL))
+    # the heaviest body the gateway still parses (the most containers it accepts, and
+    # a long string), and the reviewer's body: 15 MiB of small objects, which took
+    # seconds to parse on the event loop and is now refused before parsing
+    parsed = (
+        b'{"model": "llama3:8b", "x": ['
+        + b",".join([b'{"a":1}'] * (MAX_JSON_CONTAINERS - 10))
+        + b'], "y": "'
+        + b"z" * (12 << 20)
+        + b'"}'
+    )
+    objects = b'{"model": "qwen3:14b", "x": [' + b",".join([b'{"a":1}'] * 1_900_000) + b"]}"
+    assert len(objects) > 14 << 20
+    with full_gateway(fake.url, keys, max_request_s=30) as config:
+        proxy, admin = f"http://{config.listen}", f"http://{config.admin_listen}"
+        gaps: list[float] = []
+        health: list[float] = []
+
+        def watch() -> None:
+            with (
+                httpx.Client(timeout=10) as client,
+                client.stream(
+                    "POST", proxy + "/api/chat", headers=_auth(other), content=CHAT
+                ) as stream,
+            ):
+                last = time.monotonic()
+                for _ in stream.iter_raw():
+                    now = time.monotonic()
+                    gaps.append(now - last)
+                    last = now
+                    if len(gaps) > 60:
+                        return
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        time.sleep(0.5)
+        for heavy, reason in ((parsed, "not granted"), (objects, "too many")) * 2:
+            response = httpx.post(proxy + "/api/chat", headers=_auth(), content=heavy, timeout=30)
+            assert response.status_code == 403
+            assert reason in response.json()["error"]["reason"]
+            started = time.monotonic()
+            assert httpx.get(admin + "/healthz", timeout=5).status_code == 200
+            health.append(time.monotonic() - started)
+        watcher.join(15)
+    assert len(gaps) > 20
+    # chunks come every 50 ms; the parse on the event loop stalled them for seconds
+    # (the bound leaves room for a loaded test host: client and server share a GIL)
+    assert max(gaps[1:]) < 1.0, max(gaps[1:])
+    assert max(health) < 1.0, max(health)
+
+
+def test_a_client_leaving_during_prefill_cancels_the_upstream_call(
+    gw: Running, fake: FakeOllama
+) -> None:
+    fake.mode = "prefill"
+    with pytest.raises(httpx.ReadTimeout):
+        httpx.post(gw.proxy + "/api/chat", headers=_auth(), content=CHAT, timeout=0.5)
+    # Ollama's response headers never came; the gateway still hung up on it
+    assert fake.closed.wait(5)
+
+
+def test_every_content_encoding_value_is_checked(gw: Running, fake: FakeOllama) -> None:
+    for headers in (
+        ["content-encoding: identity, gzip"],
+        ["content-encoding: identity", "content-encoding: gzip"],
+        ["content-encoding: gzip, identity"],
+    ):
+        raw = _raw("POST", "/api/chat", f"authorization: Bearer {KEY}", *headers, body=CHAT)
+        assert status_of(raw_http(gw.proxy, raw)) == 415, headers
+    raw = _raw(
+        "POST", "/api/chat", f"authorization: Bearer {KEY}", "content-encoding: identity", body=CHAT
+    )
+    assert status_of(raw_http(gw.proxy, raw)) == 200
+    assert len(fake.seen) == 1
+
+
+def test_a_grant_without_a_tag_lists_the_latest_tag(gw: Running, fake: FakeOllama) -> None:
+    key = secrets.token_urlsafe(32)
+    gw.keys.register("run_b", key_sha256(key), ["qwen3"], datetime.now(UTC) + timedelta(hours=1))
+    tags = httpx.get(gw.proxy + "/api/tags", headers=_auth(key))
+    assert [m["name"] for m in tags.json()["models"]] == ["qwen3:latest"]
+    models = httpx.get(gw.proxy + "/v1/models", headers=_auth(key))
+    assert [m["id"] for m in models.json()["data"]] == ["qwen3:latest"]
+    # and a tagged grant does not pick up :latest
+    tags = httpx.get(gw.proxy + "/api/tags", headers=_auth())
+    assert [m["name"] for m in tags.json()["models"]] == [MODEL]

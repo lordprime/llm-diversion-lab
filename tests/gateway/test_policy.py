@@ -8,11 +8,11 @@ import pytest
 
 from control.gateway.policy import (
     ALLOWED_ENDPOINTS,
+    MAX_JSON_CONTAINERS,
     Decision,
     EndpointPolicy,
     ModelPolicy,
     ModelRefused,
-    normalise_model,
 )
 
 POLICY = EndpointPolicy()
@@ -157,9 +157,8 @@ def _body(**fields: object) -> bytes:
     return json.dumps({"messages": [{"role": "user", "content": "hi"}], **fields}).encode()
 
 
-@pytest.mark.parametrize("model", ["qwen3:14b", "ollama/qwen3:14b", "ollama_chat/qwen3:14b"])
-def test_model_must_match_grant(model: str) -> None:
-    assert GRANT.check(_body(model=model), "/api/chat") == "qwen3:14b"
+def test_model_must_match_grant() -> None:
+    assert GRANT.check(_body(model="qwen3:14b"), "/api/chat") == "qwen3:14b"
 
 
 @pytest.mark.parametrize(
@@ -175,6 +174,10 @@ def test_model_must_match_grant(model: str) -> None:
         "qwen3:14b\n",
         "registry.ollama.ai/library/qwen3:14b",
         "library/qwen3:14b",
+        # exact match only: Ollama reads "ollama/qwen3:14b" as namespace "ollama", another
+        # model, and LiteLLM-based clients strip their routing prefix before sending
+        "ollama/qwen3:14b",
+        "ollama_chat/qwen3:14b",
         "ollama/ollama/qwen3:14b",
         "ollama_chat/ollama/qwen3:14b",
         "openai/qwen3:14b",
@@ -266,10 +269,11 @@ def test_nested_model_fields_are_not_the_request_model() -> None:
     assert GRANT.check(body, "/api/chat") == "qwen3:14b"
 
 
-def test_the_grant_itself_is_normalised() -> None:
+def test_the_grant_is_compared_exactly_too() -> None:
     policy = ModelPolicy(frozenset({"ollama/qwen3:14b"}))
-    assert policy.check(_body(model="qwen3:14b"), "/api/chat") == "qwen3:14b"
-    assert policy.allowed == frozenset({"qwen3:14b"})
+    with pytest.raises(ModelRefused):
+        policy.check(_body(model="qwen3:14b"), "/api/chat")
+    assert policy.check(_body(model="ollama/qwen3:14b"), "/api/chat") == "ollama/qwen3:14b"
 
 
 def test_a_refusal_reason_names_the_model_but_stays_short() -> None:
@@ -279,15 +283,23 @@ def test_a_refusal_reason_names_the_model_but_stays_short() -> None:
 
 
 @pytest.mark.parametrize(
-    ("raw", "normal"),
-    [
-        ("ollama/qwen3:14b", "qwen3:14b"),
-        ("ollama_chat/qwen3:14b", "qwen3:14b"),
-        ("qwen3:14b", "qwen3:14b"),
-        ("ollama/ollama/x", "ollama/x"),
-        ("ollama_chat/ollama_chat/x", "ollama_chat/x"),
-        ("ollamax/x", "ollamax/x"),
-    ],
+    "fill",
+    [b"[]", b"{}", b'{"a":[]}', b"[[[]]]"],
 )
-def test_normalisation_strips_one_litellm_prefix_only(raw: str, normal: str) -> None:
-    assert normalise_model(raw) == normal
+def test_a_body_with_too_many_arrays_or_objects_is_refused(fill: bytes) -> None:
+    # every container costs the parser an allocation the event loop's thread pays for
+    # too (CPython's JSON scanner keeps the GIL); a body is bounded by their number
+    count = MAX_JSON_CONTAINERS // fill.count(b"[" if b"[" in fill else b"{") + 10
+    body = b'{"model": "qwen3:14b", "x": [' + b",".join([fill] * count) + b"]}"
+    with pytest.raises(ModelRefused, match="too many"):
+        GRANT.check(body, "/api/chat")
+
+
+def test_a_realistic_large_body_is_well_inside_the_container_cap() -> None:
+    history = [{"role": "user", "content": "x" * 16_000, "images": []} for _ in range(1000)]
+    tools = [
+        {"type": "function", "function": {"name": f"t{i}", "parameters": {}}} for i in range(200)
+    ]
+    body = json.dumps({"model": "qwen3:14b", "messages": history, "tools": tools}).encode()
+    assert len(body) > 14 << 20
+    assert GRANT.check(body, "/api/chat") == "qwen3:14b"

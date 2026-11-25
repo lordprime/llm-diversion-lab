@@ -42,7 +42,7 @@
   - `POST /api/chat`, `POST /api/generate`, `POST /v1/chat/completions` and `POST /v1/messages`;
   - `GET /api/tags`, `POST /api/show` and `GET /v1/models`, read-only, filtered to the run's model;
   - everything else is denied, including `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/delete`, `/api/embed*` (unless the run's config allows embeddings), `/api/ps` and `/api/version`.
-- **Each run may use only its configured model id(s)**, compared exactly after one normalisation rule: an `ollama/` or `ollama_chat/` prefix added by LiteLLM-based clients is stripped. Any other model gives 403, recorded.
+- **Each run may use only its configured model id(s)**, compared exactly, with no normalisation: Ollama reads `ollama/qwen3:14b` as namespace `ollama`, another model, and LiteLLM-based clients strip their `ollama/` or `ollama_chat/` routing prefix before sending. Any other model gives 403, recorded. (Controller ruling, M2 Task 1 fix round 1.)
 - **Models are pulled only by an admin command** (`labctl models pull <id>`), never during a run. `labctl doctor` lists the pulled models with their digests, and an experiment file pins each model by Ollama digest.
 
 ## Review Focus

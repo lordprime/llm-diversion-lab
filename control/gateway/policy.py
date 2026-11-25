@@ -11,7 +11,16 @@ forwarded:
   lets the run's own model through. Go's ``encoding/json`` matches object keys without
   regard to case and keeps the last duplicate, so a body with a second spelling of
   ``model`` (``Model``, ``MODEL``, a repeated key) is refused outright: otherwise the
-  gateway and Ollama could each see a different model.
+  gateway and Ollama could each see a different model. The model id must equal a
+  granted one exactly. Nothing is stripped or normalised: Ollama reads
+  ``ollama/qwen3:14b`` as the model ``qwen3:14b`` of a namespace ``ollama``, another
+  model, and LiteLLM-based clients drop their ``ollama/`` routing prefix themselves.
+
+The parse is bounded so it can run off the event loop without starving it: a body may
+hold at most :data:`MAX_JSON_CONTAINERS` arrays and objects (counted before parsing),
+and numbers go through a Python hook. CPython's JSON scanner keeps the GIL while it
+builds containers and numbers in C, so without these bounds a worker thread parsing a
+crafted body would still freeze the loop for a noticeable time.
 """
 
 from __future__ import annotations
@@ -24,7 +33,7 @@ from typing import Any, Final
 
 __all__ = [
     "ALLOWED_ENDPOINTS",
-    "LITELLM_PREFIXES",
+    "MAX_JSON_CONTAINERS",
     "Decision",
     "Endpoint",
     "EndpointPolicy",
@@ -32,7 +41,6 @@ __all__ = [
     "ModelPolicy",
     "ModelRefused",
     "Ruling",
-    "normalise_model",
 ]
 
 
@@ -128,9 +136,10 @@ class EndpointPolicy:
 # --------------------------------------------------------------------------- models
 
 
-#: Prefixes LiteLLM-based clients put in front of an Ollama model id. Exactly one is
-#: stripped before the comparison; nothing else is normalised.
-LITELLM_PREFIXES: Final = ("ollama_chat/", "ollama/")
+#: The most arrays and objects a request body may hold. A real agent request, even
+#: a 16 MiB one with a long history and many tools, has a few thousand; each one costs
+#: the parser an allocation made while it holds the GIL.
+MAX_JSON_CONTAINERS: Final = 200_000
 
 #: The top-level body fields that select the model, per path. Ollama's /api/show
 #: still honours the deprecated ``name`` when ``model`` is empty.
@@ -138,14 +147,6 @@ _MODEL_FIELDS: Final = {"/api/show": ("model", "name")}
 _DEFAULT_MODEL_FIELDS: Final = ("model",)
 #: How much of an agent-chosen model id a refusal reason quotes.
 _QUOTE_CHARS: Final = 80
-
-
-def normalise_model(model: str) -> str:
-    """Strip one LiteLLM prefix (``ollama/`` or ``ollama_chat/``); nothing else."""
-    for prefix in LITELLM_PREFIXES:
-        if model.startswith(prefix):
-            return model.removeprefix(prefix)
-    return model
 
 
 class ModelRefused(Exception):
@@ -168,14 +169,27 @@ def _reject_constant(name: str) -> Any:
     raise ValueError(f"{name} is not JSON")
 
 
+def _number(text: str) -> int:
+    # numbers are never a model; a Python hook lets other threads run between them
+    return 0
+
+
 class ModelPolicy:
     """Checks that a request body names one of ``allowed``, and nothing else."""
 
     def __init__(self, allowed: frozenset[str]) -> None:
-        self.allowed = frozenset(normalise_model(m) for m in allowed)
+        self.allowed = allowed
+
+    def lists(self, name: str) -> bool:
+        """Whether a model list entry is a granted model. An untagged grant (``qwen3``)
+        is the ``:latest`` tag to Ollama, so it also matches ``qwen3:latest``."""
+        if name in self.allowed:
+            return True
+        base, _, tag = name.rpartition(":")
+        return tag == "latest" and base in self.allowed
 
     def check(self, body: bytes, path: str) -> str | None:
-        """The normalised model id, or ``None`` when the body names no model.
+        """The model id, or ``None`` when the body names no model.
 
         Raises :class:`ModelRefused` for a body that is not one JSON object, for a
         model field that is not a string, is spelt twice or in another case, and for
@@ -193,17 +207,23 @@ class ModelPolicy:
         for _, value in named:
             if not isinstance(value, str):
                 raise ModelRefused("the model must be a string")
-            model = normalise_model(value)
-            if model not in self.allowed:
+            if value not in self.allowed:
                 raise ModelRefused(f"model {value[:_QUOTE_CHARS]!r} is not granted to this run")
-            models.append(model)
+            models.append(value)
         return models[0]
 
     @staticmethod
     def _parse(body: bytes) -> _Pairs:
+        # an over-count (brackets inside strings count too) only errs on the safe side
+        if body.count(b"[") + body.count(b"{") > MAX_JSON_CONTAINERS:
+            raise ModelRefused("the request body has too many arrays and objects")
         try:
             document = json.loads(
-                body.decode("utf-8"), object_pairs_hook=_pairs, parse_constant=_reject_constant
+                body.decode("utf-8"),
+                object_pairs_hook=_pairs,
+                parse_constant=_reject_constant,
+                parse_int=_number,
+                parse_float=_number,
             )
         except (UnicodeDecodeError, ValueError, RecursionError) as exc:
             raise ModelRefused("the request body is not one JSON object") from exc

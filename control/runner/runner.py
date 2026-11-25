@@ -155,6 +155,7 @@ __all__ = [
     "PREFLIGHT_COMMAND",
     "RECORDING_FAILURE_MARKERS",
     "RECORDING_SERVICES",
+    "REVOKE_ATTEMPTS",
     "CellLeftBehindError",
     "HostLockError",
     "ProbeFailedError",
@@ -192,6 +193,10 @@ AGENT_START_GRACE_S: Final = 60.0
 #: A run's gateway grant outlives its timeout by this much (the final poll, collection
 #: and teardown), so it lapses by itself should the revoke ever be lost.
 GRANT_MARGIN: Final = timedelta(minutes=30)
+#: Tries at revoking a run's grant, with a doubling pause (from 1 s) in between: a
+#: revoke the gateway could not mirror to its database may come back after a gateway
+#: restart, until the grant lapses.
+REVOKE_ATTEMPTS: Final = 3
 
 
 class GatewayGrants(Protocol):
@@ -737,13 +742,20 @@ class Runner:
             raise CellError(f"the model gateway refused the run's grant: {exc}") from None
 
     def _revoke(self, state: _RunState) -> None:
-        """Withdraw the run's grant; a failure is logged (the grant lapses by itself)."""
+        """Withdraw the run's grant, retrying with backoff; a last failure is logged
+        (the grant then lapses by itself after the run's timeout)."""
         if self._gateway is None or not state.granted:
             return
-        try:
-            self._gateway.revoke(state.run.run_id)
-        except Exception as exc:
-            log.error("run %s: cannot revoke its gateway grant: %s", state.run.run_id, exc)
+        for attempt in range(REVOKE_ATTEMPTS):
+            try:
+                self._gateway.revoke(state.run.run_id)
+                return
+            except Exception as exc:
+                if attempt + 1 == REVOKE_ATTEMPTS:
+                    log.error("run %s: cannot revoke its gateway grant: %s", state.run.run_id, exc)
+                    return
+                log.warning("run %s: revoke failed, retrying: %s", state.run.run_id, exc)
+                self._sleep(float(2**attempt))
 
     def _keep_latch(self, state: _RunState) -> None:
         """Dump the target's latch once, after the final poll, as a write-once artifact."""

@@ -36,19 +36,29 @@ class Refused(Exception):
 
 
 class BodyReader:
-    """Reads a request body within a size cap and a deadline, or refuses it."""
+    """Reads a request body within a size cap and a deadline, or refuses it.
 
-    def __init__(self, limit: int, timeout_s: float) -> None:
+    ``on_large``, if given, is called once as soon as the body is known to pass
+    ``large`` bytes (from its Content-Length, or while it arrives): it may refuse the
+    body by raising :class:`Refused` before the rest is held in memory.
+    """
+
+    def __init__(self, limit: int, timeout_s: float, large: int | None = None) -> None:
         self._limit = limit
         self._timeout_s = timeout_s
+        self._large = large if large is not None else limit
 
-    async def read(self, request: Request) -> bytes:
+    async def read(self, request: Request, on_large: Callable[[], None] | None = None) -> bytes:
         declared = request.headers.get("content-length")
+        flagged = False
         if declared is not None:
             if not _CONTENT_LENGTH.fullmatch(declared):
                 raise Refused(400, "malformed content-length")
             if int(declared) > self._limit:
                 raise Refused(413, f"request body over {self._limit} bytes")
+            if int(declared) > self._large and on_large is not None:
+                on_large()
+                flagged = True
         chunks: list[bytes] = []
         size = 0
         try:
@@ -57,6 +67,9 @@ class BodyReader:
                     size += len(chunk)
                     if size > self._limit:
                         raise Refused(413, f"request body over {self._limit} bytes")
+                    if size > self._large and not flagged and on_large is not None:
+                        on_large()
+                        flagged = True
                     chunks.append(chunk)
         except TimeoutError:
             raise Refused(408, "request body not received in time") from None

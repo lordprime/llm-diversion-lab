@@ -2,7 +2,8 @@
 
 :meth:`GatewayConfig.from_env` reads ``LAB_OLLAMA_URL``, ``LAB_GATEWAY_LISTEN`` (the
 cell-facing address), ``LAB_GATEWAY_ADMIN_LISTEN`` (a control-plane address),
-``LAB_GATEWAY_ADMIN_SECRET`` and the optional ``LAB_GATEWAY_*`` limits. The
+``LAB_GATEWAY_ADMIN_SECRET`` and the optional limits, each read from
+``LAB_GATEWAY_<FIELD NAME IN CAPITALS>`` (``LAB_GATEWAY_MAX_INFLIGHT_PER_RUN``...). The
 configuration refuses to exist with both listeners on one address and port, with the
 admin listener on the cell-facing address, or with either on a wildcard address: the
 admin API must never answer on the interface the cells reach.
@@ -11,17 +12,14 @@ admin API must never answer on the interface the cells reach.
 from __future__ import annotations
 
 import ipaddress
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+import math
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields
 from typing import Any, Final
 from urllib.parse import urlsplit
 
 __all__ = [
-    "DEFAULT_BODY_TIMEOUT_S",
-    "DEFAULT_CONNECT_TIMEOUT_S",
-    "DEFAULT_MAX_BODY_BYTES",
-    "DEFAULT_MAX_REQUEST_S",
-    "DEFAULT_READ_TIMEOUT_S",
+    "LARGE_BODY_BYTES",
     "MIN_SECRET_CHARS",
     "GatewayConfig",
     "GatewayConfigError",
@@ -29,14 +27,8 @@ __all__ = [
 ]
 
 MIN_SECRET_CHARS: Final = 32
-#: Defaults of the limits (LAB_GATEWAY_*): a 32 MiB body received within a minute;
-#: Ollama must connect in 5 s, send something at least every 10 min (a long prompt
-#: can take minutes before the first token) and finish within the hour.
-DEFAULT_MAX_BODY_BYTES: Final = 32 << 20
-DEFAULT_BODY_TIMEOUT_S: Final = 60.0
-DEFAULT_CONNECT_TIMEOUT_S: Final = 5.0
-DEFAULT_READ_TIMEOUT_S: Final = 600.0
-DEFAULT_MAX_REQUEST_S: Final = 3600.0
+#: A body above this size is "large": it counts against the large-body caps.
+LARGE_BODY_BYTES: Final = 1 << 20
 
 
 class GatewayConfigError(ValueError):
@@ -81,11 +73,32 @@ class GatewayConfig:
     listen: Listener
     admin_listen: Listener
     admin_secret: str = field(repr=False)
-    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
-    body_timeout_s: float = DEFAULT_BODY_TIMEOUT_S
-    connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S
-    read_timeout_s: float = DEFAULT_READ_TIMEOUT_S
-    max_request_s: float = DEFAULT_MAX_REQUEST_S
+    #: The largest request body. Real agent traffic stays well below it: a 128k-token
+    #: context is about 0.5 MB of text, and even a long history with tool output and a
+    #: few base64 screenshots is a few MB. 16 MiB leaves room for that and keeps the
+    #: memory the caps below allow small enough to size the container.
+    max_body_bytes: int = 16 << 20
+    #: How many large (over 1 MiB) bodies one run, and the whole gateway, may hold in
+    #: memory at once. Worst case held: 8 x 16 MiB plus 1 MiB for every other call.
+    max_large_bodies_per_run: int = 2
+    max_large_bodies: int = 8
+    #: Calls one run may have open at once (an agent with a few sub-agents needs a
+    #: handful); more get 429.
+    max_inflight_per_run: int = 8
+    #: Calls the whole gateway may have open at once, which is also the size of the
+    #: connection pool to Ollama, so the pool never queues; more get 503.
+    max_upstream_connections: int = 64
+    #: Open connections on the cell-facing listener (idle ones included).
+    max_connections: int = 256
+    #: A new or kept-alive connection must deliver a complete request head this fast.
+    header_timeout_s: float = 10.0
+    #: The request body must arrive within this time.
+    body_timeout_s: float = 60.0
+    #: Ollama must accept the connection in 5 s, send something at least every 10 min
+    #: (a long prompt can take minutes before the first token) and finish in an hour.
+    connect_timeout_s: float = 5.0
+    read_timeout_s: float = 600.0
+    max_request_s: float = 3600.0
 
     def __post_init__(self) -> None:
         if self.admin_listen == self.listen:
@@ -118,15 +131,19 @@ class GatewayConfig:
             raise GatewayConfigError(
                 f"the upstream must be a bare http(s)://host:port URL, got {self.upstream!r}"
             )
-        numbers = (
-            self.max_body_bytes,
-            self.body_timeout_s,
-            self.connect_timeout_s,
-            self.read_timeout_s,
-            self.max_request_s,
-        )
-        if any(n <= 0 for n in numbers):
-            raise GatewayConfigError("limits and timeouts must be positive")
+        for limit in self._limits():
+            value = getattr(self, limit.name)
+            if not math.isfinite(value) or value <= 0:
+                raise GatewayConfigError(f"{limit.name} must be a positive, finite number")
+        if self.max_inflight_per_run > self.max_upstream_connections:
+            raise GatewayConfigError("max_inflight_per_run exceeds max_upstream_connections")
+        if self.max_large_bodies_per_run > min(self.max_large_bodies, self.max_inflight_per_run):
+            raise GatewayConfigError("max_large_bodies_per_run exceeds the other caps")
+
+    @classmethod
+    def _limits(cls) -> list[Any]:
+        """The numeric fields: every limit and timeout."""
+        return [f for f in fields(cls) if f.type in ("int", "float")]
 
     @property
     def upstream_base(self) -> str:
@@ -140,13 +157,16 @@ class GatewayConfig:
                 raise GatewayConfigError(f"{name} is not set")
             return value
 
-        def number(name: str, kind: Callable[[str], Any], default: Any) -> Any:
+        limits: dict[str, Any] = {}
+        for limit in cls._limits():
+            name = f"LAB_GATEWAY_{limit.name.upper()}"
             raw = env.get(name, "")
+            if not raw:
+                continue
             try:
-                return kind(raw) if raw else default
+                limits[limit.name] = int(raw) if limit.type == "int" else float(raw)
             except ValueError:
                 raise GatewayConfigError(f"{name}: not a number: {raw!r}") from None
-
         return cls(
             upstream=need("LAB_OLLAMA_URL"),
             listen=Listener.parse(need("LAB_GATEWAY_LISTEN"), "LAB_GATEWAY_LISTEN"),
@@ -154,11 +174,5 @@ class GatewayConfig:
                 need("LAB_GATEWAY_ADMIN_LISTEN"), "LAB_GATEWAY_ADMIN_LISTEN"
             ),
             admin_secret=need("LAB_GATEWAY_ADMIN_SECRET"),
-            max_body_bytes=number("LAB_GATEWAY_MAX_BODY_BYTES", int, DEFAULT_MAX_BODY_BYTES),
-            body_timeout_s=number("LAB_GATEWAY_BODY_TIMEOUT_S", float, DEFAULT_BODY_TIMEOUT_S),
-            connect_timeout_s=number(
-                "LAB_GATEWAY_CONNECT_TIMEOUT_S", float, DEFAULT_CONNECT_TIMEOUT_S
-            ),
-            read_timeout_s=number("LAB_GATEWAY_READ_TIMEOUT_S", float, DEFAULT_READ_TIMEOUT_S),
-            max_request_s=number("LAB_GATEWAY_MAX_REQUEST_S", float, DEFAULT_MAX_REQUEST_S),
+            **limits,
         )

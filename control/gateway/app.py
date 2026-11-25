@@ -15,9 +15,13 @@ refusal is the gateway's own JSON answer,
 any other response.
 
 Limits that keep a hostile client or a stuck upstream from holding the gateway: a
-request body cap and a deadline for receiving it, connect and per-read timeouts to
-Ollama, and an overall deadline per request that also ends a stream that drips. A
-stream cut short is never ended cleanly: the client sees a broken response, not a
+request body cap and a deadline for receiving it, caps on open calls and large bodies
+per run and in total (:mod:`control.gateway.limits`), connect and per-read timeouts to
+Ollama, and an overall deadline per request that also ends a stream that drips. The
+model check of a large body runs in a worker thread, so the event loop keeps serving
+other streams meanwhile. The client leaving at any point after its request, also
+while Ollama is still reading a long prompt, cancels the call to Ollama. A stream cut
+short is never ended cleanly: the client sees a broken response, not a
 complete-looking one.
 """
 
@@ -25,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Final
 
 import anyio
@@ -35,8 +40,9 @@ from starlette.responses import JSONResponse, Response
 from starlette.types import Receive, Scope, Send
 
 from control.gateway.asgi import UPSTREAM_ERROR, BodyReader, Refused, serve_lifespan
-from control.gateway.config import GatewayConfig
+from control.gateway.config import LARGE_BODY_BYTES, GatewayConfig
 from control.gateway.keys import RunGrant, RunKeys
+from control.gateway.limits import Call, CallLimits
 from control.gateway.policy import (
     Decision,
     Endpoint,
@@ -79,63 +85,79 @@ HOP_BY_HOP: Final = frozenset(
 )
 #: The most a model list from Ollama may weigh.
 MAX_LISTING_BYTES: Final = 4 << 20
+#: Model checks of large bodies running at once, each in its own worker thread.
+PARSE_THREADS: Final = 2
+#: Idle connections the pool to Ollama keeps for reuse.
+KEEPALIVE_CONNECTIONS: Final = 16
+
+Opener = Callable[[], Awaitable[tuple[httpx.Response, float]]]
 
 
-class _UpstreamStream:
-    """An ASGI response that relays an open upstream response chunk by chunk.
+def _response_headers(upstream: httpx.Response) -> list[tuple[bytes, bytes]]:
+    """Ollama's response headers without the hop-by-hop ones (and those it names)."""
+    named = {
+        token.strip().lower()
+        for value in upstream.headers.get_list("connection")
+        for token in value.split(",")
+    }
+    return [
+        (name.lower(), value)
+        for name, value in upstream.headers.raw
+        if name.lower().decode("latin-1") not in HOP_BY_HOP | named
+    ]
 
-    The client going away cancels the relay at once and closes the upstream
-    connection, so Ollama stops generating. Past the deadline, or when Ollama breaks
-    off, the relay stops without ending the body: the server then drops the
-    connection and the client sees an incomplete response.
+
+class _Relay:
+    """An ASGI response that calls Ollama and relays its answer chunk by chunk.
+
+    The client is watched from the moment the call is made, so a client that leaves
+    while Ollama is still reading a long prompt cancels the call at once, as does one
+    that leaves mid-stream; Ollama then stops generating. Past the deadline, or when
+    Ollama breaks off, the relay stops without ending the body: the server then drops
+    the connection and the client sees an incomplete response.
     """
 
-    def __init__(self, upstream: httpx.Response, deadline: float, label: str) -> None:
-        self._upstream = upstream
-        self._deadline = deadline
+    def __init__(self, opener: Opener, label: str) -> None:
+        self._opener = opener
         self._label = label
 
-    def _headers(self) -> list[tuple[bytes, bytes]]:
-        named = {
-            token.strip().lower()
-            for value in self._upstream.headers.get_list("connection")
-            for token in value.split(",")
-        }
-        out = []
-        for name, value in self._upstream.headers.raw:
-            lower = name.lower()
-            if lower.decode("latin-1") not in HOP_BY_HOP | named:
-                out.append((lower, value))
-        return out
-
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        try:
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": self._upstream.status_code,
-                    "headers": self._headers(),
-                }
-            )
-            async with anyio.create_task_group() as group:
-                group.start_soon(self._watch, receive, group.cancel_scope)
-                await self._relay(send)
-                group.cancel_scope.cancel()
-        finally:
-            with anyio.CancelScope(shield=True):
-                await self._upstream.aclose()
+        async with anyio.create_task_group() as group:
+            group.start_soon(self._watch, receive, group.cancel_scope)
+            await self._run(scope, receive, send)
+            group.cancel_scope.cancel()
 
     async def _watch(self, receive: Receive, scope: anyio.CancelScope) -> None:
         while (await receive())["type"] != "http.disconnect":
             pass
-        log.info("gateway: %s: the client went away mid-stream; closing upstream", self._label)
+        log.info("gateway: %s: the client went away; cancelling the upstream call", self._label)
         scope.cancel()
 
-    async def _relay(self, send: Send) -> None:
-        chunks = self._upstream.aiter_raw()
+    async def _run(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            upstream, deadline = await self._opener()
+        except Refused as refused:
+            log.warning("gateway: %s refused %d: %s", self._label, refused.status, refused.reason)
+            await refused.response()(scope, receive, send)
+            return
+        try:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": upstream.status_code,
+                    "headers": _response_headers(upstream),
+                }
+            )
+            await self._relay(upstream, deadline, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await upstream.aclose()
+
+    async def _relay(self, upstream: httpx.Response, deadline: float, send: Send) -> None:
+        chunks = upstream.aiter_raw()
         sent = 0
         while True:
-            remaining = max(self._deadline - anyio.current_time(), 0.0)
+            remaining = max(deadline - anyio.current_time(), 0.0)
             try:
                 with anyio.fail_after(remaining):
                     chunk = await anext(chunks)
@@ -154,7 +176,7 @@ class _UpstreamStream:
                 except OSError:
                     return  # the client is gone
         await send({"type": "http.response.body", "body": b"", "more_body": False})
-        log.info("gateway: %s -> %d (%d bytes)", self._label, self._upstream.status_code, sent)
+        log.info("gateway: %s -> %d (%d bytes)", self._label, upstream.status_code, sent)
 
 
 class ModelProxy:
@@ -170,8 +192,10 @@ class ModelProxy:
         self._config = config
         self._keys = keys
         self._policy = policy or EndpointPolicy()
-        self._bodies = BodyReader(config.max_body_bytes, config.body_timeout_s)
+        self._bodies = BodyReader(config.max_body_bytes, config.body_timeout_s, LARGE_BODY_BYTES)
+        self._limits = CallLimits(config)
         self._client: httpx.AsyncClient | None = None
+        self._parsers: anyio.CapacityLimiter | None = None
 
     async def startup(self) -> None:
         if self._client is None:
@@ -181,10 +205,19 @@ class ModelProxy:
                 write=self._config.body_timeout_s,
                 pool=self._config.connect_timeout_s,
             )
-            # no redirects and no proxy settings from the environment: Ollama only
-            self._client = httpx.AsyncClient(
-                timeout=timeout, follow_redirects=False, trust_env=False
+            # as many connections as calls may be open, so the pool never queues; no
+            # redirects and no proxy settings from the environment: Ollama only
+            pool = httpx.Limits(
+                max_connections=self._config.max_upstream_connections,
+                max_keepalive_connections=min(
+                    KEEPALIVE_CONNECTIONS, self._config.max_upstream_connections
+                ),
             )
+            self._client = httpx.AsyncClient(
+                timeout=timeout, limits=pool, follow_redirects=False, trust_env=False
+            )
+        if self._parsers is None:
+            self._parsers = anyio.CapacityLimiter(PARSE_THREADS)
 
     async def shutdown(self) -> None:
         if self._client is not None:
@@ -197,13 +230,18 @@ class ModelProxy:
             return
         if scope["type"] != "http":
             return  # no websockets: the server refuses the handshake
+        calls: list[Call] = []
         try:
-            response = await self._handle(Request(scope, receive))
+            response = await self._handle(Request(scope, receive), calls)
+            await response(scope, receive, send)
         except ClientDisconnect:
             return
-        await response(scope, receive, send)
+        finally:
+            for call in calls:
+                call.close()
 
-    async def _handle(self, request: Request) -> Response | _UpstreamStream:
+    async def _handle(self, request: Request, calls: list[Call]) -> Response | _Relay:
+        """The answer to one request; the call it opens is appended to ``calls``."""
         raw = request.scope.get("raw_path")
         path = raw.partition(b"?")[0].decode("latin-1") if isinstance(raw, bytes) else ""
         label = f"{request.method} {path[:100]!r}"
@@ -211,15 +249,15 @@ class ModelProxy:
             grant = self._authenticate(request.headers)
             label = f"run {grant.run_id} {label}"
             endpoint = self._route(request, path, grant)
-            encoding = request.headers.get("content-encoding", "identity").strip().lower()
-            if encoding != "identity":
-                raise Refused(415, "compressed request bodies are not accepted")
-            body = await self._bodies.read(request)
+            self._check_encoding(request.headers)
+            call = self._limits.open(grant.run_id)
+            calls.append(call)
+            body = await self._bodies.read(request, on_large=call.hold_large)
             if endpoint.names_model:
-                self._check_model(grant, endpoint, body)
+                await self._check_model(grant, endpoint, body)
             if endpoint.listing is not None:
                 return await self._listing(endpoint, grant)
-            return await self._forward(endpoint, request, body, label)
+            return self._forward(endpoint, request, body, label)
         except Refused as refused:
             log.warning("gateway: %s refused %d: %s", label, refused.status, refused.reason)
             return refused.response()
@@ -253,9 +291,26 @@ class ModelProxy:
         return ruling.endpoint
 
     @staticmethod
-    def _check_model(grant: RunGrant, endpoint: Endpoint, body: bytes) -> None:
+    def _check_encoding(headers: Headers) -> None:
+        """Every Content-Encoding header, and every coding listed in one, is identity."""
+        codings = [
+            token.strip().lower()
+            for value in headers.getlist("content-encoding")
+            for token in value.split(",")
+        ]
+        if any(coding != "identity" for coding in codings):
+            raise Refused(415, "compressed request bodies are not accepted")
+
+    async def _check_model(self, grant: RunGrant, endpoint: Endpoint, body: bytes) -> None:
+        """The body names the run's model; a large body is checked off the event loop."""
+        policy = ModelPolicy(grant.models)
         try:
-            model = ModelPolicy(grant.models).check(body, endpoint.path)
+            if len(body) > LARGE_BODY_BYTES:
+                model = await anyio.to_thread.run_sync(
+                    policy.check, body, endpoint.path, limiter=self._parsers
+                )
+            else:
+                model = policy.check(body, endpoint.path)
         except ModelRefused as refused:
             raise Refused(403, refused.reason) from None
         if model is None:
@@ -278,16 +333,13 @@ class ModelProxy:
             raise Refused(502, "the model server is unavailable", UPSTREAM_ERROR) from None
         return response, deadline
 
-    async def _forward(
-        self, endpoint: Endpoint, request: Request, body: bytes, label: str
-    ) -> _UpstreamStream:
+    def _forward(self, endpoint: Endpoint, request: Request, body: bytes, label: str) -> _Relay:
         headers = {n: v for n in FORWARD_HEADERS if (v := request.headers.get(n)) is not None}
         headers["accept-encoding"] = "identity"
         query = request.scope.get("query_string", b"").decode("latin-1")
         url = self._config.upstream_base + endpoint.path + (f"?{query}" if query else "")
         upstream = self._http().build_request(endpoint.method, url, headers=headers, content=body)
-        response, deadline = await self._open(upstream)
-        return _UpstreamStream(response, deadline, label)
+        return _Relay(lambda: self._open(upstream), label)
 
     async def _listing(self, endpoint: Endpoint, grant: RunGrant) -> Response:
         """Ollama's model list, narrowed to the run's models (the gateway's own answer)."""
@@ -320,6 +372,6 @@ class ModelProxy:
                 raise TypeError(field_name)
         except (ValueError, TypeError, KeyError):
             raise Refused(502, "the model server's list is malformed", UPSTREAM_ERROR) from None
-        allowed = ModelPolicy(grant.models).allowed
-        kept = [e for e in entries if isinstance(e, dict) and e.get(id_name) in allowed]
+        policy = ModelPolicy(grant.models)
+        kept = [e for e in entries if isinstance(e, dict) and policy.lists(str(e.get(id_name, "")))]
         return JSONResponse({**document, field_name: kept})

@@ -445,6 +445,9 @@ def test_the_gateway_publishes_nothing_and_splits_its_listeners() -> None:
     assert env["LAB_OLLAMA_URL"] == "http://ollama:11434"
     assert set(nets) == {"control", "cells", "models"}
     assert gateway["read_only"] is True and gateway["cap_drop"] == ["ALL"]
+    # bounded memory and processes: bodies are held in memory, sized from the caps
+    assert gateway["mem_limit"] == "1g"
+    assert 64 <= gateway["pids_limit"] <= 256
 
 
 def test_only_the_models_network_is_internal_and_only_the_gateway_is_on_cells() -> None:

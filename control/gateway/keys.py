@@ -9,7 +9,10 @@ Grants live in memory, for the proxy's hot path, and are mirrored to the
 ``gateway_grants`` table so a gateway restart keeps the running runs' grants. The
 mirror is written first: a grant the database did not take is not granted. A revoke
 works the other way round: access is cut in memory at once, even when the database
-cannot be reached (the stale row then lapses at its ``expires_at``).
+cannot be reached. The stale row then stays in the database until its
+``expires_at``, so a gateway restarted before then reloads the revoked grant: the
+admin API answers such a revoke with 503, and the runner retries it a few times with
+backoff before it gives up and logs the failure.
 """
 
 from __future__ import annotations

@@ -1644,6 +1644,8 @@ class FakeGrants:
     calls: list[tuple[str, str]]
     fail_grant: bool = False
     fail_revoke: bool = False
+    #: revokes that fail before one goes through
+    revoke_failures: int = 0
     granted: list[tuple[str, str, tuple[str, ...], datetime]] = field(default_factory=list)
 
     def grant(self, run_id: str, key: str, models: Sequence[str], expires_at: datetime) -> None:
@@ -1654,7 +1656,8 @@ class FakeGrants:
 
     def revoke(self, run_id: str) -> None:
         self.calls.append(("revoke", run_id))
-        if self.fail_revoke:
+        if self.fail_revoke or self.revoke_failures > 0:
+            self.revoke_failures -= 1
             raise GatewayAdminError("gateway admin unreachable")
 
 
@@ -1664,6 +1667,7 @@ def _gateway_runner(
     backend: FakeBackend,
     tmp_path: Path,
     grants: FakeGrants | None,
+    sleep: Callable[[float], None] = lambda _s: None,
 ) -> Runner:
     return Runner(
         store=RunStore(engine),
@@ -1675,7 +1679,7 @@ def _gateway_runner(
         work_dir=tmp_path / "work",
         oracle_interval_s=0,
         tick_s=0,
-        sleep=lambda _s: None,
+        sleep=sleep,
         gateway=grants,
     )
 
@@ -1740,6 +1744,26 @@ def test_a_failed_revoke_is_logged_and_leaves_the_run_valid(
     assert "cannot revoke" in caplog.text
     for project in backend.projects:
         assert project.gateway_key is not None and project.gateway_key not in caplog.text
+    # it was retried before giving up
+    for result in results:
+        revokes = [c for c, arg in backend.calls if c == "revoke" and arg == result.run_id]
+        assert len(revokes) == runner_module.REVOKE_ATTEMPTS
+
+
+def test_a_revoke_that_fails_briefly_is_retried_with_backoff(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    backend = FakeBackend()
+    grants = FakeGrants(backend.calls, revoke_failures=2)
+    sleeps: list[float] = []
+    runner = _gateway_runner(engine, collector, backend, tmp_path, grants, sleep=sleeps.append)
+    results = runner.run_experiment(read_experiment(SELFTEST))
+    assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
+    assert "cannot revoke" not in caplog.text
+    first = results[0].run_id
+    assert [c for c, arg in backend.calls if c == "revoke" and arg == first] == ["revoke"] * 3
+    backoff = [s for s in sleeps if s > 0]
+    assert backoff[:2] == sorted(backoff[:2]) and backoff[0] > 0
 
 
 def test_gateway_mode_without_the_admin_client_is_refused(
