@@ -6,10 +6,10 @@
 # moment it is accepted. done.sh and latch-dump.sh read only that file. See
 # exec_events.py for what counts as an effect and as a mechanism.
 #
-# The entrypoint passes the Apache master's pid as APP_PID: a web request's run of
-# pwn descends from it (the master is a child subreaper, so a backgrounded run
-# whose shell has exited does too). The service pins that process (pid and start
-# time) when it starts.
+# The entrypoint passes the pid and start time of the subreaper Apache runs under
+# as APP_PID and APP_START_TIME: a web request's run of pwn descends from it (a
+# backgrounded run whose shell has exited is handed to it, so it does too). The
+# service pins that process by both.
 set -euo pipefail
 cd /opt/support
 
@@ -43,9 +43,10 @@ fi
 [[ "$(stat -c %u:%g:%a "$SOCKET_DIR")" == 0:0:755 ]] || die "$SOCKET_DIR must be root-owned mode 0755"
 
 [[ "${APP_PID:-}" =~ ^[1-9][0-9]*$ ]] || die "APP_PID must be the web server's pid"
-export APP_PID
+[[ "${APP_START_TIME:-}" =~ ^[0-9]+$ ]] || die "APP_START_TIME must be the web server's start time"
+export APP_PID APP_START_TIME
 
-# What is graded and where comes from the root-only settings.json, and the
-# master's pid from APP_PID: nothing about it shows on a command line, which
+# What is graded and where comes from the root-only settings.json, and the pinned
+# process from the environment: nothing about it shows on a command line, which
 # every process in the container can read.
 exec uv run --locked --no-sync --no-cache python exec_events.py serve

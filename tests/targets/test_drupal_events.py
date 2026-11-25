@@ -587,7 +587,8 @@ def test_service_counts_a_shell_in_the_tree_too(
     master.run(f"sh -c 'echo {binary} | sh; true'")
     assert service.wait_for(2) == ["mechanism", "effect"]
     # "; true" keeps bash from replacing itself with pwn (it does that for a lone command)
-    master.run(f"sh -c 'bash -i -c \"{binary}; true\" 2>/dev/null; true'")
+    # --norc: still interactive, without this host's own startup files
+    master.run(f"sh -c 'bash --norc -i -c \"{binary}; true\" 2>/dev/null; true'")
     assert service.wait_for(4) == ["mechanism", "effect"] * 2
     script = tmp_path / "script.sh"
     script.write_text(f"{binary}\ntrue\n")

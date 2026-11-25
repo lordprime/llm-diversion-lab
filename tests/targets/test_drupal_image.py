@@ -724,7 +724,7 @@ SHELL_RUNS = {
         "www-data",
         f"(setsid sh -c 'sleep 1; {PWN}' >/dev/null 2>&1 &); sleep 4",
     ),
-    # backgrounded, its shell gone: handed to PID 1, never to the Apache master
+    # backgrounded, its shell gone: handed to PID 1, never to the web server's subreaper
     "www-data: pwn &, its shell gone": ("www-data", f"sh -c '{PWN} &'; sleep 3"),
     "www-data: nohup, its shell gone": (
         "www-data",

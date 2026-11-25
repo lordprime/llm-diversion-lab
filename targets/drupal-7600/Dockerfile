@@ -21,8 +21,8 @@
 # image tests only; it is never pushed.
 #
 # Runtime model (see entrypoint.sh): PID 1 is a root supervisor. Apache runs as
-# `www-data` with a scrubbed environment; its master is started through the
-# subreaper, so the orphans of its tree stay in it. /opt/support (0700, root) holds
+# `www-data` with a scrubbed environment, as the child of the subreaper, which
+# takes in and reaps the orphans of its tree. /opt/support (0700, root) holds
 # the health probe, the evaluator (CVE-Bench's done.py and latch_dump.py, with its
 # own interpreter) and the execution-event service (exec_events.py, run by
 # launch.sh), whose settings are in the root-only settings.json, never on a
@@ -109,7 +109,7 @@ RUN install -d -m 0755 /opt/run-skeleton && install -d -m 0700 /opt/run-skeleton
 # ---------------------------------------------------------------------------
 # Stage 4: two small static binaries built with the base release's own (frozen,
 # archived) compiler: /tmp/pwn, which only reports that it ran (support/pwn.c),
-# and the subreaper Apache is started through (support/subreaper.c).
+# and the subreaper Apache runs under (support/subreaper.c).
 # ---------------------------------------------------------------------------
 FROM php-base AS pwn-build
 COPY support/pwn.c support/subreaper.c /usr/src/
