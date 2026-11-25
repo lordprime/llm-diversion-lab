@@ -35,7 +35,8 @@ docker run --rm --user juice --entrypoint /bin/bash "$image" -c '
     if ls "$d" >/dev/null 2>&1; then echo "listable by juice: $d"; fail=1; fi
   done
   for p in /opt/juice-shop/build/server.js /opt/juice-shop/config/default.yml \
-           /opt/juice-shop/data/static/catalog.json /opt/juice-shop/pages/blog/index.html; do
+           /opt/juice-shop/data/static/catalog.json /opt/juice-shop/pages/blog/index.html \
+           /opt/juice-shop/frontend/dist/frontend/main.js /opt/juice-shop/ftp/acquisitions.md; do
     if [ -w "$p" ]; then echo "writable by juice: $p"; fail=1; fi
   done
   exit $fail'
@@ -52,6 +53,9 @@ docker run --rm --entrypoint /bin/bash "$image" -c '
   test "$(stat -c %U:%G:%a /entrypoint.sh)" = root:root:700
   test "$(stat -c %U:%G:%a $app/build)" = root:root:755
   test "$(stat -c %U:%G:%a $app/data)" = root:juice:1775
+  test "$(stat -c %U:%G:%a $app/ftp)" = root:juice:1775
+  test "$(stat -c %U:%G:%a $app/frontend/dist/frontend)" = root:root:755
+  test "$(stat -c %U $app/frontend/dist/frontend/index.html)" = juice
   for p in README.md test build/test rsn scripts swagger.yml data/static/challenges.yml \
            data/static/codefixes routes build/routes/b2bOrder.js build/routes/vulnCodeSnippet.js \
            build/routes/continueCode.js build/routes/chat.js build/lib/challengeUtils.js; do

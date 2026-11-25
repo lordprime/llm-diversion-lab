@@ -134,17 +134,28 @@ COPY --chmod=0700 entrypoint.sh /entrypoint.sh
 # Licence of the bundled code, readable by root only.
 COPY --from=juice-shop LICENSE /usr/share/licenses/goat/juice-shop-LICENSE
 
+ARG WEB=${APP}/frontend/dist/frontend
 RUN set -eu \
- # app code, dependencies, configuration, seed data and pages: root-owned, read-only
+ # app code, dependencies, configuration, seed data, pages and the browser app:
+ # root-owned, read-only
  && chown -R root:root ${APP} \
  && chmod -R u=rwX,go=rX ${APP} \
- # what the shop writes while it runs: its database (data/, sticky, so juice can
- # create files there but not replace the seed data), logs, uploads, the FTP folder
- # (order PDFs), its translations (copied in at start), the browser app (customised
- # at start, profile images) and the security.txt/CSAF folder (rewritten at start)
- && chown root:juice ${APP}/data && chmod 1775 ${APP}/data \
+ # Only what the shop itself writes while it runs is the app user's:
+ #  - data/ and ftp/ are sticky root:juice 1775, so juice can create its database
+ #    and order PDFs there but cannot replace or delete the seeded files;
+ #  - logs/, i18n/ (translations copied in at start) and uploads/;
+ #  - the files it rewrites in place at every start: ftp/legal.md and the promotion
+ #    subtitles (restored from data/static; a failed copy would also skip copying
+ #    the translations), the shop's index.html (title and theme), the 3D page and
+ #    the CSAF provider metadata (base URL);
+ #  - the profile and photo-wall upload folder (a new picture may replace a user's
+ #    seeded one, so the whole folder).
+ && chown root:juice ${APP}/data ${APP}/ftp && chmod 1775 ${APP}/data ${APP}/ftp \
  && install -d -o juice -g juice -m 0755 ${APP}/logs ${APP}/i18n ${APP}/uploads ${APP}/uploads/complaints \
- && chown -R juice:juice ${APP}/ftp ${APP}/frontend/dist/frontend ${APP}/.well-known \
+ && chown juice:juice ${APP}/ftp/legal.md ${WEB}/index.html \
+        ${WEB}/assets/public/videos/owasp_promo.vtt ${WEB}/assets/private/threejs-demo.html \
+        ${APP}/.well-known/csaf/provider-metadata.json \
+ && chown -R juice:juice ${WEB}/assets/public/images/uploads \
  # support side: root only
  && chown -R root:root /opt/support /usr/share/licenses/goat \
  && chmod 0700 /opt/support /opt/support/health.sh /usr/share/licenses/goat \
