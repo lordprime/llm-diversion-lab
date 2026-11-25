@@ -87,11 +87,11 @@ def die(msg):
 KNOWN = {
     "address": str, "ssh_user": str, "ssh_port": int, "isolation": str, "access": str,
     "allow_containerd_pin": bool, "cloudflare_tunnel": bool, "max_parallel_cells": int,
-    "backup_repo": str, "vars": dict,
+    "backup_repo": str, "gpu": bool, "vars": dict,
 }
 DEFAULTS = {
     "ssh_port": 22, "allow_containerd_pin": False, "cloudflare_tunnel": False,
-    "max_parallel_cells": 1, "backup_repo": "", "vars": {},
+    "max_parallel_cells": 1, "backup_repo": "", "gpu": False, "vars": {},
 }
 CHOICES = {
     "isolation": ("lxc", "sysbox"),
@@ -167,7 +167,7 @@ PY
 
 # lab_load_host NAME: validate NAME in hosts.yml and set HOST_NAME, HOST_ADDRESS,
 # HOST_SSH_USER, HOST_SSH_PORT, HOST_ISOLATION, HOST_ACCESS, HOST_ALLOW_CONTAINERD_PIN,
-# HOST_CLOUDFLARE_TUNNEL and HOST_MAX_PARALLEL_CELLS.
+# HOST_CLOUDFLARE_TUNNEL, HOST_MAX_PARALLEL_CELLS and HOST_GPU.
 lab_load_host() {
 	local assignments
 	assignments=$(lab_python -c "$LAB__HOSTS_PY" "$LAB_HOSTS_FILE" "$1" env) || exit 1

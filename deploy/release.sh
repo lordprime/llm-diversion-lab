@@ -17,6 +17,8 @@ Deploys the git tag to /srv/lab/releases/<tag> on <host> and makes it current:
  5. if the release has a `migrate` service: stop the app services (the database
     keeps running), pg_dump, then `compose run --rm --no-deps migrate`;
  6. swap the `current` symlink and restart the control plane (compose up --wait);
+    on a GPU host (gpu: true) that includes the model server, Ollama
+    (deploy/compose/models.yml), which stays up while the app services restart;
  7. `labctl selftest --quick` if labctl is installed;
  8. on any failure in 5-7: stop the app services, restore the dump, swap
     `current` back, start the previous release, exit non-zero;
@@ -113,8 +115,14 @@ images=$(git_ show "$commit:deploy/images.lock" | lab_python -c "$IMAGES_PY") ||
 [[ -n $images ]] || lab_fail "deploy/images.lock in $tag lists no images"
 mapfile -t image_refs <<<"$images"
 
-lab_step "Preflight on $host"
 lab_load_host "$host"
+# A GPU host runs Ollama from the release: a tag without its compose file is refused.
+if [[ $HOST_GPU == true ]]; then
+	git_ cat-file -e "$commit:deploy/compose/models.yml" 2>/dev/null ||
+		lab_fail "$host is a GPU host (gpu: true) but $tag has no deploy/compose/models.yml"
+fi
+
+lab_step "Preflight on $host"
 rc=0
 lab_remote release.sh preflight || rc=$?
 case $rc in

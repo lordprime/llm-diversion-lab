@@ -29,6 +29,7 @@ from control.cli import doctor
 from control.cli.doctor import (
     CHECK_NAMES,
     DEFAULT_CELL_RANGE,
+    GPU_CHECKS,
     CheckResult,
     DoctorConfig,
     Status,
@@ -38,6 +39,7 @@ from control.cli.doctor import (
     run_doctor,
 )
 from control.cli.settings import LabSettings
+from control.runner.compose_backend import CommandResult
 from tests.conftest import alembic_config
 
 VALID_HOST_ENV = """\
@@ -419,7 +421,9 @@ def test_all_checks_pass_end_to_end(
         http_client=collector_client,
     )
     results = run_doctor(cfg)
-    assert {r.name: r.status for r in results} == dict.fromkeys(CHECK_NAMES, Status.OK)
+    # a host without a GPU has no Ollama: those three checks are skipped, not failed
+    expected = dict.fromkeys(CHECK_NAMES, Status.OK) | dict.fromkeys(GPU_CHECKS, Status.SKIP)
+    assert {r.name: r.status for r in results} == expected
     assert exit_code(results) == 0
     assert os.environ.get("LAB_ROOT") is None  # nothing leaked into the process env
 
@@ -490,3 +494,182 @@ def test_unparsable_database_url_is_a_clean_failure(tmp_path: Path) -> None:
     result = doctor.check_database(_config(tmp_path, database_url="not a url"))
     assert result.status is Status.FAIL
     assert "not a valid" in result.detail
+
+
+# --------------------------------------------------------------------- GPU host: Ollama
+
+GPU_HOST_ENV = VALID_HOST_ENV + "LAB_GPU=true\n"
+OLLAMA_ID = "0llama0123456789"
+DIGEST = "d" * 64
+
+
+class FakeEngine:
+    """The docker CLI as the GPU checks use it: one Ollama container on `lab_models`."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.running = [OLLAMA_ID]
+        self.smi = "GPU 0: NVIDIA H200 (UUID: GPU-1234)\n"
+        self.smi_rc = 0
+        self.tags = (
+            b'HTTP/1.0 200 OK\r\n\r\n{"models": [{"name": "qwen3:32b", "digest": "'
+            + DIGEST.encode()
+            + b'", "size": 5}]}'
+        )
+        self.ports: dict[str, Any] = {}
+        self.networks = {"lab_models": {"IPAddress": "172.31.232.2"}}
+        self.internal = True
+        self.subnet = "172.31.232.0/24"
+        self.services_on_net = ["ollama", "gateway"]
+
+    def __call__(self, argv: Any, *, stdin: bytes | None = None, timeout: float | None = None):  # type: ignore[no-untyped-def]
+        a = list(argv)
+        self.calls.append(a)
+        if a[1] == "ps" and any(x.startswith("network=") for x in a):
+            return CommandResult(
+                tuple(a), 0, "".join(f"{s}\n" for s in self.services_on_net).encode()
+            )
+        if a[1] == "ps":
+            return CommandResult(tuple(a), 0, "".join(f"{i}\n" for i in self.running).encode())
+        if a[1] == "exec" and "nvidia-smi" in a:
+            return CommandResult(
+                tuple(a),
+                self.smi_rc,
+                self.smi.encode(),
+                b"" if not self.smi_rc else b"nvidia-smi failed",
+            )
+        if a[1] == "exec":
+            return CommandResult(tuple(a), 0, self.tags)
+        if a[1] == "inspect":
+            doc = [{"NetworkSettings": {"Ports": self.ports, "Networks": self.networks}}]
+            return CommandResult(tuple(a), 0, json.dumps(doc).encode())
+        if a[1:3] == ["network", "inspect"]:
+            doc = [{"Internal": self.internal, "IPAM": {"Config": [{"Subnet": self.subnet}]}}]
+            return CommandResult(tuple(a), 0, json.dumps(doc).encode())
+        return CommandResult(tuple(a), 1, b"", b"unexpected")
+
+
+def _gpu_config(
+    tmp_path: Path, engine: FakeEngine, *, host_env: str = GPU_HOST_ENV
+) -> DoctorConfig:
+    _write_host_env(tmp_path, host_env)
+    return _config(tmp_path, runner=engine)
+
+
+def test_gpu_checks_are_skipped_on_a_host_without_a_gpu(tmp_path: Path) -> None:
+    _write_host_env(tmp_path)
+    engine = FakeEngine()
+    cfg = _config(tmp_path, runner=engine)
+    for check in (doctor.check_gpu, doctor.check_models, doctor.check_ollama_isolation):
+        assert check(cfg).status is Status.SKIP
+    assert engine.calls == []
+
+
+def test_a_gpu_host_whose_host_env_is_missing_skips_rather_than_guessing(tmp_path: Path) -> None:
+    engine = FakeEngine()
+    assert doctor.check_gpu(_config(tmp_path, runner=engine)).status is Status.SKIP
+
+
+def test_gpu_visible_in_the_ollama_container(tmp_path: Path) -> None:
+    result = doctor.check_gpu(_gpu_config(tmp_path, FakeEngine()))
+    assert result.status is Status.OK, result.detail
+    assert "H200" in result.detail
+
+
+def test_doctor_fails_without_a_gpu(tmp_path: Path) -> None:
+    engine = FakeEngine()
+    engine.smi, engine.smi_rc = "", 127  # no driver in the container
+    result = doctor.check_gpu(_gpu_config(tmp_path, engine))
+    assert result.status is Status.FAIL
+    assert "no GPU" in result.detail
+
+
+@pytest.mark.parametrize("output", ["", "No devices were found\n", "garbage"])
+def test_nvidia_smi_that_lists_no_gpu_fails(tmp_path: Path, output: str) -> None:
+    engine = FakeEngine()
+    engine.smi = output
+    assert doctor.check_gpu(_gpu_config(tmp_path, engine)).status is Status.FAIL
+
+
+def test_gpu_check_fails_when_ollama_is_not_running(tmp_path: Path) -> None:
+    engine = FakeEngine()
+    engine.running = []
+    result = doctor.check_gpu(_gpu_config(tmp_path, engine))
+    assert result.status is Status.FAIL
+    assert "not running" in result.detail
+
+
+def test_models_lists_each_pulled_model_with_its_full_digest(tmp_path: Path) -> None:
+    result = doctor.check_models(_gpu_config(tmp_path, FakeEngine()))
+    assert result.status is Status.OK
+    assert f"qwen3:32b sha256:{DIGEST}" in result.detail
+
+
+def test_models_with_nothing_pulled_is_ok_but_says_so(tmp_path: Path) -> None:
+    engine = FakeEngine()
+    engine.tags = b'HTTP/1.0 200 OK\r\n\r\n{"models": []}'
+    result = doctor.check_models(_gpu_config(tmp_path, engine))
+    assert result.status is Status.OK and "no models pulled" in result.detail
+
+
+def test_models_fails_on_an_unreadable_answer(tmp_path: Path) -> None:
+    engine = FakeEngine()
+    engine.tags = b"nonsense"
+    assert doctor.check_models(_gpu_config(tmp_path, engine)).status is Status.FAIL
+
+
+def test_ollama_isolation_ok_when_only_the_gateway_shares_the_internal_network(
+    tmp_path: Path,
+) -> None:
+    result = doctor.check_ollama_isolation(_gpu_config(tmp_path, FakeEngine()))
+    assert result.status is Status.OK, result.detail
+
+
+@pytest.mark.parametrize(
+    ("change", "expect"),
+    [
+        (
+            lambda e: setattr(
+                e, "ports", {"11434/tcp": [{"HostIp": "127.0.0.1", "HostPort": "11434"}]}
+            ),
+            "published",
+        ),
+        (lambda e: setattr(e, "internal", False), "not internal"),
+        (lambda e: setattr(e, "subnet", "10.231.4.0/27"), "cell network"),
+        (lambda e: setattr(e, "services_on_net", ["ollama", "gateway", "collector"]), "collector"),
+        (
+            lambda e: setattr(e, "networks", {"lab_models": {}, "bridge": {}}),
+            "more than the models network",
+        ),
+    ],
+)
+def test_ollama_isolation_fails_on_any_way_in(tmp_path: Path, change: Any, expect: str) -> None:
+    engine = FakeEngine()
+    change(engine)
+    result = doctor.check_ollama_isolation(_gpu_config(tmp_path, engine))
+    assert result.status is Status.FAIL
+    assert expect in result.detail
+
+
+def test_an_unpublished_port_entry_is_not_a_published_port(tmp_path: Path) -> None:
+    engine = FakeEngine()
+    engine.ports = {"11434/tcp": None}  # exposed by the image, bound to nothing
+    assert doctor.check_ollama_isolation(_gpu_config(tmp_path, engine)).status is Status.OK
+
+
+def test_all_gpu_checks_pass_end_to_end(
+    tmp_path: Path, db_url: str, engine: Engine, docker_socket: Path, collector_client: TestClient
+) -> None:
+    _write_lab_env(tmp_path)
+    fake = FakeEngine()
+    cfg = _gpu_config(tmp_path, fake)
+    cfg.settings = LabSettings.from_environ(
+        {"LAB_ROOT": str(tmp_path / "lab"), "LAB_COLLECTOR_URL": "http://testserver"}
+    )
+    cfg.secrets_owners = frozenset({ME})
+    cfg.database_url = db_url
+    cfg.docker_host = f"unix://{docker_socket}"
+    cfg.egress_command = _egress(tmp_path, 0)
+    cfg.http_client = collector_client
+    results = run_doctor(cfg)
+    assert {r.name: r.status for r in results} == dict.fromkeys(CHECK_NAMES, Status.OK)

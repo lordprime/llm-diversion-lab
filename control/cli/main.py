@@ -12,6 +12,10 @@ Commands (each takes ``--json`` for scripting):
   recorded in the self-test status file (``labctl status``, ``/metrics``), after an
   "in progress" marker recorded before it starts. SIGTERM and SIGHUP end it through
   ``SystemExit`` (exit 128 + signal), so its cell is still torn down.
+* ``labctl models list|pull ID|rm ID``: the Ollama models on a GPU host
+  (:mod:`control.cli.models`). Admin only: refused inside a container or cell, without
+  root, and (for a pull) while a run cell is in flight. It reaches Ollama only through
+  ``docker exec`` on the host, never through a cell's path.
 
 Exit status: 0 success (the self-test passed); 1 a check failed, the self-test failed
 (an unusable ``DATABASE_URL`` included: it is recorded), the database is unreachable or
@@ -44,6 +48,7 @@ from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from control.cli import doctor, queries
+from control.cli.models import ModelsError, OllamaAdmin
 from control.cli.settings import ConfigError, LabSettings, read_env_file
 from control.core.logging import configure_logging, redact_text
 from control.core.models import RunStatus
@@ -55,6 +60,7 @@ from control.core.selftest_status import (
 )
 from control.db.engine import create_db_engine
 from control.runner import selftest
+from control.runner.compose_backend import SubprocessRunner
 
 __all__ = ["EXIT_FAIL", "EXIT_OK", "EXIT_USAGE", "build_parser", "main"]
 
@@ -382,6 +388,59 @@ def _selftest_report(args: argparse.Namespace, settings: LabSettings) -> selftes
         engine.dispose()
 
 
+# --------------------------------------------------------------------- models
+
+
+def _ollama_admin(settings: LabSettings) -> OllamaAdmin:
+    docker_env = {k: settings.environ[k] for k in ("DOCKER_HOST",) if k in settings.environ}
+    return OllamaAdmin(SubprocessRunner(docker_env), environ=settings.environ)
+
+
+def _cmd_models_list(args: argparse.Namespace, settings: LabSettings) -> int:
+    try:
+        models = _ollama_admin(settings).models()
+    except ModelsError as exc:
+        raise _Failure(str(exc)) from None
+    if args.json:
+        _json([m.to_json() for m in models])
+        return EXIT_OK
+    if not models:
+        _out("no models pulled")
+        return EXIT_OK
+    width = max(len(m.name) for m in models)
+    for m in models:
+        _out(f"{m.name.ljust(width)}  {m.digest}  {m.size_bytes / 2**30:.1f} GiB")
+    return EXIT_OK
+
+
+def _cmd_models_pull(args: argparse.Namespace, settings: LabSettings) -> int:
+    admin = _ollama_admin(settings)
+    try:
+        admin.pull(args.model)
+        models = admin.models()
+    except ModelsError as exc:
+        raise _Failure(str(exc)) from None
+    # Ollama names an untagged model `:latest`
+    name = args.model if ":" in args.model.rpartition("/")[2] else f"{args.model}:latest"
+    pulled = next((m for m in models if m.name == name), None)
+    if pulled is None:
+        raise _Failure(f"{args.model} was pulled but is not listed by Ollama")
+    if args.json:
+        _json(pulled.to_json())
+    else:
+        _out(f"pulled {pulled.name}  {pulled.digest}")
+    return EXIT_OK
+
+
+def _cmd_models_rm(args: argparse.Namespace, settings: LabSettings) -> int:
+    try:
+        _ollama_admin(settings).remove(args.model)
+    except ModelsError as exc:
+        raise _Failure(str(exc)) from None
+    _out(f"removed {args.model}")
+    return EXIT_OK
+
+
 # --------------------------------------------------------------------- parser
 
 
@@ -401,7 +460,8 @@ def _cell_range(value: str) -> IPv4Network:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="labctl", description="LLM Diversion Lab control CLI (read-only except selftest)."
+        prog="labctl",
+        description="LLM Diversion Lab control CLI (read-only except selftest and models).",
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
 
@@ -451,6 +511,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="first target only, containment probed in one cell (after a deploy)",
     )
     p.add_argument("--json", action="store_true", help="JSON output")
+
+    models = sub.add_parser(
+        "models",
+        help="Ollama models on a GPU host (admin only)",
+        description="list, pull and remove Ollama models; refused inside a cell or without root",
+    )
+    models_sub = models.add_subparsers(dest="models_command", metavar="COMMAND", required=True)
+    p = add("list", "list pulled models with their digests", _cmd_models_list, parent=models_sub)
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p = add("pull", "pull a model (never during a run)", _cmd_models_pull, parent=models_sub)
+    p.add_argument("model", metavar="ID", help="model id, e.g. qwen3:32b")
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p = add("rm", "remove a pulled model", _cmd_models_rm, parent=models_sub)
+    p.add_argument("model", metavar="ID", help="model id, e.g. qwen3:32b")
     return parser
 
 

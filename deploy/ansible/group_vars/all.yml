@@ -46,3 +46,16 @@ docker_default_address_pools:
 
 # Set by `bootstrap.sh --format-data-disk` (sysbox profile only; refused in an LXC).
 format_data_disk: false
+
+# GPU hosts (gpu: true): host config for the model server, deploy/compose/models.yml;
+# the nvidia role writes it to /srv/lab/models.env. Override per host under `vars:` in
+# hosts.yml.
+#   ollama_num_parallel: requests Ollama serves at once; its KV cache is sized for
+#     num_parallel x context, so raise it only with the GPU memory to match.
+#   ollama_context_length: Ollama's default context window (an experiment's num_ctx
+#     overrides it per model).
+#   ollama_models_volume: the Docker volume holding the models (name it to keep the
+#     models on a particular disk or across a re-provision).
+ollama_num_parallel: 1
+ollama_context_length: 65536
+ollama_models_volume: lab_ollama_models

@@ -297,6 +297,11 @@ Data from homelab runs is development data only and is never mixed into paper re
 5. **The LLM gateway questions** above.
 6. **Only if scaling to Slurm later:** the container runtime on the `wdr` nodes, user namespaces, maximum walltime, node-local scratch, and whether WDR jobs can reach the control-plane VM.
 
+**GPU hosts and the open-weight route (`gpu: true`).** The same VM can serve open-weight models, so no model traffic leaves it:
+- **Host.** `gpu: true` in `hosts.yml` (sysbox profile only) adds the `nvidia` role: the NVIDIA Container Toolkit at a pinned version from NVIDIA's apt repository (key fingerprint checked, packages held) and the `nvidia` Docker runtime (`nvidia-ctk runtime configure --runtime=docker`). **The GPU driver is never installed by the scripts.** The role stops with a message if `nvidia-smi` does not work; installing the driver (and rebooting) is the operator's decision. `ollama_num_parallel`, `ollama_context_length` and `ollama_models_volume` go under `vars:` and end up in `/srv/lab/models.env`.
+- **Service.** `deploy/compose/models.yml` runs Ollama (digest-pinned in `images.lock`) on the `nvidia` runtime, on the internal `models` network that only the gateway joins. It publishes no port, so a cell can neither resolve nor reach it; the self-test proves that from a cell's probe (the name `ollama` and its address on 11434 must both fail), and `labctl doctor` checks the GPU, the pulled models with their digests, and the isolation. `release.sh` brings it up with the control plane and leaves it running while the app services restart.
+- **Models.** `labctl models pull|list|rm` (root on the host only; refused inside a cell or container) runs `docker exec` into the Ollama container. The `models` network has no route out, so a pull attaches the container to a throwaway uplink network for the pull and detaches it afterwards; it refuses while a run cell is in flight. Pulling is never part of a run.
+
 ### 0.7 Quickstart for the LXC
 
 ```

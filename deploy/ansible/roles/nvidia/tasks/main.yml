@@ -1,0 +1,186 @@
+---
+# site.yml runs this role only when gpu is true; it refuses on its own too.
+- name: Refuse to run in an LXC
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['virtualization_type'] != 'lxc'
+    fail_msg: >-
+      A GPU host is a VM or bare metal (isolation sysbox) with the GPU passed through;
+      this role does not run in an LXC.
+    quiet: true
+
+- name: Check the host's own settings for the model server
+  ansible.builtin.assert:
+    that:
+      - ollama_num_parallel | string is match('^[1-9][0-9]*$')
+      - ollama_context_length | string is match('^[1-9][0-9]{3,6}$')
+      - ollama_models_volume is match('^[a-z0-9][a-z0-9_]*$')
+    fail_msg: >-
+      ollama_num_parallel must be a positive integer, ollama_context_length an integer
+      from 1000 to 9999999 and ollama_models_volume a lower-case volume name (this
+      host's `vars:` in hosts.yml).
+    quiet: true
+
+# The driver comes first and is never installed here: on the CISPA VM that choice
+# (and a reboot) belongs to the operator.
+- name: Read the GPUs the NVIDIA driver sees
+  ansible.builtin.command:
+    argv: [nvidia-smi, "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"]
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  register: nvidia_gpus
+
+- name: Check the NVIDIA driver is installed and sees a GPU
+  ansible.builtin.assert:
+    that:
+      - nvidia_gpus.rc == 0
+      - nvidia_gpus.stdout_lines | length > 0
+    fail_msg: >-
+      No working NVIDIA driver: `nvidia-smi` {{ 'is not installed' if nvidia_gpus.rc == 2 else
+      'failed (exit ' ~ nvidia_gpus.rc ~ ')' }} on this host ({{ nvidia_gpus.msg | default('') }}
+      {{ nvidia_gpus.stderr | default('') | trim }}). This role does not install the driver
+      (that is the operator's decision on the host): install the NVIDIA driver and
+      reboot, check that `nvidia-smi` lists the GPU, then run bootstrap.sh again.
+    success_msg: "GPU: {{ nvidia_gpus.stdout_lines | join('; ') }}"
+    quiet: true
+
+- name: Install the apt repository prerequisites
+  ansible.builtin.apt:
+    lock_timeout: "{{ lab_apt_lock_timeout }}"
+    name: [ca-certificates, curl, gnupg]
+    state: present
+
+- name: Create the apt keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# The key is downloaded to a candidate file and checked there; the trusted keyring
+# is only written after the check passes, so a bad download never replaces it.
+- name: Download NVIDIA's apt signing key (candidate)
+  ansible.builtin.get_url:
+    url: "{{ nvidia_apt_key_url }}"
+    dest: "{{ nvidia_apt_key_candidate }}"
+    force: true
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Read the candidate key's fingerprints
+  ansible.builtin.command:
+    argv: [gpg, --show-keys, --with-colons, "{{ nvidia_apt_key_candidate }}"]
+  changed_when: false
+  check_mode: false
+  register: nvidia_key_info
+  when: not ansible_check_mode
+
+# Exactly one primary key, and it is NVIDIA's: an extra key appended to the file
+# (which apt would also trust) fails the check. gpg prints the primary key as a `pub`
+# record followed by its `fpr` record.
+- name: Check the keyring holds exactly NVIDIA's repository key
+  vars:
+    nvidia_key_records: "{{ nvidia_key_info.stdout_lines }}"
+  ansible.builtin.assert:
+    that:
+      - nvidia_key_records | select('match', '^pub:') | list | length == 1
+      - (nvidia_key_records | select('match', '^fpr:') | first).split(':')[9] == nvidia_apt_key_fingerprint
+    fail_msg: >-
+      The key from {{ nvidia_apt_key_url }} is not exactly NVIDIA's signing key
+      {{ nvidia_apt_key_fingerprint }}; refusing to trust it (the keyring is unchanged).
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Install the checked key as the trusted keyring
+  ansible.builtin.copy:
+    src: "{{ nvidia_apt_key_candidate }}"
+    dest: /etc/apt/keyrings/nvidia-container-toolkit.asc
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  when: not ansible_check_mode
+
+- name: Add NVIDIA's container toolkit apt repository
+  ansible.builtin.template:
+    src: nvidia-container-toolkit.list.j2
+    dest: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Refresh the apt cache
+  ansible.builtin.apt:
+    lock_timeout: "{{ lab_apt_lock_timeout }}"
+    update_cache: true
+  changed_when: false
+
+- name: Install the NVIDIA Container Toolkit, version {{ nvidia_toolkit_version }}
+  ansible.builtin.apt:
+    lock_timeout: "{{ lab_apt_lock_timeout }}"
+    name: "{{ nvidia_toolkit_packages | map('regex_replace', '$', '=' ~ nvidia_toolkit_version) | list }}"
+    state: present
+    # Exactly the pinned version, even over a newer one a re-run finds installed.
+    allow_downgrade: true
+    allow_change_held_packages: true
+    install_recommends: false
+
+- name: Hold the toolkit packages (upgraded only in a maintenance window)
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  register: nvidia_hold
+  # dpkg --set-selections fails at once while the dpkg lock is held.
+  until: nvidia_hold is succeeded
+  retries: "{{ (lab_apt_lock_timeout | int) // 10 }}"
+  delay: 10
+  loop: "{{ nvidia_toolkit_packages }}"
+  when: not ansible_check_mode
+
+# Docker learns the `nvidia` runtime from nvidia-ctk. The docker role keeps what
+# nvidia-ctk wrote when it rewrites daemon.json, so the two never fight.
+- name: Read the runtimes Docker knows
+  ansible.builtin.command:
+    argv: [docker, info, --format, "{{ '{{json .Runtimes}}' }}"]
+  changed_when: false
+  check_mode: false
+  register: nvidia_runtimes
+
+- name: Register the nvidia runtime in Docker's daemon.json
+  ansible.builtin.command:
+    argv: [nvidia-ctk, runtime, configure, --runtime=docker]
+  changed_when: true
+  when: "'nvidia' not in (nvidia_runtimes.stdout | from_json)"
+  notify: Restart Docker
+
+- name: Apply the new runtime now
+  ansible.builtin.meta: flush_handlers
+
+- name: Read the runtimes Docker knows after the change
+  ansible.builtin.command:
+    argv: [docker, info, --format, "{{ '{{json .Runtimes}}' }}"]
+  changed_when: false
+  check_mode: false
+  register: nvidia_runtimes_after
+  when: not ansible_check_mode
+
+- name: Check Docker has the nvidia runtime
+  ansible.builtin.assert:
+    that:
+      - "'nvidia' in (nvidia_runtimes_after.stdout | from_json)"
+    fail_msg: >-
+      Docker does not list an `nvidia` runtime after `nvidia-ctk runtime configure`;
+      check /etc/docker/daemon.json and `systemctl status docker`.
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Write the host settings of the model server
+  ansible.builtin.template:
+    src: models.env.j2
+    dest: "{{ lab_root }}/models.env"
+    owner: root
+    group: root
+    mode: "0644"
