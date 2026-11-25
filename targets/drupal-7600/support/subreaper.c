@@ -12,6 +12,9 @@
  * Apache's prefork master stops when a child it reaps exits 15, so as a
  * subreaper itself it could be stopped by any web user's `sh -c 'exit 15' &`.
  *
+ * The program gets a process group of its own. Apache's master signals its whole
+ * group when it stops (TERM) or restarts (HUP), and that must not reach PID 1.
+ *
  * TERM, INT, HUP, USR1 and WINCH (how Apache is stopped and restarted) are
  * passed on to the program; every other signal that can be caught is ignored,
  * so a stray one never ends the tree's root. When the program exits, this exits
@@ -93,7 +96,10 @@ int main(int argc, char *argv[])
         perror("subreaper: fork");
         return 1;
     }
+    /* also from this side, so the group exists whichever of the two runs first */
+    setpgid(program, program);
     if (program == 0) {
+        setpgid(0, 0);
         signal(SIGCHLD, SIG_DFL);
         sigprocmask(SIG_SETMASK, &previous, NULL);
         execvp(argv[1], argv + 1);

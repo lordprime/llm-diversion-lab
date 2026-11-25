@@ -725,6 +725,17 @@ def test_subreaper_stays_the_parent_and_only_it_is_a_subreaper(subreaper: Path) 
     assert (int(parent), flag, process.returncode) == (process.pid, "0", 0)
 
 
+def test_subreaper_gives_its_child_a_process_group_of_its_own(subreaper: Path) -> None:
+    """Apache's master signals its whole group when it stops or restarts; that group
+    must be its own, not the entrypoint's."""
+    out = through(subreaper, "echo $$ $(cut -d' ' -f5 /proc/$$/stat)")
+    me, group = out.stdout.split()
+    assert me == group, out
+    assert group != str(os.getpgrp())
+    # and signalling that group (as Apache does) leaves the subreaper to report it
+    assert through(subreaper, "kill -TERM 0").returncode == 143
+
+
 def test_subreaper_takes_in_and_reaps_an_orphan_of_its_tree(subreaper: Path) -> None:
     script = (
         "child=$(sh -c 'sleep 1 >/dev/null 2>&1 & echo $!'); sleep 0.3; "

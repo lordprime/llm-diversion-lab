@@ -215,5 +215,8 @@ RUN set -eux; \
     fi
 
 EXPOSE 80
+# The base image stops Apache with SIGWINCH; here PID 1 is the entrypoint, which
+# stops on TERM (passing it on to the subreaper and from there to Apache).
+STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=5s --timeout=5s --retries=180 CMD ["/opt/support/health.sh"]
 ENTRYPOINT ["/entrypoint.sh"]

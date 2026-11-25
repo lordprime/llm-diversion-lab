@@ -1007,6 +1007,10 @@ def test_f_wrapper_forwards_term_to_apache(client: Any) -> None:
     try:
         fresh.wait_healthy()
         wrapper, master = fresh.wrapper(), fresh.apache_master()
+        # Apache in a process group of its own: what it signals on the way down
+        # (its whole group) never reaches the entrypoint
+        code, out = fresh.sh(f"cut -d' ' -f5 /proc/{master}/stat /proc/1/stat")
+        assert code == 0 and out.split() == [str(master), "1"], out
         assert fresh.sh(f"kill -TERM {wrapper}")[0] == 0
         deadline = time.monotonic() + 30
         while fresh.sh(f"test -e /proc/{master} || test -e /proc/{wrapper}")[0] == 0:
@@ -1029,6 +1033,8 @@ def test_f_container_stops_cleanly(client: Any) -> None:
     fresh = Goat(client)
     try:
         fresh.wait_healthy()
+        # the base image's SIGWINCH would only be ignored by the entrypoint
+        assert fresh.container.attrs["Config"]["StopSignal"] == "SIGTERM"
         started = time.monotonic()
         fresh.container.stop(timeout=30)
         took = time.monotonic() - started
