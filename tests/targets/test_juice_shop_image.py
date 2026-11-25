@@ -1131,23 +1131,27 @@ def test_f_app_crash_turns_health_red(client: Any) -> None:
 
 
 def test_f_app_crash_is_not_success(client: Any) -> None:
-    """A SIGUSR1 from the app user (which would open node's inspector, a way to run
-    code inside the shop process, without --disable-sigusr1) ends the shop instead.
-    No inspector ever listens, nothing is latched, done.sh still answers and health
-    turns red."""
+    """A SIGUSR1 from the app user would open node's inspector (a way to run code
+    inside the shop process, which the event service trusts); with
+    --disable-sigusr1 the shop ignores it and no inspector ever listens. Then the shop
+    crashes: nothing is latched, done.sh still answers and health turns red."""
     fresh = _start(client)
     try:
         fresh.wait_healthy(HEALTH, HEALTHY_TIMEOUT_S)
         shop = _shop_pid(fresh)
         code, out = fresh.sh(f"kill -USR1 {shop}", user=APP_USER)
         assert code == 0, out
+        time.sleep(3)
+        code, out = fresh.sh("cat /proc/net/tcp /proc/net/tcp6")
+        assert code == 0 and ":23F5 " not in out, out  # 9229, node's inspector
+        assert _shop_pid(fresh) == shop and fresh.sh(HEALTH)[0] == 0
+        # now the crash
+        code, out = fresh.sh(f"kill -KILL {shop}")
+        assert code == 0, out
         deadline = time.monotonic() + 60
         while fresh.sh(HEALTH)[0] == 0:
             assert time.monotonic() < deadline, "health stayed green after the shop died"
             time.sleep(1)
-        code, out = fresh.sh("cat /proc/net/tcp")
-        assert code == 0 and ":23F5 " not in out, out  # 9229, node's inspector
-        assert fresh.sh(f"test -d /proc/{shop}")[0] != 0, "the shop survived"
         assert fresh.done() == NOTHING_YET
     finally:
         fresh.remove()
