@@ -62,7 +62,8 @@ resources are never touched.
 A cell that fails before its agent would start (so before the probe) is reported as a
 cell failure, not as a containment failure.
 
-``--quick`` is what ``deploy/remote/release.sh`` runs after every deploy. It keeps the
+``deploy/release.sh`` runs the full self-test after every deploy (``--quick-selftest``
+runs ``--quick`` instead). ``--quick`` keeps the
 **first target only** (DVGA: one matched pair, two cells, the smallest unit the
 matched-pair schedule can run, and the control's zero-tag check is a core claim) and
 runs the containment probe in the **first cell only** (the cells differ only by subnet;
@@ -883,6 +884,11 @@ class ResetGate(BackendGate):
         self._inner.start_agent(cell)
         self._started.add(cell.project.run_id)
 
+    @property
+    def unchecked(self) -> frozenset[str]:
+        """Runs whose agent started but whose agent service was never stopped."""
+        return frozenset(self._started)
+
     def stop(self, cell: CellHandle, services: Sequence[str], *, timeout_s: int) -> None:
         project = cell.project
         if project.agent_service in services and project.run_id in self._started:
@@ -1115,6 +1121,11 @@ class SelftestDeps:
     runner_options: Mapping[str, Any] = field(default_factory=dict)
 
 
+#: Prefixes of runner-made cell work directories the sweep recognises: today's, and
+#: ``labcell-`` from releases up to v0.1.0, so an upgraded host's leftovers go too.
+CELL_DIR_PREFIXES: Final = (CELL_NAME_PREFIX, "labcell-")
+
+
 def _cell_dir(work_dir: Path, run_id: str) -> Path:
     return work_dir / f"{CELL_NAME_PREFIX}{run_id.lower()}"
 
@@ -1154,7 +1165,15 @@ def run_selftest(
             except CellLeftBehindError as exc:
                 results = list(exc.results)
                 checks.append(Check("run the pair", False, f"stopped: {exc}"[:500]))
-            checks += _check_results(deps, ef, results, gate.records, resets.records, quick=quick)
+            checks += _check_results(
+                deps,
+                ef,
+                results,
+                gate.records,
+                resets.records,
+                quick=quick,
+                unstopped=resets.unchecked,
+            )
     except HostLockError as exc:
         checks.append(Check("run the pair", False, f"another runner is active: {exc}"))
     except Exception as exc:
@@ -1242,26 +1261,23 @@ def _sweep_earlier(deps: SelftestDeps) -> Check:
                 )
             ).all()
         )
-        stale_dirs = (
-            [
-                d
-                for d in deps.work_dir.iterdir()
-                if d.is_dir() and d.name.startswith(CELL_NAME_PREFIX)
-            ]
-            if deps.work_dir.is_dir()
-            else []
-        )
-        by_dir = {
-            _cell_dir(deps.work_dir, run_id).name: run_id
+        # cell directory -> the run id it names (lowercased), under every prefix
+        stale_dirs = {
+            d: d.name.removeprefix(prefix)
+            for d in (sorted(deps.work_dir.iterdir()) if deps.work_dir.is_dir() else [])
+            for prefix in CELL_DIR_PREFIXES
+            if d.is_dir() and d.name.startswith(prefix)
+        }
+        known = {
+            run_id.lower(): run_id
             for run_id in s.scalars(
                 select(t.Run.run_id).where(
                     t.Run.experiment_id.startswith(SELFTEST_EXPERIMENT_PREFIX, autoescape=True),
-                    func.lower(t.Run.run_id).in_(
-                        [d.name.removeprefix(CELL_NAME_PREFIX) for d in stale_dirs]
-                    ),
+                    func.lower(t.Run.run_id).in_(list(stale_dirs.values())),
                 )
             ).all()
         }
+        by_dir = {d.name: known[rid] for d, rid in stale_dirs.items() if rid in known}
     removed: list[str] = []
     left: dict[str, Any] = {}
     for run_id in sorted(labelled & selftest_runs):
@@ -1338,6 +1354,7 @@ def _check_results(
     resets: Sequence[ResetRecord],
     *,
     quick: bool,
+    unstopped: frozenset[str] = frozenset(),
 ) -> list[Check]:
     """Every check on the runs, named ``<target> <arm>: <what>`` (one pair per target)."""
     checks: list[Check] = []
@@ -1399,13 +1416,17 @@ def _check_results(
         # the scripted agent runs the target's exploit in both arms: both succeed
         checks.append(_oracle_check(name, *_stored_verdict(deps.engine, result.run_id)))
         reset = reset_of.get(result.run_id)
-        checks.append(
-            Check(
-                f"{name}: reset after success",
-                reset is not None and reset.ok,
-                "not checked: the agent never started" if reset is None else reset.detail,
+        if reset is None:
+            why = (
+                "the runner never stopped the agent"
+                if result.run_id in unstopped
+                else "the agent never started"
             )
-        )
+            checks.append(
+                Check(f"{name}: reset after success", False, f"reset check not run: {why}")
+            )
+        else:
+            checks.append(Check(f"{name}: reset after success", reset.ok, reset.detail))
         record = probed.get(result.run_id)
         if record is not None:
             checks.append(
@@ -1444,14 +1465,15 @@ def _oracle_check(
     """The stored verdict: Outcome, effect and mechanism all true (the oracle answered
     "not yet" before the agent, which the runner's probe requires, and then saw the
     scripted exploit do its work by the route the target's mechanism rule names)."""
-    ok = outcome is True and effect is True and mechanism is True and decided_at is not None
-    detail = (
-        ""
-        if ok
-        else f"stored verdict: outcome {outcome}, effect {effect}, mechanism {mechanism}, "
-        f"decided at {decided_at}"
-    )
-    return Check(f"{name}: oracle", ok, detail)
+    wrong = [
+        f"{what} is {value}, not true"
+        for what, value in (("outcome", outcome), ("effect", effect), ("mechanism", mechanism))
+        if value is not True
+    ]
+    if decided_at is None:
+        wrong.append("no decision time stored")
+    detail = "stored verdict: " + "; ".join(wrong) if wrong else ""
+    return Check(f"{name}: oracle", not wrong, detail)
 
 
 def _funnel_check(

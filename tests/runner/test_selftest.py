@@ -28,7 +28,7 @@ import pytest
 import yaml
 from dnslib import DNSRecord
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine
+from sqlalchemy import Engine, select
 
 from cell.probe import containment
 from control.api.app import create_app
@@ -43,12 +43,15 @@ from control.core.models import (
     Surface,
 )
 from control.core.selftest_status import read_selftest_status
+from control.core.tokens import derive_token
 from control.db import tables as t
 from control.db.engine import session_scope
 from control.runner import selftest
 from control.runner.cell_spec import CellError, CellSettings, ComposeProject, ResetSpec
 from control.runner.compose_backend import CellHandle, CollectReport, CommandResult, ContainerState
 from control.runner.experiment import parse_experiment, read_experiment
+from control.runner.oracle import DONE_COMMAND, LATCH_COMMAND
+from control.runner.render import placement_id_for
 from control.runner.runner import Runner
 from control.runner.selftest import (
     ContainmentGate,
@@ -106,6 +109,35 @@ class SelftestBackend(FakeBackend):
         self.wrong_token = wrong_token
         self.cell_dirs = cell_dirs
         self.on_collect = extra
+        #: (what, run id) in the order the cell saw it: oracle polls, the latch dump,
+        #: the reset, stops and the agent's start
+        self.order: list[tuple[str, str]] = []
+
+    def exec(
+        self,
+        cell: CellHandle,
+        service: str,
+        argv: Sequence[str],
+        *,
+        timeout_s: float,
+        user: str | None = None,
+    ) -> CommandResult:
+        names = {DONE_COMMAND: "done", LATCH_COMMAND: "latch"}
+        what = names.get(tuple(argv), "reset" if service == "goat" else f"exec:{service}")
+        self.order.append((what, cell.project.run_id))
+        return super().exec(cell, service, argv, timeout_s=timeout_s, user=user)
+
+    def start_agent(self, cell: CellHandle) -> None:
+        self.order.append(("start_agent", cell.project.run_id))
+        super().start_agent(cell)
+
+    def restart(self, cell: CellHandle, service: str, *, timeout_s: int) -> None:
+        self.order.append(("restart", cell.project.run_id))
+        super().restart(cell, service, timeout_s=timeout_s)
+
+    def stop(self, cell: CellHandle, services: Sequence[str], *, timeout_s: int) -> None:
+        self.order.append(("stop:" + ",".join(services), cell.project.run_id))
+        super().stop(cell, services, timeout_s=timeout_s)
 
     def prepare(self, project: ComposeProject, workdir: Path) -> CellHandle:
         handle = super().prepare(project, workdir)
@@ -298,8 +330,7 @@ def test_a_healthy_pair_passes(engine: Engine, collector: CollectorClient, tmp_p
                 assert f"{target} {arm}: {what}" in names
             assert f"{target} {arm}: reset after success" in names
         assert f"{target} injected: callbacks" in names and f"{target} control: no tags" in names
-    # full mode probes every cell, each before its agent starts; every cell is reset
-    # after its final poll, before anything is stopped
+    # full mode probes every cell, each before its agent starts
     assert len(report.probes) == 6 and all(p.contained for p in report.probes)
     assert len(report.resets) == 6 and all(r.ok for r in report.resets)
     for run in report.runs:
@@ -317,6 +348,13 @@ def test_a_healthy_pair_passes(engine: Engine, collector: CollectorClient, tmp_p
             "teardown",
         ]
         assert run["effect"] is True and run["mechanism"] is True
+        # every cell is reset after the runner's final poll and the latch dump, and
+        # before anything is stopped: done, latch | done, reset, done | stop the agent
+        seen = [what for what, arg in backend.order if arg == run["run_id"]]
+        latch = seen.index("latch")
+        assert seen[latch - 1] == "done"  # the runner's final word
+        assert seen[latch + 1 : latch + 5] == ["done", reset, "done", "stop:agent"]
+        assert seen.count("latch") == 1 and seen.index("start_agent") < latch
     # the summary is short and carries no tag or token
     assert report.summary.startswith("passed")
     data = report.to_json()
@@ -704,6 +742,50 @@ def test_earlier_selftest_leftovers_are_swept_and_study_runs_never(
     assert "2 earlier" in swept.detail
 
 
+def test_v0_1_0_labcell_work_directories_are_swept_too(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    """Releases up to v0.1.0 named cell work directories labcell-<run>: after an
+    upgrade, an earlier self-test's go like today's c-<run>; a study run's, an unknown
+    run's and anything else stay."""
+    earlier = run_selftest(_deps(engine, collector, tmp_path / "a"), quick=True)
+    earlier_ids = [r["run_id"] for r in earlier.runs]
+    study_id = (
+        Runner(
+            store=RunStore(engine),
+            collector=collector,
+            backend=SelftestBackend(),
+            settings=CellSettings(images=IMAGES),
+            lab_key=KEY,
+            runs_dir=tmp_path / "s" / "runs",
+            work_dir=tmp_path / "s" / "work",
+        )
+        .register(read_experiment(SELFTEST_YAML))[0]
+        .run_id
+    )
+    deps = _deps(engine, collector, tmp_path / "b")
+    swept = [
+        deps.work_dir / f"labcell-{earlier_ids[0].lower()}",
+        deps.work_dir / f"c-{earlier_ids[1].lower()}",
+    ]
+    kept = [
+        deps.work_dir / f"labcell-{study_id.lower()}",
+        deps.work_dir / "labcell-run_01unknownrun000000000000000",
+        deps.work_dir / f"labcellx-{earlier_ids[0].lower()}",
+        deps.work_dir / f"lab-{earlier_ids[0].lower()}",
+    ]
+    for directory in (*swept, *kept):
+        (directory / "inner").mkdir(parents=True)
+    (deps.work_dir / f"labcell-{earlier_ids[1].lower()}.txt").write_text("a file, not a cell")
+    report = run_selftest(deps, quick=True)
+    assert report.passed, _failed(report)
+    assert not any(d.exists() for d in swept)
+    assert all(d.exists() for d in kept)
+    assert (deps.work_dir / f"labcell-{earlier_ids[1].lower()}.txt").exists()
+    check = next(c for c in report.checks if c.name == "earlier self-tests swept")
+    assert "removed resources of 2 earlier self-test runs" in check.detail
+
+
 def test_selftest_runs_are_left_out_of_the_study_counters(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
@@ -986,6 +1068,145 @@ def test_a_run_with_no_success_has_nothing_to_reset_after(
     assert "dvga injected: oracle" in failed
 
 
+@pytest.mark.parametrize("target", TARGETS)
+@pytest.mark.parametrize(
+    "answer",
+    [
+        done_v2(effect=True, mechanism=False, latch_events=1),
+        done_v2(effect=True, mechanism=None, latch_events=1),
+    ],
+    ids=["mechanism false", "mechanism undecidable"],
+)
+def test_an_effect_without_the_mechanism_fails_that_targets_oracle_check(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, target: str, answer: str
+) -> None:
+    """The exploit must score by the target's mechanism rule, not only its effect."""
+    # the probe poll answers "not yet" with the same mechanism value, which then latches
+    not_yet = done_v2(effect=False, mechanism=json.loads(answer)["mechanism"])
+    backend = SelftestBackend(done_by_target={target: [(0, not_yet), (0, answer)]})
+    report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=False)
+    failed = _failed(report)
+    mechanism = json.loads(answer)["mechanism"]
+    for arm in ("injected", "control"):
+        assert failed[f"{target} {arm}: oracle"] == (
+            f"stored verdict: mechanism is {mechanism}, not true"
+        )
+    # the other targets' runs are untouched
+    for other in set(TARGETS) - {target}:
+        assert not [name for name in failed if name.startswith(f"{other} ")], failed
+
+
+def test_a_verdict_with_no_decision_time_fails_the_oracle_check() -> None:
+    check = selftest._oracle_check("dvga injected", True, True, True, None)
+    assert not check.ok and check.detail == "stored verdict: no decision time stored"
+    check = selftest._oracle_check("dvga injected", None, None, None, None)
+    assert check.detail == (
+        "stored verdict: outcome is None, not true; effect is None, not true; "
+        "mechanism is None, not true; no decision time stored"
+    )
+    assert selftest._oracle_check("dvga injected", True, True, True, TS).ok
+
+
+@pytest.mark.parametrize("target", TARGETS)
+@pytest.mark.parametrize("arm", [Arm.INJECTED, Arm.CONTROL])
+def test_a_target_missing_one_arm_fails(
+    engine: Engine,
+    collector: CollectorClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    arm: Arm,
+) -> None:
+    """If the runner hands back no run of one arm on one target, that target fails."""
+    real = Runner.run_experiment
+
+    def without(self: Runner, ef: Any) -> list[Any]:
+        results = real(self, ef)
+        with session_scope(engine) as s:
+            gone = {
+                rid
+                for rid, name, a in s.execute(
+                    select(t.Run.run_id, t.Target.name, t.Run.arm).join(
+                        t.Target, t.Run.target_id == t.Target.target_id
+                    )
+                ).all()
+                if name == target and a is arm
+            }
+        return [r for r in results if r.run_id not in gone]
+
+    monkeypatch.setattr(selftest.Runner, "run_experiment", without)
+    report = run_selftest(_deps(engine, collector, tmp_path), quick=False)
+    failed = _failed(report)
+    assert failed[f"{target} {arm.value}: valid"] == "no run of this arm"
+    assert failed["runs"] == "5 runs, expected 6"
+
+
+@pytest.mark.parametrize("what", ["tag", "token"])
+@pytest.mark.parametrize(
+    ("control_of", "leaked_from"), [("dvga", "juice-shop"), ("drupal-7600", "dvga")]
+)
+def test_another_targets_tag_or_token_in_a_control_fails(
+    engine: Engine,
+    collector: CollectorClient,
+    tmp_path: Path,
+    what: str,
+    control_of: str,
+    leaked_from: str,
+) -> None:
+    """The control scan covers every injected run of the experiment, not only its pair."""
+
+    def leak(manifest: RunManifest, dest: Path) -> None:
+        if manifest.arm is not Arm.CONTROL or manifest.target != control_of:
+            return
+        with session_scope(engine) as s:
+            run_id, tag = s.execute(
+                select(t.Run.run_id, t.Run.tag)
+                .join(t.Target, t.Run.target_id == t.Target.target_id)
+                .where(
+                    t.Run.experiment_id == manifest.experiment_id,
+                    t.Target.name == leaked_from,
+                    t.Run.arm == Arm.INJECTED,
+                )
+            ).one()
+        # tokens follow from the lab key and the run, whether that run has started yet
+        token = derive_token(KEY, run_id, placement_id_for(run_id, Surface.P3))
+        needle = tag if what == "tag" else token
+        assert needle
+        (dest / "agent" / "notes.txt").write_text(f"seen elsewhere: {needle}\n")
+
+    backend = SelftestBackend(extra=leak)
+    report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=False)
+    failed = _failed(report)
+    assert "agent/notes.txt" in failed[f"{control_of} control: no tags"]
+    for target in set(TARGETS) - {control_of}:
+        assert f"{target} control: no tags" not in failed
+
+
+def test_a_reset_never_run_because_the_agent_was_never_stopped_says_so(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def stop_without_checking(
+        self: selftest.ResetGate, cell: CellHandle, services: Sequence[str], *, timeout_s: int
+    ) -> None:
+        self._inner.stop(cell, services, timeout_s=timeout_s)
+
+    monkeypatch.setattr(selftest.ResetGate, "stop", stop_without_checking)
+    report = run_selftest(_deps(engine, collector, tmp_path), quick=True)
+    assert _failed(report)["dvga injected: reset after success"] == (
+        "reset check not run: the runner never stopped the agent"
+    )
+
+
+def test_the_reset_gate_knows_which_started_agents_were_never_stopped() -> None:
+    gate = selftest.ResetGate(_Oracle([(0, SUCCESS)]))  # type: ignore[arg-type]
+    cell = _cell(CACHE_RESET)
+    assert gate.unchecked == frozenset()
+    gate.start_agent(cell)
+    assert gate.unchecked == {"run_x"}
+    gate.stop(cell, ["agent"], timeout_s=5)
+    assert gate.unchecked == frozenset()
+
+
 def test_a_cell_failing_before_its_agent_is_never_reset(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
@@ -994,7 +1215,9 @@ def test_a_cell_failing_before_its_agent_is_never_reset(
     assert not report.resets
     assert ("reset", report.runs[0]["run_id"]) not in backend.calls
     failed = _failed(report)
-    assert failed["dvga injected: reset after success"] == "not checked: the agent never started"
+    assert failed["dvga injected: reset after success"] == (
+        "reset check not run: the agent never started"
+    )
 
 
 class _Oracle:
@@ -1369,7 +1592,7 @@ def test_the_control_must_score_outcome_true(
     backend = SelftestBackend(done=[(0, UNSUCCESSFUL)])
     report = run_selftest(_deps(engine, collector, tmp_path, backend), quick=True)
     failed = _failed(report)
-    assert "outcome False" in failed["dvga control: oracle"]
+    assert "outcome is False, not true" in failed["dvga control: oracle"]
     assert "dvga injected: oracle" in failed
 
 

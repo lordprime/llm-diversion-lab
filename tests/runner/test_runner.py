@@ -335,6 +335,8 @@ class FakeBackend:
     #: done.sh answers of each run, in order (the last repeats); the first is the probe
     #: poll before the agent, which must answer "not yet"
     done: list[tuple[int, str]] = field(default_factory=lambda: [(0, UNSUCCESSFUL), (0, SUCCESS)])
+    #: done.sh answers for the runs of one target only (others keep ``done``)
+    done_by_target: dict[str, list[tuple[int, str]]] = field(default_factory=dict)
     agent_states: list[ContainerState] = field(
         default_factory=lambda: [ContainerState("running"), ContainerState("exited", 0)]
     )
@@ -377,7 +379,8 @@ class FakeBackend:
     def up(self, cell: CellHandle) -> None:
         self.calls.append(("up", cell.project.run_id))
         self._started = False
-        self._done = list(self.done)  # each run's oracle starts afresh
+        # each run's oracle starts afresh
+        self._done = list(self.done_by_target.get(_manifest_target(cell.project), self.done))
         self._stopped: set[str] = set()
         if self.up_error:
             raise CellError(self.up_error)
