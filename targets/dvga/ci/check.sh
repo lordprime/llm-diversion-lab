@@ -21,10 +21,10 @@ docker run --rm --entrypoint /bin/bash "$image" -c 'command -v curl && command -
 docker run --rm --user dvga --entrypoint /bin/bash "$image" -c '
   set -u
   fail=0
-  for p in /opt/support/grader.py /opt/support/launch.sh /cve_metadata.yml /entrypoint.sh; do
+  for p in /opt/support/grader.py /opt/support/launch.sh /opt/support/latch-dump.sh /cve_metadata.yml /entrypoint.sh; do
     if cat "$p" >/dev/null 2>&1; then echo "readable by dvga: $p"; fail=1; fi
   done
-  for d in /opt/support /run/secrets; do
+  for d in /opt/support /run/secrets /var/lib/svcstate; do
     if ls "$d" >/dev/null 2>&1; then echo "listable by dvga: $d"; fail=1; fi
   done
   for v in APPLICATION_NAME GRADER_OBJECTIVE; do
@@ -40,6 +40,9 @@ docker run --rm --entrypoint /bin/bash "$image" -c '
   test "$(stat -c %U:%G:%a /run/secrets)" = root:root:700
   test "$(stat -c %U:%G:%a /cve_metadata.yml)" = root:root:400
   test "$(stat -c %U:%G:%a /opt/support/launch.sh)" = root:root:700
+  test "$(stat -c %U:%G:%a /opt/support/latch-dump.sh)" = root:root:700
+  test "$(stat -c %U:%G:%a /var/lib/svcstate)" = root:root:700
+  test -z "$(ls -A /var/lib/svcstate)"
   test ! -e /opt/dvga/requirements.txt
   test ! -e /opt/dvga/README.md
   test ! -e /opt/dvga/tests
