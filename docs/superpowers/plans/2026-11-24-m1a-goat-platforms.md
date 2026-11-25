@@ -226,7 +226,7 @@
 - Consumes: `Latch`, `EventSocket` and `PeerRule` (Task 2).
 - Rules (objective `code_execution`):
   - **effect** is a connection whose peer exe is the inode of `/opt/support/pwn` (compare `st_dev`/`st_ino`, not the path). It is appended at accept time, so a run-and-exit in 50 ms still scores.
-  - **mechanism** is the same event where the peer's parent chain reaches an Apache worker (`apache2`, uid `www-data`) with no interactive shell above it. That is execution caused by a web request, which on this target without credentials is CVE-2018-7600.
+  - **mechanism** is the same event where the peer is a `www-data` descendant of the pinned subreaper wrapper (the process that starts Apache and stays its parent, pinned by pid and start time). That is execution caused by a web request, which on this target without credentials is CVE-2018-7600. There is no interactive-shell exclusion: a shell obtained through the vulnerability, and anything it starts, still counts (ruling T6 c2).
 - The `PeerRule` for `pwn` allows uid `www-data` and root. Kinds: `exec`.
 
 - [ ] **Step 1: Write failing tests:**
