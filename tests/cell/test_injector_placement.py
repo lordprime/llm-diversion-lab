@@ -9,6 +9,9 @@ from __future__ import annotations
 import gzip
 import json
 import re
+import subprocess
+import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -20,6 +23,7 @@ from cell.injector.placement import (
     MAX_NOTICE_BYTES,
     PROTECTED_HEADERS,
     SCANNER_PROBE,
+    SCANNER_PROBE_TAGS,
     SURFACE_LOCATORS,
     ActionKind,
     Plant,
@@ -208,9 +212,36 @@ def test_offset_fraction_snaps_to_tag_boundary() -> None:
         wire, offset, ok = plant_into_body(HTML, None, payload, fraction=fraction)
         assert ok is True
         target = int(len(HTML) * fraction)
-        expected = next((e for e in ends if e > target), close)  # first tag end after target
+        expected = next((e for e in ends if e >= target), close)  # first tag end at or after it
         assert offset == expected
         assert wire == _at(HTML, offset, payload)
+
+
+def test_a_tag_end_exactly_at_the_target_is_used() -> None:
+    """The rule is inclusive: a boundary that sits right on floor(len * fraction) counts."""
+    page = b"<html><body><p>one</p><p>two</p><p>three</p></body></html>"
+    for end in [e for e in _tag_ends(page) if e > page.index(b"<body>")][:-2]:
+        for fraction in (end / len(page), (end + 0.5) / len(page)):
+            if int(len(page) * fraction) != end:
+                continue  # a float that rounds below the boundary says nothing here
+            assert _boundary_offsets(page, [fraction]) == [end]
+    # one byte past a boundary moves on to the next one
+    first = page.index(b"<p>") + len(b"<p>")
+    second = page.index(b"</p>") + len(b"</p>")
+    assert _boundary_offsets(page, [(first + 1.5) / len(page)]) == [second]
+
+
+@pytest.mark.parametrize("fraction", [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+def test_the_inclusive_rule_on_a_hundred_byte_page(fraction: float) -> None:
+    """On a 100-byte page every tenth is an exact byte, and some of them are tag ends."""
+    page = b"<html><body>" + b"<i>x</i>" * 9 + b"..</body></html>"
+    assert len(page) == 100  # tag ends at 20 and 60 sit exactly on a tenth
+    target = int(100 * fraction)
+    ends = [e for e in _tag_ends(page) if len(b"<html><body>") <= e <= page.index(b"</body>")]
+    expected = next((e for e in ends if e >= target), page.index(b"</body>"))
+    assert _boundary_offsets(page, [fraction]) == [expected]
+    if target in ends:
+        assert expected == target
 
 
 def test_fraction_zero_goes_after_the_body_start_tag_not_into_the_head() -> None:
@@ -227,7 +258,7 @@ def test_fraction_one_or_no_boundary_after_it_goes_before_body_close() -> None:
 
 def test_boundary_inside_the_closing_body_tag_is_not_used() -> None:
     page = b"<html><body>text</body></html>"
-    # the first '>' after the target is the one that ends </body>: that is past the limit
+    # the first '>' at or after the target is the one that ends </body>: past the limit
     assert plant_into_body(page, None, b"X", fraction=0.6)[1] == page.index(b"</body>")
 
 
@@ -613,7 +644,7 @@ def test_offsets_count_bytes_not_characters_in_a_non_ascii_page() -> None:
     wire, offset, ok = plant_into_body(page, None, b"X", fraction=0.4)
     assert ok is True and wire == _at(page, offset, b"X")
     assert page[offset - 1 : offset] == b">"
-    assert offset == page.index(b"</p>") + len(b"</p>")  # the first tag end after 40% of the bytes
+    assert offset == page.index(b"</p>") + len(b"</p>")  # the first tag end at or after 40%
     assert plant_into_body(page, None, b"X", fraction=1.0)[1] == page.index(b"</body>")
 
 
@@ -624,7 +655,7 @@ def test_multi_line_pages_map_their_positions_to_bytes() -> None:
     for fraction in (0.0, 0.3, 0.5, 0.7, 1.0):
         offset = plant_into_body(page, None, b"X", fraction=fraction)[1]
         target = int(len(page) * fraction)
-        assert offset == next((e for e in ends if e > target), page.index(b"</body>"))
+        assert offset == next((e for e in ends if e >= target), page.index(b"</body>"))
 
 
 @pytest.mark.parametrize(
@@ -675,7 +706,7 @@ def _expected_end(page: bytes, fraction: float) -> int:
         return close if close >= 0 else inside[-1]
     limit = close if close >= low else inside[-1]  # no real </body>: the last tag end
     target = int(len(page) * fraction)
-    return next((e for e in inside if target < e <= limit), limit)
+    return next((e for e in inside if target <= e <= limit), limit)
 
 
 @pytest.mark.parametrize("page", AMPERSAND_PAGES)
@@ -752,7 +783,92 @@ def _tags(page: bytes) -> list[tuple[str, bool]]:
 def test_the_scanner_probe_page_reads_as_expected() -> None:
     """The cell image build runs this same check, so a drift fails there too."""
     check_scanner()
-    assert SCANNER_PROBE.startswith(b"<html>")
+    assert tuple(_TagScanner(SCANNER_PROBE).tags) == SCANNER_PROBE_TAGS
+    for start, end, name, is_end in SCANNER_PROBE_TAGS:  # each entry is a whole tag
+        tag = SCANNER_PROBE[start:end].lower()
+        assert tag.startswith(b"</" + name.encode() if is_end else b"<" + name.encode())
+        assert tag.endswith(b">")
+    # the probe holds every construct the check is meant to guard
+    for construct in (b"<!-->", b"--!>", b"<noscript>", b'"a>b"', b"<![CDATA[", b"<template>"):
+        assert construct in SCANNER_PROBE
+
+
+def _mutate_cdata(scanner: type[_TagScanner], monkeypatch: pytest.MonkeyPatch) -> None:
+    real = scanner._next_tag
+
+    def next_tag(self: _TagScanner, i: int, *, cdata: bool = False) -> Any:
+        return real(self, i, cdata=False)
+
+    monkeypatch.setattr(scanner, "_next_tag", next_tag)
+
+
+def _mutate_quotes(scanner: type[_TagScanner], monkeypatch: pytest.MonkeyPatch) -> None:
+    def tag_end(self: _TagScanner, j: int) -> tuple[int, bool]:
+        k = self._text.find(">", j)
+        return (-1, False) if k < 0 else (k + 1, self._text[k - 1] == "/")
+
+    monkeypatch.setattr(scanner, "_tag_end", tag_end)
+
+
+def _mutate_foreign(scanner: type[_TagScanner], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(scanner, "_foreign_end", lambda self, start, root: start)
+
+
+def _mutate_template(scanner: type[_TagScanner], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(scanner, "_INERT", frozenset())
+
+
+def _mutate_script(scanner: type[_TagScanner], monkeypatch: pytest.MonkeyPatch) -> None:
+    def script_end(self: _TagScanner, start: int) -> Any:
+        return self._raw_end("script", start)
+
+    monkeypatch.setattr(scanner, "_script_end", script_end)
+
+
+SCANNER_MUTATIONS = {
+    "comment ends only at -->": lambda s, m: m.setattr(s, "_COMMENT_END", re.compile(r"-->")),
+    "noscript is not raw text": lambda s, m: m.setattr(s, "_RAWTEXT", s._RAWTEXT - {"noscript"}),
+    "style is not raw text": lambda s, m: m.setattr(s, "_RAWTEXT", s._RAWTEXT - {"style"}),
+    "a quoted > ends a tag": _mutate_quotes,
+    "no CDATA in foreign content": _mutate_cdata,
+    "svg is normal content": _mutate_foreign,
+    "template is normal content": _mutate_template,
+    "a script ends at its first </script>": _mutate_script,
+}
+
+
+@pytest.mark.parametrize("name", sorted(SCANNER_MUTATIONS))
+def test_check_scanner_catches_a_broken_scanner(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    SCANNER_MUTATIONS[name](_TagScanner, monkeypatch)
+    with pytest.raises(RuntimeError, match="misreads its probe page"):
+        check_scanner()
+
+
+DOCKERFILE = Path(__file__).resolve().parents[2] / "cell" / "Dockerfile"
+CHECK_COMMAND = 'python -c "from cell.injector.placement import check_scanner; check_scanner()"'
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_a_broken_scanner_fails_the_cell_image_build(mutated: bool) -> None:
+    """The image's RUN step chains the check with '&&', so its exit status decides the build."""
+    run = DOCKERFILE.read_text()
+    assert f"&& {CHECK_COMMAND} \\" in run
+    code = CHECK_COMMAND.removeprefix('python -c "').removesuffix('"')
+    patch = (
+        "import re, cell.injector.placement as p; p._TagScanner._COMMENT_END = re.compile('-->'); "
+        if mutated
+        else ""
+    )
+    result = subprocess.run(  # noqa: S603 - fixed argv
+        [sys.executable, "-c", patch + code],
+        cwd=DOCKERFILE.parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (result.returncode != 0) is mutated, result.stderr
+    if mutated:
+        assert "misreads its probe page" in result.stderr
 
 
 def test_the_scanner_reads_the_basics() -> None:
@@ -836,6 +952,146 @@ def test_a_comment_hiding_a_script_start_is_not_a_script() -> None:
     assert ("p", False) in _tags(page) and ("body", True) in _tags(page)
 
 
+# ------------------------------------------------------------------------ foreign and inert
+
+# Each page hides "IN" in a construct whose text never renders as normal content. The
+# span runs from the "<" of the construct's start tag to the end of its matching end tag.
+HIDDEN_PROBES = {
+    # the round-3 review probes: CDATA and comments are real inside svg and math
+    "svg-cdata": b"<svg><![CDATA[ a > b <p>IN</p> ]]><rect/></svg>",
+    "math-cdata": b"<math><mi><![CDATA[ x > y <b>IN</b> ]]></mi></math>",
+    "svg-style-comment": b"<svg><style><!--</style><p>IN</p>--></style></svg>",
+    "svg-title-comment": b"<svg><title><!--</title><p>IN</p>--></title></svg>",
+    "svg-script-comment": b"<svg><script><!--</script><p>IN</p>--></script></svg>",
+    "svg-plain": b"<svg viewBox='0 0 1 1'><g><path d='M0 0'/><circle r=1></circle></g></svg>",
+    "svg-title-text": b"<svg><title>IN icon</title><path d='M1'/></svg>",
+    "svg-in-svg": b"<svg><svg><g>IN</g></svg><rect/><text>IN</text></svg>",
+    "svg-mixed-case": b"<SVG><RECT/><Text>IN</Text></sVg>",
+    "math-nested": b"<math><mrow><mi>x</mi><mo>+</mo><math><mn>IN</mn></math></mrow></math>",
+    "svg-comment-hides-end": b"<svg><!-- </svg><p>IN</p> --><g/></svg>",
+    "svg-quoted-end": b"<svg><g data-x='</svg>'>IN</g></svg>",
+    # template and select hold text that does not render as normal content
+    "template": b"<template><p>IN</p><p>IN2</p></template>",
+    "template-nested": b"<template><template><p>IN</p></template><p>IN</p></template>",
+    "template-svg": b"<template><svg><g>IN</g></svg><p>IN</p></template>",
+    "select": b"<select name=s><option>a</option><option>IN</option></select>",
+    "select-script": b"<select><option>a</option><script>x='</select><p>IN</p>'</script></select>",
+}
+
+
+def _hidden_span(page: bytes, probe: bytes) -> tuple[int, int]:
+    start = page.index(probe)
+    return start, start + len(probe)
+
+
+@pytest.mark.parametrize("name", sorted(HIDDEN_PROBES))
+def test_foreign_content_and_inert_containers_hold_no_boundary(name: str) -> None:
+    probe = HIDDEN_PROBES[name]
+    page = b"<html><body><p>a</p>" + probe + b"<p>b</p><p>c</p></body></html>"
+    start, end = _hidden_span(page, probe)
+    for tenth in range(11):
+        offset = plant_into_body(page, None, b"X", fraction=tenth / 10)[1]
+        assert not start < offset <= end, (name, tenth, page[:offset])
+    ends = [t[1] for t in _TagScanner(page).tags]
+    assert not any(start < e <= end for e in ends), (name, ends)
+    # what follows the construct is normal content again
+    assert page.index(b"<p>b</p>") + len(b"<p>") in ends
+    assert page.index(b"</body>") in {t[0] for t in _TagScanner(page).tags}
+
+
+def test_the_review_svg_cdata_page_is_planted_after_the_svg() -> None:
+    page = (
+        b"<html><body><p>a</p><svg><![CDATA[ a > b <p>IN</p> ]]><rect/></svg><p>b</p></body></html>"
+    )
+    after = page.index(b"<p>b</p>") + len(b"<p>")
+    for fraction in (0.3, 0.5):
+        assert plant_into_body(page, None, b"X", fraction=fraction)[1] == after
+    page = b"<html><body><p>a</p><math><mi><![CDATA[ x > y <b>IN</b> ]]>"
+    before_math = len(b"<html><body><p>a</p>")
+    for fraction in (0.3, 0.5, 1.0):
+        assert plant_into_body(page, None, b"X", fraction=fraction)[1] == before_math
+
+
+@pytest.mark.parametrize("probe", [b"<svg/>", b"<math/>", b"<SVG />", b"<svg a='1'/>"])
+def test_a_self_closing_svg_or_math_hides_nothing_after_it(probe: bytes) -> None:
+    page = b"<html><body><p>a</p>" + probe + b"<p>b</p></body></html>"
+    start, end = _hidden_span(page, probe)
+    ends = [t[1] for t in _TagScanner(page).tags]
+    assert not any(start < e <= end for e in ends)
+    assert end + len(b"<p>") in ends  # the next tag is normal content
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        b"<svg a=b/><p>IN</p>",  # the slash belongs to the value: not self-closing
+        b"<svg / ><p>IN</p>",  # a slash then a space: not self-closing
+    ],
+)
+def test_a_slash_that_is_not_a_self_closing_flag_opens_the_svg(probe: bytes) -> None:
+    page = b"<html><body><p>a</p>" + probe + b"</body></html>"
+    svg = page.index(b"<svg")
+    ends = [t[1] for t in _TagScanner(page).tags]
+    assert all(e <= svg for e in ends)  # the svg never closes: the rest is swallowed
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        b"<svg><g>",  # never closed
+        b"<math><mi>x",
+        b"<svg><![CDATA[ never closed </svg>",
+        b"<svg><!-- never closed </svg>",
+        b"<template><p>x</p>",
+        b"<select><option>x",
+        # a browser leaves foreign content here; we do not follow it and stop instead
+        b"<svg><p>x</p></svg>",
+        b"<svg><g></p></g></svg>",
+        b"<svg><font color=red>x</font></svg>",
+        b"<svg><foreignObject><div>x</div></foreignObject></svg>",
+        b"<svg><title><style></title><p>x</p></style></title></svg>",
+        b"<math><mi><b>x</b></mi></math>",
+        b"<math><annotation-xml encoding='text/html'><p>x</p></annotation-xml></math>",
+        b"<div><svg><g></div><style></svg><p>x</p></style>",  # </div> closes the svg
+        b"<template><svg><g></template><p>x</p>",
+        # a select holds what old and new parsers read differently: stop
+        b"<select><style></select><p>x</p></style></select>",
+        b"<select><textarea></select><p>x</p></textarea>",
+        b"<select><svg></select><p>x</p></svg>",
+        b"<select><table></select><p>x</p>",
+        b"<select><template></select><p>x</p></template>",
+        b"<select><select></select><p>x</p>",
+    ],
+)
+def test_constructs_we_cannot_follow_swallow_the_rest_of_the_page(probe: bytes) -> None:
+    page = b"<html><body><p>a</p>" + probe + b"<p>b</p><p>c</p></body></html>"
+    found = re.search(rb"<(svg|math|template|select)", page)
+    assert found is not None
+    start = found.start()  # nothing after the construct opens may count
+    ends = [t[1] for t in _TagScanner(page).tags]
+    assert all(e <= start for e in ends), (probe, ends)
+    for tenth in range(11):
+        wire, offset, ok = plant_into_body(page, None, b"X", fraction=tenth / 10)
+        assert ok is True and offset <= start
+        assert wire == _at(page, offset, b"X")
+
+
+def test_a_page_that_is_all_svg_has_no_safe_place() -> None:
+    for page in (b"<svg><g><p>x</p></g>", b"<svg><rect/></svg>", b"<template><p>x</p></template>"):
+        assert _boundary_offsets(page, [0.5]) is None
+        assert plant_into_body(page, None, b"X", fraction=0.5) == (page, -1, False)
+
+
+def test_a_body_tag_inside_a_template_is_not_the_real_body() -> None:
+    page = (
+        b"<html><head><template><body><p>t</p></body></template></head>"
+        b"<body><p>a</p><p>b</p></body></html>"
+    )
+    real = page.index(b"<body><p>a") + len(b"<body>")
+    assert plant_into_body(page, None, b"X", fraction=0.0)[1] == real
+    assert plant_into_body(page, None, b"X", fraction=1.0)[1] == page.rindex(b"</body>")
+
+
 # --------------------------------------------------------------------------- property test
 
 _TEXT = st.sampled_from(
@@ -869,6 +1125,7 @@ _SCRIPT_CONTENT = st.sampled_from(
 _RAW_CONTENT = st.sampled_from(
     [b"a > b", b"<p>", b"if (x) { y = '<b>' }", b"&#D;", b"<!-- not a comment ->", b"x;"]
 )
+_HIDDEN = st.sampled_from([*HIDDEN_PROBES.values(), b"<svg/>", b"<math/>"])
 
 
 @st.composite
@@ -877,7 +1134,7 @@ def _documents(draw: Any) -> tuple[bytes, list[int]]:
     page = b"<html><body>"
     ends = [len(page)]  # the body start tag's own end
     for _ in range(draw(st.integers(0, 14))):
-        kind = draw(st.sampled_from(["text", "tag", "tag", "comment", "raw", "script"]))
+        kind = draw(st.sampled_from(["text", "tag", "tag", "comment", "raw", "script", "hidden"]))
         if kind == "text":
             page += draw(_TEXT)
         elif kind == "tag":
@@ -885,6 +1142,8 @@ def _documents(draw: Any) -> tuple[bytes, list[int]]:
             ends.append(len(page))
         elif kind == "comment":
             page += draw(_COMMENT)
+        elif kind == "hidden":
+            page += draw(_HIDDEN)  # svg, math, template or select: no tag end counts
         elif kind == "script":
             page += b"<script>" + draw(_SCRIPT_CONTENT) + b"</script>"
             ends.append(len(page))  # only the end of the closing tag is in normal content
@@ -897,7 +1156,7 @@ def _documents(draw: Any) -> tuple[bytes, list[int]]:
 
 @settings(max_examples=600, deadline=None)
 @given(doc=_documents(), fractions=st.lists(st.floats(0, 1), min_size=1, max_size=6))
-def test_every_boundary_is_the_first_tag_end_after_the_target(
+def test_every_boundary_is_the_first_tag_end_at_or_after_the_target(
     doc: tuple[bytes, list[int]], fractions: list[float]
 ) -> None:
     page, ends = doc
@@ -906,7 +1165,7 @@ def test_every_boundary_is_the_first_tag_end_after_the_target(
     assert offsets is not None
     for fraction, offset in zip(fractions, offsets, strict=True):
         target = int(len(page) * fraction)
-        expected = next((e for e in ends if target < e <= close), close)
+        expected = next((e for e in ends if target <= e <= close), close)
         assert offset == expected, (fraction, page[:offset], page[offset:])
     # and the scanner records exactly the construction's tag ends, nothing hidden or extra
     recorded = [t[1] for t in _TagScanner(page).tags]

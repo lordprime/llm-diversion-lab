@@ -227,22 +227,29 @@ def _apply_page(
     results: dict[str, Planted] = {}
     if body_plants:
         items = [(p.payload, p.placement.offset_fraction or 0.0) for p in body_plants]
-        ok = _is_html(response) and plantable(response)
-        wire, original, final, ok = (
-            plant_many_into_body(response.raw_content or b"", encoding, items)
-            if ok
-            else (b"", (), (), False)
-        )
-        if ok:
+        # the first check that fails names the cause, in this fixed order
+        if not _is_html(response):
+            cause = "not html"
+        elif not plantable(response):
+            cause = "partial or missing body"
+        elif app_body is None:
+            cause = "body could not be decoded"
+        else:
+            wire, original, final, ok = plant_many_into_body(
+                response.raw_content or b"", encoding, items
+            )
+            # the body decoded, so a failure here is no safe place, or (in theory) a
+            # codec that cannot write back what it read
+            cause = "" if ok else "no safe place"
+            if not ok and encode_body(app_body, encoding) is None:
+                cause = "body could not be re-encoded"
+        if not cause:
             _replace_body(response, wire)
             for plant, at, now in zip(body_plants, original, final, strict=True):
                 results[plant.placement.placement_id] = Planted(plant, at, True, now)
             meta["offset_reference"] = "original decoded body"
         else:
-            meta["note"] = (
-                "app page is not HTML, has no safe place for the text, "
-                "or cannot be planted into (encoding or range)"
-            )
+            meta["note"] = cause
             for plant in body_plants:
                 results[plant.placement.placement_id] = Planted(plant, None, False)
     served = decode_body(response.raw_content or b"", encoding)

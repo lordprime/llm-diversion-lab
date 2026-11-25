@@ -191,7 +191,7 @@ def test_page_that_is_not_html_is_not_planted(tmp_path: Path) -> None:
     assert (resp.raw_content, resp.headers.fields) == (raw, fields)
     _a, serve = _events(tmp_path)
     assert serve.insert_ok is False and serve.byte_offset is None and serve.offset_fraction is None
-    assert "not HTML" in _meta(tmp_path)["note"]
+    assert _meta(tmp_path)["note"] == "not html"
 
 
 def test_xhtml_counts_as_html(tmp_path: Path) -> None:
@@ -223,6 +223,7 @@ def test_undecodable_bodies_are_left_exactly_as_they_were(tmp_path: Path, encodi
     assert (resp.raw_content, resp.headers.fields) == (raw, fields)
     _a, serve = _events(tmp_path)
     assert serve.insert_ok is False
+    assert _meta(tmp_path)["note"] == "body could not be decoded"
 
 
 def test_range_responses_are_not_planted(tmp_path: Path) -> None:
@@ -232,6 +233,31 @@ def test_range_responses_are_not_planted(tmp_path: Path) -> None:
     resp = _serve(injector, _flow(PAGE), app)
     assert resp.raw_content == raw
     assert _events(tmp_path)[1].insert_ok is False
+    assert _meta(tmp_path)["note"] == "partial or missing body"
+
+
+def test_a_failed_plant_names_one_cause_checked_in_a_fixed_order(tmp_path: Path) -> None:
+    """Not html wins over a bad encoding, and a bad encoding over a page with no safe place."""
+    cases = [
+        (_page(b"<p>a</p>", content_type="text/plain", encoding=None), "not html"),
+        (_page(b"no tags at all", content_type="image/png", encoding="gzip"), "not html"),
+        (_page(b"no tags at all", encoding="gzip"), "no safe place"),
+        (_page(b"<svg><g><p>x</p></g>", encoding="br"), "no safe place"),
+        (_page(b"<template><p>x</p></template>", encoding=None), "no safe place"),
+    ]
+    for n, (app, note) in enumerate(cases):
+        if app.headers.get("content-encoding") == "br":
+            _codec("br")
+        injector = _injector_for(tmp_path / str(n), page_placement(Surface.P5))
+        raw = app.raw_content
+        resp = _serve(injector, _flow(PAGE), app)
+        assert resp.raw_content == raw
+        assert _meta(tmp_path / str(n))["note"] == note, n
+    bad = http.Response.make(200, b"\x1f\x8b broken", {"content-type": "text/html"})
+    bad.headers["content-encoding"] = "gzip"
+    injector = _injector_for(tmp_path / "bad", page_placement(Surface.P5))
+    _serve(injector, _flow(PAGE), bad)
+    assert _meta(tmp_path / "bad")["note"] == "body could not be decoded"
 
 
 def test_etag_and_digests_follow_a_planted_body(tmp_path: Path) -> None:
@@ -741,7 +767,7 @@ def test_a_page_with_no_safe_place_is_left_alone_and_says_why(tmp_path: Path) ->
         assert (resp.raw_content, resp.headers.fields) == (raw, fields)
         serve = _events(tmp_path / str(n))[1]
         assert serve.insert_ok is False and serve.byte_offset is None
-        assert "no safe place" in _meta(tmp_path / str(n))["note"]
+        assert _meta(tmp_path / str(n))["note"] == "no safe place"
 
 
 def test_a_page_with_an_unterminated_comment_is_planted_before_the_comment(

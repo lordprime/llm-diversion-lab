@@ -37,9 +37,10 @@ differs or that lacks the run's tag.
 * ``GET`` on a page path (P2-P6, P8): if the app answers 200, the P2-P6 texts are
   planted into its own HTML body, each wrapped by :class:`SurfaceMarkup`. Every point
   is found once, on the body as the app sent it: the end of the first start or end tag
-  after ``floor(len(body) * offset_fraction)`` between the real ``<body>`` and the
-  real last ``</body>``, found with a tokenizer (never inside a script, style, textarea,
-  title, comment, tag or attribute value), else just before ``</body>``. The texts go
+  ending at or after ``floor(len(body) * offset_fraction)`` between the real ``<body>``
+  and the real last ``</body>``, found with a tokenizer (never inside a script, style,
+  textarea, title, comment, tag, attribute value, svg, math, template or select), else
+  just before ``</body>``. The texts go
   in from the end backwards, so none lands inside another; texts that share a point keep
   the surface order P2..P6. The serve's ``byte_offset`` is the point in the app's
   ORIGINAL body (see :func:`plant_many_into_body`). A P8 text only becomes the
@@ -89,6 +90,7 @@ __all__ = [
     "ROBOTS_LOCATOR",
     "ROBOTS_PATH",
     "SCANNER_PROBE",
+    "SCANNER_PROBE_TAGS",
     "SURFACE_LOCATORS",
     "Action",
     "ActionKind",
@@ -190,13 +192,47 @@ class _TagScanner:
       opens a double-escaped section that only a later ``</script>`` followed by ``-->``
       and a final ``</script>`` can end.
     * Tag ends honour quoted attribute values, so a ``>`` inside one is not a tag end.
+    * Nothing is recorded from an ``svg`` or ``math`` start tag up to and including its
+      matching end tag (foreign content, where CDATA sections are real and ``style``,
+      ``title`` and ``script`` are not raw text), nor from ``template`` or ``select`` to
+      their matching end tag: text there never renders as normal content.
 
-    Anything unterminated (a comment, a quote, a script, a raw element) swallows the rest
-    of the page: no later boundary is recorded, which fails closed.
+    Anything unterminated (a comment, a quote, a script, a raw element, foreign content)
+    swallows the rest of the page: no later boundary is recorded, which fails closed. So
+    does foreign content or a ``select`` holding markup that only a full tree builder
+    could follow (a tag that leaves foreign content, HTML inside an integration point,
+    or anything old and new browsers read differently inside a ``select``).
     """
 
     _RAWTEXT: Final = frozenset({"style", "xmp", "iframe", "noembed", "noframes", "noscript"})
     _RCDATA: Final = frozenset({"textarea", "title"})
+    #: Roots of foreign content, each with the elements of its namespace inside which a
+    #: browser reads start tags as HTML again (integration points).
+    _FOREIGN: Final = {
+        "svg": frozenset({"foreignobject", "desc", "title"}),
+        "math": frozenset({"mi", "mo", "mn", "ms", "mtext", "annotation-xml"}),
+    }
+    #: Start tags that make a browser leave foreign content ("font" only with some
+    #: attributes, but any font is treated so here).
+    _BREAKOUT: Final = frozenset(
+        {
+            "b", "big", "blockquote", "body", "br", "center", "code", "dd", "div", "dl", "dt",
+            "em", "embed", "h1", "h2", "h3", "h4", "h5", "h6", "head", "hr", "i", "img", "li",
+            "listing", "menu", "meta", "nobr", "ol", "p", "pre", "ruby", "s", "small", "span",
+            "strong", "strike", "sub", "sup", "table", "tt", "u", "ul", "var", "font",
+        }
+    )  # fmt: skip
+    #: Elements whose content is inert until their matching end tag.
+    _INERT: Final = frozenset({"template"})
+    #: Start tags inside a ``select`` that change how the rest is read, or that old and
+    #: new parsers (before and after the 2025 select change) treat differently.
+    _SELECT_UNSAFE: Final = frozenset(
+        {
+            "plaintext", "svg", "math", "template", "select", "input", "keygen", "textarea",
+            "table", "caption", "colgroup", "col", "tbody", "thead", "tfoot", "tr", "td",
+            "th", "applet", "marquee", "object", "html",
+        }
+    )  # fmt: skip
     _SPACE: Final = "\t\n\f\r "
     _NAME_END: Final = re.compile(r"[^\t\n\f\r />]*")
     _ATTR_NAME: Final = re.compile(r"=?[^\t\n\f\r />=]*")
@@ -212,13 +248,17 @@ class _TagScanner:
         self.tags: list[tuple[int, int, str, bool]] = []
         self._scan()
 
-    def _tag_end(self, j: int) -> int:
-        """Index just after the ``>`` of the tag whose name ends at ``j``; -1 if unterminated."""
+    def _tag_end(self, j: int) -> tuple[int, bool]:
+        """``(index just after the tag's ">", self-closing)`` for the tag whose name ends at
+        ``j``; ``(-1, False)`` if unterminated. Self-closing means ``/>`` that is not the
+        end of an unquoted attribute value."""
         text, n = self._text, len(self._text)
         while j < n:
             c = text[j]
             if c == ">":
-                return j + 1
+                return j + 1, False
+            if c == "/" and text.startswith(">", j + 1):
+                return j + 2, True
             if c in self._SPACE or c == "/":
                 j += 1
                 continue
@@ -231,11 +271,64 @@ class _TagScanner:
             if quote in ('"', "'"):
                 close = text.find(quote, k + 1)
                 if close < 0:
-                    return -1
+                    return -1, False
                 j = close + 1
             else:
                 j = self._UNQUOTED.match(text, k).end()  # type: ignore[union-attr]
-        return -1
+        return -1, False
+
+    def _next_tag(self, i: int, *, cdata: bool = False) -> tuple[int, int, str, bool, bool] | None:
+        """The next start or end tag from ``i``, read in the data state.
+
+        Returns ``(start, end, name, is_end_tag, self_closing)``. Comments, doctypes and
+        bogus comments are stepped over, and so are CDATA sections when ``cdata`` is set
+        (they only exist in foreign content). ``None`` at the end of the page or at
+        anything unterminated.
+        """
+        text = self._text
+        while (i := text.find("<", i)) >= 0:
+            nxt = text[i + 1 : i + 2]
+            if nxt == "!":
+                if cdata and text.startswith("[CDATA[", i + 2):
+                    close = text.find("]]>", i + 9)
+                    if close < 0:
+                        return None
+                    i = close + 3
+                elif text.startswith("<!--", i):
+                    if text.startswith(">", i + 4):
+                        i += 5
+                    elif text.startswith("->", i + 4):
+                        i += 6
+                    else:
+                        found = self._COMMENT_END.search(text, i + 4)
+                        if found is None:
+                            return None
+                        i = found.end()
+                else:  # a doctype or a bogus comment, up to the next ">"
+                    close = text.find(">", i + 2)
+                    if close < 0:
+                        return None
+                    i = close + 1
+            elif nxt == "?" or (nxt == "/" and not self._letter(i + 2)):
+                # "<?..>" and junk end tags are bogus comments; "</>" is dropped
+                close = text.find(">", i + 2)
+                if close < 0:
+                    return None
+                i = close + 1
+            elif nxt == "/" or self._letter(i + 1):
+                first = i + 2 if nxt == "/" else i + 1
+                name_end = self._NAME_END.match(text, first).end()  # type: ignore[union-attr]
+                end, closing = self._tag_end(name_end)
+                if end < 0:
+                    return None
+                return i, end, text[first:name_end].lower(), nxt == "/", closing
+            else:
+                i += 1
+        return None
+
+    def _letter(self, j: int) -> bool:
+        c = self._text[j : j + 1]
+        return c.isascii() and c.isalpha()
 
     def _raw_end(self, name: str, start: int) -> tuple[int, int] | None:
         """``(start, end)`` of the end tag that closes raw text from ``start``; ``None`` if none."""
@@ -243,7 +336,7 @@ class _TagScanner:
         found = pattern.search(self._text, start)
         if found is None:
             return None
-        end = self._tag_end(found.end())
+        end = self._tag_end(found.end())[0]
         return None if end < 0 else (found.start(), end)
 
     def _script_end(self, start: int) -> tuple[int, int] | None:
@@ -267,102 +360,132 @@ class _TagScanner:
             elif state == "double":  # "</script" inside a double-escaped section
                 state = "escaped"
             else:
-                end = self._tag_end(m.end())
+                end = self._tag_end(m.end())[0]
                 return None if end < 0 else (m.start(), end)
         return None
 
+    def _foreign_end(self, start: int, root: str) -> int | None:
+        """Index just after the end tag that closes the ``svg`` or ``math`` opened before
+        ``start``; ``None`` if nothing does.
+
+        Open elements are tracked as a browser does in foreign content: an end tag closes
+        the nearest open element of its name (and everything inside it), a self-closing
+        start tag opens nothing. ``None`` too where a browser would leave foreign content
+        (a breakout tag, ``</p>``, ``</br>``, an end tag with no open element of its name,
+        or a start tag inside an integration point), since only a full tree builder could
+        say where normal content resumes.
+        """
+        points = self._FOREIGN[root]
+        open_ = [root]
+        i = start
+        while (tag := self._next_tag(i, cdata=True)) is not None:
+            _start, end, name, is_end, closing = tag
+            i = end
+            if is_end:
+                if name in ("p", "br") or name not in open_:
+                    return None
+                del open_[len(open_) - 1 - open_[::-1].index(name) :]
+                if not open_:
+                    return end
+            elif open_[-1] in points or name in self._BREAKOUT:
+                return None
+            elif not closing:
+                open_.append(name)
+        return None
+
+    def _select_end(self, start: int) -> int | None:
+        """Index just after the ``</select>`` that closes the select opened before ``start``;
+        ``None`` if nothing does or the select holds a tag in :attr:`_SELECT_UNSAFE`."""
+        i = start
+        while (tag := self._next_tag(i)) is not None:
+            _start, end, name, is_end, _closing = tag
+            i = end
+            if is_end:
+                if name == "select":
+                    return end
+                if name in self._INERT:
+                    return None
+            elif name == "script":
+                closing = self._script_end(end)
+                if closing is None:
+                    return None
+                i = closing[1]
+            elif name in self._SELECT_UNSAFE or name in self._RAWTEXT or name in self._RCDATA:
+                return None
+        return None
+
     def _scan(self) -> None:
-        text, i = self._text, 0
-        while (i := text.find("<", i)) >= 0:
-            nxt = text[i + 1 : i + 2]
-            if nxt == "!":
-                if text.startswith("<!--", i):
-                    if text.startswith(">", i + 4):
-                        i += 5
-                    elif text.startswith("->", i + 4):
-                        i += 6
-                    else:
-                        found = self._COMMENT_END.search(text, i + 4)
-                        if found is None:
-                            return
-                        i = found.end()
-                else:  # a doctype or a bogus comment, up to the next ">"
-                    close = text.find(">", i + 2)
-                    if close < 0:
-                        return
-                    i = close + 1
-            elif nxt == "?":
-                close = text.find(">", i + 2)
-                if close < 0:
+        i, inert = 0, 0  # inert: how many templates are open
+        while (tag := self._next_tag(i)) is not None:
+            start, end, name, is_end, closing = tag
+            i = end
+            if is_end:
+                if name in self._INERT and inert:
+                    inert -= 1
+                elif not inert:
+                    self.tags.append((start, end, name, True))
+                continue
+            if name == "plaintext":
+                return
+            if name in self._FOREIGN or name == "select":
+                if closing and name != "select":  # "<svg/>" holds nothing
+                    continue
+                after = self._select_end(end) if name == "select" else self._foreign_end(end, name)
+                if after is None:
                     return
-                i = close + 1
-            elif nxt == "/":
-                after = text[i + 2 : i + 3]
-                if after.isascii() and after.isalpha():
-                    name_end = self._NAME_END.match(text, i + 2).end()  # type: ignore[union-attr]
-                    end = self._tag_end(name_end)
-                    if end < 0:
-                        return
-                    self.tags.append((i, end, text[i + 2 : name_end].lower(), True))
-                    i = end
-                else:  # "</>" is ignored; anything else is a bogus comment
-                    close = text.find(">", i + 2)
-                    if close < 0:
-                        return
-                    i = close + 1
-            elif nxt.isascii() and nxt.isalpha():
-                name_end = self._NAME_END.match(text, i + 1).end()  # type: ignore[union-attr]
-                name = text[i + 1 : name_end].lower()
-                end = self._tag_end(name_end)
-                if end < 0:
+                i = after
+            elif name in self._INERT:
+                inert += 1
+            elif name == "script" or name in self._RAWTEXT or name in self._RCDATA:
+                raw = self._script_end(end) if name == "script" else self._raw_end(name, end)
+                if raw is None:
                     return
-                if name == "plaintext":
-                    return
-                if name == "script" or name in self._RAWTEXT or name in self._RCDATA:
-                    closing = (
-                        self._script_end(end) if name == "script" else self._raw_end(name, end)
-                    )
-                    if closing is None:
-                        return
-                    self.tags.append((closing[0], closing[1], name, True))
-                    i = closing[1]
-                else:
-                    self.tags.append((i, end, name, False))
-                    i = end
-            else:
-                i += 1
+                if not inert:
+                    self.tags.append((raw[0], raw[1], name, True))
+                i = raw[1]
+            elif not inert:
+                self.tags.append((start, end, name, False))
 
 
-#: A page whose tag ends are known, for :func:`check_scanner`: an abrupt comment, a quoted
-#: ``>``, a bad character reference, a double-escaped script and a style holding ``>``.
+#: A page whose tag ends are known, for :func:`check_scanner`: an abrupt comment, a
+#: quoted ``>``, a bad character reference, a ``--!>`` comment end, a noscript holding
+#: ``<!--``, a double-escaped script, a style holding ``>``, an svg with a CDATA section
+#: and a template.
 SCANNER_PROBE: Final = (
-    b'<html><body><!--> x --><p class="a>b">R&#D</p><script><!--\n'
+    b'<html><body><!--> x --><p class="a>b">R&#D</p><!-- <i> --!><b>q</b>'
+    b"<noscript><!--</noscript><i>n</i><script><!--\n"
     b'document.write("<script></script>");\n//--></script><style>a>b{}</style>'
+    b"<svg><![CDATA[ <p>c</p> ]]><rect/></svg><template><p>t</p></template>"
     b"<p>z</p></body></html>"
 )
+#: Every ``(start, end, tag, is_end_tag)`` the scanner must record on :data:`SCANNER_PROBE`.
 SCANNER_PROBE_TAGS: Final = (
-    ("html", False),
-    ("body", False),
-    ("p", False),
-    ("p", True),
-    ("script", True),
-    ("style", True),
-    ("p", False),
-    ("p", True),
-    ("body", True),
-    ("html", True),
+    (0, 6, "html", False),
+    (6, 12, "body", False),
+    (23, 38, "p", False),
+    (42, 46, "p", True),
+    (59, 62, "b", False),
+    (63, 67, "b", True),
+    (81, 92, "noscript", True),
+    (92, 95, "i", False),
+    (96, 100, "i", True),
+    (155, 164, "script", True),
+    (176, 184, "style", True),
+    (253, 256, "p", False),
+    (257, 261, "p", True),
+    (261, 268, "body", True),
+    (268, 275, "html", True),
 )
 
 
 def check_scanner() -> None:
-    """Raise ``RuntimeError`` unless the scanner reads :data:`SCANNER_PROBE` as expected.
+    """Raise ``RuntimeError`` unless the scanner reads :data:`SCANNER_PROBE` exactly.
 
-    Run by the cell image build and by the tests, so a change of behaviour fails loudly.
+    Every recorded tag must match :data:`SCANNER_PROBE_TAGS` to the byte. Run by the
+    cell image build and by the tests, so a change of behaviour fails loudly.
     """
-    tags = _TagScanner(SCANNER_PROBE).tags
-    if tuple((t[2], t[3]) for t in tags) != SCANNER_PROBE_TAGS or any(
-        not SCANNER_PROBE[: t[1]].endswith(b">") for t in tags
-    ):
+    tags = tuple(_TagScanner(SCANNER_PROBE).tags)
+    if tags != SCANNER_PROBE_TAGS:
         raise RuntimeError(f"the tag scanner misreads its probe page: {tags}")
 
 
@@ -370,14 +493,15 @@ def _boundary_offsets(decoded: bytes, fractions: Sequence[float]) -> list[int] |
     """Where in ``decoded`` the in-page text for each relative fraction goes.
 
     The page is tokenised once (:class:`_TagScanner`). The point is the end of the
-    first start or end tag that lies after ``floor(len(decoded) * fraction)``, between
-    the real ``<body>`` start tag (its own end counts) and the real last ``</body>``.
+    first start or end tag whose end is at or after ``floor(len(decoded) * fraction)``
+    (inclusive: a tag ending exactly there is used), between the real ``<body>`` start
+    tag (its own end counts) and the real last ``</body>``.
     If there is none, just before that ``</body>``. With no real ``</body>`` (an
     unclosed script, comment, plaintext or quote swallowed it) the point is the end of
     the last tag in normal content, which always lies before the swallowing construct.
     ``None`` if the page has no tag in normal content at all: there is no safe place.
     Positions are in ``decoded``; nothing is ever inserted inside a raw-text element,
-    comment, tag or attribute value.
+    comment, tag, attribute value, foreign content (svg, math), template or select.
     """
     tags = _TagScanner(decoded).tags
     opened = next((t for t in tags if t[2] == "body" and not t[3]), None)
@@ -395,7 +519,7 @@ def _boundary_offsets(decoded: bytes, fractions: Sequence[float]) -> list[int] |
     out: list[int] = []
     for fraction in fractions:
         target = int(len(decoded) * fraction)
-        out.append(next((end for end in inside if end > target and end <= close), close))
+        out.append(next((end for end in inside if target <= end <= close), close))
     return out
 
 
