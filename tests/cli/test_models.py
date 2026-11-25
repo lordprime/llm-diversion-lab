@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from control.cli import main as labctl
+from control.cli import models as models_module
 from control.cli.models import ModelsError, OllamaAdmin, OllamaService
 from control.runner.compose_backend import CommandResult
 
@@ -27,6 +28,11 @@ TAGS_BODY = {
         {"name": "llama3.1:8b", "digest": "sha256:" + "b" * 64, "size": 4_900_000_000},
     ]
 }
+
+
+@pytest.fixture(autouse=True)
+def _lock_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(models_module, "DEFAULT_LOCK_PATH", tmp_path / "run" / "models.lock")
 
 
 def _http(body: str, status: str = "200 OK") -> bytes:
@@ -311,17 +317,118 @@ def test_the_uplink_is_created_without_container_to_container_traffic() -> None:
     assert "lab.role=ollama-uplink" in create
 
 
-def test_a_leftover_network_with_the_wrong_label_or_strangers_is_refused() -> None:
-    for uplink in (
-        {"Labels": {}, "Containers": {}},
-        {"Labels": {"lab.role": "ollama-uplink"}, "Containers": {"f" * 64: {}}},
-    ):
-        docker = FakeDocker()
-        docker.fail["network create"] = CommandResult(("d",), 1, b"", b"already exists")
-        docker.uplink = uplink
-        with pytest.raises(ModelsError, match="not the Ollama uplink"):
-            _admin(docker).pull("qwen3:32b")
-        assert not any(c[1:3] == ["network", "connect"] for c in docker.calls)
+@pytest.mark.parametrize(
+    ("uplink", "message"),
+    [
+        ({"Labels": {}, "Containers": {}}, "not the Ollama uplink"),
+        ({"Labels": {"lab.role": "ollama-uplink"}, "Containers": {"f" * 64: {}}}, "already has"),
+        ({"Labels": {"lab.role": "ollama-uplink"}, "Containers": {CID: {}}}, "already has"),
+    ],
+)
+def test_an_uplink_that_is_not_ours_to_touch_is_refused_and_left_alone(
+    uplink: dict[str, Any], message: str
+) -> None:
+    docker = FakeDocker()
+    docker.fail["network create"] = CommandResult(("d",), 1, b"", b"already exists")
+    docker.uplink = uplink
+    with pytest.raises(ModelsError, match=message) as info:
+        _admin(docker).pull("qwen3:32b")
+    assert "docker network rm" in str(info.value)  # the exact commands to clear it
+    assert not any(
+        c[1:3] in (["network", "connect"], ["network", "disconnect"]) for c in docker.calls
+    )
+    assert not any(c[1:3] == ["network", "rm"] for c in docker.calls)
+
+
+def test_two_operations_cannot_overlap() -> None:
+    docker = FakeDocker()
+    inner: list[str] = []
+
+    def stream(argv: Sequence[str]) -> int:
+        # while A downloads, B (a pull or a removal) must be refused outright
+        for action in (lambda a: a.pull("other:1b"), lambda a: a.remove("qwen3:32b")):
+            with pytest.raises(ModelsError, match="another model operation is running"):
+                action(_admin(docker))
+        inner.append("refused")
+        return 0
+
+    OllamaAdmin(docker, geteuid=lambda: 0, container_markers=(), environ={}, stream=stream).pull(
+        "qwen3:32b"
+    )
+    assert inner == ["refused"]
+    # B never touched the network or the container: one create, one connect, one disconnect
+    assert [c[2] for c in docker.calls if c[1] == "network" and c[2] != "ls"] == [
+        "create",
+        "connect",
+        "disconnect",
+        "rm",
+    ]
+    _admin(docker).remove("qwen3:32b")  # the lock is free again
+
+
+def test_the_lock_is_free_after_a_failed_pull() -> None:
+    docker = FakeDocker()
+    docker.fail["ollama pull"] = CommandResult(("d",), 1)
+    with pytest.raises(ModelsError):
+        _admin(docker).pull("qwen3:32b")
+    _admin(FakeDocker()).pull("qwen3:32b")
+
+
+def test_an_unusable_lock_file_refuses_cleanly(tmp_path: Path) -> None:
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+    admin = OllamaAdmin(
+        FakeDocker(),
+        geteuid=lambda: 0,
+        container_markers=(),
+        environ={},
+        lock_path=blocker / "x.lock",
+    )
+    with pytest.raises(ModelsError, match="lock"):
+        admin.remove("qwen3:32b")
+
+
+@pytest.mark.parametrize(
+    "said", ["Error: No such network: lab-ollama-uplink", "network x not found"]
+)
+def test_detaching_a_network_that_is_not_there_is_not_an_error(said: str) -> None:
+    docker = FakeDocker()
+    docker.fail["network create"] = CommandResult(("d",), 1, b"", b"permission denied")
+    docker.fail["network disconnect"] = CommandResult(("d",), 1, b"", said.encode())
+    with pytest.raises(ModelsError) as info:
+        _admin(docker).pull("qwen3:32b")
+    assert "permission denied" in str(info.value)
+    assert "attached to the internet" not in str(info.value)
+    assert not any(c[1:3] == ["network", "rm"] for c in docker.calls)
+
+
+@pytest.mark.parametrize("sig", ["SIGTERM", "SIGHUP", "SIGINT"])
+def test_a_signal_while_the_uplink_closes_waits_until_it_is_closed(sig: str) -> None:
+    import signal
+
+    docker = FakeDocker()
+    real_call = docker.__call__
+
+    def call(argv: Sequence[str], **kw: Any) -> CommandResult:
+        if argv[1:3] == ["network", "disconnect"]:
+            signal.raise_signal(getattr(signal, sig))  # held: the signals are blocked now
+        return real_call(argv, **kw)
+
+    def to_exit(signum: int, _frame: Any) -> None:
+        raise SystemExit(128 + signum)
+
+    admin = OllamaAdmin(
+        call, geteuid=lambda: 0, container_markers=(), environ={}, stream=docker.stream
+    )
+    old = {s: signal.signal(s, to_exit) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    try:
+        with pytest.raises(SystemExit):
+            admin.pull("qwen3:32b")
+    finally:
+        for s, handler in old.items():
+            signal.signal(s, handler)
+    # the signal was delivered, but only after disconnect AND rm had both run
+    assert docker.verbs()[-2:] == ["network:disconnect", "network:rm"]
 
 
 class Interrupt(BaseException):
@@ -354,25 +461,12 @@ def test_an_interrupt_anywhere_in_a_pull_still_detaches_the_uplink(
     assert docker.verbs()[-2:] == ["network:disconnect", "network:rm"]
 
 
-def test_sigint_is_ignored_while_the_uplink_closes() -> None:
+def test_the_signal_mask_is_restored_after_the_uplink_closes() -> None:
     import signal
 
-    docker = FakeDocker()
-    seen: list[Any] = []
-    real_call = docker.__call__
-
-    def call(argv: Sequence[str], **kw: Any) -> CommandResult:
-        if argv[1:3] == ["network", "disconnect"]:
-            seen.append(signal.getsignal(signal.SIGINT))
-        return real_call(argv, **kw)
-
-    admin = OllamaAdmin(
-        call, geteuid=lambda: 0, container_markers=(), environ={}, stream=docker.stream
-    )
-    before = signal.getsignal(signal.SIGINT)
-    admin.pull("qwen3:32b")
-    assert seen == [signal.SIG_IGN]
-    assert signal.getsignal(signal.SIGINT) == before
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    _admin(FakeDocker()).pull("qwen3:32b")
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == before
 
 
 def test_the_pull_streams_its_output_instead_of_capturing_it() -> None:

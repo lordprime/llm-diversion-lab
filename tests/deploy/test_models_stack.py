@@ -442,3 +442,8 @@ def test_release_pulls_the_ollama_image_only_for_a_gpu_host() -> None:
     filter_at = text.index("docker.io/ollama/ollama@")
     assert text.index("$HOST_GPU != true") < filter_at < text.index("release.sh pull")
     assert filter_at > text.index('lab_load_host "$host"')
+
+
+def test_release_guards_the_empty_image_list_for_set_u() -> None:
+    text = (ROOT / "deploy" / "release.sh").read_text(encoding="utf-8")
+    assert 'image_refs=("${kept[@]+"${kept[@]}"}")' in text

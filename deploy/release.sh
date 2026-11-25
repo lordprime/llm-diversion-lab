@@ -128,7 +128,7 @@ if [[ $HOST_GPU != true ]]; then
 	for ref in "${image_refs[@]}"; do
 		[[ $ref == docker.io/ollama/ollama@* ]] || kept+=("$ref")
 	done
-	image_refs=("${kept[@]}")
+	image_refs=("${kept[@]+"${kept[@]}"}")
 fi
 
 lab_step "Preflight on $host"
