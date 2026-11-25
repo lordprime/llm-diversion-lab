@@ -71,6 +71,7 @@ __all__ = [
     "DEFAULT_CELL_NETWORK",
     "DEFAULT_EVIDENCE_PATH",
     "EVIDENCE_PREFIXES",
+    "GATEWAY_KEY_ENV",
     "HOST_ENV_FILE",
     "IMAGE_ROLES",
     "REPO_ROOT",
@@ -120,6 +121,12 @@ _NETWORK_ROLES: Final = ("agent", "target", "llm")
 _DIGEST_REF = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
 _PLACEHOLDER = re.compile(r"@[A-Z_]+@")
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
+#: The run key's shape: ``secrets.token_urlsafe(32)``.
+_GATEWAY_KEY = re.compile(r"^[A-Za-z0-9_-]{43}$")
+#: In gateway mode the agent gets its run key under the name each client reads it
+#: from (OpenAI, Anthropic and LiteLLM's Ollama route); the gateway accepts it from
+#: ``Authorization: Bearer``, ``x-api-key`` or ``api-key``.
+GATEWAY_KEY_ENV: Final = ("ANTHROPIC_API_KEY", "OLLAMA_API_KEY", "OPENAI_API_KEY")
 _TAP_URL: Final = "http://tap:8080"
 _GUARD_DIR: Final = "/run/cellguard"
 #: The host profile written by the Ansible site play (deploy/ansible/templates/host.env.j2).
@@ -404,10 +411,12 @@ def bridge_name(run_id: str, role: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class CellSecrets:
-    """Per-run bearer secrets: the oracle's canaries and the injector's probe secret."""
+    """Per-run bearer secrets: the oracle's canaries, the injector's probe secret and
+    the agent's model-gateway key (used only in gateway mode)."""
 
     canaries: Mapping[str, str] = field(repr=False)
     probe_secret: str = field(repr=False)
+    gateway_key: str = field(repr=False, default_factory=lambda: secrets.token_urlsafe(32))
 
     def __post_init__(self) -> None:
         if set(self.canaries) != set(CANARY_FILES.values()):
@@ -415,6 +424,8 @@ class CellSecrets:
         values = [*self.canaries.values(), self.probe_secret]
         if not all(_HEX32.fullmatch(v) for v in values) or len(set(values)) != len(values):
             raise ValueError("canaries and the probe secret must be distinct 32-hex values")
+        if not _GATEWAY_KEY.fullmatch(self.gateway_key):
+            raise ValueError("the gateway key must be secrets.token_urlsafe(32)")
 
     @classmethod
     def mint(cls) -> CellSecrets:
@@ -481,7 +492,8 @@ class ComposeProject:
 
     name: str
     run_id: str
-    document: Mapping[str, Any]
+    #: not in the repr: it holds the probe secret and, in gateway mode, the run key
+    document: Mapping[str, Any] = field(repr=False)
     files: tuple[CellFile, ...]
     probe_secret: str = field(repr=False)
     #: ``(path, expected status)`` the pre-flight probe requests through the injector.
@@ -497,6 +509,8 @@ class ComposeProject:
     #: The cell-guard scratch volume (agents that start containers), created by the
     #: backend with the run label before anything starts; ``None`` without cell-guard.
     scratch_volume: str | None = None
+    #: The agent's model-gateway key in gateway mode (the runner grants it), else None.
+    gateway_key: str | None = field(default=None, repr=False)
 
     @property
     def infra_services(self) -> tuple[str, ...]:
@@ -707,6 +721,8 @@ def render_cell(
         "ANTHROPIC_BASE_URL": _TAP_URL,
         **spec.env,
     }
+    if gateway is not None:  # after the spec's env, which cannot replace the run key
+        agent_env.update(dict.fromkeys(GATEWAY_KEY_ENV, secrets.gateway_key))
     agent_volumes = ["cfg_agent:/etc/lab/agent:ro", "ev_agent:/evidence"]
     volumes: dict[str, Any] = {k: {} for k in cell.get("volumes", {})}
     files: list[CellFile] = []
@@ -830,4 +846,5 @@ def render_cell(
         evidence=evidence,
         evidence_paths={"cellguard": _GUARD_EVIDENCE} if spec.needs_docker else {},
         scratch_volume=f"{name}_scratch" if spec.needs_docker else None,
+        gateway_key=secrets.gateway_key if gateway is not None else None,
     )

@@ -17,7 +17,7 @@ import os
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +50,7 @@ from control.core.models import (
 from control.db import tables as t
 from control.db.engine import session_scope
 from control.db.repo import invalid_runs_by_reason
+from control.gateway.client import GatewayAdminError
 from control.runner import runner as runner_module
 from control.runner.cell_spec import AgentSpec, CellError, CellSettings, ComposeProject
 from control.runner.compose_backend import CellHandle, CollectReport, CommandResult, ContainerState
@@ -1628,3 +1629,143 @@ def test_a_probe_poll_in_the_old_v1_format_stops_before_the_agent(
     assert not any(c == "start_agent" for c, _ in backend.calls)
     for result in results:
         assert _count(engine, t.OraclePoll, result.run_id) >= 1  # kept as error polls
+
+
+# --------------------------------------------------------------------------- gateway
+
+
+GATEWAY_URL = "http://172.30.0.1:4000"
+
+
+@dataclass
+class FakeGrants:
+    """Records the runner's calls to the gateway's admin API, in the backend's call log."""
+
+    calls: list[tuple[str, str]]
+    fail_grant: bool = False
+    fail_revoke: bool = False
+    granted: list[tuple[str, str, tuple[str, ...], datetime]] = field(default_factory=list)
+
+    def grant(self, run_id: str, key: str, models: Sequence[str], expires_at: datetime) -> None:
+        self.calls.append(("grant", run_id))
+        if self.fail_grant:
+            raise GatewayAdminError("gateway admin answered 503")
+        self.granted.append((run_id, key, tuple(models), expires_at))
+
+    def revoke(self, run_id: str) -> None:
+        self.calls.append(("revoke", run_id))
+        if self.fail_revoke:
+            raise GatewayAdminError("gateway admin unreachable")
+
+
+def _gateway_runner(
+    engine: Engine,
+    collector: CollectorClient,
+    backend: FakeBackend,
+    tmp_path: Path,
+    grants: FakeGrants | None,
+) -> Runner:
+    return Runner(
+        store=RunStore(engine),
+        collector=collector,
+        backend=backend,
+        settings=CellSettings(images=IMAGES, llm_gateway=GATEWAY_URL),
+        lab_key=KEY,
+        runs_dir=tmp_path / "runs",
+        work_dir=tmp_path / "work",
+        oracle_interval_s=0,
+        tick_s=0,
+        sleep=lambda _s: None,
+        gateway=grants,
+    )
+
+
+def test_gateway_mode_grants_the_run_key_before_the_agent_and_revokes_it_after(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    backend = FakeBackend()
+    grants = FakeGrants(backend.calls)
+    ef = read_experiment(SELFTEST)
+    results = _gateway_runner(engine, collector, backend, tmp_path, grants).run_experiment(ef)
+    assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
+    for result, project in zip(results, backend.projects, strict=True):
+        mine = [c for c, arg in backend.calls if arg == result.run_id]
+        assert mine == [
+            "prepare",
+            "up",
+            "health",
+            "grant",
+            "start_agent",
+            "collect",
+            "revoke",
+            "teardown",
+        ]
+        (_, key, models, expires_at) = next(g for g in grants.granted if g[0] == result.run_id)
+        # the key granted is the one in the agent's environment, for the run's model only
+        assert key == project.gateway_key
+        assert project.document["services"]["agent"]["environment"]["OPENAI_API_KEY"] == key
+        assert models == tuple(ef.experiment.models)
+        lifetime = expires_at - datetime.now(UTC)
+        assert timedelta(seconds=ef.experiment.limits.timeout_s) < lifetime < timedelta(hours=2)
+    # one key per run
+    assert len({g[1] for g in grants.granted}) == len(results)
+
+
+def test_a_refused_grant_stops_the_run_before_the_agent(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    backend = FakeBackend()
+    grants = FakeGrants(backend.calls, fail_grant=True)
+    results = _gateway_runner(engine, collector, backend, tmp_path, grants).run_experiment(
+        read_experiment(SELFTEST)
+    )
+    assert {r.reason for r in results} == {InvalidReason.CELL_FAILED}
+    assert all("gateway" in r.detail for r in results)
+    assert not any(c == "start_agent" for c, _ in backend.calls)
+    # the grant may have landed although its reply was lost: it is revoked anyway
+    for result in results:
+        mine = [c for c, arg in backend.calls if arg == result.run_id]
+        assert mine.index("revoke") < mine.index("teardown")
+
+
+def test_a_failed_revoke_is_logged_and_leaves_the_run_valid(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    backend = FakeBackend()
+    grants = FakeGrants(backend.calls, fail_revoke=True)
+    results = _gateway_runner(engine, collector, backend, tmp_path, grants).run_experiment(
+        read_experiment(SELFTEST)
+    )
+    assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
+    assert "cannot revoke" in caplog.text
+    for project in backend.projects:
+        assert project.gateway_key is not None and project.gateway_key not in caplog.text
+
+
+def test_gateway_mode_without_the_admin_client_is_refused(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError, match="gateway"):
+        _gateway_runner(engine, collector, FakeBackend(), tmp_path, None)
+
+
+def test_the_stub_mode_never_calls_the_gateway(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    backend = FakeBackend()
+    grants = FakeGrants(backend.calls)
+    runner = Runner(
+        store=RunStore(engine),
+        collector=collector,
+        backend=backend,
+        settings=CellSettings(images=IMAGES),
+        lab_key=KEY,
+        runs_dir=tmp_path / "runs",
+        work_dir=tmp_path / "work",
+        oracle_interval_s=0,
+        tick_s=0,
+        sleep=lambda _s: None,
+        gateway=grants,
+    )
+    runner.run_experiment(read_experiment(SELFTEST))
+    assert not any(c in ("grant", "revoke") for c, _ in backend.calls)

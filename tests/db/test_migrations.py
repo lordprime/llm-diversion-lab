@@ -38,6 +38,7 @@ EXPECTED_TABLES = {
     "artifacts",
     "run_heartbeats",
     "rejected_batches",
+    "gateway_grants",
 }
 
 EVENT_TABLES = {

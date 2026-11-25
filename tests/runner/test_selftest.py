@@ -730,9 +730,14 @@ def test_control_plane_destinations_come_from_the_compose_file_and_the_engine() 
         return CommandResult(tuple(argv), 0, json.dumps(doc).encode())
 
     dests = selftest.control_plane_destinations(engine_cli, compose)
+    # every control-plane network's gateway, the model gateway's two included
     assert set(dests) == {
         "host:tcp:172.31.231.1:5432",
         "host:tcp:172.31.231.1:8100",
+        "host:tcp:172.31.232.1:5432",
+        "host:tcp:172.31.232.1:8100",
+        "host:tcp:172.31.233.1:5432",
+        "host:tcp:172.31.233.1:8100",
         "host:tcp:172.31.231.2:5432",
         "host:tcp:172.31.231.3:8000",
     }

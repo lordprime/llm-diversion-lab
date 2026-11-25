@@ -38,6 +38,14 @@
 #   the mount point itself to postgres (uid 999), so initdb never has to enter the
 #   0700 parent. release.sh creates pgdata (0700) if it is missing and never touches
 #   it again; Ansible does not manage it.
+# * `gateway` is the model gateway (python -m control.gateway), the only way from a
+#   run cell to a model. It runs only with the `models` profile (the GPU host) and
+#   publishes no port. Two listeners, each on one address: the cell-facing proxy on
+#   its fixed address on the `cells` network (host.env's LAB_LLM_GATEWAY, the one
+#   destination the host firewall lets a cell bridge reach) and the admin API on its
+#   fixed address on `control`, where the runner registers each run's key. It reaches
+#   Ollama over the internal `models` network. LAB_GATEWAY_ADMIN_SECRET comes from
+#   lab.env; without it the gateway refuses to start (no other service needs it).
 
 name: lab
 
@@ -124,9 +132,59 @@ services:
       retries: 6
       start_period: 20s
 
+  gateway:
+    <<: *control-image
+    profiles: [models]
+    restart: unless-stopped
+    command: ["python", "-m", "control.gateway"]
+    environment:
+      <<: *control-env
+      LAB_OLLAMA_URL: http://ollama:11434
+      LAB_GATEWAY_LISTEN: 172.31.232.10:4000
+      LAB_GATEWAY_ADMIN_LISTEN: 172.31.231.20:4001
+      LAB_GATEWAY_ADMIN_SECRET: ${LAB_GATEWAY_ADMIN_SECRET:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      control:
+        ipv4_address: 172.31.231.20
+      cells:
+        ipv4_address: 172.31.232.10
+      models: {}
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://172.31.231.20:4001/healthz', timeout=4)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
 networks:
   control:
     driver: bridge
     ipam:
       config:
         - subnet: 172.31.231.0/24
+  # the gateway's cell-facing network: run cells reach 172.31.232.10:4000 here
+  cells:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.232.0/24
+  # the gateway and Ollama only; no route out
+  models:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.233.0/24

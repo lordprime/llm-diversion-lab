@@ -96,6 +96,7 @@ __all__ = [
     "EventRow",
     "Experiment",
     "ExperimentArm",
+    "GatewayGrant",
     "Label",
     "LlmCall",
     "LlmModel",
@@ -644,3 +645,29 @@ class RejectedBatch(Base):
     #: validation errors, conflicting keys or the database error, as JSON
     detail: Mapped[Any] = mapped_column(JSONB)
     received_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now())
+
+
+# --------------------------------------------------------------------------- gateway
+
+
+class GatewayGrant(Base):
+    """A run's grant at the model gateway (``control.gateway.keys``).
+
+    Only the SHA-256 of the run key is stored, never the key. The gateway keeps its
+    grants in memory and mirrors them here, so a restart keeps working runs going.
+    ``run_id`` is deliberately not a foreign key: the gateway is its own service, and
+    a grant only lives as long as its run's agent.
+    """
+
+    __tablename__ = "gateway_grants"
+    __table_args__ = (
+        CheckConstraint("key_sha256 ~ '^[0-9a-f]{64}$'", name="key_sha256_format"),
+        CheckConstraint("cardinality(models) >= 1", name="models_nonempty"),
+    )
+
+    run_id: Mapped[str] = mapped_column(_ID, primary_key=True)
+    key_sha256: Mapped[str] = mapped_column(_SHA256, unique=True)
+    models: Mapped[list[str]] = mapped_column(ARRAY(_NAME))
+    embeddings: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    expires_at: Mapped[datetime] = mapped_column(_TS)
+    created_at: Mapped[datetime] = mapped_column(_TS, server_default=func.now())

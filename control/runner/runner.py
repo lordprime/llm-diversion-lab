@@ -22,8 +22,11 @@ queued: a leaked cell may still hold a Docker socket, an agent or a gateway rout
    restarted; then the oracle must answer "not yet" (one answered poll with
    ``effect`` and ``mechanism`` not true, kept in the oracle evidence). A failure stops
    here: the agent never starts, no token is spent;
-4. **run** -- start the agent; poll the oracle (``/opt/support/done.sh`` only) every
-   15 s while it runs, stop it at the run's ``timeout_s``, poll once more after and
+4. **run** -- in gateway mode, grant the agent's fresh run key the run's model at the
+   model gateway first (a refused grant is a cell failure; the grant is revoked at
+   teardown and lapses by itself after the timeout); start the agent; poll the
+   oracle (``/opt/support/done.sh`` only) every 15 s while it runs, stop it at the
+   run's ``timeout_s``, poll once more after and
    dump the latch to ``oracle/latch.jsonl`` (``/opt/support/latch-dump.sh``). An
    agent that never leaves ``created`` is a cell failure, not a timeout;
 5. **collect** -- note which infrastructure is no longer exactly ``running`` with no
@@ -82,9 +85,9 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Final
+from typing import Final, Protocol
 from urllib.parse import urlsplit
 
 from control.core.logging import redact_text
@@ -99,6 +102,7 @@ from control.core.models import (
     RunStatus,
     Verdict,
 )
+from control.gateway.client import GatewayAdminError
 from control.labeler.funnel import (
     ContaminationError,
     IncompleteEvidenceError,
@@ -185,6 +189,16 @@ HEALTH_TIMEOUT_S: Final = 300.0
 STOP_TIMEOUT_S: Final = 15
 #: How long an agent container may stay ``created`` before the cell counts as failed.
 AGENT_START_GRACE_S: Final = 60.0
+#: A run's gateway grant outlives its timeout by this much (the final poll, collection
+#: and teardown), so it lapses by itself should the revoke ever be lost.
+GRANT_MARGIN: Final = timedelta(minutes=30)
+
+
+class GatewayGrants(Protocol):
+    """The gateway's admin API as the runner uses it (:class:`GrantClient`)."""
+
+    def grant(self, run_id: str, key: str, models: Sequence[str], expires_at: datetime) -> None: ...
+    def revoke(self, run_id: str) -> None: ...
 
 
 class ProbeFailedError(RuntimeError):
@@ -410,6 +424,8 @@ class _RunState:
     manifest: RunManifest | None = None
     cell: CellHandle | None = None
     up_done: bool = False
+    #: a gateway grant was asked for (revoked at teardown even if the call failed)
+    granted: bool = False
     agent_started: bool = False
     collected: bool = False
     event_lines: list[bytes] = field(default_factory=list)
@@ -443,9 +459,15 @@ class Runner:
         clock: Callable[[], float] = time.monotonic,
         agent_specs: Mapping[str, AgentSpec] = AGENT_SPECS,
         templates_root: Path = REPO_ROOT,
+        gateway: GatewayGrants | None = None,
     ) -> None:
         if not lab_key:
             raise ValueError("lab_key must be non-empty")
+        if settings.llm_gateway is not None and gateway is None:
+            raise ValueError(
+                "gateway mode needs the gateway's admin client: without a grant every "
+                "model call of the agent would be refused"
+            )
         self._store = store
         self._collector = collector
         self._backend = backend
@@ -464,6 +486,7 @@ class Runner:
         self._clock = clock
         self._agent_specs = agent_specs
         self._templates_root = templates_root
+        self._gateway = gateway if settings.llm_gateway is not None else None
         self._ef: ExperimentFile | None = None
 
     def __repr__(self) -> str:  # the key never appears in a repr or traceback local
@@ -667,6 +690,7 @@ class Runner:
         oracle_log = OracleLog(state.run.run_id, state.evidence_dir)
         self._probe_oracle(state, oracle_log)
 
+        self._grant(state, project, float(experiment.limits.timeout_s))
         self._heartbeat(state, RunPhase.AGENT_RUNNING)
         self._backend.start_agent(state.cell)
         state.agent_started = True
@@ -696,6 +720,30 @@ class Runner:
             self._sleep(self._tick_s)
         self._poll(state, oracle_log)  # the final word, after the agent stopped
         self._keep_latch(state)
+
+    def _grant(self, state: _RunState, project: ComposeProject, timeout_s: float) -> None:
+        """Let the agent's run key use the run's model at the gateway (gateway mode)."""
+        if self._gateway is None:
+            return
+        if project.gateway_key is None:  # pragma: no cover - render_cell sets it
+            raise CellError("gateway mode, but the cell has no run key")
+        expires_at = datetime.now(UTC) + timedelta(seconds=timeout_s) + GRANT_MARGIN
+        state.granted = True
+        try:
+            self._gateway.grant(
+                state.run.run_id, project.gateway_key, (state.run.model,), expires_at
+            )
+        except GatewayAdminError as exc:
+            raise CellError(f"the model gateway refused the run's grant: {exc}") from None
+
+    def _revoke(self, state: _RunState) -> None:
+        """Withdraw the run's grant; a failure is logged (the grant lapses by itself)."""
+        if self._gateway is None or not state.granted:
+            return
+        try:
+            self._gateway.revoke(state.run.run_id)
+        except Exception as exc:
+            log.error("run %s: cannot revoke its gateway grant: %s", state.run.run_id, exc)
 
     def _keep_latch(self, state: _RunState) -> None:
         """Dump the target's latch once, after the final poll, as a write-once artifact."""
@@ -882,6 +930,7 @@ class Runner:
         except Exception as exc:
             state.problems.append(exc)
         finally:
+            self._revoke(state)
             self._heartbeat(state, RunPhase.TEARDOWN, best_effort=True)
             try:
                 self._backend.teardown(cell)

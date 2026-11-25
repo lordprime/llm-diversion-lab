@@ -420,3 +420,35 @@ def test_compose_refuses_to_run_without_the_db_password(
     result = _config(compose_cmd, env_file, env=TAG)
     assert result.returncode != 0
     assert DB_PASSWORD_VAR in result.stderr
+
+
+# --------------------------------------------------------------------- model gateway
+
+
+def test_the_gateway_publishes_nothing_and_splits_its_listeners() -> None:
+    gateway = _services()["gateway"]
+    assert gateway["command"] == ["python", "-m", "control.gateway"]
+    assert gateway["image"] == RELEASE_IMAGE
+    assert gateway["profiles"] == ["models"]
+    assert "ports" not in gateway
+    env = _env(gateway)
+    listen, admin = env["LAB_GATEWAY_LISTEN"], env["LAB_GATEWAY_ADMIN_LISTEN"]
+    nets = gateway["networks"]
+    # the proxy on its cells address, the admin API on its control-plane address
+    assert listen.rpartition(":")[0] == nets["cells"]["ipv4_address"]
+    assert admin.rpartition(":")[0] == nets["control"]["ipv4_address"]
+    assert listen.rpartition(":")[0] != admin.rpartition(":")[0]
+    for address in (listen, admin):
+        assert not ipaddress.ip_address(address.rpartition(":")[0]).is_unspecified
+    secret = "${LAB_GATEWAY_ADMIN_SECRET:-}"  # noqa: S105 -- interpolation, not a value
+    assert env["LAB_GATEWAY_ADMIN_SECRET"] == secret
+    assert env["LAB_OLLAMA_URL"] == "http://ollama:11434"
+    assert set(nets) == {"control", "cells", "models"}
+    assert gateway["read_only"] is True and gateway["cap_drop"] == ["ALL"]
+
+
+def test_only_the_models_network_is_internal_and_only_the_gateway_is_on_cells() -> None:
+    networks = _compose()["networks"]
+    assert networks["models"]["internal"] is True
+    on_cells = {n for n, s in _services().items() if "cells" in s.get("networks", [])}
+    assert on_cells == {"gateway"}

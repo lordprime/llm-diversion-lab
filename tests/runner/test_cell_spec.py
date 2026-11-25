@@ -28,6 +28,7 @@ from control.runner import cell_spec
 from control.runner.cell_spec import (
     AGENT_SPECS,
     CELL_NAME_PREFIX,
+    GATEWAY_KEY_ENV,
     AgentSpec,
     CellError,
     CellSecrets,
@@ -585,6 +586,58 @@ def test_gateway_mode_routes_the_tap_to_the_gateway_without_a_stub(
     assert {n for n, net in networks.items() if not net["internal"]} == {"llm"}
     on_llm = {s for s, d in services.items() if "llm" in d.get("networks", {})}
     assert on_llm == {"tap"}
+
+
+def test_gateway_mode_hands_the_agent_its_run_key(
+    experiment: Experiment, schedule: list[ScheduledRun]
+) -> None:
+    spec = AgentSpec(
+        name="scripted",
+        image="lab-cell",
+        command=("true",),
+        env={"OPENAI_API_KEY": "sk-from-the-spec", "OTHER": "kept"},
+    )
+    _, _, project = _render(
+        experiment,
+        schedule,
+        Arm.INJECTED,
+        settings=_settings(llm_gateway=GATEWAY),
+        agent_spec=spec,
+    )
+    key = project.gateway_key
+    assert key is not None and re.fullmatch(r"[A-Za-z0-9_-]{43}", key)
+    env = _env(project, "agent")
+    # every client's own variable carries the one run key; the spec cannot replace it
+    for name in GATEWAY_KEY_ENV:
+        assert env[name] == key
+    assert set(GATEWAY_KEY_ENV) == {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OLLAMA_API_KEY"}
+    assert env["OTHER"] == "kept"
+    # only the agent holds it: no other service, file or the project's repr
+    for name, service in _services(project).items():
+        if name != "agent":
+            assert key not in json.dumps(service), name
+    assert all(key.encode() not in f.content for f in project.files)
+    assert key not in repr(project)
+    # a fresh key for every render
+    _, _, again = _render(
+        experiment, schedule, Arm.INJECTED, settings=_settings(llm_gateway=GATEWAY)
+    )
+    assert again.gateway_key not in (None, key)
+
+
+def test_the_stub_llm_mode_hands_out_no_run_key(
+    injected: tuple[ScheduledRun, RunManifest, ComposeProject],
+) -> None:
+    _, _, project = injected
+    assert project.gateway_key is None
+    assert not set(GATEWAY_KEY_ENV) & set(_env(project, "agent"))
+
+
+@pytest.mark.parametrize("key", ["", "short", "x" * 43 + "!", "a" * 44])
+def test_a_malformed_gateway_key_is_refused(key: str) -> None:
+    minted = CellSecrets.mint()
+    with pytest.raises(ValueError, match="gateway key"):
+        CellSecrets(canaries=minted.canaries, probe_secret=minted.probe_secret, gateway_key=key)
 
 
 @pytest.mark.parametrize("gateway", ["http://10.231.255.1:4000", "http://10.231.0.1:4000"])
