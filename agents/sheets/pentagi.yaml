@@ -1,0 +1,39 @@
+# PentAGI capability sheet. Every value comes from docs/OLLAMA_SUPPORT_AUDIT.md;
+# audit_refs names the section behind each field, and "unknown" marks what the audit
+# could not verify. The PentAGI adapter task fills in what is still unknown.
+framework: pentagi
+version: v2.2.0 # main at cffed94 has the same Ollama config fields
+commit: b611fbe
+image_digest: unknown # set once CI builds the PentAGI agent image
+support_level: native
+# langchaingo's Ollama client posts to native /api/chat, not /v1 (ollama.go 19-22, 227-228)
+wire_formats: [ollama_chat]
+# One OLLAMA_SERVER_URL serves every agent role; PROXY_URL also covers LLM, embedding and
+# search calls (README 885).
+model_call_paths:
+  - "role agents through the Ollama provider (backend/pkg/providers/ollama/ollama.go): the 13 option types in pconfig/config.go 144-156"
+  - "auxiliary roles on the same provider: chain summariser (SUMMARIZER_*), reflector, adviser/planner, enricher, memorist, refiner"
+  - "embeddings with EMBEDDING_PROVIDER=ollama (backend/pkg/config/config.go 122)"
+side_channels_disabled:
+  openai_embeddings: "EMBEDDING_PROVIDER=ollama (the default openai falls back to the OpenAI server URL, README 3770)"
+  graphiti: "Graphiti off: the optional service has its own OpenAI-compatible LLM and embedder (README 2883-2888)"
+# Open for the PentAGI adapter task (outside PROXY_URL per README 885, and the audit names
+# no switch, so not listed above): the scraper, OAuth and Langfuse/OTel traffic.
+# Models must be rebuilt with num_ctx in a Modelfile (README 1627-1631).
+min_num_ctx: 110000 # "PentAGI uses 110K context size" (README 1627-1631)
+sub_agents: dynamic # the primary agent delegates to role agents; serial or parallel is unverified (§4 item 9)
+agent_id_source: null
+agent_id_gap: "unknown: the audit read no PentAGI log or trace that names the role agent behind each model call"
+patches: []
+max_turns_knob: unknown # agents have tool-call budgets (README 498-507); the audit names no setting
+audit_refs:
+  version: "§2.5"
+  support_level: "§1, §2.5"
+  wire_formats: "§1, §2.5"
+  model_call_paths: "§2.5"
+  side_channels_disabled: "§2.5, §3"
+  min_num_ctx: "§1, §2.5, §3"
+  sub_agents: "§2.5, §4"
+  agent_id_source: "§2.5"
+  patches: "§3"
+  max_turns_knob: "§2.5"

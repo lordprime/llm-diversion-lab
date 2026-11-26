@@ -1,0 +1,42 @@
+# hackingBuddyGPT capability sheet. Every value comes from docs/OLLAMA_SUPPORT_AUDIT.md;
+# audit_refs names the section behind each field, and "unknown" marks what the audit
+# could not verify. The hackingBuddyGPT adapter task fills in what is still unknown.
+framework: hackingbuddygpt
+version: v0.5.0
+commit: e23d918
+image_digest: unknown # set once CI builds the hackingBuddyGPT agent image
+support_level: native
+# llm.model=ollama_chat/<model> uses LiteLLM's ollama_chat route (LiteLLM 1.97.0 in uv.lock)
+wire_formats: [ollama_chat]
+# Every path below uses the one LiteLLM class. Export OLLAMA_API_BASE=<tap>: LiteLLM's
+# Ollama route reads it when no api_base is passed (litellm/main.py 4211 at v1.97.0).
+model_call_paths:
+  - "main agent: LiteLLM.raw_completion calling litellm.completion (src/hackingBuddyGPT/utils/llm.py)"
+  - "optional update-state call (usecases/priv_esc/linux_privesc.py 222)"
+  - "optional explanation call (usecases/priv_esc/linux_privesc.py 252)"
+  - "web-API response analyser (utils/web_api/response_analyzer_with_llm.py)"
+  - "AD use case: planner plus a fresh ADExecutor per delegated task (usecases/ad/executor.py)"
+  - "web use case sub-agents through SubAgentCapability (usecases/web/advanced.py)"
+side_channels_disabled:
+  rag_openai_embeddings: "rag_path unset and the RAG extra not used (hard-coded OpenAIEmbeddings text-embedding-3-large, utils/rag.py 28)"
+  openrouter_default_api_base: "llm.api_base set explicitly to the tap (its default is OpenRouter), and OLLAMA_API_BASE=<tap> exported"
+min_num_ctx: unknown # the README gives no model-size guidance; llm.context_size is user-declared (default 16385)
+sub_agents: dynamic # one agent in most use cases; the AD and advanced web use cases spawn more
+agent_id_source: null
+agent_id_gap: "unknown: the audit read no hackingBuddyGPT log that names the planner or executor behind each model call"
+patches:
+  - upstream_file: src/hackingBuddyGPT/utils/llm.py
+    change: "LiteLLM.raw_completion passes api_base=self.api_base to litellm.completion when llm.api_base is set explicitly"
+    reason: "the api_base argument is commented out, so llm.api_base is ignored and only OLLAMA_API_BASE reaches LiteLLM"
+max_turns_knob: unknown # the audit names no turn cap setting
+audit_refs:
+  version: "§2.1"
+  support_level: "§1, §2.1"
+  wire_formats: "§1, §2.1"
+  model_call_paths: "§2.1"
+  side_channels_disabled: "§2.1, §3"
+  min_num_ctx: "§2.1"
+  sub_agents: "§1, §2.1"
+  agent_id_source: "§2.1"
+  patches: "§2.1, §3"
+  max_turns_knob: "§2.1"
