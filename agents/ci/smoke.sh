@@ -72,8 +72,9 @@ model at http://tap:8000, with every other name and address going to an egress c
   --docker         give the agent a Docker socket through cell-guard
   --worker-image   an image the agent may start through cell-guard: either a
                    reference pinned by digest (pulled here, since cell-guard denies
-                   pulls) or a tag of an image built on this machine (allowed by its
-                   image id); a tag of a pulled image is refused. Repeatable.
+                   pulls) or the local tag of an extra image this job's build.sh
+                   built and listed in $EXTRA_IMAGES (allowed by its image id).
+                   Anything else is refused. Repeatable.
 
 Exit status: 0 pass, 2 usage, 3 smoke failure, 10 egress seen, 11 timeout,
 12 agent failed. Outputs: requests.jsonl, canary.jsonl, agent.log, agent.exit.
@@ -207,8 +208,9 @@ rm -rf "${out:?}/requests.jsonl" "$out/canary.jsonl" "$out/agent.log" "$out/agen
 work=$(mktemp -d)
 
 # Worker images become cell-guard's allow-list (role agent). A pinned reference is pulled
-# now (cell-guard denies pulls); a local tag is allowed by its image id, but only if it was
-# built here: a pulled image has a registry digest and must be named by it.
+# now (cell-guard denies pulls); a local tag is allowed by its image id, but only if this
+# job's build step built it, i.e. it is listed in $EXTRA_IMAGES (a tag that merely
+# resolves here may be a pulled, unpinned registry image).
 lock="$work/images.lock"
 echo "images:" >"$lock"
 index=0
@@ -218,9 +220,10 @@ for ref in "${workers[@]}"; do
 		docker pull --quiet "$ref" >/dev/null || fail_setup "cannot pull worker image $ref"
 		repo=${ref%@*} digest=${ref#*@}
 	else
-		docker image inspect "$ref" >/dev/null 2>&1 || fail_usage "--worker-image: $ref is not pinned and not built here"
-		[[ "$(docker image inspect -f '{{len .RepoDigests}}' "$ref")" == 0 ]] ||
-			fail_usage "--worker-image: $ref was pulled, not built here; pin it by digest"
+		if ! [[ -n "${EXTRA_IMAGES:-}" && -f "$EXTRA_IMAGES" ]] || ! grep -qxF -- "$ref" "$EXTRA_IMAGES"; then
+			fail_usage "--worker-image: $ref is not pinned by digest and not listed in \$EXTRA_IMAGES by the build"
+		fi
+		docker image inspect "$ref" >/dev/null 2>&1 || fail_usage "--worker-image: $ref is listed but was not built"
 		repo=${ref%:*} digest=$(docker image inspect -f '{{.Id}}' "$ref")
 	fi
 	printf '  - {name: worker-%s, image: "%s", digest: "%s", role: agent}\n' "$index" "$repo" "$digest" >>"$lock"
