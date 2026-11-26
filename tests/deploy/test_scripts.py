@@ -350,7 +350,10 @@ def test_release_reaches_the_host_only_after_local_checks(
     _git(scratch_repo, "commit", "-q", "-m", "release files")
     _git(scratch_repo, "tag", "v0.1.0-m0")
     env = _script_env(LAB_REPO_ROOT=str(scratch_repo), LAB_SSH_BIN=str(fake), FAKE_SSH_LOG=str(log))
-    result = _run(["bash", str(DEPLOY / "release.sh"), "lab1", "--tag", "v0.1.0-m0"], env=env)
+    result = _run(
+        ["bash", str(DEPLOY / "release.sh"), "lab1", "--tag", "v0.1.0-m0", "--skip-selftest"],
+        env=env,
+    )
     # The fake host has no /srv/lab, so the remote preflight refuses.
     assert result.returncode != 0
     assert "/srv/lab/releases is missing: run bootstrap.sh first" in result.stderr
@@ -2382,15 +2385,115 @@ def test_the_release_self_test_without_labctl_exits_3(
     assert result.returncode == 3, (result.returncode, result.stderr)
 
 
-def test_release_runs_the_full_self_test_by_default() -> None:
-    text = (DEPLOY / "release.sh").read_text(encoding="utf-8")
-    assert "selftest_mode=full" in text
-    assert 'lab_remote release.sh selftest "$selftest_mode"' in text
-    assert "--quick-selftest) selftest_mode=quick ;;" in text
+def _pinned(*names: str) -> str:
+    return "images:\n" + "".join(
+        f"  - name: {name}\n    image: ghcr.io/example/{name}\n    digest: sha256:{'a' * 64}\n"
+        for name in names
+    )
+
+
+ALL_SELFTEST_IMAGES = ("lab-cell", "goat-dvga", "goat-juice-shop", "goat-drupal-7600")
+
+
+def _release_repo(repo: Path, lock: str) -> None:
+    """A tagged release v0.2.0 carrying the real self-test experiment and cell files."""
+    compose = repo / "deploy" / "compose"
+    compose.mkdir(parents=True)
+    (compose / "control-plane.yml").write_text("services: {}\n", encoding="utf-8")
+    for cell in (ROOT / "deploy" / "compose").glob("cell.*.yml"):
+        (compose / cell.name).write_text(cell.read_text(encoding="utf-8"), encoding="utf-8")
+    (repo / "experiments").mkdir()
+    (repo / "experiments" / "selftest.yaml").write_text(
+        (ROOT / "experiments" / "selftest.yaml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (repo / "deploy" / "images.lock").write_text(lock, encoding="utf-8")
+    _git(repo, "add", "deploy", "experiments")
+    _git(repo, "commit", "-q", "-m", "release files")
+    _git(repo, "tag", "v0.2.0")
+
+
+def _release(repo: Path, fake_ssh: tuple[Path, Path], *flags: str) -> Any:
+    fake, log = fake_ssh
+    env = _script_env(LAB_REPO_ROOT=str(repo), LAB_SSH_BIN=str(fake), FAKE_SSH_LOG=str(log))
+    return _run(["bash", str(DEPLOY / "release.sh"), "lab1", "--tag", "v0.2.0", *flags], env=env)
+
+
+@pytest.mark.parametrize(
+    ("pinned", "missing"),
+    [
+        (("lab-cell", "goat-dvga"), "goat-juice-shop goat-drupal-7600"),
+        (("lab-cell", "goat-dvga", "goat-drupal-7600"), "goat-juice-shop"),
+        (("goat-dvga", "goat-juice-shop", "goat-drupal-7600"), "lab-cell"),
+        (("python-3.10-bookworm",), "lab-cell goat-dvga goat-juice-shop goat-drupal-7600"),
+    ],
+)
+def test_a_full_self_test_release_refuses_unpinned_target_images_before_the_host(
+    scratch_repo: Path, fake_ssh: tuple[Path, Path], pinned: tuple[str, ...], missing: str
+) -> None:
+    _release_repo(scratch_repo, _pinned(*pinned))
+    result = _release(scratch_repo, fake_ssh)
+    assert result.returncode != 0
+    assert f"the full self-test needs {missing} pinned in deploy/images.lock" in result.stderr
+    assert "--quick-selftest" in result.stderr
+    assert not fake_ssh[1].exists()  # never reached the host: no preflight, begin or migrate
+
+
+@pytest.mark.parametrize(
+    ("flags", "pinned"),
+    [
+        ((), ALL_SELFTEST_IMAGES),
+        (("--quick-selftest",), ("lab-cell", "goat-dvga")),
+        (("--skip-selftest",), ("python-3.10-bookworm",)),
+    ],
+)
+def test_a_release_whose_self_test_images_are_pinned_goes_on_to_the_host(
+    scratch_repo: Path, fake_ssh: tuple[Path, Path], flags: tuple[str, ...], pinned: tuple[str, ...]
+) -> None:
+    _release_repo(scratch_repo, _pinned(*pinned))
+    result = _release(scratch_repo, fake_ssh, *flags)
+    # past the local checks: the fake host has no /srv/lab, so the remote preflight refuses
+    assert "self-test needs" not in result.stderr
+    assert 'FAILED at step "Preflight on lab1"' in result.stderr
+    assert fake_ssh[1].exists()
+
+
+def test_a_quick_self_test_release_still_needs_dvga_and_the_cell_image(
+    scratch_repo: Path, fake_ssh: tuple[Path, Path]
+) -> None:
+    _release_repo(scratch_repo, _pinned("lab-cell", "goat-juice-shop", "goat-drupal-7600"))
+    result = _release(scratch_repo, fake_ssh, "--quick-selftest")
+    assert "the quick self-test needs goat-dvga pinned" in result.stderr
+    assert not fake_ssh[1].exists()
+
+
+@pytest.mark.parametrize(
+    ("broken", "detail"),
+    [
+        ("experiments/selftest.yaml", "experiments/selftest.yaml is missing from the release"),
+        ("deploy/compose/cell.juice-shop.yml", "cell.juice-shop.yml is missing from the release"),
+    ],
+)
+def test_a_release_that_cannot_say_what_its_self_test_needs_is_refused(
+    scratch_repo: Path, fake_ssh: tuple[Path, Path], broken: str, detail: str
+) -> None:
+    _release_repo(scratch_repo, _pinned(*ALL_SELFTEST_IMAGES))
+    _git(scratch_repo, "rm", "-q", broken)
+    _git(scratch_repo, "commit", "-q", "-m", "drop a file")
+    _git(scratch_repo, "tag", "-f", "v0.2.0")
+    result = _release(scratch_repo, fake_ssh)
+    assert result.returncode != 0
+    assert detail in result.stderr
+    assert "cannot check the images the full self-test needs" in result.stderr
+    assert not fake_ssh[1].exists()
+
+
+def test_release_runs_the_full_self_test_by_default(
+    scratch_repo: Path, fake_ssh: tuple[Path, Path]
+) -> None:
+    """With no self-test flag the release checks the full self-test's images (and with
+    --quick-selftest only the quick one's): the mode reaches the check, so the default
+    is the full self-test."""
+    _release_repo(scratch_repo, _pinned("lab-cell", "goat-dvga"))
+    assert "the full self-test needs" in _release(scratch_repo, fake_ssh).stderr
     usage = _run(["bash", str(DEPLOY / "release.sh"), "--help"], env=_script_env())
     assert usage.returncode == 0 and "--quick-selftest" in usage.stdout
-    # the flag parses (the run then stops at the missing tag, not at the option)
-    result = _run(
-        ["bash", str(DEPLOY / "release.sh"), "lab1", "--quick-selftest"], env=_script_env()
-    )
-    assert result.returncode != 0 and "unknown option" not in result.stderr

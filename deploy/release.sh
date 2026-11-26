@@ -7,7 +7,8 @@ usage() {
 Usage: deploy/release.sh <host> --tag vX.Y.Z[-suffix] [--allow-build] [--quick-selftest | --skip-selftest]
 
 Deploys the git tag to /srv/lab/releases/<tag> on <host> and makes it current:
- 1. refuse if this git tree is dirty or the tag does not exist;
+ 1. refuse if this git tree is dirty or the tag does not exist, or if its
+    images.lock does not pin every image the chosen self-test starts;
  2. refuse if run cells are in flight (containers labelled lab.run_id);
  3. `git archive` the tag and copy it over SSH, verified by SHA-256;
  4. pull every image in the tag's deploy/images.lock by digest, and the
@@ -117,6 +118,50 @@ images=$(git_ show "$commit:deploy/images.lock" | lab_python -c "$IMAGES_PY") ||
 	lab_fail "deploy/images.lock in $tag is not usable"
 [[ -n $images ]] || lab_fail "deploy/images.lock in $tag lists no images"
 mapfile -t image_refs <<<"$images"
+
+# The images the chosen self-test starts, from the release's own self-test experiment
+# (its targets; quick mode keeps the first, as labctl does) and each target's cell file
+# (x-lab cell_image and target_image). Prints the ones images.lock does not pin.
+read -r -d '' SELFTEST_IMAGES_PY <<'PY' || true
+import subprocess, sys
+
+import yaml
+
+repo, commit, mode = sys.argv[1:4]
+
+
+def show(path):
+    done = subprocess.run(
+        ["git", "-C", repo, "show", f"{commit}:{path}"], capture_output=True, text=True
+    )
+    if done.returncode != 0:
+        sys.exit(f"{path} is missing from the release")
+    return yaml.safe_load(done.stdout)
+
+
+try:
+    targets = [t["name"] for t in show("experiments/selftest.yaml")["targets"]]
+    if mode == "quick":
+        targets = targets[:1]
+    needed = []
+    for target in targets:
+        meta = show(f"deploy/compose/cell.{target}.yml")["x-lab"]
+        for name in (meta["cell_image"], meta["target_image"]):
+            if name not in needed:
+                needed.append(name)
+    pinned = {entry.get("name") for entry in show("deploy/images.lock")["images"]}
+except (KeyError, TypeError, yaml.YAMLError) as exc:
+    sys.exit(f"cannot work out the self-test's images: {exc!r}")
+if not needed:
+    sys.exit("the self-test experiment lists no targets")
+print(" ".join(name for name in needed if name not in pinned))
+PY
+if ((selftest)); then
+	missing=$(lab_python -c "$SELFTEST_IMAGES_PY" "$LAB_REPO_ROOT" "$commit" "$selftest_mode") ||
+		lab_fail "cannot check the images the $selftest_mode self-test needs in $tag"
+	[[ -z $missing ]] || lab_fail "the $selftest_mode self-test needs $missing pinned in deploy/images.lock of $tag; \
+pin them (build-images workflow, then images.lock) or deploy with --quick-selftest (DVGA only)"
+fi
 
 lab_step "Preflight on $host"
 lab_load_host "$host"
