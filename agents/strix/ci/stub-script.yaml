@@ -1,0 +1,9 @@
+# Scripted replies of the recording stub model for agents/strix/ci/check.sh, one per
+# request in arrival order. The probe sends four (preflight, main agent, compaction,
+# dedupe judge) and needs only text back. The format follows the CI-lane contract
+# (agents/ci/smoke.sh); adjust it if the stub's schema differs when the lane lands.
+turns:
+  - text: "OK"
+  - text: "lab smoke: main agent done."
+  - text: "lab smoke: summary of the earlier conversation."
+  - text: '{"is_duplicate": false, "duplicate_id": "", "confidence": 0.9, "reason": "different endpoints"}'

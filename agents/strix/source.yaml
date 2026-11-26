@@ -1,0 +1,19 @@
+# Where the Strix agent image comes from. agents/strix/Dockerfile fetches `repo` at
+# `commit` (the commit docs/OLLAMA_SUPPORT_AUDIT.md §2.2 read, release v1.7.1) and
+# applies agents/strix/patches/*.patch on top. Top-level `key: value` lines only:
+# ci/build.sh reads them with sed.
+name: strix
+repo: https://github.com/usestrix/strix
+commit: 685bbc8138d35fc9fe378ac37ec0d9198b9c46a3   # v1.7.1, 2026-11-10
+version: v1.7.1
+license: Apache-2.0
+# The orchestrator image's base, the same pins as cell/Dockerfile (python 3.12-slim
+# and uv 0.12.24, multi-arch index digests).
+image_base: docker.io/library/python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
+uv_image: ghcr.io/astral-sh/uv:0.12.24@sha256:3af4716e991d6956a41e573eab705d0ee08500cd829ed30293eb8472f372c65a
+# The Kali sandbox Strix starts for its tools: the default of strix/config/settings.py
+# (STRIX_IMAGE, tag 1.4.1) pinned by its multi-arch index digest, resolved 26 Nov 2026
+# from ghcr.io. It is never pulled in a cell (cell-guard refuses pulls): the host must
+# hold it, and images.lock must list it with role agent.
+sandbox_image: ghcr.io/usestrix/strix-sandbox@sha256:c8e70302ba4a69b678b4001c909b134d8d0b84625d7b23feed59ece02672c1d2
+sandbox_tag: "1.4.1"

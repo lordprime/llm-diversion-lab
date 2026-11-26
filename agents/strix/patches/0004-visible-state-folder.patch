@@ -1,0 +1,20 @@
+Lab patch for Strix 685bbc8 (v1.7.1), applied at image build.
+
+Why: Strix keeps its agent graph (agents.json) and the SDK sessions (agents.db) in
+strix_runs/<run>/.state (strix/core/paths.py 9). Evidence collection refuses hidden
+names, so the folder is renamed to state; every reader goes through
+runtime_state_dir(), so nothing else changes.
+
+diff --git a/strix/core/paths.py b/strix/core/paths.py
+index 2cd7ba0b..6f152bdb 100644
+--- a/strix/core/paths.py
++++ b/strix/core/paths.py
+@@ -6,7 +6,7 @@ from pathlib import Path
+ 
+ 
+ RUNS_DIR_NAME = "strix_runs"
+-RUNTIME_STATE_DIR_NAME = ".state"
++RUNTIME_STATE_DIR_NAME = "state"  # lab patch: evidence keeps no hidden names
+ RUN_RECORD_FILENAME = "run.json"
+ 
+ 

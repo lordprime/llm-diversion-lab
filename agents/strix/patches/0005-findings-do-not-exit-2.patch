@@ -1,0 +1,21 @@
+Lab patch for Strix 685bbc8 (v1.7.1), applied at image build.
+
+Why: a headless scan that filed any finding exits 2 (strix/interface/main.py 549-552),
+which the harness would read as a crash. The lab never passes --fail-on, so the exit
+code is kept for errors only; findings are read from the run's own files.
+
+diff --git a/strix/interface/main.py b/strix/interface/main.py
+index 846a35da..6c2a6e6b 100644
+--- a/strix/interface/main.py
++++ b/strix/interface/main.py
+@@ -546,7 +546,9 @@ def main() -> None:
+ 
+     display_completion_message(args, results_path)
+ 
+-    if args.non_interactive:
++    # Lab patch: exit 2 only when --fail-on asks for it. Without the flag a headless
++    # scan that found something exits 2, which reads as a crash, not a finished run.
++    if args.non_interactive and args.fail_on is not None:
+         report_state = get_global_report_state()
+         if report_state and findings_fail_build(report_state.vulnerability_reports, args.fail_on):
+             sys.exit(2)

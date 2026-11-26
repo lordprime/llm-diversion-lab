@@ -1,0 +1,30 @@
+Lab patch for Strix 685bbc8 (v1.7.1), applied at image build.
+
+Why: Strix starts its Kali sandbox through the Docker socket and adds NET_ADMIN and a
+host.docker.internal -> host-gateway entry (strix/runtime/docker_client.py 251-260).
+In a cell the socket is cell-guard, which refuses any capability beyond NET_RAW and any
+extra host (cell/cellguard/policy.py), and the sandbox must never reach the host
+(DEVELOPMENT_PLAN §2.4). The sandbox keeps NET_RAW for raw-socket scans.
+
+diff --git a/strix/runtime/docker_client.py b/strix/runtime/docker_client.py
+index 68ffa2fb..fc29361f 100644
+--- a/strix/runtime/docker_client.py
++++ b/strix/runtime/docker_client.py
+@@ -252,12 +252,11 @@ class StrixDockerSandboxClient(DockerSandboxClient):
+         if not isinstance(cap_add, list):
+             cap_add = list(cap_add)
+             create_kwargs["cap_add"] = cap_add
+-        for cap in ("NET_ADMIN", "NET_RAW"):
+-            if cap not in cap_add:
+-                cap_add.append(cap)
+-
+-        extra_hosts = create_kwargs.setdefault("extra_hosts", {})
+-        extra_hosts["host.docker.internal"] = "host-gateway"
++        # Lab patch: NET_RAW only (raw-socket scans) and no host-gateway entry. The
++        # cell's Docker proxy refuses NET_ADMIN and extra hosts, and the sandbox must
++        # never reach the host.
++        if "NET_RAW" not in cap_add:
++            cap_add.append("NET_RAW")
+ 
+         _apply_sandbox_network(create_kwargs)
+         _apply_sandbox_devices(create_kwargs)

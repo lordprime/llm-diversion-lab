@@ -1,0 +1,28 @@
+Lab patch for Strix 685bbc8 (v1.7.1), applied at image build.
+
+Why: web_search and web_get_contents are offered to every agent
+(strix/agents/factory.py 653-654) even though the lab never sets PERPLEXITY_API_KEY or
+EXA_API_KEY. A tool the model can call but that can only answer "not configured" is
+a confound (AUTOMATION_FEASIBILITY §2.2, §3 #4), so both are removed from the tool list.
+
+diff --git a/strix/agents/factory.py b/strix/agents/factory.py
+index 1b8742ba..61750be6 100644
+--- a/strix/agents/factory.py
++++ b/strix/agents/factory.py
+@@ -78,7 +78,6 @@ from strix.tools.todo.tools import (
+     update_todo,
+ )
+ from strix.tools.wait_for_user.tool import wait_for_user
+-from strix.tools.web_search.tool import web_get_contents, web_search
+ 
+ 
+ if TYPE_CHECKING:
+@@ -650,8 +649,6 @@ _BASE_TOOLS: tuple[Tool, ...] = (
+     get_threat_model,
+     save_threat_model,
+     amend_threat_model,
+-    web_search,
+-    web_get_contents,
+     create_vulnerability_report,
+     create_dependency_report,
+     update_vulnerability_report,

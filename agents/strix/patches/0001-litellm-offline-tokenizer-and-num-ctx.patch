@@ -1,0 +1,32 @@
+Lab patch for Strix 685bbc8 (v1.7.1), applied at image build.
+
+Why: two LiteLLM settings Strix has no switch for.
+1. A model name with "llama-2", "llama-3" or a Cohere "command-r" in it makes LiteLLM
+   fetch a tokenizer from huggingface.co when Strix counts tokens for compaction
+   (strix/llm/context_budget.py 76-90 -> litellm/utils.py 2172-2209 at v1.101.0).
+   disable_hf_tokenizer_download keeps counting on the bundled tiktoken encoding.
+2. Ollama must serve every call with the experiment's pinned num_ctx. Strix has no
+   setting for Ollama options, so LAB_OLLAMA_NUM_CTX sets LiteLLM's OllamaChatConfig,
+   whose values go into options of every ollama_chat request
+   (litellm/llms/ollama/chat/transformation.py 292-301 at v1.101.0).
+
+diff --git a/strix/config/models.py b/strix/config/models.py
+index 102d132c..26d55ebd 100644
+--- a/strix/config/models.py
++++ b/strix/config/models.py
+@@ -785,6 +785,15 @@ def _configure_litellm_compatibility() -> None:
+     # Disabling streaming logging also disables that callback for streamed calls.
+     litellm.disable_streaming_logging = False
+     litellm.suppress_debug_info = True
++    # Lab patch: count tokens with the bundled tiktoken encoding only. Without this,
++    # a model name containing "llama-2", "llama-3" or a Cohere "command-r" makes
++    # LiteLLM download a tokenizer from huggingface.co (litellm/utils.py 2172-2209).
++    litellm.disable_hf_tokenizer_download = True
++    # Lab patch: send the experiment's pinned context window with every Ollama call
++    # (options.num_ctx), so Ollama never falls back to its own default.
++    num_ctx = os.environ.get("LAB_OLLAMA_NUM_CTX", "").strip()
++    if num_ctx:
++        litellm.OllamaChatConfig(num_ctx=int(num_ctx))
+ 
+     _register_litellm_cost_callback()
+     _install_openrouter_stream_cost_capture()

@@ -37,8 +37,14 @@ SIDE_CHANNELS: dict[str, dict[str, str | None]] = {
         "context_images": "STRIX_MAX_CONTEXT_IMAGES=0",
         "codex_endpoint": "STRIX_LLM=ollama/<model>",
         "dedupe_endpoint": "STRIX_DEDUPE_MODEL and DEDUPE_LLM_API_BASE unset",
-        "update_check": None,
-        "litellm_cost_map": None,
+        "update_check": "STRIX_NO_UPDATE_CHECK=1",
+        "litellm_cost_map": "LITELLM_LOCAL_MODEL_COST_MAP=True",
+        "litellm_beta_headers": "LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS=True",
+        "agents_sdk_tracing": "OPENAI_AGENTS_DISABLE_TRACING=1",
+        "hf_tokenizer_download": "patch 0001 sets litellm.disable_hf_tokenizer_download",
+        "mcp_servers": (
+            "HOME=/tmp/strix-home (fresh, no mcp-servers.json) and STRIX_MCP_CONFIG unset"
+        ),
     },
     "pentagi": {
         "openai_embeddings": "EMBEDDING_PROVIDER=ollama",
@@ -137,15 +143,18 @@ def test_a_candidate_switch_stays_unresolved_until_verified(
             assert channel.status is ChannelStatus.UNRESOLVED, channel_name
             assert "AUTOMATION_FEASIBILITY §" in channel.note, channel_name
             assert channel.note.endswith("unverified at the audited commit"), channel_name
-        if channel.audit_ref is None:  # found only by the feasibility study
+        if channel.audit_ref is None:  # found only by the feasibility study or the adapter
             assert channel.feasibility_ref is not None, channel_name
-            assert channel.status is ChannelStatus.UNRESOLVED, channel_name
+            # disabled only once the adapter task verified the switch in the source
+            if channel.status is ChannelStatus.DISABLED:
+                assert channel.note is not None, channel_name
+                assert channel.note.startswith(("verified at ", "found by the adapter task")), (
+                    channel_name
+                )
 
 
 #: The candidate switch each unresolved channel's note must name (N4).
 CANDIDATES = {
-    ("strix", "update_check"): "STRIX_NO_UPDATE_CHECK=1",
-    ("strix", "litellm_cost_map"): "LITELLM_LOCAL_MODEL_COST_MAP=True",
     ("hackingbuddygpt", "litellm_cost_map"): "LITELLM_LOCAL_MODEL_COST_MAP=True",
     ("pentagi", "graphiti"): "GRAPHITI_ENABLED=false",
     ("pentagi", "search_engines"): "DUCKDUCKGO_ENABLED=false",
@@ -182,7 +191,13 @@ def test_webfetch_notes_that_its_preflight_bypasses_the_tap(
     ("name", "commit", "level", "wire", "min_ctx"),
     [
         ("hackingbuddygpt", "e23d918", "native", WireFormat.OLLAMA_CHAT, "unknown"),
-        ("strix", "685bbc8", "native", WireFormat.OLLAMA_CHAT, 16384),
+        (
+            "strix",
+            "685bbc8138d35fc9fe378ac37ec0d9198b9c46a3",
+            "native",
+            WireFormat.OLLAMA_CHAT,
+            16384,
+        ),
         ("redamon", "73ca9d3", "native", WireFormat.OPENAI_CHAT, "unknown"),
         ("pentestgpt", "e8b1bb7", "unofficial", WireFormat.ANTHROPIC_MESSAGES, 65536),
         ("pentagi", "b611fbe", "native", WireFormat.OLLAMA_CHAT, 110000),
@@ -227,7 +242,7 @@ def test_every_side_channel_and_its_exact_setting(
 @pytest.mark.parametrize(
     ("name", "knob"),
     [
-        ("strix", "unknown"),
+        ("strix", "--max-turns"),
         ("pentagi", "unknown"),
         ("redamon", "MAX_ITERATIONS"),
         ("pentestgpt", "unknown"),
@@ -238,7 +253,7 @@ def test_the_turn_cap_settings(sheets: dict[str, CapabilitySheet], name: str, kn
     assert sheets[name].max_turns_knob == knob
 
 
-@pytest.mark.parametrize("name", FRAMEWORKS)
+@pytest.mark.parametrize("name", [n for n in FRAMEWORKS if n != "strix"])
 def test_no_framework_can_run_until_its_open_items_are_resolved(
     sheets: dict[str, CapabilitySheet], name: str
 ) -> None:
@@ -289,7 +304,7 @@ def test_the_unofficial_route_is_labelled(sheets: dict[str, CapabilitySheet]) ->
     assert unofficial == {"pentestgpt"}
 
 
-@pytest.mark.parametrize("name", [n for n in FRAMEWORKS if n != "hackingbuddygpt"])
+@pytest.mark.parametrize("name", [n for n in FRAMEWORKS if n not in ("hackingbuddygpt", "strix")])
 def test_no_sheet_claims_agent_ids_the_audit_never_saw(
     sheets: dict[str, CapabilitySheet], name: str
 ) -> None:

@@ -1,70 +1,115 @@
-# Strix capability sheet. Every value comes from docs/OLLAMA_SUPPORT_AUDIT.md;
-# audit_refs and each side channel's audit_ref name the section behind it, and
-# "unknown" marks what the audit could not verify. An unresolved side channel or an
-# unknown turn cap makes every run unsupported until the Strix adapter task fixes it.
-# Side channels the audit missed come from docs/AUTOMATION_FEASIBILITY.md (feasibility_ref);
-# a "candidate" switch in a note is unverified until the adapter task checks the source.
+# Strix capability sheet. Values come from docs/OLLAMA_SUPPORT_AUDIT.md (audit_refs and
+# each side channel's audit_ref name the section) and were checked by the adapter task
+# (M3 Task 2) against the pinned source: Strix at the full commit below, LiteLLM
+# v1.101.0 and openai-agents v0.19.0 (both from Strix's uv.lock). Every file:line in a
+# note is at those versions. Side channels the audit missed cite
+# docs/AUTOMATION_FEASIBILITY.md (feasibility_ref); the ones the adapter task found in
+# the source cite §6.4, the feasibility study's phone-home table they extend, and say so.
 framework: strix
 version: v1.7.1 # LLM config byte-identical to the audited 1.7.0 (6b7ae2e)
-commit: 685bbc8
+commit: 685bbc8138d35fc9fe378ac37ec0d9198b9c46a3
 image_digest: unknown # set once CI builds the Strix agent image
 support_level: native
-# STRIX_LLM=ollama/<model> maps to LiteLLM's ollama_chat/ route (models.py 609-610)
+# STRIX_LLM=ollama/<model> maps to LiteLLM's ollama_chat/ route (strix/config/models.py
+# 609-610)
 wire_formats: [ollama_chat]
-# litellm.api_base is set globally from LLM_API_BASE (models.py 721-723, 978-982), so
-# every path below reaches the tap when LLM_API_BASE=<tap>. Also set
-# STRIX_CONTEXT_FALLBACK_TOKENS to the model's num_ctx (strix/llm/context_budget.py 61-68),
-# or compaction fires too late.
+# LLM_API_BASE becomes litellm.api_base (strix/config/models.py 721-723), and LiteLLM's
+# ollama_chat dispatch takes litellm.api_base before any per-call base (litellm/main.py
+# 4332), so every path below reaches the tap. Each goes through StrixProvider, whose
+# ollama_chat requests carry options.num_ctx from LAB_OLLAMA_NUM_CTX (patch 0001).
 model_call_paths:
   - "main agent: OpenAI Agents SDK LitellmModel behind StrixProvider (strix/config/models.py 563-660)"
-  - "history compaction: _summarize through StrixProvider().get_model, no tools (strix/llm/compaction.py 302-316)"
+  - "history compaction: _summarize through StrixProvider().get_model, no tools (strix/llm/compaction.py 302-326)"
   - "report dedupe judge: STRIX_DEDUPE_MODEL, defaults to the main model (strix/report/dedupe.py 365)"
+  - "start-up preflight: one 'Reply with just OK' call through StrixProvider (strix/interface/scan_setup.py 103-170)"
 side_channels:
   web_search_perplexity:
     status: disabled
     setting: "PERPLEXITY_API_KEY unset"
     audit_ref: "§2.2, §3"
-    note: "web_search would call Perplexity's hosted sonar-reasoning-pro (strix/tools/web_search/tool.py 49-53)"
+    note: "web_search would call Perplexity's hosted sonar-reasoning-pro (strix/tools/web_search/tool.py 49-58); patch 0002 also drops the tool"
   web_search_exa:
     status: disabled
     setting: "EXA_API_KEY unset"
     audit_ref: "§2.2, §3"
-    note: "without a Perplexity key web_search falls back to Exa (strix/tools/web_search/tool.py 122)"
+    note: "without a Perplexity key web_search falls back to Exa (strix/tools/web_search/tool.py 122, 146, 169-185); patch 0002 also drops the tool"
   telemetry:
     status: disabled
     setting: "STRIX_TELEMETRY=false"
     audit_ref: "§2.2, §3"
-    note: "PostHog and Scarf, on by default (strix/interface/main.py)"
+    note: "PostHog and Scarf both send only when settings.telemetry.enabled (strix/telemetry/posthog.py 29-35, scarf.py 32-38; strix/config/settings.py 178)"
   context_images:
     status: disabled
     setting: "STRIX_MAX_CONTEXT_IMAGES=0"
     audit_ref: "§2.2, §3"
-    note: "for text-only models; the default keeps 3 screenshots in context (strix/config/settings.py)"
+    note: "for text-only models; the default keeps 3 screenshots in context (strix/config/settings.py 172)"
   codex_endpoint:
     status: disabled
     setting: "STRIX_LLM=ollama/<model>"
     audit_ref: "§2.2"
-    note: "chatgpt/ models use a hard-coded Codex endpoint (strix/config/codex.py 50)"
+    note: "chatgpt/ models use a hard-coded Codex endpoint (strix/config/codex.py 50); only a chatgpt/ prefix selects it (codex.py 397-402)"
   dedupe_endpoint:
     status: disabled
     setting: "STRIX_DEDUPE_MODEL and DEDUPE_LLM_API_BASE unset"
     audit_ref: "§2.2, §4"
-    note: "unset, the dedupe judge uses the main model; whether DEDUPE_LLM_API_BASE is overridden by the global api_base is unverified (§4 item 11)"
+    note: "verified at 685bbc8: with STRIX_DEDUPE_MODEL unset the judge ignores DEDUPE_LLM_API_BASE and uses the main model and endpoint (strix/report/dedupe.py 61-65, 365); even when set, litellm.api_base wins on ollama_chat (litellm/main.py 4332), settling audit §4 item 11"
   update_check:
-    status: unresolved
+    status: disabled
+    setting: "STRIX_NO_UPDATE_CHECK=1"
     audit_ref: "§2.2"
     feasibility_ref: "§2.2, §6.4"
-    note: "update check against GitHub and PyPI (strix/interface/update_check.py); the audit names no switch; candidate: STRIX_NO_UPDATE_CHECK=1 (AUTOMATION_FEASIBILITY §2.2, §6.4), unverified at the audited commit"
+    note: "verified at 685bbc8: any non-empty STRIX_NO_UPDATE_CHECK turns off the GitHub and PyPI check (strix/interface/update_check.py 48-52, 178-182; called at strix/interface/main.py 477)"
   litellm_cost_map:
-    status: unresolved
+    status: disabled
+    setting: "LITELLM_LOCAL_MODEL_COST_MAP=True"
     feasibility_ref: "§2.2, §6.4"
-    note: "LiteLLM's remote model cost map; not in the audit; candidate: LITELLM_LOCAL_MODEL_COST_MAP=True (AUTOMATION_FEASIBILITY §2.2, §6.4), unverified at the audited commit"
+    note: "verified at LiteLLM v1.101.0: the remote cost map is fetched on import unless LITELLM_LOCAL_MODEL_COST_MAP is true (litellm/__init__.py 549, litellm/litellm_core_utils/get_model_cost_map.py 490)"
+  litellm_beta_headers:
+    status: disabled
+    setting: "LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS=True"
+    feasibility_ref: "§6.4"
+    note: "found by the adapter task, not in the §6.4 table: LiteLLM fetches its Anthropic beta-header config from GitHub on first use unless this is true (litellm/anthropic_beta_headers_manager.py 137-142 at v1.101.0); ollama_chat never uses it, so this is belt and braces"
+  agents_sdk_tracing:
+    status: disabled
+    setting: "OPENAI_AGENTS_DISABLE_TRACING=1"
+    feasibility_ref: "§6.4"
+    note: "found by the adapter task, not in the §6.4 table: the Agents SDK exports traces to api.openai.com/v1/traces/ingest; Strix turns tracing off itself (strix/config/models.py 707) and the env switch (agents/tracing/provider.py 347-352 at v0.19.0) covers anything that runs first"
+  hf_tokenizer_download:
+    status: disabled
+    setting: "patch 0001 sets litellm.disable_hf_tokenizer_download"
+    feasibility_ref: "§6.4"
+    note: "found by the adapter task, not in the §6.4 table: compaction counts tokens with litellm.token_counter (strix/llm/context_budget.py 76-90), which fetches a tokenizer from huggingface.co for names with llama-2, llama-3 or a Cohere command-r (litellm/utils.py 2172-2209)"
+  mcp_servers:
+    status: disabled
+    setting: "HOME=/tmp/strix-home (fresh, no mcp-servers.json) and STRIX_MCP_CONFIG unset"
+    feasibility_ref: "§6.4"
+    note: "found by the adapter task, not in the §6.4 table: Strix connects to every MCP server in ~/.strix/mcp-servers.json or $STRIX_MCP_CONFIG (strix/tools/mcp/loader.py 30-44, 103-117); a missing file means no connection"
 min_num_ctx: 16384 # local.mdx: raise num_ctx to "at least 16k-32k"
 sub_agents: dynamic # create_agent spawns children on demand; no cap found
-agent_id_source: null
-agent_id_gap: "unknown: the audit read no Strix log that names the child agent behind each model call"
-patches: []
-max_turns_knob: unknown # the audit names no turn cap setting
+# run.json llm_requests: Strix's own request log, one entry per provider attempt with
+# the agent behind it (strix/report/state.py 1024-1045, on with STRIX_RUN_RECORD_TIMINGS)
+agent_id_source: "run.json llm_requests (STRIX_RUN_RECORD_TIMINGS=true), paired with tap calls by start order and token counts; the preflight call by its fixed prompt"
+patches:
+  - upstream_file: strix/config/models.py
+    change: "_configure_litellm_compatibility sets litellm.disable_hf_tokenizer_download and, from LAB_OLLAMA_NUM_CTX, OllamaChatConfig(num_ctx)"
+    reason: "no tokenizer download from huggingface.co, and the pinned num_ctx in every Ollama request (Strix has no setting for either)"
+  - upstream_file: strix/agents/factory.py
+    change: "web_search and web_get_contents removed from _BASE_TOOLS (lines 653-654)"
+    reason: "a tool offered without a key can only fail: a confound (AUTOMATION_FEASIBILITY §2.2, §3 #4)"
+  - upstream_file: strix/runtime/docker_client.py
+    change: "the sandbox asks for NET_RAW only and gets no host.docker.internal host-gateway entry (lines 251-260)"
+    reason: "cell-guard refuses NET_ADMIN and extra hosts, and the sandbox must never reach the host (DEVELOPMENT_PLAN §2.4)"
+  - upstream_file: strix/core/paths.py
+    change: "RUNTIME_STATE_DIR_NAME .state becomes state (line 9)"
+    reason: "evidence collection refuses hidden names, and state/ holds agents.json and agents.db"
+  - upstream_file: strix/interface/main.py
+    change: "a headless run exits 2 on findings only when --fail-on is given (lines 549-552)"
+    reason: "exit 2 on any finding would read as a crash; findings are read from the run's files"
+# --max-turns: "Maximum turns per agent", default 500 (strix/interface/cli_args.py
+# 289-299). It is the SDK's max_turns for each agent's run cycle; past it the agent
+# stops with "Max turns (N) exceeded" (agents/run.py 1109 at v0.19.0). An agent that
+# answers in text gets up to N nudges back to a tool call (strix/core/execution.py 566).
+max_turns_knob: "--max-turns"
 audit_refs:
   version: "§2.2"
   support_level: "§1, §2.2"
