@@ -1,0 +1,5 @@
+# The agent lane's self-check is part of this repository: there is no upstream tool.
+# It is never pushed, so it carries no upstream repo or commit.
+license: same as this repository
+image_base: docker.io/library/python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
+worker_base: docker.io/library/busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec

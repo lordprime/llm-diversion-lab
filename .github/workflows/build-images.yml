@@ -8,6 +8,18 @@ name: build-images
 #   targets/<name>/source.yaml and the CVE-Bench evaluator pinned in
 #   cell/oracle/source.yaml; targets/<name>/ci/expect_tools holds its images.lock
 #   expect_tools. A target without a Dockerfile is listed as not built yet.
+# * agent-<name> (role agent) one per agent with an image recipe, i.e. every
+#   agents/<name>/Dockerfile (with its source.yaml, ci/build.sh, ci/check.sh and its
+#   agents/sheets/<name>.yaml). Its ci/check.sh smoke-tests it with agents/ci/smoke.sh
+#   against the recording stub model and the egress canary (the smoke kit image,
+#   agents/ci/stub_model/Dockerfile, is built first, in the same job). build.sh may
+#   build extra images, tagged agent-<name>-<part>:ci and listed one per line in the
+#   file $EXTRA_IMAGES; check.sh reads the same file. Only agent-<name> is pushed, plus
+#   each <part> named in agents/<name>/ci/push_extra. A directory starting with _
+#   (agents/_selfcheck, the lane's own end-to-end check) is built and checked, never
+#   pushed. No agent with a Dockerfile yet is fine.
+#   GOATs and agents share one matrix job, `image`: build, check, push by digest,
+#   then the digest artifact.
 # * lab-cell   (role infra)   cell/Dockerfile, context the repository root (the root
 #   .dockerignore allow-list): injector, tap, catcher, stub LLM, cell-guard, probe.
 # * control    (role control) deploy/compose/control.Dockerfile, context the
@@ -37,6 +49,11 @@ on:
         required: false
         default: ""
         type: string
+      only:
+        description: "Build only these image jobs, space-separated (e.g. agent-strix goat-dvga); lab-cell and control are then skipped. Empty builds everything."
+        required: false
+        default: ""
+        type: string
 
 permissions: {}
 
@@ -53,6 +70,8 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       goats: ${{ steps.goats.outputs.goats }}
+      agents: ${{ steps.agents.outputs.agents }}
+      images: ${{ steps.images.outputs.images }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -102,40 +121,124 @@ jobs:
             if (( ${#pending[@]} )); then echo; echo "Not built yet (no Dockerfile): ${pending[*]}"; fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-  goat:
-    name: goat-${{ matrix.goat }}
+      - name: Find the agents with an image recipe
+        id: agents
+        run: |
+          set -euo pipefail
+          # an agent has an image recipe when agents/<name>/Dockerfile exists; a name
+          # starting with _ is a lane fixture (built and checked, never pushed)
+          agents=()
+          for dir in agents/*/; do
+            a=$(basename "$dir")
+            [[ -f "agents/$a/Dockerfile" ]] || continue
+            [[ "$a" =~ ^_?[a-z0-9][a-z0-9-]*$ ]] || { echo "::error::bad agent directory name: $a" >&2; exit 1; }
+            for need in source.yaml ci/build.sh ci/check.sh; do
+              [[ -f "agents/$a/$need" ]] || { echo "::error::agents/$a has a Dockerfile but no $need" >&2; exit 1; }
+            done
+            if [[ "$a" != _* && ! -f "agents/sheets/$a.yaml" ]]; then
+              echo "::error::agents/$a has a Dockerfile but no agents/sheets/$a.yaml" >&2; exit 1
+            fi
+            agents+=("$a")
+          done
+          pending=()
+          for sheet in agents/sheets/*.yaml; do
+            [[ -e "$sheet" ]] || continue
+            a=$(basename "$sheet" .yaml)
+            [[ -f "agents/$a/Dockerfile" ]] || pending+=("$a")
+          done
+          # names are [a-z0-9-] after an optional _ (checked above): no escaping needed
+          json=""
+          if (( ${#agents[@]} )); then json=$(printf '"%s",' "${agents[@]}"); fi
+          echo "agents=[${json%,}]" >> "$GITHUB_OUTPUT"
+          {
+            echo
+            echo "Agent images built: ${agents[*]:-none}"
+            if (( ${#pending[@]} )); then echo; echo "Agents not built yet (no Dockerfile): ${pending[*]}"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Lay out the image matrix
+        id: images
+        env:
+          GOATS: ${{ steps.goats.outputs.goats }}
+          AGENTS: ${{ steps.agents.outputs.agents }}
+          ONLY: ${{ inputs.only }}
+        run: |
+          set -euo pipefail
+          # one entry per image job; GOATs and agents share the `image` job
+          names() { tr -d '[]"' <<<"$1" | tr ',' ' '; }
+          # `only` must name existing jobs: goat-<name> or agent-<directory name>
+          known=" $(for g in $(names "$GOATS"); do printf 'goat-%s ' "$g"; done)$(for a in $(names "$AGENTS"); do printf 'agent-%s ' "$a"; done)"
+          for job in ${ONLY:-}; do
+            [[ "$known" == *" $job "* ]] || { echo "::error::only: no image job $job (known:$known)" >&2; exit 1; }
+          done
+          wanted() { [[ -z "${ONLY// /}" || " $ONLY " == *" $1 "* ]]; }
+          entries=()
+          for g in $(names "$GOATS"); do
+            wanted "goat-$g" || continue
+            entries+=("{\"lane\":\"goat\",\"name\":\"$g\",\"dir\":\"targets/$g\",\"image\":\"goat-$g\",\"role\":\"target\",\"push\":true,\"timeout\":45}")
+          done
+          for a in $(names "$AGENTS"); do
+            wanted "agent-$a" || continue
+            push=true
+            [[ "$a" != _* ]] || push=false
+            entries+=("{\"lane\":\"agent\",\"name\":\"$a\",\"dir\":\"agents/$a\",\"image\":\"agent-${a#_}\",\"role\":\"agent\",\"push\":$push,\"timeout\":90}")
+          done
+          json=""
+          if (( ${#entries[@]} )); then json=$(IFS=,; echo "${entries[*]}"); fi
+          echo "images=[$json]" >> "$GITHUB_OUTPUT"
+
+  image:
+    name: ${{ matrix.image.lane }}-${{ matrix.image.name }}
     needs: plan
+    if: needs.plan.outputs.images != '[]'
     strategy:
       fail-fast: false
       matrix:
-        goat: ${{ fromJSON(needs.plan.outputs.goats) }}
+        image: ${{ fromJSON(needs.plan.outputs.images) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.image.timeout }}
     permissions:
       contents: read
       packages: write
     env:
-      GOAT: ${{ matrix.goat }}
-      IMAGE: ghcr.io/lordprime/goat-${{ matrix.goat }}
+      LANE: ${{ matrix.image.lane }}
+      NAME: ${{ matrix.image.name }}
+      DIR: ${{ matrix.image.dir }}
+      ROLE: ${{ matrix.image.role }}
+      LOCAL: ${{ matrix.image.image }}:ci
+      IMAGE: ghcr.io/lordprime/${{ matrix.image.image }}
       TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
-      - name: Read pinned fork commits
+      - name: Read pinned commits
         id: pins
+        env:
+          PUSH: ${{ matrix.image.push }}
         run: |
           set -euo pipefail
           # top-level `key: value` of a source.yaml (indented upstream keys don't match)
           read_pin() { sed -n "s/^$2:[[:space:]]*\([^[:space:]#]*\).*/\1/p" "$1"; }
-          app_repo=$(read_pin "targets/$GOAT/source.yaml" repo)
-          app_commit=$(read_pin "targets/$GOAT/source.yaml" build_commit)
-          eval_repo=$(read_pin cell/oracle/source.yaml repo)
-          eval_commit=$(read_pin cell/oracle/source.yaml build_commit)
-          [[ "$app_repo" == https://github.com/* && "$eval_repo" == https://github.com/* ]] \
-            || { echo "unexpected fork repo URL" >&2; exit 1; }
-          for c in "$app_commit" "$eval_commit"; do
+          if [[ "$LANE" == goat ]]; then
+            # a GOAT: its fork and the CVE-Bench evaluator fork, both cloned below
+            app_repo=$(read_pin "$DIR/source.yaml" repo)
+            app_commit=$(read_pin "$DIR/source.yaml" build_commit)
+            eval_repo=$(read_pin cell/oracle/source.yaml repo)
+            eval_commit=$(read_pin cell/oracle/source.yaml build_commit)
+          elif [[ "$PUSH" == true ]]; then
+            # an agent: its upstream tool, which its own Dockerfile fetches; only recorded
+            app_repo=$(read_pin "$DIR/source.yaml" repo)
+            app_commit=$(read_pin "$DIR/source.yaml" commit)
+            eval_repo="" eval_commit=""
+          else
+            exit 0  # a lane fixture (agents/_<name>): no upstream, never pushed
+          fi
+          for r in "$app_repo" ${eval_repo:+"$eval_repo"}; do
+            [[ "$r" == https://github.com/* ]] || { echo "unexpected fork repo URL" >&2; exit 1; }
+          done
+          for c in "$app_commit" ${eval_commit:+"$eval_commit"}; do
             [[ "$c" =~ ^[0-9a-f]{40}$ ]] || { echo "not a full commit sha: $c" >&2; exit 1; }
           done
           {
@@ -146,6 +249,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Clone forks at the pinned commits
+        if: matrix.image.lane == 'goat'
         env:
           APP_REPO: ${{ steps.pins.outputs.app_repo }}
           APP_COMMIT: ${{ steps.pins.outputs.app_commit }}
@@ -168,18 +272,46 @@ jobs:
         env:
           APP_COMMIT: ${{ steps.pins.outputs.app_commit }}
           EVAL_COMMIT: ${{ steps.pins.outputs.eval_commit }}
+          EXTRA_IMAGES: ${{ runner.temp }}/extra-images
         run: |
           set -euo pipefail
+          : > "$EXTRA_IMAGES"
           APP_SRC="$RUNNER_TEMP/app" EVAL_SRC="$RUNNER_TEMP/cvebench" \
             SOURCE_URL="https://github.com/${GITHUB_REPOSITORY}" REVISION="${GITHUB_SHA}" \
-            bash "targets/$GOAT/ci/build.sh" "goat-$GOAT:ci"
+            bash "$DIR/ci/build.sh" "$LOCAL"
+          # extra images (agents only): each listed as <image>-<part>:ci and built here
+          while read -r extra; do
+            [[ "$extra" =~ ^${LOCAL%:ci}-[a-z0-9][a-z0-9-]*:ci$ ]] \
+              || { echo "::error::$DIR/ci/build.sh listed a bad extra image: $extra" >&2; exit 1; }
+            docker image inspect "$extra" >/dev/null \
+              || { echo "::error::$DIR/ci/build.sh listed $extra but did not build it" >&2; exit 1; }
+          done < "$EXTRA_IMAGES"
 
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
-      - name: Check the image (the GOAT's own checks and behaviour tests)
-        run: bash "targets/$GOAT/ci/check.sh" "goat-$GOAT:ci"
+      - name: Build the smoke kit (stub model, egress canary, cell-guard)
+        if: matrix.image.lane == 'agent'
+        run: |
+          set -euo pipefail
+          docker buildx build --load -f agents/ci/stub_model/Dockerfile -t lab-smoke-kit:ci .
+
+      - name: Check the image (its own checks; agents also run agents/ci/smoke.sh)
+        env:
+          SMOKE_OUT: ${{ runner.temp }}/smoke
+          EXTRA_IMAGES: ${{ runner.temp }}/extra-images
+        run: bash "$DIR/ci/check.sh" "$LOCAL"
+
+      - name: Keep the smoke outputs
+        if: always() && matrix.image.lane == 'agent'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.image.image }}-smoke
+          path: ${{ runner.temp }}/smoke
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Log in to GHCR
+        if: matrix.image.push
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -188,50 +320,92 @@ jobs:
 
       - name: Push
         id: push
+        if: matrix.image.push
+        env:
+          EXTRA_IMAGES: ${{ runner.temp }}/extra-images
         run: |
           set -euo pipefail
-          # a named version is pushed once: never move a tag that already exists
-          if [[ "$TAG" != sha-* ]] && docker buildx imagetools inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
-            echo "::error::$IMAGE:$TAG already exists; choose a new version" >&2; exit 1
+          # the main image, then each extra image the agent's ci/push_extra names
+          pairs=("$LOCAL $IMAGE")
+          if [[ -f "$DIR/ci/push_extra" ]]; then
+            while read -r part; do
+              [[ -n "$part" && "$part" != \#* ]] || continue
+              extra="${LOCAL%:ci}-$part:ci"
+              grep -qxF "$extra" "$EXTRA_IMAGES" \
+                || { echo "::error::$DIR/ci/push_extra names $part, but build.sh built no $extra" >&2; exit 1; }
+              pairs+=("$extra $IMAGE-$part")
+            done < "$DIR/ci/push_extra"
           fi
-          docker tag "goat-$GOAT:ci" "$IMAGE:$TAG"
-          docker push "$IMAGE:$TAG" | tee push.log
-          # the digest the registry reported for this push (the daemon's RepoDigests
-          # can list the local build name first, so it is not used)
-          digest=$(sed -n 's/^.*digest: \(sha256:[0-9a-f]*\) size: [0-9]*$/\1/p' push.log | tail -n1)
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad digest: $digest" >&2; exit 1; }
-          # and the registry must now serve exactly that digest at the tag
-          served=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest}}' | jq -r .digest)
-          [[ "$served" == "$digest" ]] || { echo "registry serves $served at $IMAGE:$TAG, push said $digest" >&2; exit 1; }
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          # a named version is pushed once: never move a tag that already exists
+          for pair in "${pairs[@]}"; do
+            remote=${pair#* }
+            if [[ "$TAG" != sha-* ]] && docker buildx imagetools inspect "$remote:$TAG" >/dev/null 2>&1; then
+              echo "::error::$remote:$TAG already exists; choose a new version" >&2; exit 1
+            fi
+          done
+          : > pushed.txt
+          for pair in "${pairs[@]}"; do
+            local_ref=${pair%% *} remote=${pair#* }
+            docker tag "$local_ref" "$remote:$TAG"
+            docker push "$remote:$TAG" | tee push.log
+            # the digest the registry reported for this push (the daemon's RepoDigests
+            # can list the local build name first, so it is not used)
+            digest=$(sed -n 's/^.*digest: \(sha256:[0-9a-f]*\) size: [0-9]*$/\1/p' push.log | tail -n1)
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad digest: $digest" >&2; exit 1; }
+            # and the registry must now serve exactly that digest at the tag
+            served=$(docker buildx imagetools inspect "$remote:$TAG" --format '{{json .Manifest}}' | jq -r .digest)
+            [[ "$served" == "$digest" ]] || { echo "registry serves $served at $remote:$TAG, push said $digest" >&2; exit 1; }
+            echo "$remote $digest" >> pushed.txt
+          done
+          echo "digest=$(head -n1 pushed.txt | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
 
       - name: Record the digest
+        if: matrix.image.push
         env:
-          DIGEST: ${{ steps.push.outputs.digest }}
+          APP_REPO: ${{ steps.pins.outputs.app_repo }}
           APP_COMMIT: ${{ steps.pins.outputs.app_commit }}
           EVAL_COMMIT: ${{ steps.pins.outputs.eval_commit }}
         run: |
           set -euo pipefail
-          expect_tools=$(head -n1 "targets/$GOAT/ci/expect_tools")
-          [[ "$expect_tools" =~ ^\[[a-z0-9_.,\ -]+\]$ ]] || { echo "bad expect_tools: $expect_tools" >&2; exit 1; }
-          cat > images.lock.entry.yml <<EOF
-          # Paste into deploy/images.lock in a reviewed commit.
-            - name: goat-${GOAT}
-              image: ${IMAGE}
-              digest: ${DIGEST}
+          # a GOAT must list its tools; an agent may (ci/expect_tools), else none are listed
+          expect_tools="[]"
+          if [[ "$LANE" == goat || -f "$DIR/ci/expect_tools" ]]; then
+            expect_tools=$(head -n1 "$DIR/ci/expect_tools")
+            [[ "$expect_tools" =~ ^\[[a-z0-9_.,\ -]+\]$ ]] || { echo "bad expect_tools: $expect_tools" >&2; exit 1; }
+          fi
+          if [[ "$LANE" == goat ]]; then
+            provenance="${NAME} ${APP_COMMIT}; evaluator ${EVAL_COMMIT}"
+          else
+            provenance="${NAME} ${APP_REPO} ${APP_COMMIT}"
+          fi
+          echo "# Paste into deploy/images.lock in a reviewed commit." > images.lock.entry.yml
+          while read -r remote digest; do
+            # extra images get no tool list of their own
+            [[ "$remote" == "$IMAGE" ]] || expect_tools="[]"
+            cat >> images.lock.entry.yml <<EOF
+            - name: ${remote##*/}
+              image: ${remote}
+              digest: ${digest}
               expect_tools: ${expect_tools}
-              role: target
-              # tag ${TAG}; ${GOAT} ${APP_COMMIT}; evaluator ${EVAL_COMMIT}
+              role: ${ROLE}
+              # tag ${TAG}; ${provenance}
           EOF
+          done < pushed.txt
           {
-            echo "## goat-${GOAT}"
+            echo "## ${LANE}-${NAME}"
             echo
-            echo "Pushed \`${IMAGE}:${TAG}\`"
-            echo
-            echo "**Digest:** \`${DIGEST}\`"
-            echo
-            echo "- ${GOAT} fork commit: \`${APP_COMMIT}\`"
-            echo "- CVE-Bench fork commit: \`${EVAL_COMMIT}\`"
+            while read -r remote digest; do
+              echo "Pushed \`${remote}:${TAG}\`"
+              echo
+              echo "**Digest:** \`${digest}\`"
+              echo
+            done < pushed.txt
+            if [[ "$LANE" == goat ]]; then
+              echo "- ${NAME} fork commit: \`${APP_COMMIT}\`"
+              echo "- CVE-Bench fork commit: \`${EVAL_COMMIT}\`"
+            else
+              echo "- ${NAME} upstream: ${APP_REPO} at \`${APP_COMMIT}\`"
+            fi
             echo
             echo "deploy/images.lock entry (commit it by hand, after review):"
             echo
@@ -240,13 +414,15 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - if: matrix.image.push
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: goat-${{ matrix.goat }}-digest
+          name: ${{ matrix.image.image }}-digest
           path: images.lock.entry.yml
 
   lab-cell:
     needs: plan
+    if: inputs.only == ''
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -368,6 +544,7 @@ jobs:
 
   control:
     needs: plan
+    if: inputs.only == ''
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

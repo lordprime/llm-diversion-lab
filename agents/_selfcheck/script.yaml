@@ -1,0 +1,16 @@
+# Stub model script for the self-check: a text turn, a tool-call turn and a turn that
+# only answers Anthropic requests, then the final reply for everything after.
+version: 1
+models: [stub-model]
+embedding_dimensions: 8
+final: "Self-check done."
+turns:
+  - text: "Self-check: plain text reply."
+  - tool_calls:
+      - name: run_command
+        arguments: {command: "echo selfcheck"}
+  - when: {path: /v1/messages}
+    text: "Self-check: an Anthropic-only turn."
+    tool_calls:
+      - name: read_file
+        arguments: {path: /etc/hostname}
