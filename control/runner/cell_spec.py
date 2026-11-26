@@ -765,8 +765,12 @@ def render_cell(
     agent_volumes = ["cfg_agent:/etc/lab/agent:ro", "ev_agent:/evidence"]
     volumes: dict[str, Any] = {k: {} for k in cell.get("volumes", {})}
     files: list[CellFile] = []
-    if spec.needs_docker:
+    # The cell's one scratch named volume: created by the backend, allowed by cell-guard,
+    # and named to the agent so the containers it starts can mount it.
+    scratch_volume = f"{name}_scratch" if spec.needs_docker else None
+    if scratch_volume is not None:
         agent_env["DOCKER_HOST"] = f"unix://{_GUARD_DIR}/docker.sock"
+        agent_env["LAB_SCRATCH_VOLUME"] = scratch_volume
         agent_volumes.append(f"cellguard_sock:{_GUARD_DIR}")
         for extra in ("cellguard_sock", "cfg_cellguard", "ev_cellguard"):
             volumes[extra] = {}
@@ -796,7 +800,7 @@ def render_cell(
                 "LAB_CELLGUARD_EXTRA_HOSTS": PinnedHost.render(pinned),
                 "LAB_CELLGUARD_LISTEN": f"{_GUARD_DIR}/docker.sock",
                 "LAB_CELLGUARD_UPSTREAM": _DOCKER_SOCKET,
-                "LAB_CELLGUARD_SCRATCH_VOLUME": f"{name}_scratch",
+                "LAB_CELLGUARD_SCRATCH_VOLUME": scratch_volume,
                 "LAB_CELLGUARD_SOCKET_MODE": "666",
                 "LAB_EVIDENCE_DIR": _GUARD_EVIDENCE,
             },
@@ -887,6 +891,6 @@ def render_cell(
         probe_paths=tuple(probe_paths),
         evidence=evidence,
         evidence_paths={"cellguard": _GUARD_EVIDENCE} if spec.needs_docker else {},
-        scratch_volume=f"{name}_scratch" if spec.needs_docker else None,
+        scratch_volume=scratch_volume,
         reset=ResetSpec.from_meta(meta.get("reset")),
     )

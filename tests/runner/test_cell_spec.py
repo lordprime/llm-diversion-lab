@@ -248,6 +248,9 @@ def test_agent_is_only_on_an_internal_network_and_reaches_the_llm_only_via_the_t
             assert "com.docker.network.bridge.gateway_mode_ipv4" not in opts
         env = _env(project, "agent")
         assert env["ANTHROPIC_BASE_URL"] == "http://tap:8080"
+        # no Docker for this agent: no socket, no scratch volume, no cell-guard
+        assert not {"DOCKER_HOST", "LAB_SCRATCH_VOLUME"} & set(env)
+        assert "cellguard" not in services and project.scratch_volume is None
         # the LLM side is reachable only from the tap
         on_llm = {s for s, d in services.items() if "llm" in d.get("networks", {})}
         assert on_llm == {"tap", "stub-llm"}
@@ -676,6 +679,9 @@ def test_an_agent_that_starts_containers_gets_a_cell_guard(
     assert "scratch" not in project.document["volumes"]
     assert project.scratch_volume == f"{project.name}_scratch"
     assert env["LAB_CELLGUARD_SCRATCH_VOLUME"] == project.scratch_volume
+    # The agent is told the one volume cell-guard lets its containers mount.
+    agent_env = services["agent"]["environment"]
+    assert agent_env["LAB_SCRATCH_VOLUME"] == env["LAB_CELLGUARD_SCRATCH_VOLUME"]
     assert project.evidence["cellguard"] == "cellguard"
     assert env["LAB_EVIDENCE_DIR"] == project.evidence_paths["cellguard"] != "/evidence"
     assert "LAB_CELLGUARD_NAME_PREFIX" not in env  # the default <run id>- prefix
