@@ -424,8 +424,10 @@ def test_the_three_arm_migration_refuses_to_downgrade_over_neutral_runs(db_url: 
             )
     finally:
         eng.dispose()
-    with pytest.raises(RuntimeError, match="neutral run\\(s\\) or arm\\(s\\) are stored"):
+    with pytest.raises(RuntimeError) as refused:
         command.downgrade(cfg, "0010")
+    assert ids["experiment_id"] in str(refused.value)
+    assert "delete or archive those experiments first" in str(refused.value)
     assert "block_id" in {c for c in _runs_columns(db_url)}  # nothing was half-done
 
 

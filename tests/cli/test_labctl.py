@@ -387,7 +387,7 @@ def test_build_backend_is_pinned() -> None:
 # --------------------------------------------------------------------- telemetry
 
 EXPORT_HEADER = (
-    "run_id,arm,target,agent,model,end_status,status,invalid_reason,effect,mechanism,calls,"
+    "run_id,block_id,arm,target,agent,model,end_status,status,invalid_reason,effect,mechanism,calls,"
     "agents,agents_source,peak_input_tokens,input_tokens,output_tokens,reasoning_chars,"
     "calls_with_reasoning,single_call_threads,largest_thread_calls,branch_points,"
     "persona_splits,telemetry_version,telemetry_status"
@@ -464,14 +464,17 @@ def test_export_csv_has_one_row_per_run_in_schedule_order(
     # schedule index 0, 1, 2, then the queued run: every run of the experiment is a row
     assert [line.split(",")[0] for line in lines[1:]] == [*run_ids[::-1], ids["queued_run_id"]]
     first = lines[1].split(",")
-    assert first[1:11] == [
+    with session_scope(lab_db) as s:
+        block_of = dict(s.execute(select(t.Run.run_id, t.Run.block_id)).all())
+    assert first[1] == block_of[first[0]]  # the block, so the three arms can be paired up
+    assert first[2:12] == [
         "instruction", ids["target_id"], ids["agent_id"], ids["model_id"],
         "completed", "valid", "", "true", "", "12",
     ]  # fmt: skip
     assert first[-1] == "ok"
-    assert lines[2].split(",")[13] == ""  # no peak input tokens reported: an empty cell
+    assert lines[2].split(",")[14] == ""  # no peak input tokens reported: an empty cell
     queued = lines[4].split(",")
-    assert queued[6] == "queued" and queued[10:23] == [""] * 13 and queued[-1] == "missing"
+    assert queued[7] == "queued" and queued[11:24] == [""] * 13 and queued[-1] == "missing"
     again = _run(capsys, "export", "telemetry", "--experiment", experiment, "--format", "csv")
     assert again[1] == out  # deterministic
 
@@ -483,7 +486,9 @@ def test_export_markdown_is_a_table(lab_db: Engine, capsys: pytest.CaptureFixtur
     )
     lines = out.splitlines()
     assert rc == 0 and len(lines) == 2 + len(run_ids) + 1
-    assert lines[0].startswith("| run_id | arm | target |") and set(lines[1]) <= set("|- ")
+    assert lines[0].startswith("| run_id | block_id | arm | target |") and set(lines[1]) <= set(
+        "|- "
+    )
     assert lines[2].split("|")[1].strip() == run_ids[-1]
     assert all(line.count("|") == lines[0].count("|") for line in lines)
 
@@ -518,7 +523,7 @@ def test_export_keeps_a_run_whose_telemetry_failed_as_an_empty_row(
     )
     assert rc == 0 and "1 run" in err and failed in err
     row = out.splitlines()[2].split(",")
-    assert row[0] == failed and row[10:23] == [""] * 13 and row[23] == "error"
+    assert row[0] == failed and row[11:24] == [""] * 13 and row[24] == "error"
 
 
 def test_export_with_no_telemetry_is_just_the_header(
@@ -569,7 +574,7 @@ def test_export_counts_every_status_and_every_non_valid_run_on_stderr(
     assert "telemetry: ok 1, error 1, missing 2" in err
     assert "2 of 4 run(s) are not valid" in err
     row = next(line for line in out.splitlines() if line.startswith(bad)).split(",")
-    assert row[6:8] == ["invalid", "internal"] and row[-1] == "missing"
+    assert row[7:9] == ["invalid", "internal"] and row[-1] == "missing"
 
 
 def test_a_summary_replacing_an_error_gets_a_fresh_derived_time(engine: Engine) -> None:

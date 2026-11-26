@@ -12,7 +12,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # release tags: a test fails once a release outlives a deprecated alias
       - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen --all-extras
       # Pinned linters for tests/deploy; with LAB_REQUIRE_TOOLS=1 a missing tool fails

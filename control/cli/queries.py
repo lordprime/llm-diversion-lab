@@ -53,6 +53,7 @@ QUERY_TIMEOUT_MS: Final = 15_000
 #: then the summary (``telemetry_version`` last).
 EXPORT_COLUMNS: Final = (
     "run_id",
+    "block_id",
     "arm",
     "target",
     "agent",
@@ -316,6 +317,7 @@ def telemetry_export_rows(session: Session, experiment_id: str) -> list[dict[str
     return [
         {
             "run_id": run.run_id,
+            "block_id": run.block_id,
             "arm": _value(run.arm),
             "target": run.target_id,
             "agent": run.agent_id,

@@ -1,7 +1,10 @@
 import base64
 import hashlib
 import json
+import re
+import subprocess
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -11,6 +14,7 @@ from control.core import models as m
 from control.core.ids import new_id
 from control.core.models import (
     ALL_MODELS,
+    LEGACY_ARM_NAMES_UNTIL,
     AgentEvent,
     Arm,
     Callback,
@@ -575,3 +579,42 @@ def test_new_id_embeds_creation_time() -> None:
 def test_new_id_rejects_bad_prefix(prefix: str) -> None:
     with pytest.raises(ValueError):
         new_id(prefix)
+
+
+def test_reading_a_two_arm_name_logs_a_warning(caplog: pytest.LogCaptureFixture) -> None:
+    old = manifest_dict(arm="injected")
+    old["pair_id"] = old.pop("block_id")
+    with caplog.at_level("WARNING", logger="control.core.models"):
+        RunManifest.model_validate(old)
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("'injected' as 'instruction'" in m for m in messages)
+    assert any("'pair_id' as block_id" in m for m in messages)
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="control.core.models"):
+        RunManifest.model_validate(manifest_dict())
+    assert caplog.records == []
+
+
+def _release_tags() -> list[tuple[int, int, int]]:
+    """Every vX.Y.Z release tag of this repository."""
+    root = Path(__file__).resolve().parents[2]
+    out = subprocess.run(  # noqa: S603 - fixed argv
+        ["git", "-C", str(root), "tag", "-l", "v*"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    found = (re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(?:-.*)?", line) for line in out.split())
+    return [(int(m[1]), int(m[2]), int(m[3])) for m in found if m]
+
+
+def test_the_two_arm_names_do_not_outlive_their_one_release() -> None:
+    """``injected`` and ``pair_id`` are read for one release only: once a release tag
+    reaches LEGACY_ARM_NAMES_UNTIL, remove ``Arm._missing_`` and the ``pair_id`` alias
+    (and this test)."""
+    tags = _release_tags()
+    assert tags, "no release tags: CI must check out tags (fetch-tags) for this test"
+    assert max(tags) < LEGACY_ARM_NAMES_UNTIL, (
+        f"release v{'.'.join(map(str, max(tags)))} reached "
+        f"v{'.'.join(map(str, LEGACY_ARM_NAMES_UNTIL))}: drop the two-arm names now"
+    )

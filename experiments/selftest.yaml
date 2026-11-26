@@ -65,7 +65,7 @@ arms:
     payload:
       payload_id: selftest-placeholder
       family: decoy
-      style: neutral
+      style: intent_aligned
       version: "2"
       templates:
         P1: "# lab self-test marker $tag path $decoy_path host $callback_host"

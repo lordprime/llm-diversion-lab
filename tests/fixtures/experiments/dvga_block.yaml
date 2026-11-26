@@ -3,11 +3,14 @@
 # placements.
 # (experiments/selftest.yaml is the real self-test: every target, every surface.)
 #
-# The payload texts below are NEUTRAL PLACEHOLDERS for exercising the pipeline. They
-# are not study wording: the study's payload library is versioned separately. Each
-# neutral text matches its instruction text in length and markup.
+# The payload texts below are PLACEHOLDERS for exercising the pipeline (a payload id
+# naming "placeholder" is allowed only in a self-test experiment). They are not study
+# wording: the study's payload library is versioned separately. Each neutral text
+# matches its instruction text in length, URL length and markup, and names an
+# innocuous URL instead of the decoy path and callback host.
 #
-# Template placeholders: $tag (required), $token, $decoy_path, $callback_host.
+# Template placeholders: $tag (required), $token, $decoy_path, $callback_host (the last
+# three in the instruction arm only).
 # Frozen by hash: any edit makes a new experiment definition.
 experiment_id: exp_selftest
 name: selftest
@@ -47,7 +50,7 @@ arms:
     payload:
       payload_id: selftest-placeholder
       family: decoy
-      style: neutral
+      style: intent_aligned
       version: "1"
       templates:
         P1: "# lab self-test marker $tag path $decoy_path host $callback_host"

@@ -19,6 +19,7 @@ from control.runner.experiment import (
     SUPPORTED_SURFACES,
     ByteEstimateTokenizer,
     Experiment,
+    Mismatch,
     PlacementMapFile,
     PlacementSpec,
     TargetSpec,
@@ -579,7 +580,7 @@ def test_a_neutral_payload_outside_five_percent_is_refused_with_the_measured_num
     message = str(caught.value)
     assert "not matched" in message
     assert f"P6 chars: instruction {size}, neutral {size + 2}" in message
-    assert "P6 tokens" in message and "at most 5.0%" in message
+    assert "P6 estimated tokens (bytes/4)" in message and "at most 5.0%" in message
     assert "P6 lines" not in message  # only the measures that are off are named
 
 
@@ -604,7 +605,7 @@ def test_tokens_are_measured_on_bytes_so_non_ascii_text_can_fail_on_tokens_alone
     with pytest.raises(ValidationError) as caught:
         Experiment.model_validate(_neutral_doc(P2="éééé éééé $tag"))
     message = str(caught.value)
-    assert "P2 tokens" in message and "P2 chars" not in message
+    assert "P2 estimated tokens (bytes/4)" in message and "P2 chars" not in message
 
 
 @pytest.mark.parametrize("field", ["decoy_path", "callback_host", "token"])
@@ -640,6 +641,8 @@ def test_the_match_tolerance_can_never_be_loosened_or_absurd(tolerance: float) -
 class _WordTokenizer:
     """A stand-in for a real tokenizer: one token per word."""
 
+    label = "word tokens"
+
     def count(self, text: str) -> float:
         return float(len(text.split()))
 
@@ -660,7 +663,7 @@ def test_check_neutral_match_takes_any_tokenizer_and_reports_each_mismatch() -> 
     assert [(m.surface, m.measure) for m in by_words] == [(Surface.P2, "tokens")]
     (found,) = by_words
     assert (found.instruction, found.neutral, found.tolerance) == (3.0, 1.0, 0.05)
-    assert str(found) == "P2 tokens: instruction 3, neutral 1 (66.7% apart, at most 5.0%)"
+    assert str(found) == "P2 word tokens: instruction 3, neutral 1 (66.7% apart, at most 5.0%)"
 
 
 def test_check_neutral_match_names_a_surface_only_one_payload_covers() -> None:
@@ -688,7 +691,7 @@ def test_the_byte_estimate_is_pinned() -> None:
 
 def test_the_measure_reads_markup_case_insensitively_and_ignores_text_like_angles() -> None:
     measure = TextMeasure.of("<P class=x>a < b</P><br/>", ByteEstimateTokenizer())
-    assert measure.markup == ("p", "/p", "br")
+    assert measure.markup == ("p[class]", "/p", "br")
     assert (measure.lines, measure.chars) == (1, 25)
 
 
@@ -717,3 +720,176 @@ def test_the_selftest_neutral_texts_are_matched_placeholders() -> None:
     for surface in Surface:
         assert neutral.placeholders(surface) == {"tag"}
         assert "https://example.org/" in neutral.templates[surface]
+
+
+# --------------------------------------------------------------------------- fix round 1
+
+
+DVGA_BLOCK_TEXT = (REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_block.yaml").read_text()
+NEUTRAL_P1 = '"# lab self-test neutral marker $tag see https://example.org/docs/lab-selftest.html"'
+
+
+def _fixture_with_neutral_p1(text: str) -> str:
+    assert NEUTRAL_P1 in DVGA_BLOCK_TEXT
+    return DVGA_BLOCK_TEXT.replace(NEUTRAL_P1, text)
+
+
+@pytest.mark.parametrize(
+    "p1",
+    [
+        '"# lab self-test neutral marker $tag see /x-$tag/docs/lab-selftest.html"',
+        '"# lab self-test neutral marker $tag see /X-$tag/docs/lab-selftest.html"',
+        '"# lab self-test neutral marker $tag see https://h.test/x/X-${tag}a.html"',
+    ],
+)
+def test_a_neutral_text_naming_the_decoy_path_literally_is_refused(p1: str) -> None:
+    with pytest.raises(ValidationError, match=r"names the run's decoy path"):
+        parse_experiment(_fixture_with_neutral_p1(p1))
+
+
+@pytest.mark.parametrize(
+    "p1",
+    [
+        '"# lab self-test neutral marker $tag see http://$tag.cb.lab.test/docs/self.html"',
+        '"# lab self-test neutral marker $tag see https://www.CB.Lab.Test/docs/self.html"',
+    ],
+)
+def test_a_neutral_text_naming_the_callback_domain_literally_is_refused(p1: str) -> None:
+    with pytest.raises(ValidationError, match=r"names the callback domain cb\.lab\.test"):
+        parse_experiment(_fixture_with_neutral_p1(p1))
+
+
+def test_the_callback_domain_check_follows_the_experiments_own_domain() -> None:
+    text = DVGA_BLOCK_TEXT.replace("callback_domain: cb.lab.test", "callback_domain: hooks.example")
+    with pytest.raises(ValidationError, match=r"names the callback domain hooks\.example"):
+        parse_experiment(
+            text.replace(
+                NEUTRAL_P1,
+                '"# lab self-test neutral marker $tag see https://hooks.example/a/b/c/d.html"',
+            )
+        )
+
+
+def test_the_match_is_measured_at_the_experiments_real_callback_domain() -> None:
+    """A long callback zone makes the instruction's callback host longer: a neutral
+    matched exactly at that zone is accepted, and a refusal quotes the real lengths."""
+    zone = "callbacks.long-lab-zone.example"
+    host = 12 + 1 + len(zone)  # <token>.<zone>
+    url = "https://h.test/" + "a" * (19 + host - len("https://h.test/"))
+    doc = _full(callback_domain=zone)
+    doc["arms"]["instruction"]["payload"]["templates"]["P2"] = "see $decoy_path$callback_host $tag"
+    doc["arms"]["neutral"]["payload"]["templates"]["P2"] = f"see {url} $tag"
+    exp = Experiment.model_validate(doc)
+    assert exp.callback_domain == zone
+    # the same texts at the default zone no longer match: the numbers are the real ones
+    doc["arms"]["neutral"]["payload"]["templates"]["P2"] = f"see {url[:-20]} $tag"
+    with pytest.raises(ValidationError) as caught:
+        Experiment.model_validate(doc)
+    want = len("see ") + 19 + host + 1 + 16
+    assert f"P2 chars: instruction {want}, neutral {want - 20}" in str(caught.value)
+
+
+def test_a_neutral_text_without_the_instructions_url_is_refused() -> None:
+    text = _fixture_with_neutral_p1(
+        '"# lab self-test neutral marker $tag see the documentation for this lab test."'
+    )
+    with pytest.raises(ValidationError, match=r"P1 URL characters: instruction 43, neutral 0"):
+        parse_experiment(text)
+
+
+def test_a_neutral_url_of_another_length_is_refused() -> None:
+    text = _fixture_with_neutral_p1(
+        '"# lab self-test neutral marker $tag see the docs here: https://example.org/a.html"'
+    )
+    with pytest.raises(ValidationError, match=r"P1 URL characters: instruction 43, neutral 26"):
+        parse_experiment(text)
+
+
+def test_a_neutral_url_where_the_instruction_names_none_is_refused() -> None:
+    doc = _full()
+    doc["arms"]["neutral"]["payload"]["templates"]["P2"] = "see h.test $tag"
+    with pytest.raises(ValidationError) as caught:
+        Experiment.model_validate(doc)
+    assert "P2 URL characters: instruction 0, neutral 6 (the instruction has none" in str(
+        caught.value
+    )
+
+
+def test_markup_attributes_must_match_too() -> None:
+    doc = _full()
+    doc["arms"]["instruction"]["payload"]["templates"]["P7"] = "<p>$tag 1234567</p>"
+    doc["arms"]["neutral"]["payload"]["templates"]["P7"] = "<p class=x>$tag</p>"
+    with pytest.raises(
+        ValidationError, match=r"P7 markup: instruction p /p, neutral p\[class\] /p"
+    ):
+        Experiment.model_validate(doc)
+
+
+def test_attribute_order_and_values_do_not_count() -> None:
+    measure = TextMeasure.of('<a title="x" href=y>$tag</a>', ByteEstimateTokenizer())
+    other = TextMeasure.of("<a href=z title=q>$tag</a>", ByteEstimateTokenizer())
+    assert measure.markup == other.markup == ("a[href,title]", "/a")
+
+
+def test_the_instruction_payload_may_not_set_its_own_tolerance() -> None:
+    doc = _full()
+    doc["arms"]["instruction"]["payload"]["match_tolerance"] = 0.0
+    with pytest.raises(ValidationError, match="match_tolerance belongs to the neutral payload"):
+        Experiment.model_validate(doc)
+    doc["arms"]["instruction"]["payload"]["match_tolerance"] = 0.05  # the default, as dumped
+    Experiment.model_validate(doc)
+
+
+def test_the_instruction_may_not_have_the_neutral_style() -> None:
+    doc = _full()
+    doc["arms"]["instruction"]["payload"]["style"] = "neutral"
+    with pytest.raises(ValidationError, match="style neutral marks the neutral arm"):
+        Experiment.model_validate(doc)
+
+
+@pytest.mark.parametrize("style", ["override", "intent_aligned"])
+def test_the_instruction_may_have_either_instruction_style(style: str) -> None:
+    doc = _full()
+    doc["arms"]["instruction"]["payload"]["style"] = style
+    assert Experiment.model_validate(doc).arms.instruction.payload.style.value == style
+
+
+def test_a_zero_instruction_measure_is_reported_without_dividing_by_it() -> None:
+    mismatch = Mismatch(Surface.P2, "url_chars", 0.0, 6.0, 0.05, "URL characters")
+    assert str(mismatch) == (
+        "P2 URL characters: instruction 0, neutral 6 (the instruction has none, at most 5.0%)"
+    )
+
+
+class _ZeroTokenizer:
+    label = "zero tokens"
+
+    def count(self, text: str) -> float:
+        return 0.0
+
+
+def test_a_tokenizer_counting_nothing_matches_and_never_divides_by_zero() -> None:
+    exp = Experiment.model_validate(_full())
+    payload = exp.arms.instruction.payload
+    assert check_neutral_match(payload, exp.arms.neutral.payload, _ZeroTokenizer()) == []
+
+
+def test_a_two_arm_experiment_is_told_how_to_become_a_three_arm_one() -> None:
+    doc = _full()
+    doc["arms"] = {"control": {}, "injected": doc["arms"]["instruction"]}
+    with pytest.raises(ValidationError) as caught:
+        Experiment.model_validate(doc)
+    message = str(caught.value)
+    assert "rename it to 'instruction'" in message and "matched 'neutral' arm" in message
+
+
+@pytest.mark.parametrize("arm", ["neutral", "instruction"])
+@pytest.mark.parametrize("payload_id", ["placeholder", "my-Placeholder-2", "x-PLACEHOLDER"])
+def test_a_placeholder_payload_is_for_the_self_test_only(arm: str, payload_id: str) -> None:
+    doc = _full()
+    doc["arms"][arm]["payload"]["payload_id"] = payload_id
+    with pytest.raises(ValidationError, match="placeholder payloads are for the self-test only"):
+        Experiment.model_validate(doc)
+    for selftest_id in ("exp_selftest", "exp_selftest_01JABCDEF"):
+        doc["experiment_id"] = selftest_id
+        Experiment.model_validate(doc)

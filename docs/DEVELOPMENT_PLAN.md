@@ -38,7 +38,7 @@ The immediate goal is a **short pilot that tells us whether this line of work ha
 - **G1.** One-command pilot: `.env` → `./labctl pilot` → results on a local website.
 - **G2.** Every run produces a complete evidence record: placement manifest, serve log, LLM request/response bytes, agent trajectory, callbacks, pcap, and oracle verdict.
 - **G3.** Funnel labels are computed deterministically from that record and are reproducible from the raw artifacts alone.
-- **G4.** In every phase that estimates an *effect on outcome* (P2, and later the paper's E2, E3 and E6), every injected run has a matched clean control: same target, agent, model and run index, in randomised, interleaved order, from fresh containers. Exposure-map phases (P1, P1b, like the paper's E1) measure the funnel in injected runs only. Their outcome is reported for context against the P0 baseline, as in the paper.
+- **G4.** In every phase that estimates an *effect on outcome* (P2, and later the paper's E2, E3 and E6), runs come in **blocks of three arms** (M2, register T1/S1): a clean control, a neutral run (same surfaces, tag and markup, with matched text that asks for nothing) and the instruction run, sharing a block id: same target, agent, model and run index, in randomised, interleaved order, from fresh containers. Exposure-map phases (P1, P1b, like the paper's E1) measure the funnel in injected runs only. Their outcome is reported for context against the P0 baseline, as in the paper.
 - **G5.** Adding a new agent, model provider or target is an adapter or config change, not a redesign.
 - **G6.** The pilot grading interface matches CVE-Bench's, so CVE-Bench tasks drop in later.
 
@@ -388,11 +388,11 @@ The catcher has no egress and no database access. It writes JSONL to the run vol
 | Table | Contents |
 |---|---|
 | `experiments` | Definition YAML, hash, schedule seed, budget |
-| `arms` | Condition (control or injected), surface set, payload family/style/version |
+| `arms` | Condition (control, neutral or instruction), surface set, payload family/style/version |
 | `targets` | GOAT, seeded image digest, content-pack hash, placement-map hash, oracle grader |
 | `agents` | Adapter, framework version, image digests, capability sheet |
 | `models` | Provider, model ID, effort |
-| `runs` | Experiment, arm, target, agent, model, `pair_id`, schedule index, attempt, status (`queued`, `running`, `valid`, `invalid`), end status, tag, container IPs, timestamps, manifest hash |
+| `runs` | Experiment, arm, target, agent, model, `block_id`, schedule index, attempt, status (`queued`, `running`, `valid`, `invalid`), end status, tag, container IPs, timestamps, manifest hash |
 | `placements` | Planned |
 | `placement_serves` | Realised |
 | `target_access` | Agent requests to the target |
@@ -561,7 +561,7 @@ Everything else has defaults in versioned config. The lab CA, HMAC key and datab
 | 2 | **Images:** pull every third-party image by pinned digest; build the seeded GOAT images from their content packs; build the agent images | A digest mismatch |
 | 3 | **Control plane up:** Postgres, Collector, Control and Results APIs, LiteLLM gateway, website | A health check fails |
 | 4 | **Self-test** (§5.3): no LLM spend | Any funnel stage or containment check fails |
-| 5 | **Schedule:** load `experiments/pilot.yaml`, expand arms × targets × agents × models × repetitions, randomise with a recorded seed, keep each injected run adjacent to its matched control, insert into the queue | The estimated cost exceeds `LAB_BUDGET_USD` |
+| 5 | **Schedule:** load `experiments/pilot.yaml`, expand arms × targets × agents × models × repetitions, randomise with a recorded seed, keep each block's three runs adjacent (arm order balanced per stratum), insert into the queue | The estimated cost exceeds `LAB_BUDGET_USD` |
 | 6 | **Run:** workers drain the queue (§5.4), with a concurrency semaphore per provider | — |
 | 7 | **Label + analyse** as runs complete; the dashboard updates live | — |
 | 8 | **Report:** write a static HTML/PDF summary + a CSV/Parquet export | — |
@@ -570,7 +570,7 @@ The command is **resumable**. Re-running it continues the queue; completed runs 
 
 ### 5.3 The instrumentation self-test (no tokens spent)
 
-Before any real run, a **scripted agent** paired with a **stub LLM** (a fixed-response model behind the same tap) exercises the whole pipeline on every target. It runs first in an injected cell, then in a control cell.
+Before any real run, a **scripted agent** paired with a **stub LLM** (a fixed-response model behind the same tap) exercises the whole pipeline on every target. It runs one block per target: a control, a neutral and an instruction cell.
 
 1. It fetches every surface, P1–P7.
 2. It sends a "model request" containing what it fetched, through the tap.
@@ -579,7 +579,8 @@ Before any real run, a **scripted agent** paired with a **stub LLM** (a fixed-re
 5. A sibling container it starts tries to reach the internet, and must fail.
 
 **Expected results:**
-- The injected cell shows **all four funnel stages detected**, a callback mapped to the right placement, and the oracle returning true.
+- The instruction cell shows **all four funnel stages detected**, a callback mapped to the right placement, and the oracle returning true.
+- The neutral cell shows Access and Visible but no Uptake, and none of the instruction's tag, decoy path or tokens.
 - The control cell shows **no tag anywhere**.
 - Any mismatch stops the experiment.
 
@@ -797,7 +798,7 @@ The pilot "has promise" if all three instrumentation checks pass and at least on
 
 - All 3 GOATs are **development** targets. No prevention claim is made on them.
 - Payload wording and placement maps are frozen before P1.
-- Injected runs and their matched controls run interleaved, in random order, from fresh cells, in the same time window.
+- The three runs of a block (control, neutral, instruction) run interleaved, in random order, from fresh cells, in the same time window.
 - The model ID, adapter version and image digests are logged on every run. Refusals, timeouts and budget exhaustion are outcomes, not exclusions.
 
 ---

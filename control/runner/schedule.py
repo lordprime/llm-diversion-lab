@@ -12,13 +12,22 @@ Planning the order and assigning identities are separate steps:
 * :func:`plan_order` is pure: the order is a deterministic function of the
   experiment's ``seed`` and its cells only. Each block's position is given by
   ``sha256(canonical JSON of [seed, "block", target, agent, model, rep])`` (sorted
-  ascending). The arm order inside a block is one of the six permutations of the three
-  arms; the blocks are taken six at a time, and each run of six gets every permutation
-  exactly once, shuffled by ``sha256([seed, "order", round, permutation])``. So the
-  order inside any one block is unpredictable, yet over the schedule each arm holds
-  each position equally often (exactly, when the number of blocks is a multiple of
-  six). Treating sha256 as a random oracle this is a uniformly random block order, and
-  unlike :mod:`random` it can never change across Python versions.
+  ascending). Treating sha256 as a random oracle this is a uniformly random block
+  order, and unlike :mod:`random` it can never change across Python versions.
+* The arm order inside a block is one of the six permutations of the three arms,
+  balanced **within each stratum** ``(target, agent, model)`` so that an order effect
+  cannot hide in one stratum. A stratum's blocks, taken in schedule order, are grouped
+  six at a time ("rounds"); each round uses every permutation exactly once, shuffled by
+  ``sha256([seed, "order", target, agent, model, round, permutation])``. With
+  ``repetitions`` a multiple of six every arm holds every position equally often in
+  every stratum. Otherwise the stratum's last round is partial: its ``k < 6`` blocks
+  take the first ``k`` permutations of that round's shuffle, so an arm's count in a
+  position is off an even split by less than 1.5 (for 5 repetitions: 1 or 2 times per
+  position).
+
+The seed's meaning changed with the three-arm design (M2): before it, the same seed
+gave a two-arm order from the digests ``"pair"`` and ``"first"``. An M2 seed is not
+comparable to an M1a one; ``tests/runner/test_blocks.py`` pins one seed's order.
 * :func:`build_schedule` takes that order and gives every run a fresh ``run_id``
   (``run_<ULID>``), every block a fresh ``block_id`` and every neutral and instruction
   run a fresh tag. Ids are issued in schedule order from
@@ -154,17 +163,21 @@ def _digest(seed: int, purpose: str, *parts: object) -> bytes:
 def plan_order(experiment: Experiment) -> list[PlannedRun]:
     """The run order of ``experiment``: three adjacent entries per block, seeded.
 
-    Pure and deterministic: the same seed and cells always give the same order. Every
-    six blocks in a row use the six arm orders once each (see the module docstring).
+    Pure and deterministic: the same seed and cells always give the same order. Within
+    each stratum, every six blocks use the six arm orders once each (see the module
+    docstring).
     """
     seed = experiment.seed
     cells = sorted(_cells(experiment), key=lambda k: (_digest(seed, "block", *k), k))
+    seen: dict[tuple[str, str, str], int] = defaultdict(int)
     order: list[PlannedRun] = []
-    for index, key in enumerate(cells):
-        round_, slot = divmod(index, len(ARM_ORDERS))
+    for key in cells:
+        stratum = (key.target, key.agent, key.model)
+        round_, slot = divmod(seen[stratum], len(ARM_ORDERS))
+        seen[stratum] += 1
         shuffled = sorted(
             ARM_ORDERS,
-            key=lambda arms: _digest(seed, "order", round_, [a.value for a in arms]),
+            key=lambda arms: _digest(seed, "order", *stratum, round_, [a.value for a in arms]),
         )
         order.extend(PlannedRun(key, arm) for arm in shuffled[slot])
     return order

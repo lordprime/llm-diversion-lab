@@ -51,5 +51,5 @@ def test_quotes_commas_and_newlines_survive_a_csv_round_trip() -> None:
 def test_markdown_cells_have_no_newlines_pipes_or_backticks() -> None:
     out = TelemetryTable([_row(agent="a|b\nc\r\nd `code`")]).render("md")
     lines = out.splitlines()
-    assert len(lines) == 3 and all(line.count("|") - line.count("\\|") == 25 for line in lines)
+    assert len(lines) == 3 and all(line.count("|") - line.count("\\|") == 26 for line in lines)
     assert "a\\|b c d \\`code\\`" in lines[2]

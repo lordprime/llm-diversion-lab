@@ -28,8 +28,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import logging
 from enum import StrEnum
-from typing import Annotated, Final, Literal, Self
+from typing import Annotated, Any, Final, Literal, Self
 
 from pydantic import (
     AliasChoices,
@@ -51,6 +52,8 @@ from control.core.tokens import TAG_PATTERN, TOKEN_PATTERN
 __all__ = [
     "ALL_MODELS",
     "ARTIFACT_PATH_PATTERN",
+    "LEGACY_ARM_NAMES_UNTIL",
+    "LEGACY_BLOCK_KEY",
     "LEGACY_INJECTED_ARM",
     "MAX_ARTIFACTS_PER_BATCH",
     "MAX_EVENTS_PER_BATCH",
@@ -96,6 +99,8 @@ SCHEMA_VERSION: Final = 1
 MAX_EVENTS_PER_BATCH: Final = 5_000
 #: Most files one :class:`ArtifactBatch` may register; ship more as several batches.
 MAX_ARTIFACTS_PER_BATCH: Final = 10_000
+
+log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- types
 
@@ -148,7 +153,15 @@ class Arm(StrEnum):
     @classmethod
     def _missing_(cls, value: object) -> Arm | None:
         # the two-arm design's treated arm, read as the instruction arm (deprecated)
-        return cls.INSTRUCTION if value == LEGACY_INJECTED_ARM else None
+        if value != LEGACY_INJECTED_ARM:
+            return None
+        log.warning(
+            "read the two-arm name %r as 'instruction' (deprecated; no longer read from "
+            "release v%s)",
+            LEGACY_INJECTED_ARM,
+            ".".join(map(str, LEGACY_ARM_NAMES_UNTIL)),
+        )
+        return cls.INSTRUCTION
 
     @property
     def tagged(self) -> bool:
@@ -158,6 +171,11 @@ class Arm(StrEnum):
 
 #: The old name of the instruction arm, still accepted on input for one release.
 LEGACY_INJECTED_ARM: Final = "injected"
+#: The old name of ``RunManifest.block_id``, still accepted on input for one release.
+LEGACY_BLOCK_KEY: Final = "pair_id"
+#: The first release that no longer reads the two-arm names (``injected``,
+#: ``pair_id``). A test fails once a release tag reaches it while they are still read.
+LEGACY_ARM_NAMES_UNTIL: Final = (0, 3, 0)
 
 
 class OracleVerdictKind(StrEnum):
@@ -552,7 +570,7 @@ class RunManifest(_Model):
 
     run_id: Id
     experiment_id: Id
-    block_id: Annotated[Id, Field(validation_alias=AliasChoices("block_id", "pair_id"))]
+    block_id: Annotated[Id, Field(validation_alias=AliasChoices("block_id", LEGACY_BLOCK_KEY))]
     arm: Arm
     target: NonEmptyStr
     agent: NonEmptyStr
@@ -562,6 +580,17 @@ class RunManifest(_Model):
     tag: Tag | None
     placements: list[Placement]
     created_at: AwareDatetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def _warn_legacy_key(cls, data: Any) -> Any:
+        if isinstance(data, dict) and LEGACY_BLOCK_KEY in data:
+            log.warning(
+                "read a manifest's %r as block_id (deprecated; no longer read from release v%s)",
+                LEGACY_BLOCK_KEY,
+                ".".join(map(str, LEGACY_ARM_NAMES_UNTIL)),
+            )
+        return data
 
     @model_validator(mode="after")
     def _arm_invariants(self) -> Self:

@@ -44,17 +44,26 @@ from control.runner.schedule import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DVGA_BLOCK = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_block.yaml"
 KEY = hashlib.sha256(b"pairing-test-lab-key").digest()
-#: Stand-ins as long as what each instruction-only placeholder renders to.
+
+
+def _innocuous_url(length: int) -> str:
+    """An innocuous URL of exactly ``length`` characters (at least 16)."""
+    return "https://h.test/" + "a" * (length - len("https://h.test/"))
+
+
+#: Stand-ins as long as what each instruction-only placeholder renders to: the decoy
+#: path and the callback host become innocuous URLs, the token plain letters.
 _STAND_INS = {
-    "decoy_path": "x" * 19,
-    "callback_host": "y" * (TOKEN_LENGTH + 1 + len("cb.lab.test")),
+    "decoy_path": _innocuous_url(19),
+    "callback_host": _innocuous_url(TOKEN_LENGTH + 1 + len("cb.lab.test")),
     "token": "z" * TOKEN_LENGTH,
 }
 
 
 def neutral_for(templates: dict[str, str]) -> dict[str, str]:
     """Neutral templates matched exactly to ``templates``: the instruction-only
-    placeholders become innocuous letters of the same length (the tag stays)."""
+    placeholders become innocuous text of the same length, URLs where the instruction
+    names one (the tag stays)."""
     return {
         surface: Template(text).safe_substitute(_STAND_INS) for surface, text in templates.items()
     }
@@ -112,9 +121,9 @@ def _doc(**overrides: Any) -> dict[str, Any]:
             "instruction": {
                 "surfaces": ["P1", "P7"],
                 "payload": {
-                    "payload_id": "test-placeholder",
+                    "payload_id": "test-instruction",
                     "family": "decoy",
-                    "style": "neutral",
+                    "style": "intent_aligned",
                     "version": "1",
                     "templates": instruction_templates,
                 },
@@ -206,26 +215,79 @@ def test_order_is_shuffled_not_canonical_and_the_arm_order_within_blocks_varies(
     assert len(set(_blocks(build_schedule(_experiment())))) == len(ARM_ORDERS)
 
 
+def _strata(schedule: list[ScheduledRun]) -> dict[tuple[str, str, str], list[tuple[Arm, ...]]]:
+    """Each stratum's block arm orders, in schedule order."""
+    found: dict[tuple[str, str, str], list[tuple[Arm, ...]]] = defaultdict(list)
+    for i in range(0, len(schedule), 3):
+        first = schedule[i]
+        found[(first.target, first.agent, first.model)].append(
+            tuple(r.arm for r in schedule[i : i + 3])
+        )
+    return found
+
+
 @pytest.mark.parametrize("seed", [0, 1, 7, 20261107, 2**63 - 1])
-def test_every_six_blocks_use_each_arm_order_once_so_positions_are_balanced(seed: int) -> None:
-    """12 blocks: every arm holds every position exactly 4 times, at any seed."""
-    orders = _blocks(build_schedule(_experiment(seed=seed)))
-    assert len(orders) == 12
-    for start in range(0, 12, 6):
-        assert sorted(orders[start : start + 6]) == sorted(ARM_ORDERS)
-    for position in range(3):
-        counts = Counter(order[position] for order in orders)
-        assert counts == {arm: 4 for arm in BLOCK_ARMS}
+def test_every_stratum_uses_each_arm_order_once_per_round_of_six(seed: int) -> None:
+    """12 repetitions: in every (target, agent, model) stratum, each run of six blocks
+    uses the six arm orders once, so every arm holds every position exactly 4 times."""
+    strata = _strata(build_schedule(_experiment(seed=seed, repetitions=12)))
+    assert len(strata) == 4
+    for orders in strata.values():
+        assert len(orders) == 12
+        for start in (0, 6):
+            assert sorted(orders[start : start + 6]) == sorted(ARM_ORDERS)
+        for position in range(3):
+            assert Counter(order[position] for order in orders) == dict.fromkeys(BLOCK_ARMS, 4)
 
 
-@pytest.mark.parametrize("repetitions", [1, 2, 4, 5, 7])
-def test_a_partial_round_stays_within_two_of_an_even_split(repetitions: int) -> None:
-    orders = _blocks(build_schedule(_experiment(repetitions=repetitions)))
-    blocks = len(orders)
-    for position in range(3):
-        counts = Counter(order[position] for order in orders)
-        for arm in BLOCK_ARMS:
-            assert abs(counts[arm] - blocks / 3) <= 2, (position, arm, counts)
+@pytest.mark.parametrize("repetitions", [1, 2, 3, 4, 5, 7, 11])
+def test_a_partial_last_round_stays_within_one_and_a_half_of_an_even_split(
+    repetitions: int,
+) -> None:
+    for orders in _strata(build_schedule(_experiment(repetitions=repetitions))).values():
+        assert len(orders) == repetitions
+        last = orders[repetitions - repetitions % 6 :]
+        assert len(set(last)) == len(last)  # no order twice within a round
+        for position in range(3):
+            counts = Counter(order[position] for order in orders)
+            for arm in BLOCK_ARMS:
+                assert abs(counts[arm] - repetitions / 3) < 1.5, (position, arm, counts)
+
+
+def test_the_balance_is_per_stratum_not_only_over_the_whole_schedule() -> None:
+    """Six blocks of one stratum in a row get the six orders, whatever the others do."""
+    exp = _experiment(repetitions=6, agents=["scripted"], targets=_doc()["targets"])
+    for orders in _strata(build_schedule(exp)).values():
+        assert sorted(orders) == sorted(ARM_ORDERS)
+
+
+#: The order seed 7 gives the two-target, two-agent experiment with two repetitions:
+#: (target, agent, rep, arms by initial). Pinned so a change to the scheduler's
+#: digests, or to the seed's meaning, cannot go unnoticed.
+GOLDEN_SEED_7 = [
+    ("dvga", "other-agent", 0, "ICN"),
+    ("dvga", "scripted", 1, "CNI"),
+    ("juice-shop", "scripted", 0, "CNI"),
+    ("dvga", "scripted", 0, "INC"),
+    ("dvga", "other-agent", 1, "INC"),
+    ("juice-shop", "other-agent", 1, "NIC"),
+    ("juice-shop", "scripted", 1, "NIC"),
+    ("juice-shop", "other-agent", 0, "ICN"),
+]
+
+
+def test_the_order_of_one_seed_is_pinned() -> None:
+    order = plan_order(_experiment(seed=7, repetitions=2))
+    got = [
+        (
+            order[i].key.target,
+            order[i].key.agent,
+            order[i].key.rep,
+            "".join(p.arm.value[0].upper() for p in order[i : i + 3]),
+        )
+        for i in range(0, len(order), 3)
+    ]
+    assert got == GOLDEN_SEED_7
 
 
 def test_a_single_block_schedule_still_has_all_three_arms() -> None:
@@ -424,7 +486,7 @@ def _neutral(doc: dict[str, Any]) -> dict[str, Any]:
         (lambda d: d["arms"].update(injected=d["arms"].pop("instruction")), "injected"),
         (lambda d: _neutral(d)["templates"].pop("P7"), "neutral payload must have one template"),
         (lambda d: _neutral(d)["templates"].update(P2="x $tag"), "not planted: P2"),
-        (lambda d: _neutral(d).update(payload_id="test-placeholder"), "share the payload_id"),
+        (lambda d: _neutral(d).update(payload_id="test-instruction"), "share the payload_id"),
         (lambda d: _neutral(d).update(style="override"), "style must be neutral"),
         (lambda d: _neutral(d).update(family="beacon"), "family must be the instruction's"),
         (lambda d: _neutral(d)["templates"].update(P1="# no tag at all"), r"\$tag"),

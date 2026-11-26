@@ -11,8 +11,10 @@
   run; no value changes.
 
 The downgrade maps ``instruction`` back to ``injected`` and ``block_id`` back to
-``pair_id``. It refuses while any neutral run or arm is stored: the two-arm schema has
-no place for one, and deleting runs (with their evidence) is never done silently.
+``pair_id``. It refuses while any neutral run or arm is stored, naming the experiments
+that hold them: the two-arm schema has no place for one, and deleting runs (with their
+evidence) is never done silently, so those experiments must be deleted or archived
+first.
 
 Revision ID: 0011
 Revises: 0010
@@ -80,16 +82,22 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
-    neutral = bind.execute(
-        sa.text(
-            "SELECT (SELECT count(*) FROM runs WHERE arm = 'neutral') "
-            "+ (SELECT count(*) FROM arms WHERE arm = 'neutral')"
+    holding = (
+        bind.execute(
+            sa.text(
+                "SELECT DISTINCT experiment_id FROM runs WHERE arm = 'neutral' "
+                "UNION SELECT DISTINCT experiment_id FROM arms WHERE arm = 'neutral' "
+                "ORDER BY 1"
+            )
         )
-    ).scalar_one()
-    if neutral:
+        .scalars()
+        .all()
+    )
+    if holding:
         raise RuntimeError(
-            f"cannot downgrade below 0011: {neutral} neutral run(s) or arm(s) are stored, "
-            "and the two-arm schema has no place for them"
+            "cannot downgrade below 0011: experiment(s) "
+            f"{', '.join(holding)} hold neutral runs or arms, which the two-arm schema has "
+            "no place for; delete or archive those experiments first"
         )
     _rename_block_column("block_id", "pair_id")
     _drop_arm_checks()
