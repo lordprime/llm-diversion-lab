@@ -2,6 +2,8 @@
 # audit_refs and each side channel's audit_ref name the section behind it, and
 # "unknown" marks what the audit could not verify. An unresolved side channel or an
 # unknown turn cap makes every run unsupported until the PentAGI adapter task fixes it.
+# Side channels the audit missed come from docs/AUTOMATION_FEASIBILITY.md (feasibility_ref);
+# a "candidate" switch in a note is unverified until the adapter task checks the source.
 framework: pentagi
 version: v2.2.0 # main at cffed94 has the same Ollama config fields
 commit: b611fbe
@@ -25,11 +27,13 @@ side_channels:
   graphiti:
     status: unresolved
     audit_ref: "§2.5, §3"
-    note: "optional service with its own OpenAI-compatible LLM and embedder (README 2883-2888); the audit says turn it off but names no setting"
+    feasibility_ref: "§2.5"
+    note: "optional service with its own OpenAI-compatible LLM and embedder (README 2883-2888); the audit says turn it off but names no setting; candidate: GRAPHITI_ENABLED=false (AUTOMATION_FEASIBILITY §2.5), unverified at the audited commit"
   search_engines:
     status: unresolved
     audit_ref: "§2.5"
-    note: "PROXY_URL routes search-engine requests (README 885); the audit names no switch that turns search off"
+    feasibility_ref: "§2.5, §6.4"
+    note: "PROXY_URL routes search-engine requests (README 885); the audit names no switch that turns search off; candidate: DUCKDUCKGO_ENABLED=false (AUTOMATION_FEASIBILITY §2.5, §6.4), unverified at the audited commit"
   scraper:
     status: unresolved
     audit_ref: "§2.5"
@@ -41,7 +45,16 @@ side_channels:
   langfuse_otel:
     status: unresolved
     audit_ref: "§2.5"
-    note: "Langfuse and OTel export, outside PROXY_URL (README 885); the audit names no switch"
+    feasibility_ref: "§2.5"
+    note: "Langfuse and OTel export, outside PROXY_URL (README 885); the audit names no switch; candidate: no LANGFUSE_* and no OTEL_HOST set (AUTOMATION_FEASIBILITY §2.5), unverified at the audited commit"
+  update_reporter:
+    status: unresolved
+    feasibility_ref: "§2.5, §6.4"
+    note: "a 3-hourly report to update.pentagi.com; not in the audit; candidate: UPDATE_CHECK_INTERVAL=0 (AUTOMATION_FEASIBILITY §2.5, §6.4), unverified at the audited commit"
+  image_selection:
+    status: unresolved
+    feasibility_ref: "§2.5, §6.4"
+    note: "the image chooser picks sandbox images itself; not in the audit; candidate: DOCKER_IMAGE_SELECTION_MODE=fixed with DOCKER_DEFAULT_IMAGE_FOR_PENTEST and DOCKER_DEFAULT_IMAGE pinned (AUTOMATION_FEASIBILITY §2.5, §6.4), unverified at the audited commit"
 min_num_ctx: 110000 # "PentAGI uses 110K context size" (README 1627-1631)
 sub_agents: dynamic # the primary agent delegates to role agents; serial or parallel is unverified (§4 item 9)
 agent_id_source: null

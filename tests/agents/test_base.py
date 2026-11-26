@@ -151,7 +151,8 @@ class FakeAdapter(Adapter):
     framework: ClassVar[str] = "fake"
     sheets_dir: ClassVar[Path]
     signals_update: ClassVar[dict[str, Any]] = {}
-    recorded: ClassVar[dict[str, str]] = {}
+    #: what the launch records; None records the run's turn cap, as a real adapter must
+    recorded: ClassVar[dict[str, str] | None] = None
 
     def __init__(self) -> None:
         super().__init__()
@@ -163,7 +164,11 @@ class FakeAdapter(Adapter):
             image="lab-agent-fake",
             command=("fake", "--headless", "--max-turns", str(run.limits.max_turns)),
             env={"FAKE_MODEL": run.model.name, "FAKE_NUM_CTX": str(run.model.num_ctx)},
-            recorded_settings=dict(self.recorded),
+            recorded_settings=(
+                {"FAKE_MAX_TURNS": str(run.limits.max_turns)}
+                if self.recorded is None
+                else dict(self.recorded)
+            ),
         )
 
     def start(self, run: AdapterRun, host: AgentHost) -> None:
@@ -191,7 +196,7 @@ def fake_adapter(tmp_path: Path) -> Callable[..., FakeAdapter]:
         class Adapted(FakeAdapter):
             sheets_dir = tmp_path
             signals_update = signals
-            recorded = recorded_settings or {}
+            recorded = recorded_settings
 
         return Adapted()
 
@@ -863,7 +868,7 @@ def test_a_run_with_enough_context_is_rendered_with_its_own_context(
 def test_a_capped_framework_must_record_its_cap(
     fake_adapter: Callable[..., FakeAdapter],
 ) -> None:
-    recorded = {"FAKE_MAX_MEMBERS": "5", "FAKE_MAX_CONCURRENT": "2"}
+    recorded = {"FAKE_MAX_TURNS": "50", "FAKE_MAX_MEMBERS": "5", "FAKE_MAX_CONCURRENT": "2"}
     adapter = fake_adapter(good_sheet(sub_agent_cap=CAP), recorded_settings=recorded)
     launch = adapter.prepare(run_for(model()))
     assert isinstance(launch, AgentLaunch)
@@ -885,8 +890,11 @@ def test_a_capped_framework_must_record_its_cap(
 def test_a_capped_framework_with_a_missing_or_wrong_cap_is_refused(
     fake_adapter: Callable[..., FakeAdapter], recorded: dict[str, str]
 ) -> None:
-    adapter = fake_adapter(good_sheet(sub_agent_cap=CAP), recorded_settings=recorded)
-    with pytest.raises(ValueError, match="record"):
+    # the turn cap is recorded correctly, so only the sub-agent cap can be wrong
+    adapter = fake_adapter(
+        good_sheet(sub_agent_cap=CAP), recorded_settings={"FAKE_MAX_TURNS": "50", **recorded}
+    )
+    with pytest.raises(ValueError, match=r"record FAKE_MAX_(MEMBERS|CONCURRENT)"):
         adapter.prepare(run_for(model()))
 
 
@@ -933,7 +941,7 @@ def test_a_fresh_adapter_tears_down_from_the_run_alone(
 def test_agent_ids_default_to_none(
     fake_adapter: Callable[..., FakeAdapter], tmp_path: Path
 ) -> None:
-    assert fake_adapter().agent_ids(tmp_path) is None
+    assert fake_adapter().agent_ids(run_for(model()), tmp_path) is None
 
 
 def test_an_adapter_whose_sheet_names_an_id_source_must_read_it(
@@ -948,10 +956,13 @@ def test_an_adapter_whose_sheet_names_an_id_source_must_read_it(
     class Reading(FakeAdapter):
         sheets_dir = tmp_path
 
-        def agent_ids(self, collected: Path) -> dict[int, str] | None:
-            return {0: "root"}
+        def agent_ids(self, run: AdapterRun, collected: Path) -> dict[int, str] | None:
+            return {0: f"{run.run_id}/root"}
 
-    assert Reading().agent_ids(tmp_path) == {0: "root"}
+    run = run_for(model())
+    # the handle survives a restart: a fresh adapter reads the same ids from the stored run
+    stored = AdapterRun.model_validate_json(run.model_dump_json())
+    assert Reading().agent_ids(stored, tmp_path) == {0: f"{run.run_id}/root"}
 
 
 def _calls(seqs: Sequence[int]) -> list[Any]:
@@ -1029,3 +1040,173 @@ def test_an_adapter_run_refuses_malformed_parts(changes: dict[str, Any]) -> None
 
 def test_channel_status_values() -> None:
     assert {s.value for s in ChannelStatus} == {"disabled", "unresolved"}
+
+
+# --------------------------------------------------------------------------- round 2 probes
+
+# Values that dress a placeholder up: extra words, punctuation, look-alike letters,
+# compatibility forms and invisible characters. None of them is a setting.
+PROBES = [
+    "unknown: the audit names no setting",
+    "Unknown (see §4)",
+    "unknown.",
+    "n/a.",
+    "N/A.",
+    "TBD - check source",
+    "TBD.",
+    "none found",
+    "none (cannot be turned off)",
+    "\u200b",  # a lone zero-width space
+    "unknown\u200b",
+    "\uff55\uff4e\uff4b\uff4e\uff4f\uff57\uff4e",  # full-width "unknown"
+    "unkn\u043ewn",  # Cyrillic o
+    "unknow\u0144",  # n with an acute accent
+    "\u2014",  # em dash
+    "--",
+    "\u2026",  # ellipsis
+    "\ufeff",  # a byte-order mark
+    "\ufeffunknown",
+    "?!",
+    "  off  ",
+]
+
+
+@pytest.mark.parametrize("probe", PROBES)
+def test_a_disguised_placeholder_is_not_a_disabling_setting(probe: str) -> None:
+    with pytest.raises(ValidationError):
+        SideChannel.model_validate(channel(setting=probe))
+
+
+@pytest.mark.parametrize("probe", PROBES)
+def test_a_disguised_placeholder_is_not_a_turn_cap(probe: str) -> None:
+    with pytest.raises(ValidationError):
+        sheet_of(max_turns_knob=probe)
+
+
+@pytest.mark.parametrize("probe", PROBES)
+def test_a_disguised_turn_cap_blocks_the_run_even_if_it_slipped_into_a_sheet(probe: str) -> None:
+    # model_copy skips validation, as a hand-built sheet would: check_runnable must use
+    # the same predicate as the validator, not a comparison with "unknown".
+    sheet = sheet_of().model_copy(update={"max_turns_knob": probe})
+    verdict = sheet.check_runnable(model())
+    assert isinstance(verdict, UnsupportedRun)
+    assert "turn cap" in verdict.reason
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "STRIX_TELEMETRY=false",
+        "--backend claude",
+        "PERPLEXITY_API_KEY unset",
+        "llm.api_base=<tap> and OLLAMA_API_BASE=<tap>",
+        "no OpenAI or Anthropic provider key configured",
+        "noneless_SETTING=1",  # starts with a placeholder word, but as part of a word
+        "OFFSET=0",
+        "NA_REGION=eu",
+        "unknown_flag=1",
+    ],
+)
+def test_real_settings_are_not_placeholders(setting: str) -> None:
+    assert SideChannel.model_validate(channel(setting=setting)).setting == setting
+
+
+@pytest.mark.parametrize("text", ["\u200b", "\ufeff", "\u200b \u200d", " \u2060 "])
+def test_text_needs_a_visible_character(text: str) -> None:
+    with pytest.raises(ValidationError):
+        ModelConfig(name=text, num_ctx=32768)
+
+
+def test_a_side_channel_cites_the_audit_or_the_feasibility_study() -> None:
+    with pytest.raises(ValidationError, match="audit_ref"):
+        SideChannel.model_validate({"status": "unresolved"})
+    only_feasibility = SideChannel.model_validate(
+        {"status": "unresolved", "feasibility_ref": "§6.4"}
+    )
+    assert only_feasibility.audit_ref is None
+    with pytest.raises(ValidationError):
+        SideChannel.model_validate({"status": "unresolved", "feasibility_ref": "6.4"})
+
+
+@pytest.mark.parametrize(
+    "observed_flags",
+    [{"budget_exhausted": True}, {"refused": True}, {"tool_format_failure": True}],
+)
+def test_wait_refuses_an_adapter_that_clears_an_observed_signal(
+    fake_adapter: Callable[..., FakeAdapter], tmp_path: Path, observed_flags: dict[str, bool]
+) -> None:
+    cleared = dict.fromkeys(observed_flags, False)
+    adapter = fake_adapter(**cleared)
+    observed = ExitSignals(exit_code=1, **observed_flags)
+    with pytest.raises(ValueError, match="cleared"):
+        adapter.wait(run_for(model()), observed, tmp_path)
+
+
+def test_wait_refuses_clearing_budget_and_refusal_together(
+    fake_adapter: Callable[..., FakeAdapter], tmp_path: Path
+) -> None:
+    adapter = fake_adapter(budget_exhausted=False, refused=False)
+    observed = ExitSignals(exit_code=0, budget_exhausted=True, refused=True)
+    with pytest.raises(
+        ValueError, match=r"cleared observed signals \['budget_exhausted', 'refused'\]"
+    ):
+        adapter.wait(run_for(model()), observed, tmp_path)
+
+
+def test_wait_lets_an_adapter_add_signals(
+    fake_adapter: Callable[..., FakeAdapter], tmp_path: Path
+) -> None:
+    adapter = fake_adapter(tool_format_failure=True)
+    observed = ExitSignals(exit_code=0, refused=True)
+    outcome = adapter.wait(run_for(model()), observed, tmp_path)
+    assert outcome.signalled == (AgentEndState.REFUSED, AgentEndState.TOOL_FORMAT_FAILURE)
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        {},  # the turn cap is missing
+        {"FAKE_MAX_TURNS": "49"},  # not the run's limit
+        {"FAKE_MAX_TURNS": "51"},
+        {"FAKE_MAX_TURNS": "050"},  # the same number, but not the same text the run uses
+        {"FAKE_MAX_TURNS": "fifty"},
+        {"FAKE_MAX_TURNS": "\u0665\u0660"},  # Arabic-Indic digits for 50
+        {"OTHER_MAX_TURNS": "50"},
+    ],
+)
+def test_the_launch_must_record_the_runs_turn_cap(
+    fake_adapter: Callable[..., FakeAdapter], recorded: dict[str, str]
+) -> None:
+    adapter = fake_adapter(recorded_settings=recorded)
+    with pytest.raises(ValueError, match="record FAKE_MAX_TURNS as 50"):
+        adapter.prepare(run_for(model()))
+
+
+def test_the_launch_records_the_runs_turn_cap(fake_adapter: Callable[..., FakeAdapter]) -> None:
+    launch = fake_adapter().prepare(run_for(model()))
+    assert isinstance(launch, AgentLaunch)
+    assert launch.recorded_settings == {"FAKE_MAX_TURNS": "50"}
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"objective": "find\x00the flag"},
+        {"objective": "\x00"},
+    ],
+)
+def test_an_objective_has_no_nul(changes: dict[str, Any]) -> None:
+    good = run_for(model()).model_dump()
+    with pytest.raises(ValidationError):
+        AdapterRun.model_validate({**good, **changes})
+
+
+def test_an_objective_may_span_lines() -> None:
+    good = run_for(model()).model_dump()
+    assert AdapterRun.model_validate({**good, "objective": "line one\nline two"}).objective
+
+
+@pytest.mark.parametrize("env", [{"FAKE\x00": "x"}, {"FAKE": "x\x00y"}, {"FAKE": "\x00"}])
+def test_env_has_no_nul(env: dict[str, str]) -> None:
+    with pytest.raises(ValidationError):
+        AgentLaunch(image="lab-agent-fake", command=("fake",), env=env)

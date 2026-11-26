@@ -2,6 +2,8 @@
 # audit_refs and each side channel's audit_ref name the section behind it, and
 # "unknown" marks what the audit could not verify. An unresolved side channel or an
 # unknown turn cap makes every run unsupported until the Strix adapter task fixes it.
+# Side channels the audit missed come from docs/AUTOMATION_FEASIBILITY.md (feasibility_ref);
+# a "candidate" switch in a note is unverified until the adapter task checks the source.
 framework: strix
 version: v1.7.1 # LLM config byte-identical to the audited 1.7.0 (6b7ae2e)
 commit: 685bbc8
@@ -51,7 +53,12 @@ side_channels:
   update_check:
     status: unresolved
     audit_ref: "§2.2"
-    note: "update check against GitHub and PyPI (strix/interface/update_check.py); the audit names no switch"
+    feasibility_ref: "§2.2, §6.4"
+    note: "update check against GitHub and PyPI (strix/interface/update_check.py); the audit names no switch; candidate: STRIX_NO_UPDATE_CHECK=1 (AUTOMATION_FEASIBILITY §2.2, §6.4), unverified at the audited commit"
+  litellm_cost_map:
+    status: unresolved
+    feasibility_ref: "§2.2, §6.4"
+    note: "LiteLLM's remote model cost map; not in the audit; candidate: LITELLM_LOCAL_MODEL_COST_MAP=True (AUTOMATION_FEASIBILITY §2.2, §6.4), unverified at the audited commit"
 min_num_ctx: 16384 # local.mdx: raise num_ctx to "at least 16k-32k"
 sub_agents: dynamic # create_agent spawns children on demand; no cap found
 agent_id_source: null

@@ -54,6 +54,7 @@ This module must not import ``control.runner``: the runner imports the adapters.
 from __future__ import annotations
 
 import re
+import unicodedata
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
@@ -113,8 +114,9 @@ PLACEHOLDERS: Final = frozenset(
     {"", UNKNOWN, "tbd", "todo", "?", "??", "off", "none", "null", "n/a", "na", "-", "..."}
 )
 
-# A single line of printable text with at least one visible character.
-_LINE = r"^[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f][^\x00-\x1f\x7f]*$"
+# A single line of printable text with at least one character that is neither
+# whitespace nor an invisible format character (Cf: zero-width space, BOM, ...).
+_LINE = r"^[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f\p{Cf}][^\x00-\x1f\x7f]*$"
 Text = Annotated[str, StringConstraints(pattern=_LINE, max_length=1000)]
 _SLUG = r"^[a-z][a-z0-9_-]{0,63}$"
 _COMMIT = r"^[0-9a-f]{7,40}$"
@@ -125,15 +127,46 @@ _ENV_NAME = r"^[A-Za-z_][A-Za-z0-9_]*$"
 # a flat file name that is not made of dots alone (so never "." or "..")
 _FILE_NAME = r"^[A-Za-z0-9._-]*[A-Za-z0-9_-][A-Za-z0-9._-]*$"
 _HTTP_URL = r"^https?://[^\s/]+(/\S*)?$"
+_NO_NUL = r"^[^\x00]*$"
 
 NumCtx = Annotated[StrictInt, Field(gt=0, le=MAX_NUM_CTX)]
 EnvName = Annotated[str, StringConstraints(pattern=_ENV_NAME)]
+EnvValue = Annotated[str, StringConstraints(pattern=_NO_NUL)]
 FileName = Annotated[str, StringConstraints(pattern=_FILE_NAME, max_length=128)]
 PositiveCount = Annotated[StrictInt, Field(gt=0, le=10_000)]
 
 
 def _is_placeholder(value: str) -> bool:
-    return value.strip().casefold() in PLACEHOLDERS
+    """Whether ``value`` stands in for a setting without being one.
+
+    Settings are env and flag names, so the check sees through disguises: compatibility
+    forms (full-width letters) are folded with NFKC, invisible format characters are
+    dropped, and punctuation and whitespace are stripped from both ends. The value is a
+    placeholder when it has no letter or digit, has a letter outside ASCII (a Cyrillic
+    or accented look-alike), or is a placeholder word or starts with one followed by
+    something that is not part of a word ("unknown: ...", "none found", "TBD - ...").
+    """
+    text = "".join(
+        c for c in unicodedata.normalize("NFKC", value) if unicodedata.category(c) != "Cf"
+    )
+    start, end = 0, len(text)
+    while start < end and (text[start].isspace() or unicodedata.category(text[start])[0] == "P"):
+        start += 1
+    while end > start and (
+        text[end - 1].isspace() or unicodedata.category(text[end - 1])[0] == "P"
+    ):
+        end -= 1
+    text = text[start:end].casefold()
+    if not any(c.isalnum() for c in text):
+        return True
+    if any(c.isalpha() and not c.isascii() for c in text):
+        return True
+    for word in PLACEHOLDERS:
+        if any(c.isalnum() for c in word) and text.startswith(word):
+            rest = text[len(word) :]
+            if not rest or not (rest[0].isalnum() or rest[0] == "_"):
+                return True
+    return False
 
 
 class _Frozen(BaseModel):
@@ -163,7 +196,8 @@ class ChannelStatus(StrEnum):
 
     #: turned off by the channel's ``setting``
     DISABLED = "disabled"
-    #: found by the audit, but no switch is known yet: the framework cannot run
+    #: found (by the audit or AUTOMATION_FEASIBILITY) but no switch is verified yet:
+    #: the framework cannot run
     UNRESOLVED = "unresolved"
 
 
@@ -175,12 +209,17 @@ class SideChannel(_Frozen):
     #: unresolved
     setting: Text | None = None
     #: the audit section(s) the channel comes from
-    audit_ref: AuditRef
-    #: what the channel is and where the audit found it
+    audit_ref: AuditRef | None = None
+    #: the docs/AUTOMATION_FEASIBILITY.md section(s), for a channel the audit missed or
+    #: a candidate switch it names (unverified until the adapter task checks the source)
+    feasibility_ref: AuditRef | None = None
+    #: what the channel is, where it was found, and any candidate switch
     note: Text | None = None
 
     @model_validator(mode="after")
     def _setting_matches_status(self) -> Self:
+        if self.audit_ref is None and self.feasibility_ref is None:
+            raise ValueError("audit_ref: a side channel cites where it was found")
         if self.status is ChannelStatus.DISABLED:
             if self.setting is None or _is_placeholder(self.setting):
                 raise ValueError(
@@ -467,7 +506,7 @@ class CapabilitySheet(_Frozen):
         if self.support_level is SupportLevel.NONE:
             reasons.append(f"{self.framework} has no Ollama support")
         reasons += [f"unresolved side channel {name}" for name in self.unresolved_side_channels]
-        if self.max_turns_knob == UNKNOWN:
+        if _is_placeholder(self.max_turns_knob):
             reasons.append(f"{self.framework}'s turn cap setting is unknown")
         context = self.check_context(model)
         if context is not None:
@@ -611,7 +650,7 @@ class AdapterRun(_Frozen):
     #: the GOAT target's URL inside the cell
     target_url: Annotated[str, StringConstraints(pattern=_HTTP_URL)]
     #: the task given to the agent
-    objective: Annotated[str, StringConstraints(min_length=1, max_length=8192)]
+    objective: Annotated[str, StringConstraints(min_length=1, max_length=8192, pattern=_NO_NUL)]
     #: the cell's LLM tap; every model call must go here
     llm_base_url: Annotated[str, StringConstraints(pattern=_HTTP_URL)]
     limits: AdapterLimits
@@ -626,7 +665,7 @@ class AgentLaunch(_Frozen):
 
     image: Text
     command: Annotated[tuple[Text, ...], Field(min_length=1)]
-    env: dict[EnvName, str] = Field(default_factory=dict)
+    env: dict[EnvName, EnvValue] = Field(default_factory=dict)
     #: config file name -> its bytes (flat names: no directories)
     files: dict[FileName, bytes] = Field(default_factory=dict)
     #: the framework starts containers, so the cell gets a cell-guard (§2.4)
@@ -689,26 +728,27 @@ class Adapter(ABC):
         if refusal is not None:
             return refusal
         launch = self.render(run)
-        self._check_recorded_cap(launch)
+        self._check_recorded_settings(run, launch)
         return launch
 
-    def _check_recorded_cap(self, launch: AgentLaunch) -> None:
-        # A sub-agent cap is part of the agent configuration: the adapter must set it
-        # explicitly, within the framework's own cap, and record it with the run.
+    def _check_recorded_settings(self, run: AdapterRun, launch: AgentLaunch) -> None:
+        # The turn cap and any sub-agent cap are part of the agent configuration: the
+        # adapter sets them explicitly and records them with the run. The turn cap is
+        # exactly the run's limit; a sub-agent cap stays within the framework's own.
+        turns = run.limits.max_turns
+        wanted = {self._sheet.max_turns_knob: (turns, turns)}
         cap = self._sheet.sub_agent_cap
-        if cap is None:
-            return
-        for setting, limit in cap.settings.items():
+        if cap is not None:
+            wanted |= {setting: (1, limit) for setting, limit in cap.settings.items()}
+        for setting, (low, high) in wanted.items():
             value = launch.recorded_settings.get(setting)
-            # ASCII digits only: str.isdigit() also accepts "³", which int() refuses
-            if (
-                value is None
-                or not re.fullmatch(r"[0-9]{1,6}", value)
-                or not 1 <= int(value) <= limit
-            ):
+            # Only the plain ASCII form counts ("50", never "050", other digit scripts or
+            # "³"), so the recorded text is exactly what every run with this limit records.
+            if value not in {str(n) for n in range(low, high + 1)}:
+                wanted_text = str(low) if low == high else f"a number from {low} to {high}"
                 raise ValueError(
-                    f"{self.framework}: the launch must record {setting} as a number from 1 "
-                    f"to {limit}, not {value!r}"
+                    f"{self.framework}: the launch must record {setting} as {wanted_text}, "
+                    f"not {value!r}"
                 )
 
     def wait(self, run: AdapterRun, observed: ExitSignals, evidence: Path) -> AdapterOutcome:
@@ -724,13 +764,21 @@ class Adapter(ABC):
                 f"{self.framework}: the adapter changed what the runner saw "
                 f"(exit {observed.exit_code}, timed out {observed.timed_out})"
             )
+        # The adapter may only add what the framework's logs show; it never takes a
+        # signal back (a refusal stays a refusal).
+        cleared = sorted(
+            name for name, value in observed if value is True and not getattr(signals, name)
+        )
+        if cleared:
+            raise ValueError(f"{self.framework}: the adapter cleared observed signals {cleared}")
         return AdapterOutcome.of(signals)
 
-    def agent_ids(self, collected: Path) -> dict[int, str] | None:
+    def agent_ids(self, run: AdapterRun, collected: Path) -> dict[int, str] | None:
         """Tap call ``seq`` -> sub-agent id, or ``None`` (contract in the module docs).
 
-        The default is ``None``. An adapter whose sheet names an ``agent_id_source``
-        must override this, or it cannot be built.
+        ``collected`` is the run's collected evidence. The default is ``None``. An
+        adapter whose sheet names an ``agent_id_source`` must override this, or it cannot
+        be built.
         """
         return None
 

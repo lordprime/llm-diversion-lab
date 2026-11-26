@@ -23,7 +23,9 @@ from agents.base import (
 )
 from control.telemetry.model import WireFormat
 
-AUDIT = Path(__file__).resolve().parents[2] / "docs" / "OLLAMA_SUPPORT_AUDIT.md"
+DOCS = Path(__file__).resolve().parents[2] / "docs"
+AUDIT = DOCS / "OLLAMA_SUPPORT_AUDIT.md"
+FEASIBILITY = DOCS / "AUTOMATION_FEASIBILITY.md"
 FRAMEWORKS = ("hackingbuddygpt", "pentagi", "pentestgpt", "redamon", "strix")
 
 #: Every side channel of every sheet: its exact setting, or None while it is unresolved.
@@ -36,6 +38,7 @@ SIDE_CHANNELS: dict[str, dict[str, str | None]] = {
         "codex_endpoint": "STRIX_LLM=ollama/<model>",
         "dedupe_endpoint": "STRIX_DEDUPE_MODEL and DEDUPE_LLM_API_BASE unset",
         "update_check": None,
+        "litellm_cost_map": None,
     },
     "pentagi": {
         "openai_embeddings": "EMBEDDING_PROVIDER=ollama",
@@ -44,6 +47,8 @@ SIDE_CHANNELS: dict[str, dict[str, str | None]] = {
         "scraper": None,
         "oauth": None,
         "langfuse_otel": None,
+        "update_reporter": None,
+        "image_selection": None,
     },
     "redamon": {
         "ai_attack_surface_judge": None,
@@ -52,6 +57,9 @@ SIDE_CHANNELS: dict[str, dict[str, str | None]] = {
         "hosted_default_models": (
             "agent model and every model by feature set to custom/<providerId>"
         ),
+        "msf_update": None,
+        "nuclei_template_update": None,
+        "hardcoded_dns": None,
     },
     "pentestgpt": {
         "hosted_anthropic_api": "ANTHROPIC_BASE_URL=<tap>",
@@ -64,14 +72,15 @@ SIDE_CHANNELS: dict[str, dict[str, str | None]] = {
     "hackingbuddygpt": {
         "rag_openai_embeddings": "rag_path unset",
         "openrouter_default_api_base": "llm.api_base=<tap> and OLLAMA_API_BASE=<tap>",
+        "litellm_cost_map": None,
     },
 }
 
 
-def audit_sections() -> set[str]:
-    """Section numbers of the audit's headings: ``## 3.`` gives 3, ``### 2.5`` gives 2.5."""
+def sections(doc: Path) -> set[str]:
+    """Section numbers of a doc's headings: ``## 3.`` gives 3, ``### 2.5`` gives 2.5."""
     found: set[str] = set()
-    for line in AUDIT.read_text(encoding="utf-8").splitlines():
+    for line in doc.read_text(encoding="utf-8").splitlines():
         match = re.match(r"^#{2,3} (\d+(?:\.\d+)*)\.? ", line)
         if match:
             found.add(match.group(1))
@@ -91,16 +100,82 @@ def test_there_is_one_sheet_per_framework() -> None:
 def test_every_cited_section_exists_in_the_audit(
     sheets: dict[str, CapabilitySheet], name: str
 ) -> None:
-    known = audit_sections()
+    known = sections(AUDIT)
     assert {"1", "2.1", "2.5", "3", "4"} <= known  # the parser reads the real headings
     sheet = sheets[name]
     refs = dict(sheet.audit_refs)
-    refs |= {f"side_channels.{n}": c.audit_ref for n, c in sheet.side_channels.items()}
+    refs |= {
+        f"side_channels.{n}": c.audit_ref
+        for n, c in sheet.side_channels.items()
+        if c.audit_ref is not None
+    }
     if sheet.sub_agent_cap is not None:
         refs["sub_agent_cap"] = sheet.sub_agent_cap.audit_ref
     for where, ref in refs.items():
         for section in re.findall(r"§(\d+(?:\.\d+)*)", ref):
             assert section in known, f"{name}.{where} cites §{section}, not in the audit"
+
+
+@pytest.mark.parametrize("name", FRAMEWORKS)
+def test_every_feasibility_citation_exists(sheets: dict[str, CapabilitySheet], name: str) -> None:
+    known = sections(FEASIBILITY)
+    assert {"2.2", "2.5", "3", "6.4"} <= known
+    for channel_name, channel in sheets[name].side_channels.items():
+        cited = channel.feasibility_ref or ""
+        for section in re.findall(r"§(\d+(?:\.\d+)*)", cited):
+            assert section in known, f"{name}.{channel_name} cites feasibility §{section}"
+
+
+@pytest.mark.parametrize("name", FRAMEWORKS)
+def test_a_candidate_switch_stays_unresolved_until_verified(
+    sheets: dict[str, CapabilitySheet], name: str
+) -> None:
+    # A switch AUTOMATION_FEASIBILITY names is only a candidate: the adapter task checks it
+    # at the pinned commit before the channel may become disabled.
+    for channel_name, channel in sheets[name].side_channels.items():
+        if channel.note is not None and "candidate:" in channel.note:
+            assert channel.status is ChannelStatus.UNRESOLVED, channel_name
+            assert "AUTOMATION_FEASIBILITY §" in channel.note, channel_name
+            assert channel.note.endswith("unverified at the audited commit"), channel_name
+        if channel.audit_ref is None:  # found only by the feasibility study
+            assert channel.feasibility_ref is not None, channel_name
+            assert channel.status is ChannelStatus.UNRESOLVED, channel_name
+
+
+#: The candidate switch each unresolved channel's note must name (N4).
+CANDIDATES = {
+    ("strix", "update_check"): "STRIX_NO_UPDATE_CHECK=1",
+    ("strix", "litellm_cost_map"): "LITELLM_LOCAL_MODEL_COST_MAP=True",
+    ("hackingbuddygpt", "litellm_cost_map"): "LITELLM_LOCAL_MODEL_COST_MAP=True",
+    ("pentagi", "graphiti"): "GRAPHITI_ENABLED=false",
+    ("pentagi", "search_engines"): "DUCKDUCKGO_ENABLED=false",
+    ("pentagi", "langfuse_otel"): "no LANGFUSE_* and no OTEL_HOST",
+    ("pentagi", "update_reporter"): "UPDATE_CHECK_INTERVAL=0",
+    ("pentagi", "image_selection"): "DOCKER_IMAGE_SELECTION_MODE=fixed",
+    ("pentestgpt", "webfetch_anthropic_hosts"): "disallowed_tools=[WebSearch, WebFetch]",
+    ("pentestgpt", "hosted_web_search"): "disallowed_tools=[WebSearch, WebFetch]",
+    ("redamon", "msf_update"): "MSF_AUTO_UPDATE=false",
+    ("redamon", "nuclei_template_update"): "NUCLEI_AUTO_UPDATE=false",
+}
+
+
+@pytest.mark.parametrize(("name", "channel_name"), sorted(CANDIDATES))
+def test_the_feasibility_candidates_are_named(
+    sheets: dict[str, CapabilitySheet], name: str, channel_name: str
+) -> None:
+    note = sheets[name].side_channels[channel_name].note
+    assert note is not None
+    assert f"candidate: {CANDIDATES[name, channel_name]}" in note
+
+
+def test_webfetch_notes_that_its_preflight_bypasses_the_tap(
+    sheets: dict[str, CapabilitySheet],
+) -> None:
+    channel = sheets["pentestgpt"].side_channels["webfetch_anthropic_hosts"]
+    assert channel.audit_ref == "§4"
+    assert channel.note is not None
+    assert "preflight" in channel.note
+    assert "bypassing ANTHROPIC_BASE_URL" in channel.note
 
 
 @pytest.mark.parametrize(
@@ -173,10 +248,12 @@ def test_no_framework_can_run_until_its_open_items_are_resolved(
     assert isinstance(verdict, UnsupportedRun)
 
 
-def test_only_hackingbuddygpt_needs_a_patch(sheets: dict[str, CapabilitySheet]) -> None:
-    patched = {name for name, sheet in sheets.items() if sheet.patches}
-    assert patched == {"hackingbuddygpt"}
-    (patch,) = sheets["hackingbuddygpt"].patches
+def test_the_recorded_patches(sheets: dict[str, CapabilitySheet]) -> None:
+    # Only what the sheets record: the audit settles hackingBuddyGPT's api_base patch.
+    # Patches AUTOMATION_FEASIBILITY proposes are for the adapter tasks to confirm, so
+    # this test does not claim the other frameworks need none.
+    patches = {p.upstream_file: p for p in sheets["hackingbuddygpt"].patches}
+    patch = patches["src/hackingBuddyGPT/utils/llm.py"]
     assert patch.upstream_file == "src/hackingBuddyGPT/utils/llm.py"
     assert "api_base=self.api_base" in patch.change
 
