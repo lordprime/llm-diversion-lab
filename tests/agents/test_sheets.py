@@ -174,8 +174,8 @@ def test_webfetch_notes_that_its_preflight_bypasses_the_tap(
     channel = sheets["pentestgpt"].side_channels["webfetch_anthropic_hosts"]
     assert channel.audit_ref == "§4"
     assert channel.note is not None
-    assert "preflight" in channel.note
-    assert "bypassing ANTHROPIC_BASE_URL" in channel.note
+    assert "§1 says its domain preflight goes straight to api.anthropic.com" in channel.note
+    assert "§2.4 that the preflight bypasses ANTHROPIC_BASE_URL" in channel.note
 
 
 @pytest.mark.parametrize(

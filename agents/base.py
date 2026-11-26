@@ -111,7 +111,11 @@ MAX_NUM_CTX: Final = 1 << 24
 MAX_SHEET_BYTES: Final = 64 * 1024
 #: Words that stand in for a setting without being one (compared case-insensitively).
 PLACEHOLDERS: Final = frozenset(
-    {"", UNKNOWN, "tbd", "todo", "?", "??", "off", "none", "null", "n/a", "na", "-", "..."}
+    {
+        *("", "?", "??", "-", "..."),
+        *(UNKNOWN, "unk", "not known", "tbd", "todo", "pending", "missing"),
+        *("off", "none", "null", "n/a", "n.a", "na", "not applicable"),
+    }
 )
 
 # A single line of printable text with at least one character that is neither
@@ -139,32 +143,45 @@ PositiveCount = Annotated[StrictInt, Field(gt=0, le=10_000)]
 def _is_placeholder(value: str) -> bool:
     """Whether ``value`` stands in for a setting without being one.
 
-    Settings are env and flag names, so the check sees through disguises: compatibility
-    forms (full-width letters) are folded with NFKC, invisible format characters are
-    dropped, and punctuation and whitespace are stripped from both ends. The value is a
-    placeholder when it has no letter or digit, has a letter outside ASCII (a Cyrillic
-    or accented look-alike), or is a placeholder word or starts with one followed by
-    something that is not part of a word ("unknown: ...", "none found", "TBD - ...").
+    Settings are env and flag names, so the check sees through disguises:
+
+    * compatibility forms (full-width letters) are folded with NFKC and invisible format
+      characters dropped;
+    * a value with no letter or digit, or with a letter outside ASCII (a Cyrillic or
+      accented look-alike), is a placeholder;
+    * ``KEY=value`` with an env-style key is an assignment: only its value is checked,
+      so ``NA=1`` is a setting and ``FOO=unknown`` is not. A lowercase placeholder key
+      (``unknown=1``) is not taken as an assignment;
+    * otherwise everything but letters and digits is stripped from both ends
+      (``<unknown>``, ``$UNKNOWN``, ``|n/a|``), except the leading dashes of a flag
+      (``--off`` stays ``--off``), and the value is a placeholder when it is a
+      placeholder word or starts with one followed by anything other than a letter,
+      digit, ``_`` or ``-`` ("unknown: ...", "none found", "TBD - ..."). So
+      ``unknown-flag`` and ``OFFSET=0`` are settings. The boundary is deliberately
+      wide, so a doubtful value is refused rather than let through.
     """
     text = "".join(
         c for c in unicodedata.normalize("NFKC", value) if unicodedata.category(c) != "Cf"
-    )
-    start, end = 0, len(text)
-    while start < end and (text[start].isspace() or unicodedata.category(text[start])[0] == "P"):
-        start += 1
-    while end > start and (
-        text[end - 1].isspace() or unicodedata.category(text[end - 1])[0] == "P"
-    ):
-        end -= 1
-    text = text[start:end].casefold()
+    ).strip()
     if not any(c.isalnum() for c in text):
         return True
     if any(c.isalpha() and not c.isascii() for c in text):
         return True
+    assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(\S.*)", text)
+    if assignment and (assignment[1].isupper() or assignment[1].casefold() not in PLACEHOLDERS):
+        return _is_placeholder(assignment[2])
+    flag = re.match(r"-+(?=[A-Za-z0-9])", text)
+    start = flag.end() if flag else 0
+    while not text[start].isalnum():
+        start += 1
+    end = len(text)
+    while not text[end - 1].isalnum():
+        end -= 1
+    text = (flag[0] if flag else "") + text[start:end].casefold()
     for word in PLACEHOLDERS:
         if any(c.isalnum() for c in word) and text.startswith(word):
             rest = text[len(word) :]
-            if not rest or not (rest[0].isalnum() or rest[0] == "_"):
+            if not rest or not (rest[0].isalnum() or rest[0] in "_-"):
                 return True
     return False
 
@@ -387,6 +404,11 @@ class CapabilitySheet(_Frozen):
         if self.max_turns_knob != UNKNOWN and _is_placeholder(self.max_turns_knob):
             raise ValueError(
                 f"max_turns_knob: name the setting or say 'unknown', not {self.max_turns_knob!r}"
+            )
+        # One setting cannot hold both the run's turn limit and a sub-agent cap.
+        if self.sub_agent_cap is not None and self.max_turns_knob in self.sub_agent_cap.settings:
+            raise ValueError(
+                f"max_turns_knob: {self.max_turns_knob!r} is also a sub_agent_cap setting"
             )
 
     def _check_sub_agents(self) -> None:
@@ -735,12 +757,13 @@ class Adapter(ABC):
         # The turn cap and any sub-agent cap are part of the agent configuration: the
         # adapter sets them explicitly and records them with the run. The turn cap is
         # exactly the run's limit; a sub-agent cap stays within the framework's own.
+        # A list, not a dict: if two checks name one setting, both must hold.
         turns = run.limits.max_turns
-        wanted = {self._sheet.max_turns_knob: (turns, turns)}
+        wanted = [(self._sheet.max_turns_knob, turns, turns)]
         cap = self._sheet.sub_agent_cap
         if cap is not None:
-            wanted |= {setting: (1, limit) for setting, limit in cap.settings.items()}
-        for setting, (low, high) in wanted.items():
+            wanted += [(setting, 1, limit) for setting, limit in cap.settings.items()]
+        for setting, low, high in wanted:
             value = launch.recorded_settings.get(setting)
             # Only the plain ASCII form counts ("50", never "050", other digit scripts or
             # "³"), so the recorded text is exactly what every run with this limit records.

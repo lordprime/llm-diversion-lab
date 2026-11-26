@@ -1068,6 +1068,35 @@ PROBES = [
     "\ufeffunknown",
     "?!",
     "  off  ",
+    # placeholders wrapped in symbols (round 3)
+    "<unknown>",
+    "<tbd>",
+    "`unknown`",
+    "$UNKNOWN",
+    "=unknown",
+    "~unknown",
+    "+none",
+    "|n/a|",
+    # the added vocabulary
+    "n.a",
+    "N.A.",
+    "not applicable",
+    "Not applicable (yet)",
+    "not known",
+    "unk",
+    "UNK?",
+    "missing",
+    "missing: see source",
+    "pending",
+    "pending review",
+    # dashes that are not a flag, and assignments with a placeholder in them
+    "- unknown",
+    "-- none",
+    "unknown=1",
+    "none=x",
+    "FOO=unknown",
+    "FOO=<tbd>",
+    "unknown. see §4",
 ]
 
 
@@ -1105,6 +1134,15 @@ def test_a_disguised_turn_cap_blocks_the_run_even_if_it_slipped_into_a_sheet(pro
         "OFFSET=0",
         "NA_REGION=eu",
         "unknown_flag=1",
+        # flags and hyphenated words are settings (round 3)
+        "--none-mode",
+        "--off",
+        "-off",
+        "--na",
+        "unknown-flag",
+        "NA=1",  # an env assignment: only its value is checked
+        "STRIX_LLM=ollama/<model>",
+        "ANTHROPIC_BASE_URL=<tap>",
     ],
 )
 def test_real_settings_are_not_placeholders(setting: str) -> None:
@@ -1210,3 +1248,28 @@ def test_an_objective_may_span_lines() -> None:
 def test_env_has_no_nul(env: dict[str, str]) -> None:
     with pytest.raises(ValidationError):
         AgentLaunch(image="lab-agent-fake", command=("fake",), env=env)
+
+
+# --------------------------------------------------------------------------- round 3
+
+
+def test_the_turn_cap_cannot_also_be_a_sub_agent_cap() -> None:
+    with pytest.raises(ValidationError, match="also a sub_agent_cap setting"):
+        sheet_of(sub_agent_cap=CAP, max_turns_knob="FAKE_MAX_MEMBERS")
+
+
+def test_a_shared_setting_must_pass_both_checks(fake_adapter: Callable[..., FakeAdapter]) -> None:
+    # A sheet that got past validation (model_copy skips it) with one setting for both
+    # the turn cap and a sub-agent cap: "3" is within the sub-agent cap but is not the
+    # run's 50 turns, so prepare must refuse it rather than let one check replace the other.
+    adapter = fake_adapter(
+        good_sheet(sub_agent_cap=CAP),
+        recorded_settings={"FAKE_MAX_MEMBERS": "3", "FAKE_MAX_CONCURRENT": "3"},
+    )
+    adapter._sheet = adapter.describe().model_copy(update={"max_turns_knob": "FAKE_MAX_MEMBERS"})
+    with pytest.raises(ValueError, match="record FAKE_MAX_MEMBERS as 50"):
+        adapter.prepare(run_for(model()))
+
+
+def test_the_vocabulary_has_the_round_3_words() -> None:
+    assert {"n.a", "not applicable", "not known", "unk", "missing", "pending"} <= PLACEHOLDERS
