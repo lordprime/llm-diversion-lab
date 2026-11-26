@@ -1,0 +1,39 @@
+Why: NewDockerClient calls GET /info first and log.Fatal's the whole server when it
+fails (backend/pkg/docker/client.go:139-142, cmd/pentagi/main.go:221-224). The cell's
+cell-guard deliberately refuses /info (it describes the host daemon). PentAGI only
+uses the answer for a startup log line and for the sandbox probe's daemon id, which
+runs only with DOCKER_INSIDE=true (off here), so a refused /info is now a warning.
+Touches backend/pkg/docker/client.go.
+
+diff --git a/backend/pkg/docker/client.go b/backend/pkg/docker/client.go
+index 124bf7f..83990d8 100644
+--- a/backend/pkg/docker/client.go
++++ b/backend/pkg/docker/client.go
+@@ -24,6 +24,7 @@ import (
+ 	"github.com/moby/moby/api/types/container"
+ 	"github.com/moby/moby/api/types/mount"
+ 	"github.com/moby/moby/api/types/network"
++	"github.com/moby/moby/api/types/system"
+ 	"github.com/moby/moby/client"
+ 	"github.com/sirupsen/logrus"
+ 	"golang.org/x/sync/errgroup"
+@@ -136,11 +137,15 @@ func NewDockerClient(ctx context.Context, db database.Querier, cfg *config.Confi
+ 		return nil, fmt.Errorf("failed to initialize docker client: %w", err)
+ 	}
+ 
+-	infoResult, err := cli.Info(ctx, client.InfoOptions{})
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to get docker info: %w", err)
++	// A guarding socket proxy may refuse GET /info, which describes the host
++	// daemon. Nothing here needs it but the startup log and the sandbox probe's
++	// daemon id (only with DOCKER_INSIDE), so a refusal is logged, not fatal.
++	var info system.Info
++	if infoResult, err := cli.Info(ctx, client.InfoOptions{}); err != nil {
++		logrus.WithError(err).Warn("docker info is not available; continuing without daemon details")
++	} else {
++		info = infoResult.Info
+ 	}
+-	info := infoResult.Info
+ 
+ 	// Resolve which host socket (if any) gets bind-mounted into worker containers.
+ 	// Autodetection is skipped when DOCKER_INSIDE_HOST designates a daemon

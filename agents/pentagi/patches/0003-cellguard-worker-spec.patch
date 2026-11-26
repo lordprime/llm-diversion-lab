@@ -1,0 +1,145 @@
+Why: PentAGI's worker containers must go through cell-guard (DEVELOPMENT_PLAN §2.4),
+and cell-guard refuses six things RunContainer and WorkerSpec ask for at b611fbe:
+published ports (PortBindings), an on-failure restart policy, a json-file LogConfig, a
+named /work volume bound by name, a Hostname without the cell's prefix, and added
+capabilities beyond NET_RAW. This patch drops each of them:
+  - no PortBindings/ExposedPorts: the worker is reached on its cell address instead;
+  - no RestartPolicy and no LogConfig: the daemon's defaults apply ("no", rotation);
+  - /work is an anonymous volume (HostConfig.Mounts), removed with the container;
+  - no Hostname: the daemon uses the short container id;
+  - capabilities: Docker's default set minus MKNOD with nothing added, which is
+    PentAGI's own allow-list minus SYS_PTRACE (and minus NET_ADMIN, off by default).
+Everything else in the request is unchanged. Touches backend/pkg/docker/client.go and
+backend/pkg/docker/worker_spec.go.
+
+diff --git a/backend/pkg/docker/client.go b/backend/pkg/docker/client.go
+index 83990d8..2c81564 100644
+--- a/backend/pkg/docker/client.go
++++ b/backend/pkg/docker/client.go
+@@ -5,9 +5,7 @@ import (
+ 	"context"
+ 	"encoding/binary"
+ 	"fmt"
+-	"hash/crc32"
+ 	"io"
+-	"net/netip"
+ 	"os"
+ 	"path"
+ 	"path/filepath"
+@@ -329,7 +327,8 @@ func (dc *dockerClient) RunContainer(
+ 
+ 	logger.Info("creating container")
+ 
+-	config.Hostname = fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(containerName)))
++	// No Hostname: the daemon uses the short id. A guarding proxy refuses names a
++	// worker would publish in the network's DNS unless they carry its own prefix.
+ 	config.WorkingDir = WorkFolderPathInContainer
+ 
+ 	// Tag the container with its owning tenant so daemon-wide sweeps can filter on
+@@ -346,27 +345,17 @@ func (dc *dockerClient) RunContainer(
+ 		hostConfig = &container.HostConfig{}
+ 	}
+ 
+-	// prevent containers from auto-starting after OS or docker daemon restart
+-	// because on startup they create docker.sock directory for DinD if it's enabled
+-	hostConfig.RestartPolicy = container.RestartPolicy{
+-		Name:              container.RestartPolicyOnFailure,
+-		MaximumRetryCount: 5,
+-	}
+-
++	// No restart policy and no named volume: a guarding proxy allows only "no" as
++	// the restart policy and no named volume but its own scratch volume, so /work
++	// is an anonymous volume that goes with the container (removed with v=1).
+ 	if hostDir == "" {
+-		volumeName := fmt.Sprintf("%s%s", containerName, WorkerVolumeNameSuffix)
+-		volumeResult, err := dc.client.VolumeCreate(ctx, client.VolumeCreateOptions{
+-			Name:   volumeName,
+-			Driver: "local",
+-			Labels: dc.labels,
++		hostConfig.Mounts = append(hostConfig.Mounts, mount.Mount{
++			Type:   mount.TypeVolume,
++			Target: WorkFolderPathInContainer,
+ 		})
+-		if err != nil {
+-			defer updateContainerInfo(database.ContainerStatusFailed, "")
+-			return database.Container{}, fmt.Errorf("failed to create volume: %w", err)
+-		}
+-		hostDir = volumeResult.Volume.Name
++	} else {
++		hostConfig.Binds = append(hostConfig.Binds, fmt.Sprintf("%s:%s", hostDir, WorkFolderPathInContainer))
+ 	}
+-	hostConfig.Binds = append(hostConfig.Binds, fmt.Sprintf("%s:%s", hostDir, WorkFolderPathInContainer))
+ 
+ 	dc.applyWorkerDockerAccess(config, hostConfig)
+ 
+@@ -384,13 +373,7 @@ func (dc *dockerClient) RunContainer(
+ 		hostConfig.PidsLimit = &pidsLimit
+ 	}
+ 
+-	hostConfig.LogConfig = container.LogConfig{
+-		Type: "json-file",
+-		Config: map[string]string{
+-			"max-size": "10m",
+-			"max-file": "5",
+-		},
+-	}
++	// No LogConfig: the daemon's own log driver and rotation apply.
+ 
+ 	// Configure network mode and port bindings
+ 	var networkingConfig *network.NetworkingConfig
+@@ -400,36 +383,8 @@ func (dc *dockerClient) RunContainer(
+ 		hostConfig.NetworkMode = container.NetworkMode("host")
+ 		logger.Debug("using host network mode - container will have direct access to host network interfaces")
+ 	} else {
+-		// Bridge network mode: configure port bindings and custom network
+-		if hostConfig.PortBindings == nil {
+-			hostConfig.PortBindings = network.PortMap{}
+-		}
+-		if config.ExposedPorts == nil {
+-			config.ExposedPorts = network.PortSet{}
+-		}
+-		var hostIP netip.Addr
+-		if dc.publicIP != "" {
+-			var err error
+-			hostIP, err = netip.ParseAddr(dc.publicIP)
+-			if err != nil {
+-				defer updateContainerInfo(database.ContainerStatusFailed, "")
+-				return database.Container{}, fmt.Errorf("invalid Docker public IP %q: %w", dc.publicIP, err)
+-			}
+-		}
+-		for _, port := range GetPrimaryContainerPorts(dc.portsBase, flowID) {
+-			containerPort, ok := network.PortFrom(uint16(port), network.TCP)
+-			if !ok {
+-				return database.Container{}, fmt.Errorf("invalid container port %d", port)
+-			}
+-			hostConfig.PortBindings[containerPort] = []network.PortBinding{
+-				{
+-					HostIP:   hostIP,
+-					HostPort: fmt.Sprintf("%d", port),
+-				},
+-			}
+-			config.ExposedPorts[containerPort] = struct{}{}
+-		}
+-
++		// Bridge network mode: no published ports (a guarding proxy refuses them);
++		// the worker is reached on its network address instead.
+ 		if dc.network != "" {
+ 			networkingConfig = &network.NetworkingConfig{
+ 				EndpointsConfig: map[string]*network.EndpointSettings{
+diff --git a/backend/pkg/docker/worker_spec.go b/backend/pkg/docker/worker_spec.go
+index a4d3d4a..f23d739 100644
+--- a/backend/pkg/docker/worker_spec.go
++++ b/backend/pkg/docker/worker_spec.go
+@@ -20,8 +20,10 @@ func WorkerSpec(cfg *config.Config, image string) (*container.Config, *container
+ 			Image:      image,
+ 			Entrypoint: []string{"tail", "-f", "/dev/null"},
+ 		}, &container.HostConfig{
+-			CapDrop: []string{"ALL"},
+-			CapAdd:  workerCapabilities(cfg),
++			// Docker's default set minus MKNOD, with nothing added: a guarding proxy
++			// allows no added capability but NET_RAW (already a default). Compared
++			// with workerCapabilities this only loses SYS_PTRACE (and NET_ADMIN).
++			CapDrop: []string{"MKNOD"},
+ 		}
+ }
+ 

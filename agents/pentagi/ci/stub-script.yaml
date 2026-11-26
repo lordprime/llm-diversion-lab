@@ -1,0 +1,82 @@
+# Scripted turns for the PentAGI smoke run (agents/ci/stub_model/script.py). A request
+# takes the first unused turn whose `contains` is in its body, so every turn is keyed to
+# the tools only one PentAGI role is offered (Go encodes them as "name":"<tool>"):
+#
+#   flow setup     language and title (no tools: they get `final`), then the tool-call-ID
+#                  probe: five get_number calls and one submit_pattern call
+#                  (pkg/providers/provider/agents.go:21-26)
+#   generator      subtask_list: one subtask
+#   primary agent  delegates it to the pentester, then calls done
+#   pentester      runs one harmless terminal command (its result is stored through
+#                  /api/embeddings, pkg/tools/executor.go:600-645), then hack_result
+#   refiner        subtask_patch with no change
+#   reporter       report_result
+#
+# Any request no turn matches (the language and title calls, and any role this script
+# does not foresee) gets `final`.
+version: 1
+models: [stub-model, nomic-embed-text]
+embedding_dimensions: 8
+final: "English"
+turns:
+  - when: {path: /api/chat, contains: '"name":"get_number"'}
+    tool_calls: [{name: get_number, arguments: {value: 7}}]
+  - when: {path: /api/chat, contains: '"name":"get_number"'}
+    tool_calls: [{name: get_number, arguments: {value: 7}}]
+  - when: {path: /api/chat, contains: '"name":"get_number"'}
+    tool_calls: [{name: get_number, arguments: {value: 7}}]
+  - when: {path: /api/chat, contains: '"name":"get_number"'}
+    tool_calls: [{name: get_number, arguments: {value: 7}}]
+  - when: {path: /api/chat, contains: '"name":"get_number"'}
+    tool_calls: [{name: get_number, arguments: {value: 7}}]
+  - when: {path: /api/chat, contains: '"name":"submit_pattern"'}
+    tool_calls: [{name: submit_pattern, arguments: {template: "ollama-{r:28:x}-{r:1:d}"}}]
+  - when: {path: /api/chat, contains: '"name":"subtask_list"'}
+    tool_calls:
+      - name: subtask_list
+        arguments:
+          subtasks:
+            - title: "Check the sandbox"
+              description: "Run one harmless command in the sandbox and report its output."
+          message: "One subtask."
+  - when: {path: /api/chat, contains: '"name":"pentester"'}
+    tool_calls:
+      - name: pentester
+        arguments:
+          question: "Run `echo pentagi-smoke` in the sandbox and report the output."
+          message: "Delegating the check to the pentester."
+  - when: {path: /api/chat, contains: '"name":"hack_result"'}
+    tool_calls:
+      - name: terminal
+        arguments:
+          input: "echo pentagi-smoke"
+          cwd: "/work"
+          detach: false
+          timeout: 30
+          message: "Running one harmless command."
+  - when: {path: /api/chat, contains: '"name":"hack_result"'}
+    tool_calls:
+      - name: hack_result
+        arguments:
+          result: "The sandbox printed pentagi-smoke."
+          message: "The command ran."
+  - when: {path: /api/chat, contains: '"name":"done"'}
+    tool_calls:
+      - name: done
+        arguments:
+          success: true
+          result: "The sandbox runs commands."
+          message: "Subtask done."
+  - when: {path: /api/chat, contains: '"name":"subtask_patch"'}
+    tool_calls:
+      - name: subtask_patch
+        arguments:
+          operations: []
+          message: "No changes."
+  - when: {path: /api/chat, contains: '"name":"report_result"'}
+    tool_calls:
+      - name: report_result
+        arguments:
+          success: true
+          result: "The sandbox ran one harmless command."
+          message: "Task done."

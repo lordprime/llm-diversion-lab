@@ -1,66 +1,95 @@
-# PentAGI capability sheet. Every value comes from docs/OLLAMA_SUPPORT_AUDIT.md;
-# audit_refs and each side channel's audit_ref name the section behind it, and
-# "unknown" marks what the audit could not verify. An unresolved side channel or an
-# unknown turn cap makes every run unsupported until the PentAGI adapter task fixes it.
-# Side channels the audit missed come from docs/AUTOMATION_FEASIBILITY.md (feasibility_ref);
-# a "candidate" switch in a note is unverified until the adapter task checks the source.
+# PentAGI capability sheet. Values the audit gave come from docs/OLLAMA_SUPPORT_AUDIT.md
+# (audit_refs and each side channel's audit_ref name the section behind them). The M3
+# adapter task (agents/pentagi) checked every side channel, call path and the turn cap in
+# the source at b611fbe (v2.2.0); a note citing "file:line at b611fbe" is that check.
+# Paths in notes are relative to backend/ unless they start with another top folder.
 framework: pentagi
 version: v2.2.0 # main at cffed94 has the same Ollama config fields
-commit: b611fbe
+commit: b611fbe # the full SHA is in agents/pentagi/source.yaml
 image_digest: unknown # set once CI builds the PentAGI agent image
+use_case: "one headless flow per run: the driver (agents/pentagi/driver.py) logs in to the local API, creates a flow on the ollama provider and waits for its first task to finish or fail"
 support_level: native
-# langchaingo's Ollama client posts to native /api/chat, not /v1 (ollama.go 19-22, 227-228)
+# langchaingo's Ollama client posts to native /api/chat, not /v1 (ollama.go 19-22, 227-228).
+# Embeddings go to Ollama's older /api/embeddings, which telemetry does not parse yet
+# (wiring item 8).
 wire_formats: [ollama_chat]
-# One OLLAMA_SERVER_URL serves every agent role; PROXY_URL also covers LLM, embedding and
-# search calls (README 885). Models must be rebuilt with num_ctx in a Modelfile
-# (README 1627-1631).
+# Only the ollama provider is enabled (pkg/providers/registry.go:85-91 enables it from
+# OLLAMA_SERVER_URL; no other provider key is set), and LLM_FALLBACK_PROVIDER is left
+# empty so no call can fail over to another provider (pkg/providers/providers.go:630-638).
+# That fallback has no audit or feasibility section to cite, so it is enforced by the
+# adapter and its tests instead of being listed below (base change request in the M3
+# Task 3 report).
 model_call_paths:
-  - "role agents through the Ollama provider (backend/pkg/providers/ollama/ollama.go): the 13 option types in pconfig/config.go 144-156"
-  - "auxiliary roles on the same provider: chain summariser (SUMMARIZER_*), reflector, adviser/planner, enricher, memorist, refiner"
-  - "embeddings with EMBEDDING_PROVIDER=ollama (backend/pkg/config/config.go 122); Ollama's /api/embed has no telemetry WireFormat yet"
+  - "one-shot calls on the simple role, POST /api/chat without tools: the flow's language and title at setup (pkg/providers/providers.go:344-371), the chain summarizer and the reporter (pkg/providers/agent_for_chain.go:20-22)"
+  - "the tool-call-ID probe at flow setup, POST /api/chat with the get_number and submit_pattern tools (pkg/providers/provider/agents.go:21-26, 262-313, ollama.go:381-383)"
+  - "role agent chains, POST /api/chat with a system prompt and tools: generator, refiner, primary_agent, pentester, coder, installer, searcher, memorist, enricher, adviser, reflector, tool_call_fixer (pkg/providers/performer.go:59-230, the 13 option types in pkg/providers/pconfig/config.go:144-156)"
+  - "vector-store embeddings with EMBEDDING_PROVIDER=ollama, POST /api/embeddings, one call per text (pkg/providers/embeddings/embedder.go:154-198; langchaingo llms/ollama/ollamallm.go:617-640); tool results are stored this way (pkg/tools/executor.go:600-645)"
 side_channels:
   openai_embeddings:
     status: disabled
     setting: "EMBEDDING_PROVIDER=ollama"
     audit_ref: "§2.5, §3"
-    note: "the default openai provider falls back to the OpenAI server URL (README 3770)"
+    note: "the default openai provider falls back to the OpenAI server URL (README 3770); with ollama the embedder posts to EMBEDDING_URL, else OLLAMA_SERVER_URL (pkg/providers/embeddings/embedder.go:59-61, 162-165 at b611fbe); the adapter sets EMBEDDING_URL to the tap"
   graphiti:
-    status: unresolved
+    status: disabled
+    setting: "GRAPHITI_ENABLED=false and GRAPHITI_URL empty"
     audit_ref: "§2.5, §3"
     feasibility_ref: "§2.5"
-    note: "optional service with its own OpenAI-compatible LLM and embedder (README 2883-2888); the audit says turn it off but names no setting; candidate: GRAPHITI_ENABLED=false (AUTOMATION_FEASIBILITY §2.5), unverified at the audited commit"
+    note: "verified at b611fbe: the client is built enabled only when GRAPHITI_ENABLED is true and GRAPHITI_URL is set (pkg/providers/providers.go:253-257); a disabled client makes every call a no-op or an error (pkg/graphiti/client.go:56-59, 120-136) and graphiti_search is not offered (pkg/tools/graphiti_search.go:142-144)"
   search_engines:
-    status: unresolved
+    status: disabled
+    setting: "DUCKDUCKGO_ENABLED=false, SPLOITUS_ENABLED=false, WEB_SEARCH_INTERNAL_ENABLED=false, no search API key and SEARXNG_URL empty"
     audit_ref: "§2.5"
     feasibility_ref: "§2.5, §6.4"
-    note: "PROXY_URL routes search-engine requests (README 885); the audit names no switch that turns search off; candidate: DUCKDUCKGO_ENABLED=false (AUTOMATION_FEASIBILITY §2.5, §6.4), unverified at the audited commit"
+    note: "verified at b611fbe: DuckDuckGo is on by default (pkg/config/config.go:204); every engine is available only by its flag, key or URL (pkg/tools/searchers/*.go IsAvailable), and web_search and the search tools are offered only when one is (pkg/tools/tools.go:946, 1422, 1479); PROXY_URL stays unset"
   scraper:
-    status: unresolved
+    status: disabled
+    setting: "SCRAPER_PUBLIC_URL and SCRAPER_PRIVATE_URL empty"
     audit_ref: "§2.5"
-    note: "outside PROXY_URL (README 885); the audit names no switch"
+    note: "verified at b611fbe: the browser tool exists only with a scraper URL (pkg/tools/browser.go:602-604) and is not offered otherwise (pkg/tools/tools.go:867); no scraper service runs in the cell, so the agents have no rendered-DOM view"
   oauth:
-    status: unresolved
+    status: disabled
+    setting: "OAUTH_GOOGLE_*, OAUTH_GITHUB_* and PUBLIC_URL empty"
     audit_ref: "§2.5"
-    note: "outside PROXY_URL (README 885); the audit names no switch"
+    note: "verified at b611fbe: an OAuth client is registered only with PUBLIC_URL and that provider's id and secret (pkg/server/router.go:135-159); the driver logs in with the local password form"
   langfuse_otel:
-    status: unresolved
+    status: disabled
+    setting: "LANGFUSE_BASE_URL and OTEL_HOST empty"
     audit_ref: "§2.5"
     feasibility_ref: "§2.5"
-    note: "Langfuse and OTel export, outside PROXY_URL (README 885); the audit names no switch; candidate: no LANGFUSE_* and no OTEL_HOST set (AUTOMATION_FEASIBILITY §2.5), unverified at the audited commit"
+    note: "verified at b611fbe: both clients refuse to start without their endpoint (pkg/observability/lfclient.go:62-65, otelclient.go:98-101) and the observer falls back to no-ops (pkg/observability/obs.go:149-180, cmd/pentagi/main.go:87-104)"
   update_reporter:
-    status: unresolved
+    status: disabled
+    setting: "UPDATE_CHECK_INTERVAL=0"
     feasibility_ref: "§2.5, §6.4"
-    note: "a 3-hourly report to update.pentagi.com; not in the audit; candidate: UPDATE_CHECK_INTERVAL=0 (AUTOMATION_FEASIBILITY §2.5, §6.4), unverified at the audited commit"
+    note: "verified at b611fbe: an interval of zero or less disables the reporter before it sends anything (pkg/server/update/update.go:182-190); an empty value would mean the 3h default (pkg/config/config.go:279), so the adapter sets 0 explicitly; LICENSE_KEY stays empty"
   image_selection:
-    status: unresolved
+    status: disabled
+    setting: "DOCKER_IMAGE_SELECTION_MODE=fixed with DOCKER_DEFAULT_IMAGE_FOR_PENTEST and DOCKER_DEFAULT_IMAGE pinned"
     feasibility_ref: "§2.5, §6.4"
-    note: "the image chooser picks sandbox images itself; not in the audit; candidate: DOCKER_IMAGE_SELECTION_MODE=fixed with DOCKER_DEFAULT_IMAGE_FOR_PENTEST and DOCKER_DEFAULT_IMAGE pinned (AUTOMATION_FEASIBILITY §2.5, §6.4), unverified at the audited commit"
-min_num_ctx: 110000 # "PentAGI uses 110K context size" (README 1627-1631)
+    note: "verified at b611fbe: fixed mode skips the model call that picks the image (pkg/providers/image_selection.go:11-13, 43-52; pkg/providers/providers.go:323-342) and uses the pentest image; both images are the pinned Kali worker, so a failed start cannot fall back to debian:latest (pkg/docker/client.go:297-323)"
+min_num_ctx: 110000 # "PentAGI uses 110K context size" (README 1627-1631); sent per call by patch 0001
 sub_agents: dynamic # the primary agent delegates to role agents; serial or parallel is unverified (§4 item 9)
-agent_id_source: null
-agent_id_gap: "unknown: the audit read no PentAGI log or trace that names the role agent behind each model call"
-patches: []
-max_turns_knob: unknown # agents have tool-call budgets (README 498-507); the audit names no setting
+agent_id_source: "the msgchains table the driver exports (agent/pentagi/msgchains.jsonl): a tap call belongs to the chain whose stored conversation opens with the same system prompt (and first user message); one-shot calls without a system prompt are the simple role and /api/embeddings calls the embedder"
+patches:
+  - upstream_file: backend/pkg/config/config.go
+    change: "0001-ollama-num-ctx.patch: adds OLLAMA_SERVER_NUM_CTX (default 0, no change)"
+    reason: "the Ollama provider never sends num_ctx; the run's pinned context must reach every call"
+  - upstream_file: backend/pkg/providers/ollama/ollama.go
+    change: "0001-ollama-num-ctx.patch: passes OLLAMA_SERVER_NUM_CTX as WithRunnerNumCtx, so options.num_ctx is in every /api/chat request"
+    reason: "the Ollama provider never sends num_ctx; the run's pinned context must reach every call"
+  - upstream_file: backend/pkg/docker/client.go
+    change: "0002-docker-info-optional.patch: a refused GET /info is a warning, not fatal; 0003-cellguard-worker-spec.patch: no published ports, restart policy, LogConfig, Hostname or named /work volume"
+    reason: "cell-guard refuses /info and each of those fields; workers must go through cell-guard (DEVELOPMENT_PLAN §2.4)"
+  - upstream_file: backend/pkg/docker/worker_spec.go
+    change: "0003-cellguard-worker-spec.patch: CapDrop MKNOD with nothing added, i.e. PentAGI's capability list minus SYS_PTRACE"
+    reason: "cell-guard allows no added capability but NET_RAW"
+# Each agent chain stops at this many model turns (pkg/providers/performer.go:99-120 at
+# b611fbe) for primary_agent, pentester, coder, installer and assistant; the other roles
+# use MAX_LIMITED_AGENT_TOOL_CALLS, which the adapter sets to min(20, the run's limit) and
+# records. Both are per chain, not per run, and PentAGI never goes below 6
+# (max(setting, 2 * 3)), so the adapter refuses a turn limit under 6.
+max_turns_knob: MAX_GENERAL_AGENT_TOOL_CALLS
 audit_refs:
   version: "§2.5"
   support_level: "§1, §2.5"

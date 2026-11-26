@@ -42,13 +42,19 @@ SIDE_CHANNELS: dict[str, dict[str, str | None]] = {
     },
     "pentagi": {
         "openai_embeddings": "EMBEDDING_PROVIDER=ollama",
-        "graphiti": None,
-        "search_engines": None,
-        "scraper": None,
-        "oauth": None,
-        "langfuse_otel": None,
-        "update_reporter": None,
-        "image_selection": None,
+        "graphiti": "GRAPHITI_ENABLED=false and GRAPHITI_URL empty",
+        "search_engines": (
+            "DUCKDUCKGO_ENABLED=false, SPLOITUS_ENABLED=false, WEB_SEARCH_INTERNAL_ENABLED=false,"
+            " no search API key and SEARXNG_URL empty"
+        ),
+        "scraper": "SCRAPER_PUBLIC_URL and SCRAPER_PRIVATE_URL empty",
+        "oauth": "OAUTH_GOOGLE_*, OAUTH_GITHUB_* and PUBLIC_URL empty",
+        "langfuse_otel": "LANGFUSE_BASE_URL and OTEL_HOST empty",
+        "update_reporter": "UPDATE_CHECK_INTERVAL=0",
+        "image_selection": (
+            "DOCKER_IMAGE_SELECTION_MODE=fixed with DOCKER_DEFAULT_IMAGE_FOR_PENTEST and"
+            " DOCKER_DEFAULT_IMAGE pinned"
+        ),
     },
     "redamon": {
         "ai_attack_surface_judge": None,
@@ -139,7 +145,12 @@ def test_a_candidate_switch_stays_unresolved_until_verified(
             assert channel.note.endswith("unverified at the audited commit"), channel_name
         if channel.audit_ref is None:  # found only by the feasibility study
             assert channel.feasibility_ref is not None, channel_name
-            assert channel.status is ChannelStatus.UNRESOLVED, channel_name
+            # it stays unresolved until an adapter task checks the switch in the source
+            # at the pinned commit and says so in the note
+            verified = (
+                channel.note is not None and f"verified at {sheets[name].commit}" in channel.note
+            )
+            assert channel.status is ChannelStatus.UNRESOLVED or verified, channel_name
 
 
 #: The candidate switch each unresolved channel's note must name (N4).
@@ -147,11 +158,6 @@ CANDIDATES = {
     ("strix", "update_check"): "STRIX_NO_UPDATE_CHECK=1",
     ("strix", "litellm_cost_map"): "LITELLM_LOCAL_MODEL_COST_MAP=True",
     ("hackingbuddygpt", "litellm_cost_map"): "LITELLM_LOCAL_MODEL_COST_MAP=True",
-    ("pentagi", "graphiti"): "GRAPHITI_ENABLED=false",
-    ("pentagi", "search_engines"): "DUCKDUCKGO_ENABLED=false",
-    ("pentagi", "langfuse_otel"): "no LANGFUSE_* and no OTEL_HOST",
-    ("pentagi", "update_reporter"): "UPDATE_CHECK_INTERVAL=0",
-    ("pentagi", "image_selection"): "DOCKER_IMAGE_SELECTION_MODE=fixed",
     ("pentestgpt", "webfetch_anthropic_hosts"): "disallowed_tools=[WebSearch, WebFetch]",
     ("pentestgpt", "hosted_web_search"): "disallowed_tools=[WebSearch, WebFetch]",
     ("redamon", "msf_update"): "MSF_AUTO_UPDATE=false",
@@ -228,7 +234,7 @@ def test_every_side_channel_and_its_exact_setting(
     ("name", "knob"),
     [
         ("strix", "unknown"),
-        ("pentagi", "unknown"),
+        ("pentagi", "MAX_GENERAL_AGENT_TOOL_CALLS"),
         ("redamon", "MAX_ITERATIONS"),
         ("pentestgpt", "unknown"),
         ("hackingbuddygpt", "unknown"),
@@ -238,7 +244,11 @@ def test_the_turn_cap_settings(sheets: dict[str, CapabilitySheet], name: str, kn
     assert sheets[name].max_turns_knob == knob
 
 
-@pytest.mark.parametrize("name", FRAMEWORKS)
+#: Frameworks whose adapter task resolved every side channel and the turn cap.
+RESOLVED = frozenset({"pentagi"})
+
+
+@pytest.mark.parametrize("name", [n for n in FRAMEWORKS if n not in RESOLVED])
 def test_no_framework_can_run_until_its_open_items_are_resolved(
     sheets: dict[str, CapabilitySheet], name: str
 ) -> None:
@@ -289,7 +299,20 @@ def test_the_unofficial_route_is_labelled(sheets: dict[str, CapabilitySheet]) ->
     assert unofficial == {"pentestgpt"}
 
 
-@pytest.mark.parametrize("name", [n for n in FRAMEWORKS if n != "hackingbuddygpt"])
+@pytest.mark.parametrize("name", sorted(RESOLVED))
+def test_a_resolved_framework_runs_on_a_large_pinned_context(
+    sheets: dict[str, CapabilitySheet], name: str
+) -> None:
+    assert sheets[name].check_runnable(ModelConfig(name="qwen3:32b", num_ctx=131072)) is None
+
+
+#: Frameworks whose adapter task found where sub-agent ids come from (tested there).
+WITH_AGENT_IDS = frozenset({"pentagi"})
+
+
+@pytest.mark.parametrize(
+    "name", [n for n in FRAMEWORKS if n not in {"hackingbuddygpt", *WITH_AGENT_IDS}]
+)
 def test_no_sheet_claims_agent_ids_the_audit_never_saw(
     sheets: dict[str, CapabilitySheet], name: str
 ) -> None:

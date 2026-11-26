@@ -1,0 +1,30 @@
+# Where the PentAGI agent image comes from. The Dockerfile fetches `repo` at `commit`,
+# applies agents/pentagi/patches/*.patch in name order and builds cmd/pentagi.
+name: pentagi
+repo: https://github.com/vxcontrol/pentagi
+# v2.2.0, the commit docs/OLLAMA_SUPPORT_AUDIT.md §2.5 read (b611fbe)
+version: v2.2.0
+commit: b611fbebcf55b6deb88ad1fb7bf1f1ce7a357242
+license: MIT
+# The runtime base: PostgreSQL 17 with pgvector 0.8.6 (Debian bookworm), multi-arch index
+# digest, resolved 26 Nov 2026 from the Docker Hub registry API. PentAGI's migrations need
+# the vector and pg_trgm extensions; both ship in this image.
+image_base:
+  image: docker.io/pgvector/pgvector:0.8.6-pg17-bookworm
+  digest: sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
+# The Go toolchain the binary is built with (go.mod asks for go 1.26.5), multi-arch index
+# digest, resolved 26 Nov 2026.
+build_base:
+  image: docker.io/library/golang:1.26.5-bookworm
+  digest: sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd
+# The sandbox PentAGI starts for its agents through cell-guard
+# (DOCKER_DEFAULT_IMAGE_FOR_PENTEST and DOCKER_DEFAULT_IMAGE). It must be pre-loaded in the
+# cell and listed in deploy/images.lock with role agent; cell-guard refuses pulls.
+# `latest` is the full Kali worker, `test` the small one the smoke run uses. Both resolved
+# 26 Nov 2026 from the Docker Hub registry API.
+worker_image:
+  image: docker.io/vxcontrol/kali-linux
+  digest: sha256:7f803e5be80ec33dcf4228d9702ea1264658b43301e9d6bf3bce6cf8b1077399
+smoke_worker_image:
+  image: docker.io/vxcontrol/kali-linux
+  digest: sha256:2ec4b178bc232dd264a166db1593bfa44dd792077119b72430ce28079b1fa0bc

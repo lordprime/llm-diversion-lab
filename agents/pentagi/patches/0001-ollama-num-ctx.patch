@@ -1,0 +1,38 @@
+Why: PentAGI's Ollama provider never sends options.num_ctx, so every chat call would
+run on whatever context the Ollama server defaults to (upstream expects a Modelfile
+rebuilt with num_ctx, README 1627-1631). The campaign pins num_ctx per model in the
+experiment file, so this adds OLLAMA_SERVER_NUM_CTX (default 0, meaning unchanged
+behaviour) and passes it as langchaingo's WithRunnerNumCtx, which puts num_ctx into
+the options of every /api/chat request. The adapter sets it to the run's num_ctx.
+Touches backend/pkg/config/config.go and backend/pkg/providers/ollama/ollama.go.
+
+diff --git a/backend/pkg/config/config.go b/backend/pkg/config/config.go
+index fc23d46..4cb53a4 100644
+--- a/backend/pkg/config/config.go
++++ b/backend/pkg/config/config.go
+@@ -150,6 +150,9 @@ type Config struct {
+ 	OllamaServerPullModelsTimeout int    `env:"OLLAMA_SERVER_PULL_MODELS_TIMEOUT" envDefault:"600"`
+ 	OllamaServerPullModelsEnabled bool   `env:"OLLAMA_SERVER_PULL_MODELS_ENABLED" envDefault:"false"`
+ 	OllamaServerLoadModelsEnabled bool   `env:"OLLAMA_SERVER_LOAD_MODELS_ENABLED" envDefault:"false"`
++	// OllamaServerNumCtx is sent as options.num_ctx on every chat call when above
++	// zero, so the context window is set per request instead of in a Modelfile.
++	OllamaServerNumCtx int `env:"OLLAMA_SERVER_NUM_CTX" envDefault:"0"`
+ 
+ 	// === LLM Provider: Google Gemini ===
+ 	GeminiAPIKey    string `env:"GEMINI_API_KEY"`
+diff --git a/backend/pkg/providers/ollama/ollama.go b/backend/pkg/providers/ollama/ollama.go
+index 8268e5f..9df8e6f 100644
+--- a/backend/pkg/providers/ollama/ollama.go
++++ b/backend/pkg/providers/ollama/ollama.go
+@@ -229,6 +229,11 @@ func New(
+ 		ollama.WithModel(baseModel),
+ 	}
+ 
++	// A pinned context window travels with every request (options.num_ctx).
++	if cfg.OllamaServerNumCtx > 0 {
++		options = append(options, ollama.WithRunnerNumCtx(cfg.OllamaServerNumCtx))
++	}
++
+ 	// Add API key for Ollama Cloud support
+ 	if cfg.OllamaServerAPIKey != "" {
+ 		options = append(options, ollama.WithAPIKey(cfg.OllamaServerAPIKey))
