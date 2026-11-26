@@ -51,15 +51,41 @@ SIDE_CHANNELS: dict[str, dict[str, str | None]] = {
         "image_selection": None,
     },
     "redamon": {
-        "ai_attack_surface_judge": None,
+        "ai_attack_surface_judge": (
+            "the recon-orchestrator service is never started (the driver starts postgres, "
+            "neo4j, kali, agent and webapp only)"
+        ),
         "kb_embeddings": "KB_EMBEDDING_API_BASE_URL unset",
         "keyed_provider_model_listing": "no OpenAI or Anthropic provider key configured",
         "hosted_default_models": (
-            "agent model and every model by feature set to custom/<providerId>"
+            "agentOpenaiModel=custom/<providerId> and no model by feature set"
         ),
-        "msf_update": None,
-        "nuclei_template_update": None,
-        "hardcoded_dns": None,
+        "settings_fallback_default_model": (
+            "patches 0001 and 0002: a failed settings or provider fetch ends the run "
+            "(error code settings_unavailable)"
+        ),
+        "out_of_run_default_model": "patch 0003, and targetGuardrailEnabled=false",
+        "agent_in_the_loop": "AGENT_IN_THE_LOOP_ENABLED=false",
+        "msf_update": "MSF_AUTO_UPDATE=false",
+        "nuclei_template_update": "NUCLEI_AUTO_UPDATE=false",
+        "hardcoded_dns": (
+            "upstream docker-compose.yml is not used; cell-guard forces HostConfig.Dns to "
+            "the cell resolver"
+        ),
+        "internet_only_tools": (
+            "agentToolPhaseMap maps web_search, cve_intel, shodan, google_dork, "
+            "execute_subfinder, execute_amass, execute_gau, tradecraft_lookup and "
+            "execute_guarddog to no phase"
+        ),
+        "tunnels": (
+            "TUNNEL_AUTH_TOKEN unset, agentNgrokTunnelEnabled=false and "
+            "agentChiselTunnelEnabled=false"
+        ),
+        "webapp_telemetry": "NEXT_TELEMETRY_DISABLED=1 and CHECKPOINT_DISABLE=1",
+        "webapp_version_check": "the webapp UI is never opened; only the driver calls the webapp",
+        "webapp_plugin_catalog": "PLUGINS_CATALOG_URL=http://127.0.0.1:9/catalog.json",
+        "webapp_api_usage_check": "API_USAGE_CHECK_ENABLED=false",
+        "workspace_url_import": "WORKSPACE_URL_IMPORT_ENABLED=false",
     },
     "pentestgpt": {
         "hosted_anthropic_api": "ANTHROPIC_BASE_URL=<tap>",
@@ -139,7 +165,16 @@ def test_a_candidate_switch_stays_unresolved_until_verified(
             assert channel.note.endswith("unverified at the audited commit"), channel_name
         if channel.audit_ref is None:  # found only by the feasibility study
             assert channel.feasibility_ref is not None, channel_name
-            assert channel.status is ChannelStatus.UNRESOLVED, channel_name
+            # It may be disabled only once the adapter task read the switch in the
+            # source at the pinned commit, and says so.
+            if channel.status is ChannelStatus.DISABLED:
+                assert channel.note is not None, channel_name
+                assert (
+                    f"verified at {sheets[name].commit}" in channel.note
+                    or "found by the adapter task" in channel.note
+                ), channel_name
+            else:
+                assert channel.status is ChannelStatus.UNRESOLVED, channel_name
 
 
 #: The candidate switch each unresolved channel's note must name (N4).
@@ -154,8 +189,6 @@ CANDIDATES = {
     ("pentagi", "image_selection"): "DOCKER_IMAGE_SELECTION_MODE=fixed",
     ("pentestgpt", "webfetch_anthropic_hosts"): "disallowed_tools=[WebSearch, WebFetch]",
     ("pentestgpt", "hosted_web_search"): "disallowed_tools=[WebSearch, WebFetch]",
-    ("redamon", "msf_update"): "MSF_AUTO_UPDATE=false",
-    ("redamon", "nuclei_template_update"): "NUCLEI_AUTO_UPDATE=false",
 }
 
 
@@ -238,14 +271,22 @@ def test_the_turn_cap_settings(sheets: dict[str, CapabilitySheet], name: str, kn
     assert sheets[name].max_turns_knob == knob
 
 
+#: Sheets whose adapter task resolved every side channel and the turn cap.
+RESOLVED = frozenset({"redamon"})
+
+
 @pytest.mark.parametrize("name", FRAMEWORKS)
 def test_no_framework_can_run_until_its_open_items_are_resolved(
     sheets: dict[str, CapabilitySheet], name: str
 ) -> None:
-    # Every sheet still has an unresolved side channel or an unknown turn cap, so the
-    # adapter tasks must resolve them before any run starts, whatever the model.
+    # A sheet with an unresolved side channel or an unknown turn cap refuses every run,
+    # whatever the model; a resolved one accepts a model with a pinned context.
     verdict = sheets[name].check_runnable(ModelConfig(name="qwen3:32b", num_ctx=131072))
-    assert isinstance(verdict, UnsupportedRun)
+    if name in RESOLVED:
+        assert verdict is None
+        assert sheets[name].unresolved_side_channels == ()
+    else:
+        assert isinstance(verdict, UnsupportedRun)
 
 
 def test_the_recorded_patches(sheets: dict[str, CapabilitySheet]) -> None:
@@ -289,7 +330,20 @@ def test_the_unofficial_route_is_labelled(sheets: dict[str, CapabilitySheet]) ->
     assert unofficial == {"pentestgpt"}
 
 
-@pytest.mark.parametrize("name", [n for n in FRAMEWORKS if n != "hackingbuddygpt"])
+def test_redamon_reads_agent_ids_from_its_request_tag(
+    sheets: dict[str, CapabilitySheet],
+) -> None:
+    # The adapter task added the tag (patch 0002) and reads it back (agent_ids()).
+    sheet = sheets["redamon"]
+    assert sheet.agent_id_source is not None
+    assert "user field" in sheet.agent_id_source
+    assert sheet.agent_id_gap is None
+    assert any("patch 0002" in p.change for p in sheet.patches)
+
+
+@pytest.mark.parametrize(
+    "name", [n for n in FRAMEWORKS if n not in {"hackingbuddygpt", "redamon"}]
+)
 def test_no_sheet_claims_agent_ids_the_audit_never_saw(
     sheets: dict[str, CapabilitySheet], name: str
 ) -> None:

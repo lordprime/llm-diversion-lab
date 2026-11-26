@@ -1,61 +1,141 @@
-# RedAmon capability sheet. Every value comes from docs/OLLAMA_SUPPORT_AUDIT.md;
-# audit_refs and each side channel's audit_ref name the section behind it, and
-# "unknown" marks what the audit could not verify. An unresolved side channel makes
-# every run unsupported until the RedAmon adapter task fixes it.
-# Side channels the audit missed come from docs/AUTOMATION_FEASIBILITY.md (feasibility_ref);
-# a "candidate" switch in a note is unverified until the adapter task checks the source.
+# RedAmon capability sheet. Values from docs/OLLAMA_SUPPORT_AUDIT.md cite it in
+# audit_refs and in each side channel's audit_ref; channels found by
+# docs/AUTOMATION_FEASIBILITY.md cite it in feasibility_ref. The adapter task (M3 Task 4)
+# checked every channel and call path against the source at the pinned commit
+# 73ca9d38ced026be6d88d1dc526c72317e7d193c (agents/redamon/source.yaml); every file:line
+# below is at that commit, and "patch 000N" is agents/redamon/patches/000N-*.patch.
+#
+# Campaign constraints (cell-guard, DEVELOPMENT_PLAN §2.4), recorded with every run:
+#   - every RedAmon service runs with at most 2 GiB of memory, 2 CPUs and 512 PIDs
+#     (upstream: agent 3g, neo4j 4.5g with a 2g heap plus 1g page cache, Kali 10 CPUs
+#     and 4096 PIDs). Neo4j gets a 1g heap and a 512m page cache. Five fireteam members
+#     at once (about 512 MB each, project_settings.py:935-957) can exhaust the agent's
+#     2 GiB; an out-of-memory kill ends the run as crashed;
+#   - Kali runs with NET_RAW only. NET_ADMIN (interface, routing and iptables setup for
+#     tunnels and redirects, docker-compose.yml:758-765) and seccomp:unconfined are not
+#     granted. Raw-socket scans (nmap SYN, naabu, ping) still work; tunnelled reverse
+#     shells, iptables redirects and any tool that needs unconfined syscalls (Chromium's
+#     sandbox under Playwright is the likely one) are degraded;
+#   - Kali has no /opt/graph_db (upstream bind-mounts it) and no custom nuclei templates
+#     from mcp/nuclei-templates, so the redagraph CLI in kali_shell does not work and
+#     nuclei uses only the templates baked in at build.
+# The CI smoke runs a Kali stand-in (the same MCP servers, none of the tools); its image
+# name carries "kali-standin-smoke-only" and RunPlan refuses it outside the smoke. The
+# real Kali image is built and digest-pinned on the CISPA VM (M2 Task 7).
 framework: redamon
 version: v7.9.0 # the Ollama preset and openai_compatible branch also exist at 7.6.0 (03b46b8)
 commit: 73ca9d3
 image_digest: unknown # set once CI builds the RedAmon agent image
+use_case: >-
+  one chat session over the agent's /ws/agent WebSocket (the root ReAct loop and its
+  fireteams), driven by agents/redamon/driver.py; the recon pipeline, CypherFix, the AI
+  navigator, report narratives and the other webapp features are never started
 # The audit labels it native: its OpenAI-compatible provider has a built-in "Ollama" preset.
 support_level: native
 wire_formats: [openai_chat]
-# Configure exactly one OpenAI-compatible provider whose base URL is the tap, and assign it
-# to the agent and to every model by feature (§3).
+# One OpenAI-compatible provider row whose base URL is the tap, and the project's agent
+# model custom/<providerId>. Patch 0002 tags each request with the OpenAI "user" field
+# "redamon:<purpose>:<agent>"; "[tap: <purpose>]" names the purpose the CI smoke must see
+# at the tap, "[off: <purpose>]" one it must never see.
 model_call_paths:
-  - "main agent: JSON LLMDecision through LangChain ChatOpenAI on the custom provider (agentic/orchestrator_helpers/llm_setup.py 280-320)"
-  - "Deep Think pre-step (docs/readmes/README.AGENTIC_SYSTEM.md 545)"
-  - "Cypher translator for query_graph (README.AGENTIC_SYSTEM.md 607)"
-  - "in-run LLM scope guardrail (README.AGENTIC_SYSTEM.md 31)"
-  - "LATS expansion, off by default (README.AGENTIC_SYSTEM.md 134)"
-  - "report summariser (README.AGENTIC_SYSTEM.md 732)"
-  - "ten models by feature with no fallback to the agent model (agentic/feature_models.py); the audit names roe_parse, triage, codefix, report_narratives and navigator, the other five are unknown"
-  - "CypherFix triage and codefix with bind_tools (agentic/cypherfix_triage/orchestrator.py 1341, agentic/cypherfix_codefix/orchestrator.py 737)"
-  - "out-of-run guardrail on the first custom provider (agentic/api.py 1899-1958)"
-  - "fireteam members, on by default (agentic/project_settings.py 119-122)"
+  - "main agent: JSON LLMDecision through LabTaggedChatOpenAI on the one custom provider (agentic/orchestrator_helpers/llm_setup.py 280-320, think_node.py 1079-1083) [tap: think]"
+  - "Deep Think pre-step (agentic/orchestrator_helpers/nodes/think_node.py 538; docs/readmes/README.AGENTIC_SYSTEM.md 545) [tap: deep_think]"
+  - "attack-path classifier, not in the audit (agentic/orchestrator_helpers/phase.py 60) [tap: classify]"
+  - "Cypher translator for query_graph (agentic/tools.py 792; README.AGENTIC_SYSTEM.md 607) [tap: cypher]"
+  - "the session's final report (agentic/orchestrator_helpers/nodes/generate_response_node.py 221) [tap: report]"
+  - "fireteam members, on: at most 5 members and 5 at once (fireteam_member_think_node.py 1015; caps fireteam_deploy_node.py 505-509, 525-527) [tap: fireteam_member]"
+  - "in-run LLM scope guardrail, off: agentGuardrailEnabled=false (initialize_node.py 270; README.AGENTIC_SYSTEM.md 31) [off: scope_guardrail]"
+  - "LATS expansion, off: agentLatsEnabled=false (project_settings.py 134; README.AGENTIC_SYSTEM.md 134) [off: lats_expand]"
+  - "ten models by feature (roe_parse, preset_generator, triage, codefix, command_whisperer, tradecraft_librarian, report_narratives, multi_mute, skill_metadata, navigator), off: none is set and none falls back to the agent model (agentic/feature_models.py 7-11, 32-38) [off: tradecraft_librarian, tradecraft_ingest]"
+  - "CypherFix triage and codefix with bind_tools, never reached: they run on /ws/cypherfix-* sockets the driver never opens, on the unset triage and codefix feature models (agentic/cypherfix_triage/orchestrator.py 1341, agentic/cypherfix_codefix/orchestrator.py 737)"
+  - "report summariser /api/report/summarize, never reached: only the webapp's report pages call it, on the unset report_narratives feature model (agentic/api.py 568-572; README.AGENTIC_SYSTEM.md 732)"
+  - "out-of-run guardrail, never reached: the webapp calls /guardrail/check-target only on project create, which targetGuardrailEnabled=false skips (agentic/api.py 284, 1918-1958); patch 0003 fails it closed"
 side_channels:
   ai_attack_surface_judge:
-    status: unresolved
+    status: disabled
+    setting: "the recon-orchestrator service is never started (the driver starts postgres, neo4j, kali, agent and webapp only)"
     audit_ref: "§2.3, §3"
-    note: "the AI-attack-surface scan's judge spawns its own ollama/ollama:latest (qwen2.5:7b) at http://redamon-local-llm:11434 (recon_orchestrator/local_llm_manager.py); the audit says keep the scan off but names no setting"
+    note: "the judge's own ollama/ollama:latest (qwen2.5:7b, recon_orchestrator/local_llm_manager.py 49, 83) is created only by recon-orchestrator (recon_orchestrator/api.py 772-778); agentic/ and mcp/servers/ never call it, the webapp's RECON_ORCHESTRATOR_URL is a closed local port, and cell-guard denies pulls and allows only images.lock images"
   kb_embeddings:
     status: disabled
     setting: "KB_EMBEDDING_API_BASE_URL unset"
     audit_ref: "§2.3, §3"
-    note: "KB embeddings then stay on local sentence-transformers (.env.example 50-79)"
+    note: "the knowledge base is off as well: KB_ENABLED=false (docker-compose.yml 969) and the agent image is built with SKIP_KB=true (agentic/Dockerfile 117-160)"
   keyed_provider_model_listing:
     status: disabled
     setting: "no OpenAI or Anthropic provider key configured"
     audit_ref: "§2.3"
-    note: "model listing calls api.openai.com and api.anthropic.com only for keyed providers (orchestrator_helpers/model_providers.py)"
+    note: "model listing calls api.openai.com and api.anthropic.com only for keyed providers (orchestrator_helpers/model_providers.py 85); the driver creates exactly one openai_compatible row"
   hosted_default_models:
     status: disabled
-    setting: "agent model and every model by feature set to custom/<providerId>"
+    setting: "agentOpenaiModel=custom/<providerId> and no model by feature set"
     audit_ref: "§2.3, §3"
-    note: "the default agent model is claude-opus-4-6 (agentic/project_settings.py 92)"
+    note: "the default agent model is claude-opus-4-6 (agentic/project_settings.py 92; webapp/prisma/schema.prisma 1457); a feature with no model has none (agentic/feature_models.py 7-11)"
+  settings_fallback_default_model:
+    status: disabled
+    setting: "patches 0001 and 0002: a failed settings or provider fetch ends the run (error code settings_unavailable)"
+    audit_ref: "§2.3"
+    note: "found by the adapter task: load_project_settings fell back to DEFAULT_AGENT_SETTINGS, model claude-opus-4-6, on any webapp error (agentic/project_settings.py 1043-1060) and a failed provider fetch left an empty list (797-808)"
+  out_of_run_default_model:
+    status: disabled
+    setting: "patch 0003, and targetGuardrailEnabled=false"
+    audit_ref: "§2.3"
+    note: "found by the adapter task: _build_llm_for_user built the hosted default model when the provider fetch failed (agentic/api.py 1918-1990), and text-to-cypher (_build_cypher_manager) answered on DEFAULT_AGENT_SETTINGS' model (3403-3438)"
+  agent_in_the_loop:
+    status: disabled
+    setting: "AGENT_IN_THE_LOOP_ENABLED=false"
+    audit_ref: "§2.3"
+    note: "found by the adapter task: a loop/ model sends each model call to an external MCP client instead of a provider (agentic/agent_in_the_loop/model.py); setup_llm refuses loop/ models when the switch is off (agentic/orchestrator_helpers/llm_setup.py 217-223)"
   msf_update:
-    status: unresolved
+    status: disabled
+    setting: "MSF_AUTO_UPDATE=false"
     feasibility_ref: "§6.4"
-    note: "msfupdate at start; not in the audit; candidate: MSF_AUTO_UPDATE=false (AUTOMATION_FEASIBILITY §6.4), unverified at the audited commit"
+    note: "verified at 73ca9d3: mcp/kali-sandbox/entrypoint.sh 32-47 runs msfupdate, then an apt-get fallback, unless MSF_AUTO_UPDATE is exactly false (default true)"
   nuclei_template_update:
-    status: unresolved
+    status: disabled
+    setting: "NUCLEI_AUTO_UPDATE=false"
     feasibility_ref: "§6.4"
-    note: "nuclei template update; not in the audit; candidate: NUCLEI_AUTO_UPDATE=false (AUTOMATION_FEASIBILITY §6.4), unverified at the audited commit"
+    note: "verified at 73ca9d3: mcp/kali-sandbox/entrypoint.sh 49-52 runs nuclei -update-templates unless NUCLEI_AUTO_UPDATE is exactly false; a nuclei run's own update check is tool behaviour (AUTOMATION_FEASIBILITY §6.4, last row) and fails offline"
   hardcoded_dns:
-    status: unresolved
+    status: disabled
+    setting: "upstream docker-compose.yml is not used; cell-guard forces HostConfig.Dns to the cell resolver"
     feasibility_ref: "§6.4"
-    note: "a hard-coded DNS server 8.8.8.8; not in the audit; candidate: removed in the compose override (AUTOMATION_FEASIBILITY §6.4), unverified at the audited commit"
+    note: "verified at 73ca9d3: the only hard-coded resolver is the kali-sandbox service's dns 8.8.8.8 and 8.8.4.4 (docker-compose.yml 754-756); no runtime code under agentic/, mcp/servers/ or webapp/src/ names one, and cell-guard sets Dns on every container it creates (cell/cellguard/policy.py, _container_create)"
+  internet_only_tools:
+    status: disabled
+    setting: "agentToolPhaseMap maps web_search, cve_intel, shodan, google_dork, execute_subfinder, execute_amass, execute_gau, tradecraft_lookup and execute_guarddog to no phase"
+    feasibility_ref: "§2.1, §6.4"
+    note: "verified at 73ca9d3: a mapped tool runs only in its listed phases, an unmapped one falls back to its MCP manifest (agentic/project_settings.py 1389-1401), so each is mapped to []; the tradecraft companions inherit tradecraft_lookup (1385-1387); guarddog downloads the package it checks"
+  tunnels:
+    status: disabled
+    setting: "TUNNEL_AUTH_TOKEN unset, agentNgrokTunnelEnabled=false and agentChiselTunnelEnabled=false"
+    feasibility_ref: "§6.4"
+    note: "found by the adapter task, not in §6.4: without the token Kali's tunnel manager refuses every config push and never asks the webapp for one (mcp/kali-sandbox/entrypoint.sh 63-64)"
+  webapp_telemetry:
+    status: disabled
+    setting: "NEXT_TELEMETRY_DISABLED=1 and CHECKPOINT_DISABLE=1"
+    feasibility_ref: "§6.4"
+    note: "found by the adapter task, not in §6.4: Next.js telemetry (also baked in, webapp/Dockerfile 40, 53) and the Prisma CLI's checkpoint call when the entrypoint runs db push (webapp/Dockerfile 139)"
+  webapp_version_check:
+    status: disabled
+    setting: "the webapp UI is never opened; only the driver calls the webapp"
+    feasibility_ref: "§6.4"
+    note: "verified at 73ca9d3: /api/version/check fetches raw.githubusercontent.com (webapp/src/app/api/version/check/route.ts 5, 21-43) and only the browser hook calls it (webapp/src/hooks/useVersionCheck.ts 43)"
+  webapp_plugin_catalog:
+    status: disabled
+    setting: "PLUGINS_CATALOG_URL=http://127.0.0.1:9/catalog.json"
+    feasibility_ref: "§6.4"
+    note: "found by the adapter task, not in §6.4: plugin routes fetch the catalog from GitHub when the URL is empty (webapp/src/lib/plugins/catalog.ts 29, 79-81); the driver never calls a plugin route"
+  webapp_api_usage_check:
+    status: disabled
+    setting: "API_USAGE_CHECK_ENABLED=false"
+    feasibility_ref: "§6.4"
+    note: "found by the adapter task, not in §6.4: on-demand provider usage checks (webapp/src/lib/apiUsage/state.ts 22)"
+  workspace_url_import:
+    status: disabled
+    setting: "WORKSPACE_URL_IMPORT_ENABLED=false"
+    feasibility_ref: "§6.4"
+    note: "found by the adapter task, not in §6.4: import-from-URL fetches any URL into the workspace (agentic/workspace_import/limits.py 70-76)"
 min_num_ctx: unknown # the docs give no model-size or context guidance
 sub_agents: dynamic # root agent plus fireteam waves; members cannot spawn fireteams
 sub_agent_cap: # FIRETEAM_ENABLED is on by default; the adapter sets both caps and records them
@@ -64,10 +144,32 @@ sub_agent_cap: # FIRETEAM_ENABLED is on by default; the adapter sets both caps a
   max_agents_setting: FIRETEAM_MAX_MEMBERS
   max_concurrent_setting: FIRETEAM_MAX_CONCURRENT
   audit_ref: "§2.3, §3"
-agent_id_source: null
-agent_id_gap: "unknown: the audit read no RedAmon log that names the fireteam member behind each model call"
-patches: []
-# §2.3 "Multi-agent": "MAX_ITERATIONS defaults to 100"; the audit gives no file or line for it.
+# Patch 0002 writes "redamon:<purpose>:<agent>" into each request's "user" field: the
+# agent is "root" or the member id fireteam_deploy_node gives (member-<n>-<8 hex>, line
+# 60-61), from the purpose label (fireteam_member_think_node.py 1015) or the member's
+# streaming scope (member_streaming.py 30, fireteam_deploy_node.py 648).
+agent_id_source: "the OpenAI user field of each tap request (llm/NNNN.req.json), written by patch 0002"
+patches:
+  - upstream_file: agentic/project_settings.py
+    change: "load_project_settings raises SettingsUnavailable instead of falling back to DEFAULT_AGENT_SETTINGS, and a failed provider fetch raises instead of leaving an empty list (patch 0001)"
+    reason: "the fallback silently moves the run onto the hosted default model claude-opus-4-6 (lines 797-808, 1043-1060)"
+  - upstream_file: agentic/orchestrator_helpers/llm_setup.py
+    change: "apply_project_settings turns SettingsUnavailable into llm_setup_failure (a non-recoverable error frame), and OpenAI-compatible clients are LabTaggedChatOpenAI, which writes redamon:<purpose>:<agent> into each request's user field (patch 0002)"
+    reason: "fail closed instead of a traceback; and the tap stores bodies, not headers, so this is where the fireteam member behind each call becomes visible"
+  - upstream_file: agentic/api.py
+    change: "_build_llm_for_user and text-to-cypher refuse when settings or providers cannot be read, or no custom provider exists (patch 0003)"
+    reason: "both fell back to the hosted default model (lines 1918-1990, 3403-3438)"
+  - upstream_file: agentic/requirements.txt
+    change: "the LangChain family, langgraph-checkpoint-postgres and openai pinned with == to the newest release at the commit date (patch 0004)"
+    reason: "upstream uses >= (AUTOMATION_FEASIBILITY §2.1 and §3 #6); patch 0002 relies on ChatOpenAI._get_request_payload (langchain-openai 1.8.3)"
+  - upstream_file: agentic/Dockerfile
+    change: "cve-mcp-server installed at commit d666bac instead of @main (patch 0005)"
+    reason: "a moving branch makes the image irreproducible"
+# §2.3 "Multi-agent": "MAX_ITERATIONS defaults to 100". Verified at 73ca9d3: default
+# project_settings.py 179, set from the project's agentMaxIterations (515), enforced by
+# orchestrator.py 741-743 (the run goes to its final report before the model's decision
+# is read); config.py 99 sets LangGraph's recursion limit to five times it. A member's own
+# cap is FIRETEAM_MEMBER_MAX_ITERATIONS, fixed at 10 and recorded.
 max_turns_knob: MAX_ITERATIONS
 audit_refs:
   version: "§2.3"

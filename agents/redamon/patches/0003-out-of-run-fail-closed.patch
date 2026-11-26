@@ -1,0 +1,50 @@
+Lab patch 0003: out-of-run model clients fail closed (agentic/api.py).
+
+Why: _build_llm_for_user() (the target guardrail endpoint) builds the hosted
+default model when the provider fetch fails or no custom provider exists, and
+text-to-cypher answers on DEFAULT_AGENT_SETTINGS' model when the settings or
+provider fetch fails. Both now refuse instead. The guardrail endpoint already
+treats a failed build as "guardrail skipped"; text-to-cypher answers HTTP 503.
+
+diff --git a/agentic/api.py b/agentic/api.py
+index d1df076..a3be6ce 100644
+--- a/agentic/api.py
++++ b/agentic/api.py
+@@ -1946,9 +1946,14 @@ def _build_llm_for_user(user_id: Optional[str], purpose: str = "out-of-run clien
+             resp.raise_for_status()
+             user_providers = resp.json() or []
+         except Exception as e:
+-            logger.warning(f"{purpose}: failed to fetch user LLM providers: {e}")
++            # Lab patch: fail closed instead of building the hosted default model.
++            raise RuntimeError(f"{purpose}: user LLM providers unreadable: {type(e).__name__}") from e
+ 
+     custom_provider = _pick_custom_provider(user_providers, model_name)
++    if not custom_provider:
++        # Lab patch: only a configured custom provider may serve an out-of-run call;
++        # upstream falls back to the hosted default model on the user's own keys.
++        raise RuntimeError(f"{purpose}: no custom LLM provider configured")
+     if custom_provider:
+         custom_model = f"custom/{custom_provider.get('id', '')}"
+         logger.info(
+@@ -3419,7 +3424,10 @@ async def _build_cypher_manager(user_id: str, project_id: str):
+         if settings and settings.get('OPENAI_MODEL'):
+             model_name = settings['OPENAI_MODEL']
+     except Exception as e:
++        # Lab patch: fail closed instead of answering on the hosted default model.
+         logger.warning(f"text-to-cypher: failed to fetch project settings: {e}")
++        raise _CypherSetupError(503, "Project settings could not be read.",
++                                {"code": "settings_unavailable"}) from e
+     if is_loop_model(model_name):
+         # No chat run, so no driver can answer the generation step.
+         raise _CypherSetupError(409, LOOP_OUT_OF_SESSION_CYPHER,
+@@ -3436,7 +3444,10 @@ async def _build_cypher_manager(user_id: str, project_id: str):
+         resp.raise_for_status()
+         user_providers = resp.json()
+     except Exception as e:
++        # Lab patch: fail closed (see above).
+         logger.warning(f"text-to-cypher: failed to fetch user LLM providers: {e}")
++        raise _CypherSetupError(503, "LLM providers could not be read.",
++                                {"code": "settings_unavailable"}) from e
+ 
+     from llm_builder import (InstanceProviderUnavailable, custom_provider_or_fallback,
+                              split_instance_model)

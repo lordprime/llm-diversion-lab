@@ -1,0 +1,78 @@
+Lab patch 0001: settings fail closed (agentic/project_settings.py).
+
+Why: upstream load_project_settings() swallows any webapp error and falls back to
+DEFAULT_AGENT_SETTINGS, whose model is the hosted claude-opus-4-6 (lines 1043-1060
+at 73ca9d3), and a failed provider fetch leaves an empty provider list (lines
+797-808). A run must never silently move off the tap's model, so both now raise
+SettingsUnavailable. Patch 0002 turns that into a non-recoverable run error.
+
+diff --git a/agentic/project_settings.py b/agentic/project_settings.py
+index ee90a57..d455e4e 100644
+--- a/agentic/project_settings.py
++++ b/agentic/project_settings.py
+@@ -20,6 +20,14 @@ import scope_groups as _scope_groups
+ 
+ logger = logging.getLogger(__name__)
+ 
++
++class SettingsUnavailable(RuntimeError):
++    """The project's settings or LLM providers could not be read from the webapp.
++
++    Lab patch: a run must never fall back to DEFAULT_AGENT_SETTINGS (whose model is
++    a hosted default), so a failed read stops the run instead.
++    """
++
+ INTERNAL_HEADERS = {"X-Internal-Key": os.environ.get("INTERNAL_API_KEY", "")}
+ 
+ # =============================================================================
+@@ -804,8 +812,9 @@ def fetch_agent_settings(project_id: str, webapp_url: str, *,
+             providers_resp.raise_for_status()
+             settings['USER_LLM_PROVIDERS'] = providers_resp.json()
+         except Exception as e:
+-            logger.warning(f"Failed to fetch user LLM providers: {e}")
+-            settings['USER_LLM_PROVIDERS'] = []
++            # Lab patch: no provider list means no run, never an empty list that a
++            # later step could fill with a default model.
++            raise SettingsUnavailable(f"user LLM providers unreadable: {type(e).__name__}") from e
+ 
+         # Fetch user settings (Tavily API key)
+         try:
+@@ -1040,23 +1049,22 @@ def load_project_settings(project_id: str) -> dict[str, Any]:
+ 
+     webapp_url = os.environ.get('WEBAPP_API_URL')
+ 
++    # Lab patch: fail closed. Upstream falls back to DEFAULT_AGENT_SETTINGS here,
++    # which silently swaps the run onto the hosted default model.
+     if not webapp_url:
+-        logger.warning("WEBAPP_API_URL not set, using DEFAULT_AGENT_SETTINGS")
+-        settings = DEFAULT_AGENT_SETTINGS.copy()
+-        settings[SETTINGS_SOURCE_KEY] = "default"
+-    else:
+-        try:
+-            settings = fetch_agent_settings(project_id, webapp_url)
+-            logger.info(f"Loaded {len(settings)} agent settings from API for project {project_id}")
+-            settings[SETTINGS_SOURCE_KEY] = "api"
+-            if settings.get('PROJECT_UPDATED_AT'):
+-                _SEEN_UPDATED_AT[project_id] = settings['PROJECT_UPDATED_AT']
+-            _SEEN_IP_MODE[project_id] = bool(settings.get('IP_MODE'))
+-        except Exception as e:
+-            logger.error(f"Failed to fetch agent settings for project {project_id}: {e}")
+-            logger.warning("Falling back to DEFAULT_AGENT_SETTINGS")
+-            settings = DEFAULT_AGENT_SETTINGS.copy()
+-            settings[SETTINGS_SOURCE_KEY] = "default"
++        raise SettingsUnavailable("WEBAPP_API_URL is not set")
++    try:
++        settings = fetch_agent_settings(project_id, webapp_url)
++    except SettingsUnavailable:
++        raise
++    except Exception as e:
++        logger.error(f"Failed to fetch agent settings for project {project_id}: {e}")
++        raise SettingsUnavailable(f"project settings unreadable: {type(e).__name__}") from e
++    logger.info(f"Loaded {len(settings)} agent settings from API for project {project_id}")
++    settings[SETTINGS_SOURCE_KEY] = "api"
++    if settings.get('PROJECT_UPDATED_AT'):
++        _SEEN_UPDATED_AT[project_id] = settings['PROJECT_UPDATED_AT']
++    _SEEN_IP_MODE[project_id] = bool(settings.get('IP_MODE'))
+ 
+     # Memory governor (Part 3): scale concurrency to RAM available this turn.
+     settings = apply_memory_governor(settings)

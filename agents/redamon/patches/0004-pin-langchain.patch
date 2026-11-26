@@ -1,0 +1,65 @@
+Lab patch 0004: pin the LangChain family and openai (agentic/requirements.txt).
+
+Why: upstream lists them with ">=" (AUTOMATION_FEASIBILITY §2.1 and §3 #6), so two
+builds of the same commit can run different client code. Each is pinned to the
+newest release on PyPI at or before the commit date (2026-11-19). Patch 0002's
+LabTaggedChatOpenAI overrides ChatOpenAI._get_request_payload, which
+langchain-openai 1.8.3 has (chat_models/base.py:3871).
+
+diff --git a/agentic/requirements.txt b/agentic/requirements.txt
+index 714563a..4077ba7 100644
+--- a/agentic/requirements.txt
++++ b/agentic/requirements.txt
+@@ -1,15 +1,15 @@
+ # RedAmon Agent Dependencies
+ 
+ # LangChain core
+-langchain>=0.3.0
+-langchain-openai>=0.3.0
+-langchain-anthropic>=0.3.0
+-langchain-google-genai>=2.0.0
+-langgraph>=0.2.0
+-langchain-core>=0.3.0
++langchain==1.5.2
++langchain-openai==1.8.3
++langchain-anthropic==1.7.11
++langchain-google-genai==4.5.1
++langgraph==1.2.23
++langchain-core==1.8.3
+ 
+ # AWS Bedrock integration
+-langchain-aws>=0.2.0
++langchain-aws==1.9.3
+ boto3>=1.35.0
+ 
+ # MCP integration
+@@ -19,16 +19,16 @@ langchain-mcp-adapters==0.3.0
+ mcp==1.28.1
+ 
+ # Neo4j integration
+-langchain-community>=0.3.0
+-langchain-neo4j>=0.1.0
++langchain-community==0.4.2
++langchain-neo4j==0.11.0
+ neo4j>=5.0.0
+ 
+ # Tavily web search
+-langchain-tavily>=0.1.0
++langchain-tavily==0.2.18
+ 
+ # Vector knowledge base (heavy deps in requirements-kb.txt)
+ pyyaml>=6.0
+-openai>=1.0.0
++openai==3.55.1
+ 
+ # FastAPI
+ fastapi>=0.115.0
+@@ -61,7 +61,7 @@ tree-sitter-languages==1.8.0
+ networkx>=3.0
+ 
+ # Persistent LangGraph checkpointer (Fireteam gate: PERSISTENT_CHECKPOINTER=true)
+-langgraph-checkpoint-postgres>=2.0.0
++langgraph-checkpoint-postgres==3.2.1
+ psycopg[binary,pool]>=3.2.0
+ 
+ # Test toolchain (baked so `run_tests.sh` / `redamon.sh test` need no runtime

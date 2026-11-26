@@ -1,0 +1,85 @@
+Lab patch 0002: one model client per run, tagged with its agent
+(agentic/orchestrator_helpers/llm_setup.py).
+
+Why, part 1: apply_project_settings() turns patch 0001's SettingsUnavailable into
+llm_setup_failure, so the orchestrator ends the run with a non-recoverable error
+frame (code settings_unavailable) instead of a traceback or a default model.
+
+Why, part 2: the LLM tap stores request bodies but no headers, and RedAmon's
+fireteam members share one client. Each OpenAI-compatible request now carries the
+standard OpenAI "user" field "redamon:<purpose>:<agent>", read from the
+current_llm_purpose ContextVar upstream already sets at every call site and the
+member scope of fireteam_deploy_node. The adapter's agent_ids() reads it from the
+tap's NNNN.req.json. The model never sees the field.
+
+diff --git a/agentic/orchestrator_helpers/llm_setup.py b/agentic/orchestrator_helpers/llm_setup.py
+index e910a5c..904acb6 100644
+--- a/agentic/orchestrator_helpers/llm_setup.py
++++ b/agentic/orchestrator_helpers/llm_setup.py
+@@ -9,7 +9,7 @@ from langchain_openai import ChatOpenAI
+ from langchain_anthropic import ChatAnthropic
+ from langchain_core.language_models import BaseChatModel
+ 
+-from project_settings import load_project_settings
++from project_settings import SettingsUnavailable, load_project_settings
+ from agent_context import set_llm_context
+ from orchestrator_helpers.llm_url_guard import validate_llm_base_url
+ from llm_builder import (
+@@ -317,7 +317,7 @@ def setup_llm(
+                 import httpx
+                 kwargs["http_client"] = httpx.Client(verify=False)
+                 kwargs["http_async_client"] = httpx.AsyncClient(verify=False)
+-            llm = ChatOpenAI(**kwargs)
++            llm = LabTaggedChatOpenAI(**kwargs)
+ 
+     elif provider == "openai_compat":
+         # Legacy: openai_compat/ prefix (env-var based)
+@@ -565,6 +565,30 @@ class LlmClientCache:
+         return llm
+ 
+ 
++class LabTaggedChatOpenAI(ChatOpenAI):
++    """ChatOpenAI that names the calling agent in each request's ``user`` field.
++
++    Lab patch: the LLM tap records request bodies only, so the agent behind each
++    call is written into the standard OpenAI ``user`` field as
++    ``redamon:<purpose>:<agent>``. The purpose comes from the ``current_llm_purpose``
++    ContextVar every call site already sets. The agent is the member that label
++    names, else the member whose task is running (a tool such as query_graph run
++    by a member), else ``root``. The model never sees the field.
++    """
++
++    def _get_request_payload(self, input_, *, stop=None, **kwargs):
++        from agent_context import current_llm_purpose
++        from orchestrator_helpers.member_streaming import _member_streaming_ctx
++
++        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
++        label = current_llm_purpose.get() or {}
++        purpose = str(label.get("purpose") or "other")
++        member = _member_streaming_ctx.get()
++        agent = str(label.get("member_id") or getattr(member, "_member_id", "") or "root")
++        payload["user"] = f"redamon:{purpose}:{agent}"
++        return payload
++
++
+ def provider_fingerprint(providers: list, custom_config: dict | None) -> str:
+     """SHA-256 of everything a client is built from: a changed key, base URL or
+     header is a different client."""
+@@ -632,7 +656,16 @@ def apply_project_settings(orchestrator, project_id: str) -> None:
+     synchronous, so the binding is atomic for this task; nodes, Fireteam members
+     and text-to-Cypher read it through `current_llm`.
+     """
+-    settings = load_project_settings(project_id)
++    try:
++        settings = load_project_settings(project_id)
++    except SettingsUnavailable as e:
++        # Lab patch: no settings, no client. The caller reports llm_setup_failure as
++        # a non-recoverable error and the run ends there.
++        logger.error(f"Project settings unavailable: {e}")
++        orchestrator.llm_setup_failure = {"code": "settings_unavailable", "model": ""}
++        orchestrator.llm = None
++        set_llm_context(None)
++        return
+ 
+     # HTTP traffic capture (Phase 1): the per-project routing gate is now read
+     # from the (task-isolated) CAPTURE_PROXY_ENABLED setting at tool-execution
