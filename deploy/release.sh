@@ -4,10 +4,11 @@ set -Eeuo pipefail
 
 usage() {
 	cat <<'EOF'
-Usage: deploy/release.sh <host> --tag vX.Y.Z[-suffix] [--allow-build] [--skip-selftest]
+Usage: deploy/release.sh <host> --tag vX.Y.Z[-suffix] [--allow-build] [--quick-selftest | --skip-selftest]
 
 Deploys the git tag to /srv/lab/releases/<tag> on <host> and makes it current:
- 1. refuse if this git tree is dirty or the tag does not exist;
+ 1. refuse if this git tree is dirty or the tag does not exist, or if its
+    images.lock does not pin every image the chosen self-test starts;
  2. refuse if run cells are in flight (containers labelled lab.run_id);
  3. `git archive` the tag and copy it over SSH, verified by SHA-256;
  4. pull every image in the tag's deploy/images.lock by digest, and the
@@ -19,7 +20,8 @@ Deploys the git tag to /srv/lab/releases/<tag> on <host> and makes it current:
  6. swap the `current` symlink and restart the control plane (compose up --wait);
     on a GPU host (gpu: true) that includes the model server, Ollama
     (deploy/compose/models.yml), which stays up while the app services restart;
- 7. `labctl selftest --quick` if labctl is installed;
+ 7. `labctl selftest` (every target; `--quick-selftest`: DVGA only) if labctl
+    is installed;
  8. on any failure in 5-7: stop the app services, restore the dump, swap
     `current` back, start the previous release, exit non-zero;
  9. record the deployment in /srv/lab/deployments.jsonl.
@@ -31,13 +33,16 @@ Options:
   --tag TAG        the release tag (required)
   --allow-build    let compose build images on the host (fallback only: images
                    are normally built in CI and pulled)
-  --skip-selftest  do not run the quick self-test
+  --quick-selftest run the quick self-test (DVGA pair only) instead of the full
+                   one (every target; Juice Shop resets restart its container,
+                   so the full self-test takes several minutes)
+  --skip-selftest  do not run the self-test (emergencies only)
   --drain          not available in M0 (there is no queue to pause yet)
   -h, --help       show this help
 EOF
 }
 
-host="" tag="" allow_build=0 selftest=1
+host="" tag="" allow_build=0 selftest=1 selftest_mode=full
 while (($#)); do
 	case $1 in
 	-h | --help)
@@ -53,6 +58,7 @@ while (($#)); do
 		shift
 		;;
 	--allow-build) allow_build=1 ;;
+	--quick-selftest) selftest_mode=quick ;;
 	--skip-selftest) selftest=0 ;;
 	--drain)
 		printf 'ERROR: --drain is not available in M0: stop the runner by hand, then deploy\n' >&2
@@ -114,6 +120,50 @@ images=$(git_ show "$commit:deploy/images.lock" | lab_python -c "$IMAGES_PY") ||
 	lab_fail "deploy/images.lock in $tag is not usable"
 [[ -n $images ]] || lab_fail "deploy/images.lock in $tag lists no images"
 mapfile -t image_refs <<<"$images"
+
+# The images the chosen self-test starts, from the release's own self-test experiment
+# (its targets; quick mode keeps the first, as labctl does) and each target's cell file
+# (x-lab cell_image and target_image). Prints the ones images.lock does not pin.
+read -r -d '' SELFTEST_IMAGES_PY <<'PY' || true
+import subprocess, sys
+
+import yaml
+
+repo, commit, mode = sys.argv[1:4]
+
+
+def show(path):
+    done = subprocess.run(
+        ["git", "-C", repo, "show", f"{commit}:{path}"], capture_output=True, text=True
+    )
+    if done.returncode != 0:
+        sys.exit(f"{path} is missing from the release")
+    return yaml.safe_load(done.stdout)
+
+
+try:
+    targets = [t["name"] for t in show("experiments/selftest.yaml")["targets"]]
+    if mode == "quick":
+        targets = targets[:1]
+    needed = []
+    for target in targets:
+        meta = show(f"deploy/compose/cell.{target}.yml")["x-lab"]
+        for name in (meta["cell_image"], meta["target_image"]):
+            if name not in needed:
+                needed.append(name)
+    pinned = {entry.get("name") for entry in show("deploy/images.lock")["images"]}
+except (KeyError, TypeError, yaml.YAMLError) as exc:
+    sys.exit(f"cannot work out the self-test's images: {exc!r}")
+if not needed:
+    sys.exit("the self-test experiment lists no targets")
+print(" ".join(name for name in needed if name not in pinned))
+PY
+if ((selftest)); then
+	missing=$(lab_python -c "$SELFTEST_IMAGES_PY" "$LAB_REPO_ROOT" "$commit" "$selftest_mode") ||
+		lab_fail "cannot check the images the $selftest_mode self-test needs in $tag"
+	[[ -z $missing ]] || lab_fail "the $selftest_mode self-test needs $missing pinned in deploy/images.lock of $tag; \
+pin them (build-images workflow, then images.lock) or deploy with --quick-selftest (DVGA only)"
+fi
 
 lab_load_host "$host"
 # A GPU host runs Ollama from the release: a tag without its compose file is refused.
@@ -179,16 +229,16 @@ lab_remote release.sh activate "$tag" "${build_arg[@]}" || rollback "the control
 
 selftest_result="skipped"
 if ((selftest)); then
-	lab_step "Quick self-test on $host"
+	lab_step "Self-test ($selftest_mode) on $host"
 	rc=0
-	lab_remote release.sh selftest || rc=$?
+	lab_remote release.sh selftest "$selftest_mode" || rc=$?
 	case $rc in
-	0) selftest_result="passed" ;;
+	0) selftest_result="passed ($selftest_mode)" ;;
 	3)
-		lab_warn "labctl is not installed on $host; quick self-test skipped"
+		lab_warn "labctl is not installed on $host; self-test skipped"
 		selftest_result="not available"
 		;;
-	*) rollback "the quick self-test failed (exit $rc)" ;;
+	*) rollback "the $selftest_mode self-test failed (exit $rc)" ;;
 	esac
 fi
 

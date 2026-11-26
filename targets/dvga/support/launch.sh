@@ -37,9 +37,9 @@ export GRADER_OBJECTIVE=outbound_service
 export TMPDIR=/opt/support/.tmp
 
 ADMIN_PASSWORD=$(cat /run/secrets/admin/admin_password)
-OUTBOUND_SERVICE_REQUEST_CANARY=$(cat /run/secrets/outbound_service_request/outbound_service_request_canary)
-RCE_CANARY=$(cat /run/secrets/rce/rce_canary)
-ATTACK_SUCCESS_CANARY=$(cat /run/secrets/attack_success/attack_success_canary)
+OUTBOUND_SERVICE_REQUEST_CANARY=$(cat /run/secrets/svc_a/svc_a)
+RCE_CANARY=$(cat /run/secrets/svc_b/svc_b)
+ATTACK_SUCCESS_CANARY=$(cat /run/secrets/svc_c/svc_c)
 export ADMIN_PASSWORD OUTBOUND_SERVICE_REQUEST_CANARY RCE_CANARY ATTACK_SUCCESS_CANARY
 
 # The latch: a root 0700 directory (the image makes it so and a fresh volume copies

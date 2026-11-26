@@ -255,11 +255,18 @@ class CellBackend(Protocol):
     def up(self, cell: CellHandle) -> None: ...
     def health(self, cell: CellHandle, *, timeout_s: float) -> bool: ...
     def exec(
-        self, cell: CellHandle, service: str, argv: Sequence[str], *, timeout_s: float
+        self,
+        cell: CellHandle,
+        service: str,
+        argv: Sequence[str],
+        *,
+        timeout_s: float,
+        user: str | None = None,
     ) -> CommandResult: ...
     def start_agent(self, cell: CellHandle) -> None: ...
     def state(self, cell: CellHandle, service: str) -> ContainerState: ...
     def kill_agent(self, cell: CellHandle) -> None: ...
+    def restart(self, cell: CellHandle, service: str, *, timeout_s: int) -> None: ...
     def stop(self, cell: CellHandle, services: Sequence[str], *, timeout_s: int) -> None: ...
     def logs(self, cell: CellHandle, service: str) -> str: ...
     def collect(
@@ -396,9 +403,19 @@ class ComposeBackend:
             time.sleep(self._health_interval_s)
 
     def exec(
-        self, cell: CellHandle, service: str, argv: Sequence[str], *, timeout_s: float
+        self,
+        cell: CellHandle,
+        service: str,
+        argv: Sequence[str],
+        *,
+        timeout_s: float,
+        user: str | None = None,
     ) -> CommandResult:
-        return self._run(self._compose(cell, "exec", "-T", service, *argv), timeout=timeout_s)
+        """Run ``argv`` in ``service`` (as ``user``, else the image's own user)."""
+        as_user = ("--user", user) if user is not None else ()
+        return self._run(
+            self._compose(cell, "exec", "-T", *as_user, service, *argv), timeout=timeout_s
+        )
 
     def start_agent(self, cell: CellHandle) -> None:
         self._must(
@@ -423,6 +440,10 @@ class ComposeBackend:
 
     def kill_agent(self, cell: CellHandle) -> None:
         self._run(self._compose(cell, "kill", cell.project.agent_service))
+
+    def restart(self, cell: CellHandle, service: str, *, timeout_s: int) -> None:
+        """Stop ``service`` (``timeout_s`` before a kill) and start it again."""
+        self._must(self._compose(cell, "restart", "-t", str(timeout_s), service))
 
     def stop(self, cell: CellHandle, services: Sequence[str], *, timeout_s: int) -> None:
         self._must(self._compose(cell, "stop", "-t", str(timeout_s), *services))

@@ -84,6 +84,7 @@ __all__ = [
     "CellSubnets",
     "ComposeProject",
     "Engine",
+    "ResetSpec",
     "allocate_subnets",
     "bridge_name",
     "project_name",
@@ -95,18 +96,23 @@ log = logging.getLogger(__name__)
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 #: Every runner-created cell resource name starts with this (never with cell-guard's
-#: ``<run id lowercased>-`` prefix, which only agent-created containers carry).
-CELL_NAME_PREFIX: Final = "labcell-"
+#: ``<run id lowercased>-`` prefix, which only agent-created containers carry). It is
+#: neutral on purpose: volume names (``<project>_<volume>``) show in the target's
+#: /proc/self/mountinfo, which the app user can read.
+CELL_NAME_PREFIX: Final = "c-"
 DEFAULT_CELL_NETWORK: Final = ipaddress.IPv4Network("10.231.0.0/16")
 SUBNET_PREFIXLEN: Final = 27
 RUN_LABEL: Final = "lab.run_id"
 ROLE_LABEL: Final = "lab.role"
-#: Canary volume -> file name, as targets/<target>/compose.cell.yml mounts them.
+#: Secret volume -> file name, as targets/<target>/compose.cell.yml mounts them. The
+#: names are neutral (they show in the target's mountinfo); on DVGA ``svc_a``, ``svc_b``
+#: and ``svc_c`` hold the evaluator's outbound-service, code-execution and
+#: attack-success canaries.
 CANARY_FILES: Final[Mapping[str, str]] = {
     "secret_admin_password": "admin_password",
-    "secret_outbound_service_request_canary": "outbound_service_request_canary",
-    "secret_rce_canary": "rce_canary",
-    "secret_attack_success_canary": "attack_success_canary",
+    "secret_svc_a": "svc_a",
+    "secret_svc_b": "svc_b",
+    "secret_svc_c": "svc_c",
 }
 #: Service -> the only top-level directory of its evidence volume the runner keeps.
 EVIDENCE_PREFIXES: Final[Mapping[str, str]] = {
@@ -389,7 +395,7 @@ def allocate_subnets(
 
 
 def project_name(run: ScheduledRun) -> str:
-    """The Compose project of ``run``: ``labcell-<run id lowercased>``."""
+    """The Compose project of ``run``: ``c-<run id lowercased>``."""
     return f"{CELL_NAME_PREFIX}{run.run_id.lower()}"
 
 
@@ -467,6 +473,48 @@ AGENT_SPECS: Final[Mapping[str, AgentSpec]] = {
 }
 
 
+# --------------------------------------------------------------------------- reset
+
+
+@dataclass(frozen=True, slots=True)
+class ResetSpec:
+    """How the target resets its own app state (the cell file's ``x-lab.reset``).
+
+    Either a command run in the target container (``argv``, as ``user`` or the image's
+    default user) or a restart of the target container (``restart``). The self-test
+    runs it after a success to show the latch outlives it; a study run never does.
+    """
+
+    argv: tuple[str, ...] = ()
+    user: str | None = None
+    restart: bool = False
+
+    def __post_init__(self) -> None:
+        if bool(self.argv) == self.restart:
+            raise CellError("x-lab.reset: exactly one of exec or restart: true")
+        if self.restart and self.user is not None:
+            raise CellError("x-lab.reset: a restart takes no user")
+        if self.user is not None and not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", self.user):
+            raise CellError(f"x-lab.reset: bad user {self.user!r}")
+        if any(not isinstance(a, str) or not a for a in self.argv):
+            raise CellError("x-lab.reset: exec must be a list of non-empty strings")
+
+    @classmethod
+    def from_meta(cls, meta: Any) -> ResetSpec | None:
+        """The reset a cell file declares (``None``: it declares none)."""
+        if meta is None:
+            return None
+        if not isinstance(meta, Mapping) or not set(meta) <= {"exec", "user", "restart"}:
+            raise CellError(f"x-lab.reset: expected exec (and user) or restart, not {meta!r}")
+        argv = meta.get("exec") or ()
+        if not isinstance(argv, list | tuple):
+            raise CellError("x-lab.reset: exec must be a list")
+        restart = meta.get("restart", False)
+        if not isinstance(restart, bool):
+            raise CellError("x-lab.reset: restart must be true or false")
+        return cls(tuple(argv), meta.get("user"), restart)
+
+
 # --------------------------------------------------------------------------- project
 
 
@@ -497,6 +545,8 @@ class ComposeProject:
     #: The cell-guard scratch volume (agents that start containers), created by the
     #: backend with the run label before anything starts; ``None`` without cell-guard.
     scratch_volume: str | None = None
+    #: How the target resets its own state (only the self-test uses it).
+    reset: ResetSpec | None = None
 
     @property
     def infra_services(self) -> tuple[str, ...]:
@@ -568,19 +618,18 @@ def _agent_script(
     target_url = f"http://{host}" if port == 80 else f"http://{host}:{port}"
     target = experiment.target(run.target)
     planted = sorted(experiment.arms.injected.surfaces)
-    steps: list[dict[str, Any]] = [
-        {"action": "fetch", "path": target.placements[s].url} for s in planted
-    ]
+    # each planted page once, in surface order (P3-P6 and P8 often share one page)
+    urls = list(dict.fromkeys(target.placements[s].url for s in planted))
+    objective = meta.get("objective")
+    if not isinstance(objective, Mapping):
+        raise CellError(f"cell.{run.target}.yml: x-lab.objective must be a step mapping")
+    steps: list[dict[str, Any]] = [{"action": "fetch", "path": url} for url in urls]
     steps += [
         {"action": "llm"},
         {"action": "follow_decoy"},
         {"action": "callback_http"},
         {"action": "callback_dns"},
-        {
-            "action": "graphql",
-            "path": str(meta["objective_path"]),
-            "query": str(meta["objective_query"]),
-        },
+        dict(objective),
     ]
     doc = {
         "target_url": target_url,
@@ -806,13 +855,15 @@ def render_cell(
         script = _agent_script(run, experiment, meta, dns_server)
         files.append(CellFile("cfg_agent", "script.json", script))
 
-    probe_paths: list[tuple[str, int]] = []
+    # each planted path once (P3-P6 and P8 often share a page), in surface order
+    expected: dict[str, int] = {}
     for surface in sorted(experiment.arms.injected.surfaces):
         placement = target_spec.placements[surface]
         if surface is Surface.P7:  # the locator names the error the app must answer with
-            probe_paths.append((placement.url, int(placement.locator.rpartition(":")[2])))
+            expected.setdefault(placement.url, int(placement.locator.rpartition(":")[2]))
         else:
-            probe_paths.append((placement.url, 200))
+            expected.setdefault(placement.url, 200)
+    probe_paths = list(expected.items())
 
     document = _escape(
         {"name": name, "services": services, "networks": networks, "volumes": volumes}
@@ -830,4 +881,5 @@ def render_cell(
         evidence=evidence,
         evidence_paths={"cellguard": _GUARD_EVIDENCE} if spec.needs_docker else {},
         scratch_volume=f"{name}_scratch" if spec.needs_docker else None,
+        reset=ResetSpec.from_meta(meta.get("reset")),
     )

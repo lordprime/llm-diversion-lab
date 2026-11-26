@@ -1,4 +1,4 @@
-"""The self-test pair end to end in real cells: scripted agent, stub LLM, DVGA.
+"""The self-test end to end in real cells: scripted agent, stub LLM, every target.
 
 Runs :class:`~control.runner.runner.Runner` with the real :class:`ComposeBackend` on a
 local container engine (Podman's Docker-compatible socket, or Docker), real Postgres
@@ -6,8 +6,10 @@ and an in-process Collector API. No model is called and no third-party attack to
 runs: the agent is the scripted one, the "attack" is DVGA's own importPaste.
 
 Needs the ``docker`` CLI with the compose plugin, a reachable socket, and the images
-``localhost/lab-cell:dev`` (``cell/Dockerfile``) and ``localhost/goat-dvga:dev``
-(``targets/dvga/Dockerfile``); skipped otherwise, unless ``LAB_E2E_REQUIRE=1``.
+``localhost/lab-cell:dev`` (``cell/Dockerfile``) and ``localhost/goat-<target>:dev`` for
+DVGA, Juice Shop and Drupal (``targets/<target>/Dockerfile``); skipped otherwise, unless
+``LAB_E2E_REQUIRE=1``. The first test runs the DVGA pair only
+(``tests/fixtures/experiments/dvga_pair.yaml``); ``labctl selftest`` runs every target.
 ``LAB_E2E_ENGINE`` (``podman``/``docker``) and ``DOCKER_HOST`` choose the engine.
 Docker-only options (bridge names, DOCKER-USER) are not exercised here; their
 rendering is asserted in ``test_cell_spec.py``.
@@ -58,7 +60,13 @@ from control.runner.ship import CollectorClient
 from control.runner.store import RunStore
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-IMAGES = {"lab-cell": "localhost/lab-cell:dev", "goat-dvga": "localhost/goat-dvga:dev"}
+IMAGES = {
+    "lab-cell": "localhost/lab-cell:dev",
+    "goat-dvga": "localhost/goat-dvga:dev",
+    "goat-juice-shop": "localhost/goat-juice-shop:dev",
+    "goat-drupal-7600": "localhost/goat-drupal-7600:dev",
+}
+DVGA_PAIR = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_pair.yaml"
 KEY = hashlib.sha256(b"selftest-e2e-lab-key").digest()
 
 
@@ -112,7 +120,7 @@ def test_the_selftest_pair_in_real_cells(
         runs_dir=tmp_path / "runs",
         work_dir=tmp_path / "work",
     )
-    results = runner.run_experiment(read_experiment(REPO_ROOT / "experiments" / "selftest.yaml"))
+    results = runner.run_experiment(read_experiment(DVGA_PAIR))
     assert [(r.status, r.detail) for r in results] == [(RunStatus.VALID, "")] * 2
     assert {r.end_status for r in results} == {EndStatus.COMPLETED}
     assert {r.outcome for r in results} == {True}
@@ -229,7 +237,8 @@ def test_labctl_selftest_end_to_end(
     failed = {c["name"]: c["detail"] for c in report["checks"] if not c["ok"]}
     assert rc == 0, failed
     assert report["passed"] and not report["quick"] and not failed
-    assert len(report["runs"]) == 2 and len(report["probes"]) == 2
+    assert len(report["runs"]) == 6 and len(report["probes"]) == 6
+    assert len(report["resets"]) == 6 and all(r["ok"] for r in report["resets"])
     assert all(p["contained"] for p in report["probes"])
     # the host's own LAN address was probed as well (no control plane in development)
     own = _own_address(lan)

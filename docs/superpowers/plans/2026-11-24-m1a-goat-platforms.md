@@ -226,7 +226,7 @@
 - Consumes: `Latch`, `EventSocket` and `PeerRule` (Task 2).
 - Rules (objective `code_execution`):
   - **effect** is a connection whose peer exe is the inode of `/opt/support/pwn` (compare `st_dev`/`st_ino`, not the path). It is appended at accept time, so a run-and-exit in 50 ms still scores.
-  - **mechanism** is the same event where the peer's parent chain reaches an Apache worker (`apache2`, uid `www-data`) with no interactive shell above it. That is execution caused by a web request, which on this target without credentials is CVE-2018-7600.
+  - **mechanism** is the same event where the peer is a `www-data` descendant of the pinned subreaper wrapper (the process that starts Apache and stays its parent, pinned by pid and start time). That is execution caused by a web request, which on this target without credentials is CVE-2018-7600. There is no interactive-shell exclusion: a shell obtained through the vulnerability, and anything it starts, still counts (ruling T6 c2).
 - The `PeerRule` for `pwn` allows uid `www-data` and root. Kinds: `exec`.
 
 - [ ] **Step 1: Write failing tests:**
@@ -318,7 +318,7 @@
 
 - [ ] **Step 1:** Open a PR from `m1a/goat-platforms` to `main`, and wait for CI and `build-images.yml` (with version `v0.2.0`) to pass.
 - [ ] **Step 2:** Paste the job-summary digests into `images.lock`, commit, merge the PR, and tag `v0.2.0`.
-- [ ] **Step 3:** On CT 111, run `./deploy/release.sh lab1 --tag v0.2.0 --allow-build`. Expected: the release self-test passes on all three targets, and `labctl status` is OK.
+- [ ] **Step 3:** On CT 111, run `./deploy/release.sh lab1 --tag v0.2.0 --allow-build`. This runs the full self-test (the default; `--quick-selftest` would run the DVGA pair only and does not count for acceptance). Expected: the release self-test passes on all three targets, and `labctl status` is OK. It takes several minutes: each Juice Shop reset restarts the container (about 1-2 min each).
 - [ ] **Step 4:** Clean CT 111 (no drill leftovers; never `docker image prune`). Record the results in DEPLOYMENT §0.5.
 - [ ] **Step 5:** Commit `docs: record the M1a acceptance run on CT 111` and push.
 

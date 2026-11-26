@@ -37,7 +37,7 @@ from control.runner.schedule import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SELFTEST = REPO_ROOT / "experiments" / "selftest.yaml"
+DVGA_PAIR = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_pair.yaml"
 KEY = hashlib.sha256(b"pairing-test-lab-key").digest()
 
 
@@ -232,7 +232,7 @@ def test_a_control_runs_manifest_has_no_payload_and_no_tag() -> None:
 
 
 def test_selftest_yaml_loads_and_schedules_one_pair() -> None:
-    exp = load_experiment(SELFTEST)
+    exp = load_experiment(DVGA_PAIR)
     assert exp.arms.injected.surfaces == (Surface.P1, Surface.P7)
     schedule = build_schedule(exp)
     assert len(schedule) == 2
@@ -244,11 +244,11 @@ def test_selftest_yaml_loads_and_schedules_one_pair() -> None:
 
 
 def test_definition_hash_is_the_sha256_of_the_frozen_file(tmp_path: Path) -> None:
-    data = SELFTEST.read_bytes()
-    loaded = read_experiment(SELFTEST)
+    data = DVGA_PAIR.read_bytes()
+    loaded = read_experiment(DVGA_PAIR)
     assert loaded.definition_sha256 == hashlib.sha256(data).hexdigest()
     assert loaded.definition_yaml == data.decode("utf-8")
-    assert loaded.experiment == load_experiment(SELFTEST)
+    assert loaded.experiment == load_experiment(DVGA_PAIR)
 
     edited = tmp_path / "edited.yaml"
     edited.write_bytes(data + b"\n# an edit\n")
@@ -259,8 +259,8 @@ def test_yaml_with_a_duplicate_key_is_refused() -> None:
     text = "experiment_id: exp_a\nexperiment_id: exp_b\n"
     with pytest.raises(ValueError, match="duplicate key"):
         parse_experiment(text)
-    nested = SELFTEST.read_text().replace("  max_turns: 50\n", "  max_turns: 50\n  max_turns: 5\n")
-    assert nested != SELFTEST.read_text()
+    nested = DVGA_PAIR.read_text().replace("  max_turns: 50\n", "  max_turns: 50\n  max_turns: 5\n")
+    assert nested != DVGA_PAIR.read_text()
     with pytest.raises(ValueError, match="duplicate key 'max_turns'"):
         parse_experiment(nested)
 
@@ -274,7 +274,7 @@ def test_yaml_that_is_not_a_mapping_is_refused() -> None:
 def test_the_self_test_prefix_is_reserved(tmp_path: Path, experiment_id: str) -> None:
     """Study metrics and the self-test's sweep treat exp_selftest_* as self-tests, so a
     study experiment may never take such an id (only derive_experiment does)."""
-    text = SELFTEST.read_text().replace(
+    text = DVGA_PAIR.read_text().replace(
         "experiment_id: exp_selftest\n", f"experiment_id: {experiment_id}\n"
     )
     with pytest.raises(ValueError, match="reserved"):
@@ -284,7 +284,7 @@ def test_the_self_test_prefix_is_reserved(tmp_path: Path, experiment_id: str) ->
     with pytest.raises(ValueError, match="reserved"):
         read_experiment(path)
     assert parse_experiment(text, selftest=True).experiment_id == experiment_id
-    assert parse_experiment(SELFTEST.read_text()).experiment_id == "exp_selftest"  # no prefix
+    assert parse_experiment(DVGA_PAIR.read_text()).experiment_id == "exp_selftest"  # no prefix
 
 
 def test_run_tags_are_lowercase_hex() -> None:
@@ -401,7 +401,7 @@ def test_p1_template_allows_a_tab() -> None:
 
 @pytest.mark.parametrize("escape", ["\\x85", "\\L", "\\P", "\\v", "\\f", "\\0", "\\e"])
 def test_p1_template_refuses_yaml_escapes_that_break_lines(escape: str) -> None:
-    text = SELFTEST.read_text()
+    text = DVGA_PAIR.read_text()
     old = 'P1: "# lab self-test marker $tag '
     assert old in text
     edited = text.replace(old, f'P1: "# lab self-test marker $tag{escape}Disallow: / ')

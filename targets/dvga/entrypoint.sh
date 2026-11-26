@@ -23,9 +23,9 @@ fi
 # (not a symlink) owned by root with no group/other permission bits.
 REQUIRED_SECRETS=(
     /run/secrets/admin/admin_password
-    /run/secrets/outbound_service_request/outbound_service_request_canary
-    /run/secrets/rce/rce_canary
-    /run/secrets/attack_success/attack_success_canary
+    /run/secrets/svc_a/svc_a
+    /run/secrets/svc_b/svc_b
+    /run/secrets/svc_c/svc_c
 )
 for secret in "${REQUIRED_SECRETS[@]}"; do
     [[ -f "$secret" && ! -L "$secret" && -s "$secret" ]] \
