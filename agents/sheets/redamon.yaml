@@ -1,11 +1,12 @@
 # RedAmon capability sheet. Every value comes from docs/OLLAMA_SUPPORT_AUDIT.md;
-# audit_refs names the section behind each field, and "unknown" marks what the audit
-# could not verify. The RedAmon adapter task fills in what is still unknown.
+# audit_refs and each side channel's audit_ref name the section behind it, and
+# "unknown" marks what the audit could not verify. An unresolved side channel makes
+# every run unsupported until the RedAmon adapter task fixes it.
 framework: redamon
 version: v7.9.0 # the Ollama preset and openai_compatible branch also exist at 7.6.0 (03b46b8)
 commit: 73ca9d3
 image_digest: unknown # set once CI builds the RedAmon agent image
-# The audit calls it native: an OpenAI-compatible provider with a built-in "Ollama" preset.
+# The audit labels it native: its OpenAI-compatible provider has a built-in "Ollama" preset.
 support_level: native
 wire_formats: [openai_chat]
 # Configure exactly one OpenAI-compatible provider whose base URL is the tap, and assign it
@@ -21,25 +22,44 @@ model_call_paths:
   - "CypherFix triage and codefix with bind_tools (agentic/cypherfix_triage/orchestrator.py 1341, agentic/cypherfix_codefix/orchestrator.py 737)"
   - "out-of-run guardrail on the first custom provider (agentic/api.py 1899-1958)"
   - "fireteam members, on by default (agentic/project_settings.py 119-122)"
-side_channels_disabled:
-  ai_attack_surface_judge: "AI-attack-surface scan kept off: its judge spawns its own ollama/ollama:latest (qwen2.5:7b) at http://redamon-local-llm:11434 (recon_orchestrator/local_llm_manager.py)"
-  kb_embeddings: "KB embeddings kept on local sentence-transformers: KB_EMBEDDING_API_BASE_URL unset (.env.example 50-79)"
-  keyed_provider_model_listing: "no keyed provider configured, only the one OpenAI-compatible provider (model listing calls api.openai.com and api.anthropic.com, orchestrator_helpers/model_providers.py)"
-  hosted_default_models: "agent and every model by feature set to the custom/<providerId> provider (the default agent model is claude-opus-4-6, agentic/project_settings.py 92)"
-# Fireteam: on by default (FIRETEAM_ENABLED, FIRETEAM_MAX_MEMBERS 5, FIRETEAM_MAX_CONCURRENT 5,
-# project_settings.py 119-122). The adapter sets its size explicitly and records it.
+side_channels:
+  ai_attack_surface_judge:
+    status: unresolved
+    audit_ref: "§2.3, §3"
+    note: "the AI-attack-surface scan's judge spawns its own ollama/ollama:latest (qwen2.5:7b) at http://redamon-local-llm:11434 (recon_orchestrator/local_llm_manager.py); the audit says keep the scan off but names no setting"
+  kb_embeddings:
+    status: disabled
+    setting: "KB_EMBEDDING_API_BASE_URL unset"
+    audit_ref: "§2.3, §3"
+    note: "KB embeddings then stay on local sentence-transformers (.env.example 50-79)"
+  keyed_provider_model_listing:
+    status: disabled
+    setting: "no OpenAI or Anthropic provider key configured"
+    audit_ref: "§2.3"
+    note: "model listing calls api.openai.com and api.anthropic.com only for keyed providers (orchestrator_helpers/model_providers.py)"
+  hosted_default_models:
+    status: disabled
+    setting: "agent model and every model by feature set to custom/<providerId>"
+    audit_ref: "§2.3, §3"
+    note: "the default agent model is claude-opus-4-6 (agentic/project_settings.py 92)"
 min_num_ctx: unknown # the docs give no model-size or context guidance
 sub_agents: dynamic # root agent plus fireteam waves; members cannot spawn fireteams
+sub_agent_cap: # FIRETEAM_ENABLED is on by default; the adapter sets both caps and records them
+  max_agents: 5
+  max_concurrent: 5
+  max_agents_setting: FIRETEAM_MAX_MEMBERS
+  max_concurrent_setting: FIRETEAM_MAX_CONCURRENT
+  audit_ref: "§2.3, §3"
 agent_id_source: null
 agent_id_gap: "unknown: the audit read no RedAmon log that names the fireteam member behind each model call"
 patches: []
-max_turns_knob: "MAX_ITERATIONS (default 100, agentic/project_settings.py)"
+# §2.3 "Multi-agent": "MAX_ITERATIONS defaults to 100"; the audit gives no file or line for it.
+max_turns_knob: MAX_ITERATIONS
 audit_refs:
   version: "§2.3"
   support_level: "§1, §2.3"
   wire_formats: "§1, §2.3"
   model_call_paths: "§2.3"
-  side_channels_disabled: "§2.3, §3"
   min_num_ctx: "§2.3"
   sub_agents: "§2.3"
   agent_id_source: "§2.3"

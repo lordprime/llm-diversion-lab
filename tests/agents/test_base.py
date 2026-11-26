@@ -1,9 +1,12 @@
-"""The adapter base: capability sheets, the context check, end states and the ABC."""
+"""The adapter base: capability sheets, the run checks, end states and the ABC."""
 
 from __future__ import annotations
 
 import itertools
+import subprocess
+import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -14,30 +17,54 @@ from pydantic import ValidationError
 from agents.base import (
     MAX_NUM_CTX,
     MAX_SHEET_BYTES,
+    PLACEHOLDERS,
     SHEETS_DIR,
     Adapter,
+    AdapterLimits,
+    AdapterOutcome,
     AdapterRun,
     AgentEndState,
     AgentHost,
     AgentLaunch,
     CapabilitySheet,
+    ChannelStatus,
     EndStateMapper,
     ExitSignals,
     ModelConfig,
+    SideChannel,
+    SubAgentCap,
     SupportLevel,
     UnsupportedRun,
 )
 from control.core.ids import new_id
 from control.core.models import AgentEvent, EndStatus
-from control.runner.experiment import RunLimits
 from control.telemetry.extract import summarise
 from control.telemetry.wire import unparsed_call
 
 # --------------------------------------------------------------------------- helpers
 
+_DROP = object()
+
+CAP = {
+    "max_agents": 5,
+    "max_concurrent": 3,
+    "max_agents_setting": "FAKE_MAX_MEMBERS",
+    "max_concurrent_setting": "FAKE_MAX_CONCURRENT",
+    "audit_ref": "§2.3",
+}
+
+
+def channel(
+    status: str = "disabled", setting: str | None = "FAKE_TELEMETRY=false"
+) -> dict[str, Any]:
+    doc: dict[str, Any] = {"status": status, "audit_ref": "§2.2, §3"}
+    if setting is not None:
+        doc["setting"] = setting
+    return doc
+
 
 def good_sheet(**changes: Any) -> dict[str, Any]:
-    """A valid sheet document; ``changes`` replace (or, with ``None``, remove) keys."""
+    """A valid, runnable sheet document; ``changes`` replace (or, with ``_DROP``, remove) keys."""
     doc: dict[str, Any] = {
         "framework": "fake",
         "version": "v1.0.0",
@@ -46,19 +73,18 @@ def good_sheet(**changes: Any) -> dict[str, Any]:
         "support_level": "native",
         "wire_formats": ["ollama_chat"],
         "model_call_paths": ["main agent (fake/agent.py)"],
-        "side_channels_disabled": {"telemetry": "FAKE_TELEMETRY=false"},
+        "side_channels": {"telemetry": channel()},
         "min_num_ctx": 16384,
         "sub_agents": "dynamic",
         "agent_id_source": None,
         "agent_id_gap": "unknown: no log of child ids was read",
         "patches": [],
-        "max_turns_knob": "unknown",
+        "max_turns_knob": "FAKE_MAX_TURNS",
         "audit_refs": {
             "version": "§2.2",
             "support_level": "§2.2",
             "wire_formats": "§1",
             "model_call_paths": "§2.2",
-            "side_channels_disabled": "§2.2, §3",
             "min_num_ctx": "§2.2",
             "sub_agents": "§2.2",
             "agent_id_source": "§2.2",
@@ -74,13 +100,17 @@ def good_sheet(**changes: Any) -> dict[str, Any]:
     return doc
 
 
-_DROP = object()
+SINGLE_AGENT = {"sub_agents": "none", "agent_id_source": None, "agent_id_gap": None}
 
 
 def write_sheet(directory: Path, doc: object, name: str = "fake") -> Path:
     path = directory / f"{name}.yaml"
     path.write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return path
+
+
+def sheet_of(**changes: Any) -> CapabilitySheet:
+    return CapabilitySheet.model_validate(good_sheet(**changes))
 
 
 def model(num_ctx: int | None = 32768) -> ModelConfig:
@@ -94,16 +124,34 @@ def run_for(cfg: ModelConfig) -> AdapterRun:
         target_url="http://goat:8000",
         objective="find the flag",
         llm_base_url="http://tap:8080",
-        limits=RunLimits(budget_usd=0.0, max_turns=50, timeout_s=3600),
+        limits=AdapterLimits(max_turns=50, timeout_s=3600),
     )
 
 
+@dataclass
+class Result:
+    returncode: int = 0
+    stdout: bytes = b""
+
+
+@dataclass
+class RecordingHost:
+    """An AgentHost that records every command."""
+
+    commands: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
+
+    def exec(self, service: str, argv: Sequence[str], *, timeout_s: float) -> Result:
+        self.commands.append((service, tuple(argv)))
+        return Result()
+
+
 class FakeAdapter(Adapter):
-    """A minimal adapter whose framework-specific steps record what they were given."""
+    """A minimal adapter. Everything it needs per run comes from the AdapterRun."""
 
     framework: ClassVar[str] = "fake"
     sheets_dir: ClassVar[Path]
     signals_update: ClassVar[dict[str, Any]] = {}
+    recorded: ClassVar[dict[str, str]] = {}
 
     def __init__(self) -> None:
         super().__init__()
@@ -113,31 +161,37 @@ class FakeAdapter(Adapter):
         self.rendered.append(run)
         return AgentLaunch(
             image="lab-agent-fake",
-            command=("fake", "--headless"),
+            command=("fake", "--headless", "--max-turns", str(run.limits.max_turns)),
             env={"FAKE_MODEL": run.model.name, "FAKE_NUM_CTX": str(run.model.num_ctx)},
+            recorded_settings=dict(self.recorded),
         )
 
-    def start(self, host: AgentHost) -> None:
-        return None
+    def start(self, run: AdapterRun, host: AgentHost) -> None:
+        host.exec("agent", ["fake-start", run.run_id], timeout_s=30)
 
-    def exit_signals(self, observed: ExitSignals, evidence: Path) -> ExitSignals:
+    def exit_signals(self, run: AdapterRun, observed: ExitSignals, evidence: Path) -> ExitSignals:
         return observed.model_copy(update=self.signals_update)
 
-    def collect(self, evidence: Path) -> list[AgentEvent]:
+    def collect(self, run: AdapterRun, evidence: Path) -> list[AgentEvent]:
         return []
 
-    def teardown(self, host: AgentHost) -> None:
-        return None
+    def teardown(self, run: AdapterRun, host: AgentHost) -> None:
+        host.exec("cellguard", ["reap", f"fake-{run.run_id}"], timeout_s=30)
 
 
 @pytest.fixture
 def fake_adapter(tmp_path: Path) -> Callable[..., FakeAdapter]:
-    def make(sheet: dict[str, Any] | None = None, **signals: Any) -> FakeAdapter:
+    def make(
+        sheet: dict[str, Any] | None = None,
+        recorded_settings: dict[str, str] | None = None,
+        **signals: Any,
+    ) -> FakeAdapter:
         write_sheet(tmp_path, sheet if sheet is not None else good_sheet())
 
         class Adapted(FakeAdapter):
             sheets_dir = tmp_path
             signals_update = signals
+            recorded = recorded_settings or {}
 
         return Adapted()
 
@@ -148,47 +202,144 @@ def fake_adapter(tmp_path: Path) -> Callable[..., FakeAdapter]:
 
 
 def test_a_good_sheet_validates() -> None:
-    sheet = CapabilitySheet.model_validate(good_sheet())
+    sheet = sheet_of()
     assert sheet.support_level is SupportLevel.NATIVE
     assert sheet.min_num_ctx == 16384
     assert sheet.model_call_paths == ("main agent (fake/agent.py)",)
+    assert sheet.side_channels["telemetry"].setting == "FAKE_TELEMETRY=false"
+    assert sheet.check_runnable(model()) is None
 
 
 @pytest.mark.parametrize("level", ["native", "openai_compatible", "unofficial"])
 def test_a_runnable_sheet_must_list_its_model_call_paths(level: str) -> None:
     with pytest.raises(ValidationError, match="model_call_paths"):
-        CapabilitySheet.model_validate(good_sheet(support_level=level, model_call_paths=[]))
+        sheet_of(support_level=level, model_call_paths=[])
 
 
 @pytest.mark.parametrize("level", ["native", "openai_compatible", "unofficial"])
 def test_a_runnable_sheet_must_name_a_wire_format(level: str) -> None:
     with pytest.raises(ValidationError, match="wire_formats"):
-        CapabilitySheet.model_validate(good_sheet(support_level=level, wire_formats=[]))
+        sheet_of(support_level=level, wire_formats=[])
 
 
 def test_a_sheet_with_no_support_may_list_nothing() -> None:
-    sheet = CapabilitySheet.model_validate(
-        good_sheet(support_level="none", wire_formats=[], model_call_paths=[])
-    )
+    sheet = sheet_of(support_level="none", wire_formats=[], model_call_paths=[])
     assert sheet.support_level is SupportLevel.NONE
 
 
-@pytest.mark.parametrize("setting", ["", "   ", "\t", "unknown", "UNKNOWN", " Unknown "])
-def test_a_side_channel_needs_a_disabling_setting(setting: str) -> None:
-    with pytest.raises(ValidationError, match="side_channels_disabled"):
-        CapabilitySheet.model_validate(good_sheet(side_channels_disabled={"web_search": setting}))
+@pytest.mark.parametrize("field_name", ["min_num_ctx", "max_turns_knob"])
+def test_unknown_values_are_allowed_in_a_sheet(field_name: str) -> None:
+    assert getattr(sheet_of(**{field_name: "unknown"}), field_name) == "unknown"
 
 
-@pytest.mark.parametrize("channel", ["", "  ", "two\nlines"])
-def test_a_side_channel_needs_a_name(channel: str) -> None:
-    with pytest.raises(ValidationError):
-        CapabilitySheet.model_validate(good_sheet(side_channels_disabled={channel: "X=0"}))
+# --------------------------------------------------------------------------- side channels
 
 
-@pytest.mark.parametrize("setting", [None, 0, False, ["X=0"]])
+PLACEHOLDER_SPELLINGS = sorted(
+    {*PLACEHOLDERS, "UNKNOWN", " Unknown ", "TBD", "Off", "OFF", "None", "N/A", "\t?\t", "   "}
+)
+
+
+@pytest.mark.parametrize("setting", PLACEHOLDER_SPELLINGS)
+def test_a_disabled_side_channel_refuses_a_placeholder_setting(setting: str) -> None:
+    with pytest.raises(ValidationError, match="setting"):
+        SideChannel.model_validate(channel(setting=setting))
+
+
+def test_the_placeholders_include_the_ruled_ones() -> None:
+    assert {"unknown", "tbd", "?", "off", "none", "n/a", ""} <= PLACEHOLDERS
+
+
+def test_a_disabled_side_channel_needs_a_setting() -> None:
+    with pytest.raises(ValidationError, match="setting"):
+        SideChannel.model_validate(channel(setting=None))
+
+
+@pytest.mark.parametrize("setting", [0, False, ["X=0"], {"X": "0"}])
 def test_a_side_channel_setting_must_be_text(setting: object) -> None:
     with pytest.raises(ValidationError):
-        CapabilitySheet.model_validate(good_sheet(side_channels_disabled={"telemetry": setting}))
+        SideChannel.model_validate({**channel(), "setting": setting})
+
+
+def test_an_unresolved_side_channel_has_no_setting() -> None:
+    with pytest.raises(ValidationError, match="unresolved"):
+        SideChannel.model_validate(channel("unresolved", "FAKE_X=0"))
+    assert SideChannel.model_validate(channel("unresolved", None)).setting is None
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        {"status": "off", "setting": "X=0", "audit_ref": "§2"},
+        {"status": "DISABLED", "setting": "X=0", "audit_ref": "§2"},
+        {"status": "disabled", "setting": "X=0"},
+        {"status": "disabled", "setting": "X=0", "audit_ref": "section 2"},
+        {"status": "disabled", "setting": "X=0", "audit_ref": "§2", "colour": "red"},
+        {"status": "disabled", "setting": "two\nlines", "audit_ref": "§2"},
+        "FAKE_TELEMETRY=false",
+        None,
+    ],
+)
+def test_a_malformed_side_channel_is_refused(doc: object) -> None:
+    with pytest.raises(ValidationError):
+        sheet_of(side_channels={"telemetry": doc})
+
+
+@pytest.mark.parametrize("name", ["", "  ", "two\nlines", "Web Search", "../x"])
+def test_a_side_channel_needs_a_slug_name(name: str) -> None:
+    with pytest.raises(ValidationError):
+        sheet_of(side_channels={name: channel()})
+
+
+def test_an_unresolved_side_channel_is_allowed_in_a_sheet_but_blocks_every_run() -> None:
+    sheet = sheet_of(
+        side_channels={
+            "telemetry": channel(),
+            "update_check": channel("unresolved", None),
+            "graphiti": channel("unresolved", None),
+        }
+    )
+    assert sheet.unresolved_side_channels == ("graphiti", "update_check")
+    verdict = sheet.check_runnable(model(131072))
+    assert isinstance(verdict, UnsupportedRun)
+    assert "unresolved side channel graphiti" in verdict.reason
+    assert "unresolved side channel update_check" in verdict.reason
+
+
+def test_a_sheet_with_only_disabled_channels_has_none_unresolved() -> None:
+    assert sheet_of().unresolved_side_channels == ()
+
+
+# --------------------------------------------------------------------------- turn cap
+
+
+@pytest.mark.parametrize("knob", [*sorted(PLACEHOLDERS - {"unknown"}), " Unknown ", "TBD"])
+def test_the_turn_cap_is_a_setting_or_unknown(knob: str) -> None:
+    with pytest.raises(ValidationError, match="max_turns_knob"):
+        sheet_of(max_turns_knob=knob)
+
+
+def test_an_unknown_turn_cap_blocks_every_run() -> None:
+    verdict = sheet_of(max_turns_knob="unknown").check_runnable(model(131072))
+    assert isinstance(verdict, UnsupportedRun)
+    assert "turn cap" in verdict.reason
+
+
+def test_every_reason_a_run_is_blocked_is_given_at_once() -> None:
+    sheet = sheet_of(
+        support_level="none",
+        wire_formats=[],
+        model_call_paths=[],
+        max_turns_knob="unknown",
+        side_channels={"update_check": channel("unresolved", None)},
+    )
+    verdict = sheet.check_runnable(model(None))
+    assert isinstance(verdict, UnsupportedRun)
+    for part in ("no Ollama support", "update_check", "turn cap", "not pinned"):
+        assert part in verdict.reason
+
+
+# --------------------------------------------------------------------------- other fields
 
 
 @pytest.mark.parametrize(
@@ -197,17 +348,11 @@ def test_a_side_channel_setting_must_be_text(setting: object) -> None:
 )
 def test_min_num_ctx_is_a_sane_positive_integer_or_unknown(value: object) -> None:
     with pytest.raises(ValidationError, match="min_num_ctx"):
-        CapabilitySheet.model_validate(good_sheet(min_num_ctx=value))
-
-
-def test_min_num_ctx_may_be_unknown() -> None:
-    assert CapabilitySheet.model_validate(good_sheet(min_num_ctx="unknown")).min_num_ctx == (
-        "unknown"
-    )
+        sheet_of(min_num_ctx=value)
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("field_name", "value"),
     [
         ("framework", "Strix"),
         ("framework", "../strix"),
@@ -219,6 +364,8 @@ def test_min_num_ctx_may_be_unknown() -> None:
         ("image_digest", "sha256:abc"),
         ("image_digest", "latest"),
         ("image_digest", ""),
+        ("use_case", ""),
+        ("use_case", "two\nlines"),
         ("support_level", "partial"),
         ("support_level", "NATIVE"),
         ("wire_formats", ["grpc"]),
@@ -229,6 +376,8 @@ def test_min_num_ctx_may_be_unknown() -> None:
         ("model_call_paths", ["two\nlines"]),
         ("model_call_paths", ["nul\x00byte"]),
         ("model_call_paths", ["x" * 1001]),
+        ("side_channels", ["telemetry"]),
+        ("side_channels", None),
         ("sub_agents", "many"),
         ("sub_agents", None),
         ("version", ""),
@@ -247,58 +396,67 @@ def test_min_num_ctx_may_be_unknown() -> None:
         ("patches", ["a.py"]),
     ],
 )
-def test_malformed_fields_are_refused(field: str, value: object) -> None:
+def test_malformed_fields_are_refused(field_name: str, value: object) -> None:
     with pytest.raises(ValidationError):
-        CapabilitySheet.model_validate(good_sheet(**{field: value}))
+        sheet_of(**{field_name: value})
 
 
 @pytest.mark.parametrize(
-    "field",
-    ["framework", "commit", "support_level", "model_call_paths", "min_num_ctx", "audit_refs"],
+    "field_name",
+    [
+        "framework",
+        "commit",
+        "support_level",
+        "model_call_paths",
+        "side_channels",
+        "min_num_ctx",
+        "max_turns_knob",
+        "audit_refs",
+    ],
 )
-def test_a_missing_field_is_refused(field: str) -> None:
-    with pytest.raises(ValidationError, match=field):
-        CapabilitySheet.model_validate(good_sheet(**{field: _DROP}))
+def test_a_missing_field_is_refused(field_name: str) -> None:
+    with pytest.raises(ValidationError, match=field_name):
+        sheet_of(**{field_name: _DROP})
 
 
-def test_an_unknown_field_is_refused() -> None:
+@pytest.mark.parametrize("old_name", ["side_channels_disabled", "base_url"])
+def test_an_unknown_field_is_refused(old_name: str) -> None:
     with pytest.raises(ValidationError, match="extra"):
-        CapabilitySheet.model_validate(good_sheet(base_url="http://ollama:11434"))
+        sheet_of(**{old_name: {"telemetry": "X=0"}})
 
 
 def test_a_sheet_is_frozen() -> None:
-    sheet = CapabilitySheet.model_validate(good_sheet())
+    sheet = sheet_of()
     with pytest.raises(ValidationError):
         sheet.min_num_ctx = 1  # type: ignore[misc]
 
 
 def test_a_real_image_digest_is_accepted() -> None:
     digest = "sha256:" + "a" * 64
-    assert CapabilitySheet.model_validate(good_sheet(image_digest=digest)).image_digest == digest
+    assert sheet_of(image_digest=digest).image_digest == digest
 
 
 def test_agent_ids_need_a_source_or_a_reason_when_there_are_sub_agents() -> None:
     with pytest.raises(ValidationError, match="agent_id"):
-        CapabilitySheet.model_validate(good_sheet(agent_id_source=None, agent_id_gap=None))
+        sheet_of(agent_id_source=None, agent_id_gap=None)
     with pytest.raises(ValidationError, match="agent_id"):
-        CapabilitySheet.model_validate(
-            good_sheet(agent_id_source="events.jsonl agent_id", agent_id_gap="no reason")
-        )
-    sheet = CapabilitySheet.model_validate(
-        good_sheet(agent_id_source="events.jsonl agent_id", agent_id_gap=None)
-    )
+        sheet_of(agent_id_source="events.jsonl agent_id", agent_id_gap="no reason")
+    sheet = sheet_of(agent_id_source="events.jsonl agent_id", agent_id_gap=None)
     assert sheet.agent_id_source == "events.jsonl agent_id"
 
 
-def test_a_single_agent_framework_names_no_agent_id_source() -> None:
-    single = CapabilitySheet.model_validate(
-        good_sheet(sub_agents="none", agent_id_source=None, agent_id_gap=None)
-    )
-    assert single.sub_agents == "none"
-    with pytest.raises(ValidationError, match="agent_id"):
-        CapabilitySheet.model_validate(
-            good_sheet(sub_agents="none", agent_id_source="log", agent_id_gap=None)
-        )
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"agent_id_source": "log"},
+        {"agent_id_gap": "unknown: nothing to read"},
+        {"sub_agent_cap": CAP},
+    ],
+)
+def test_a_single_agent_framework_has_no_sub_agent_details(changes: dict[str, Any]) -> None:
+    assert sheet_of(**SINGLE_AGENT).sub_agents == "none"
+    with pytest.raises(ValidationError):
+        sheet_of(**{**SINGLE_AGENT, **changes})
 
 
 @pytest.mark.parametrize(
@@ -311,19 +469,48 @@ def test_a_single_agent_framework_names_no_agent_id_source() -> None:
         {**good_sheet()["audit_refs"], "patches": "§3,§2"},
         {**good_sheet()["audit_refs"], "patches": ""},
         {**good_sheet()["audit_refs"], "colour": "§3"},
+        {**good_sheet()["audit_refs"], "side_channels": "§3"},  # cited per channel instead
     ],
 )
 def test_every_audited_field_cites_an_audit_section(refs: dict[str, str]) -> None:
     with pytest.raises(ValidationError, match="audit_refs"):
-        CapabilitySheet.model_validate(good_sheet(audit_refs=refs))
+        sheet_of(audit_refs=refs)
+
+
+# --------------------------------------------------------------------------- sub-agent cap
+
+
+def test_a_sub_agent_cap_names_its_settings() -> None:
+    cap = sheet_of(sub_agent_cap=CAP).sub_agent_cap
+    assert cap is not None
+    assert cap.settings == {"FAKE_MAX_MEMBERS": 5, "FAKE_MAX_CONCURRENT": 3}
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"max_agents": 0},
+        {"max_agents": -5},
+        {"max_agents": True},
+        {"max_agents": "5"},
+        {"max_agents": 10**9},
+        {"max_concurrent": 6},  # more at once than in total
+        {"max_concurrent_setting": "FAKE_MAX_MEMBERS"},
+        {"max_agents_setting": "unknown"},
+        {"max_agents_setting": "TBD"},
+        {"audit_ref": "line 237"},
+    ],
+)
+def test_an_absurd_sub_agent_cap_is_refused(changes: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        SubAgentCap.model_validate({**CAP, **changes})
 
 
 # --------------------------------------------------------------------------- loading
 
 
 def test_load_reads_a_sheet_from_yaml(tmp_path: Path) -> None:
-    sheet = CapabilitySheet.load(write_sheet(tmp_path, good_sheet()))
-    assert sheet.framework == "fake"
+    assert CapabilitySheet.load(write_sheet(tmp_path, good_sheet())).framework == "fake"
 
 
 def test_load_refuses_a_sheet_named_after_another_framework(tmp_path: Path) -> None:
@@ -332,10 +519,10 @@ def test_load_refuses_a_sheet_named_after_another_framework(tmp_path: Path) -> N
         CapabilitySheet.load(path)
 
 
-def test_load_refuses_duplicate_keys(tmp_path: Path) -> None:
+@pytest.mark.parametrize("duplicate", ["min_num_ctx: 1024\n", "side_channels:\n  a: null\n"])
+def test_load_refuses_duplicate_keys(tmp_path: Path, duplicate: str) -> None:
     path = tmp_path / "fake.yaml"
-    text = yaml.safe_dump(good_sheet(), sort_keys=False)
-    path.write_text(text + "min_num_ctx: 1024\n", encoding="utf-8")
+    path.write_text(yaml.safe_dump(good_sheet(), sort_keys=False) + duplicate, encoding="utf-8")
     with pytest.raises(ValueError, match="duplicate"):
         CapabilitySheet.load(path)
 
@@ -388,55 +575,61 @@ def test_for_framework_finds_the_shipped_sheets() -> None:
     assert SHEETS_DIR.is_dir()
 
 
+def test_importing_the_base_does_not_import_the_runner() -> None:
+    # The runner will import the adapters, so the base must never import the runner.
+    code = (
+        "import sys, agents.base\n"
+        "bad = sorted(m for m in sys.modules if m.startswith('control.runner'))\n"
+        "assert not bad, bad\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)  # noqa: S603
+    assert done.returncode == 0, done.stderr
+
+
 # --------------------------------------------------------------------------- context check
 
 
 def test_a_context_below_the_minimum_is_unsupported_with_a_reason() -> None:
-    sheet = CapabilitySheet.model_validate(good_sheet(min_num_ctx=16384))
-    verdict = sheet.check_context(model(8192))
+    verdict = sheet_of(min_num_ctx=16384).check_context(model(8192))
     assert isinstance(verdict, UnsupportedRun)
     assert verdict.end_state is AgentEndState.UNSUPPORTED
-    assert "8192" in verdict.reason
-    assert "16384" in verdict.reason
-    assert "fake" in verdict.reason
+    for part in ("8192", "16384", "fake", "qwen3:32b"):
+        assert part in verdict.reason
 
 
 @pytest.mark.parametrize("num_ctx", [16384, 16385, 131072, MAX_NUM_CTX])
 def test_a_context_at_or_above_the_minimum_is_fine(num_ctx: int) -> None:
-    sheet = CapabilitySheet.model_validate(good_sheet(min_num_ctx=16384))
-    assert sheet.check_context(model(num_ctx)) is None
+    assert sheet_of(min_num_ctx=16384).check_context(model(num_ctx)) is None
+
+
+def test_one_token_short_is_unsupported() -> None:
+    assert isinstance(sheet_of(min_num_ctx=16384).check_context(model(16383)), UnsupportedRun)
 
 
 def test_an_unpinned_context_is_unsupported() -> None:
-    sheet = CapabilitySheet.model_validate(good_sheet(min_num_ctx=16384))
-    verdict = sheet.check_context(model(None))
+    verdict = sheet_of(min_num_ctx=16384).check_context(model(None))
     assert isinstance(verdict, UnsupportedRun)
     assert "not pinned" in verdict.reason
 
 
 def test_an_unpinned_context_is_unsupported_even_without_a_known_minimum() -> None:
-    sheet = CapabilitySheet.model_validate(good_sheet(min_num_ctx="unknown"))
-    assert isinstance(sheet.check_context(model(None)), UnsupportedRun)
+    assert isinstance(sheet_of(min_num_ctx="unknown").check_context(model(None)), UnsupportedRun)
 
 
 def test_an_unknown_minimum_accepts_any_pinned_context() -> None:
-    sheet = CapabilitySheet.model_validate(good_sheet(min_num_ctx="unknown"))
-    assert sheet.check_context(model(1)) is None
+    assert sheet_of(min_num_ctx="unknown").check_context(model(1)) is None
 
 
 def test_the_context_check_never_shrinks_or_changes_the_model() -> None:
-    sheet = CapabilitySheet.model_validate(good_sheet(min_num_ctx=16384))
     cfg = model(8192)
-    sheet.check_context(cfg)
+    sheet_of(min_num_ctx=16384).check_runnable(cfg)
     assert cfg.num_ctx == 8192
     with pytest.raises(ValidationError):
         cfg.num_ctx = 16384  # type: ignore[misc]
 
 
 def test_a_framework_without_support_is_never_runnable() -> None:
-    sheet = CapabilitySheet.model_validate(
-        good_sheet(support_level="none", wire_formats=[], model_call_paths=[])
-    )
+    sheet = sheet_of(support_level="none", wire_formats=[], model_call_paths=[])
     verdict = sheet.check_runnable(model(131072))
     assert isinstance(verdict, UnsupportedRun)
     assert "support" in verdict.reason
@@ -464,8 +657,7 @@ def test_every_end_state_has_a_documented_end_status_value() -> None:
 
 
 @pytest.mark.parametrize(
-    "state",
-    [s for s in AgentEndState if s not in EndStateMapper.PENDING_IN_END_STATUS],
+    "state", [s for s in AgentEndState if s not in EndStateMapper.PENDING_IN_END_STATUS]
 )
 def test_existing_end_states_map_onto_end_status(state: AgentEndState) -> None:
     assert EndStateMapper.end_status(state) is EndStatus(state.value)
@@ -486,67 +678,99 @@ def test_the_pending_end_states_are_exactly_the_two_new_ones() -> None:
     } == EndStateMapper.PENDING_IN_END_STATUS
 
 
-@pytest.mark.parametrize(
-    ("signals", "expected"),
-    [
-        (ExitSignals(exit_code=0), AgentEndState.COMPLETED),
-        (ExitSignals(exit_code=1), AgentEndState.CRASHED),
-        (ExitSignals(exit_code=137), AgentEndState.CRASHED),
-        (ExitSignals(exit_code=-9), AgentEndState.CRASHED),
-        (ExitSignals(exit_code=None, timed_out=True), AgentEndState.TIMEOUT),
-        (ExitSignals(exit_code=137, timed_out=True), AgentEndState.TIMEOUT),
-        (ExitSignals(exit_code=0, budget_exhausted=True), AgentEndState.BUDGET_EXHAUSTED),
-        (ExitSignals(exit_code=0, refused=True), AgentEndState.REFUSED),
-        (ExitSignals(exit_code=0, tool_format_failure=True), AgentEndState.TOOL_FORMAT_FAILURE),
-        (ExitSignals(exit_code=1, tool_format_failure=True), AgentEndState.TOOL_FORMAT_FAILURE),
-    ],
-)
-def test_the_end_state_table(signals: ExitSignals, expected: AgentEndState) -> None:
-    assert EndStateMapper.classify(signals) is expected
+B, T, R, F = "budget", "timeout", "refused", "tool_format"
+E = AgentEndState
+
+# Written out by hand, row by row: (signals set, exit code, the state the run is filed
+# under). A wrong precedence order fails at least one row.
+END_STATE_TABLE: list[tuple[set[str], int | None, AgentEndState]] = [
+    (set(), 0, E.COMPLETED),
+    (set(), 1, E.CRASHED),
+    (set(), 2, E.CRASHED),
+    (set(), 137, E.CRASHED),
+    (set(), -9, E.CRASHED),
+    ({T}, None, E.TIMEOUT),
+    ({T}, 137, E.TIMEOUT),
+    ({T}, 0, E.TIMEOUT),
+    ({B}, 0, E.BUDGET_EXHAUSTED),
+    ({B}, 1, E.BUDGET_EXHAUSTED),
+    ({R}, 0, E.REFUSED),
+    ({R}, 1, E.REFUSED),
+    ({F}, 0, E.TOOL_FORMAT_FAILURE),
+    ({F}, 1, E.TOOL_FORMAT_FAILURE),
+    ({B, T}, None, E.BUDGET_EXHAUSTED),
+    ({B, R}, 0, E.BUDGET_EXHAUSTED),
+    ({B, F}, 1, E.BUDGET_EXHAUSTED),
+    ({T, R}, None, E.TIMEOUT),
+    ({T, F}, None, E.TIMEOUT),
+    ({R, F}, 0, E.REFUSED),
+    ({R, F}, 1, E.REFUSED),
+    ({B, T, R}, None, E.BUDGET_EXHAUSTED),
+    ({T, R, F}, 137, E.TIMEOUT),
+    ({B, R, F}, 0, E.BUDGET_EXHAUSTED),
+    ({B, T, R, F}, None, E.BUDGET_EXHAUSTED),
+]
 
 
-@pytest.mark.parametrize(
-    "flags",
-    list(itertools.product([False, True], repeat=4)),
-    ids=lambda f: "".join("01"[x] for x in f),
-)
-@pytest.mark.parametrize("exit_code", [0, 1, None])
-def test_the_precedence_covers_every_combination(
-    flags: tuple[bool, bool, bool, bool], exit_code: int | None
-) -> None:
-    budget, timed_out, refused, tool_format = flags
-    if exit_code is None and not timed_out:
-        pytest.skip("an agent that never exited was killed at the timeout")
-    signals = ExitSignals(
+def signals_of(flags: set[str], exit_code: int | None) -> ExitSignals:
+    return ExitSignals(
         exit_code=exit_code,
-        timed_out=timed_out,
-        budget_exhausted=budget,
-        refused=refused,
-        tool_format_failure=tool_format,
+        budget_exhausted=B in flags,
+        timed_out=T in flags,
+        refused=R in flags,
+        tool_format_failure=F in flags,
     )
-    state = EndStateMapper.classify(signals)
-    expected = next(
-        s
-        for flag, s in (
-            (budget, AgentEndState.BUDGET_EXHAUSTED),
-            (timed_out, AgentEndState.TIMEOUT),
-            (refused, AgentEndState.REFUSED),
-            (tool_format, AgentEndState.TOOL_FORMAT_FAILURE),
-            (exit_code != 0, AgentEndState.CRASHED),
-            (True, AgentEndState.COMPLETED),
-        )
-        if flag
-    )
-    assert state is expected
-    # a run whose tool calls did not parse is never a completion
-    if tool_format:
-        assert state is not AgentEndState.COMPLETED
-    assert state is not AgentEndState.UNSUPPORTED
 
 
-def test_an_agent_that_never_exited_must_have_timed_out() -> None:
+@pytest.mark.parametrize(("flags", "exit_code", "expected"), END_STATE_TABLE)
+def test_the_end_state_table(flags: set[str], exit_code: int | None, expected: E) -> None:
+    assert EndStateMapper.classify(signals_of(flags, exit_code)) is expected
+
+
+ALL_FLAG_SETS = [
+    {flag for flag, on in zip((B, T, R, F), bits, strict=True) if on}
+    for bits in itertools.product([False, True], repeat=4)
+]
+POSSIBLE = [(f, code) for f in ALL_FLAG_SETS for code in (0, 1, None) if code is not None or T in f]
+IMPOSSIBLE = [(f, None) for f in ALL_FLAG_SETS if T not in f]
+
+
+@pytest.mark.parametrize(("flags", "exit_code"), POSSIBLE)
+def test_no_signal_is_lost_in_the_outcome(flags: set[str], exit_code: int | None) -> None:
+    signals = signals_of(flags, exit_code)
+    outcome = AdapterOutcome.of(signals)
+    assert outcome.signals == signals
+    assert outcome.end_state is outcome.signalled[0]
+    flagged = {B: E.BUDGET_EXHAUSTED, T: E.TIMEOUT, R: E.REFUSED, F: E.TOOL_FORMAT_FAILURE}
+    for flag in flags:
+        assert flagged[flag] in outcome.signalled  # e.g. a refusal before a timeout
+    if F in flags:
+        assert outcome.end_state is not E.COMPLETED
+    assert outcome.end_state is not E.UNSUPPORTED
+
+
+@pytest.mark.parametrize(("flags", "exit_code"), IMPOSSIBLE)
+def test_an_agent_that_never_exited_must_have_timed_out(
+    flags: set[str], exit_code: int | None
+) -> None:
     with pytest.raises(ValidationError, match="timed_out"):
-        ExitSignals(exit_code=None)
+        signals_of(flags, exit_code)
+
+
+def test_a_refusal_followed_by_a_timeout_stays_visible() -> None:
+    outcome = AdapterOutcome.of(signals_of({R, T}, None))
+    assert outcome.end_state is E.TIMEOUT
+    assert outcome.signalled == (E.TIMEOUT, E.REFUSED)
+    assert outcome.signals.refused
+
+
+def test_a_crash_after_a_refusal_is_listed_too() -> None:
+    assert AdapterOutcome.of(signals_of({R}, 1)).signalled == (E.REFUSED, E.CRASHED)
+
+
+def test_an_outcome_cannot_be_filed_under_another_state() -> None:
+    with pytest.raises(ValidationError, match="end_state"):
+        AdapterOutcome(end_state=E.COMPLETED, signals=signals_of({F}, 0))
 
 
 @pytest.mark.parametrize(
@@ -563,13 +787,9 @@ def test_exit_signals_are_strictly_typed(changes: dict[str, Any]) -> None:
 def test_the_adapter_contract_is_abstract() -> None:
     with pytest.raises(TypeError):
         Adapter()  # type: ignore[abstract]
-    assert {
-        "render",
-        "start",
-        "exit_signals",
-        "collect",
-        "teardown",
-    } <= Adapter.__abstractmethods__
+    assert {"render", "start", "exit_signals", "collect", "teardown"} <= (
+        Adapter.__abstractmethods__
+    )
 
 
 def test_an_adapter_describes_itself_with_its_sheet(
@@ -596,28 +816,36 @@ def test_an_adapter_with_a_bad_sheet_cannot_be_built(
         fake_adapter(good_sheet(model_call_paths=[]))
 
 
-def test_a_run_refuses_to_start_below_the_minimum_context(
-    fake_adapter: Callable[..., FakeAdapter],
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"model": ModelConfig(name="qwen3:32b", num_ctx=4096)},
+        {"model": ModelConfig(name="qwen3:32b", num_ctx=None)},
+    ],
+)
+def test_a_run_refuses_to_start_on_a_context_the_framework_cannot_use(
+    fake_adapter: Callable[..., FakeAdapter], changes: dict[str, Any]
 ) -> None:
     adapter = fake_adapter()
-    result = adapter.prepare(run_for(model(4096)))
+    result = adapter.prepare(run_for(model()).model_copy(update=changes))
     assert isinstance(result, UnsupportedRun)
     assert result.end_state is AgentEndState.UNSUPPORTED
     assert adapter.rendered == []  # nothing was rendered, so nothing can start
 
 
-def test_a_run_refuses_to_start_without_a_pinned_context(
-    fake_adapter: Callable[..., FakeAdapter],
+@pytest.mark.parametrize(
+    "sheet",
+    [
+        good_sheet(support_level="none", wire_formats=[], model_call_paths=[]),
+        good_sheet(side_channels={"update_check": channel("unresolved", None)}),
+        good_sheet(max_turns_knob="unknown"),
+    ],
+    ids=["no-support", "unresolved-channel", "unknown-turn-cap"],
+)
+def test_a_run_refuses_to_start_on_a_sheet_that_blocks_it(
+    fake_adapter: Callable[..., FakeAdapter], sheet: dict[str, Any]
 ) -> None:
-    adapter = fake_adapter()
-    assert isinstance(adapter.prepare(run_for(model(None))), UnsupportedRun)
-    assert adapter.rendered == []
-
-
-def test_a_run_refuses_to_start_on_an_unsupported_framework(
-    fake_adapter: Callable[..., FakeAdapter],
-) -> None:
-    adapter = fake_adapter(good_sheet(support_level="none", wire_formats=[], model_call_paths=[]))
+    adapter = fake_adapter(sheet)
     assert isinstance(adapter.prepare(run_for(model(131072))), UnsupportedRun)
     assert adapter.rendered == []
 
@@ -632,11 +860,43 @@ def test_a_run_with_enough_context_is_rendered_with_its_own_context(
     assert len(adapter.rendered) == 1
 
 
-def test_wait_classifies_what_the_adapter_reports(
+def test_a_capped_framework_must_record_its_cap(
+    fake_adapter: Callable[..., FakeAdapter],
+) -> None:
+    recorded = {"FAKE_MAX_MEMBERS": "5", "FAKE_MAX_CONCURRENT": "2"}
+    adapter = fake_adapter(good_sheet(sub_agent_cap=CAP), recorded_settings=recorded)
+    launch = adapter.prepare(run_for(model()))
+    assert isinstance(launch, AgentLaunch)
+    assert launch.recorded_settings == recorded
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        {},
+        {"FAKE_MAX_MEMBERS": "5"},
+        {"FAKE_MAX_MEMBERS": "6", "FAKE_MAX_CONCURRENT": "3"},  # above the framework's cap
+        {"FAKE_MAX_MEMBERS": "0", "FAKE_MAX_CONCURRENT": "3"},
+        {"FAKE_MAX_MEMBERS": "-1", "FAKE_MAX_CONCURRENT": "3"},
+        {"FAKE_MAX_MEMBERS": "five", "FAKE_MAX_CONCURRENT": "3"},
+        {"FAKE_MAX_MEMBERS": "5", "FAKE_MAX_CONCURRENT": "³"},
+    ],
+)
+def test_a_capped_framework_with_a_missing_or_wrong_cap_is_refused(
+    fake_adapter: Callable[..., FakeAdapter], recorded: dict[str, str]
+) -> None:
+    adapter = fake_adapter(good_sheet(sub_agent_cap=CAP), recorded_settings=recorded)
+    with pytest.raises(ValueError, match="record"):
+        adapter.prepare(run_for(model()))
+
+
+def test_wait_keeps_the_outcome_and_every_signal(
     fake_adapter: Callable[..., FakeAdapter], tmp_path: Path
 ) -> None:
-    adapter = fake_adapter(tool_format_failure=True)
-    assert adapter.wait(ExitSignals(exit_code=0), tmp_path) is AgentEndState.TOOL_FORMAT_FAILURE
+    adapter = fake_adapter(tool_format_failure=True, refused=True)
+    outcome = adapter.wait(run_for(model()), ExitSignals(exit_code=0), tmp_path)
+    assert outcome.end_state is AgentEndState.REFUSED
+    assert outcome.signals.tool_format_failure
 
 
 @pytest.mark.parametrize(
@@ -647,24 +907,51 @@ def test_wait_refuses_an_adapter_that_rewrites_what_the_runner_saw(
 ) -> None:
     adapter = fake_adapter(**rewrite)
     with pytest.raises(ValueError, match="runner"):
-        adapter.wait(ExitSignals(exit_code=137, timed_out=True), tmp_path)
+        adapter.wait(run_for(model()), ExitSignals(exit_code=137, timed_out=True), tmp_path)
+
+
+def test_a_fresh_adapter_tears_down_from_the_run_alone(
+    fake_adapter: Callable[..., FakeAdapter],
+) -> None:
+    run = run_for(model())
+    first = fake_adapter()
+    assert isinstance(first.prepare(run), AgentLaunch)
+    first.start(run, RecordingHost())
+    before = RecordingHost()
+    first.teardown(run, before)
+
+    # the runner restarts: only the stored run survives, and a new adapter is built
+    stored = run.model_dump_json()
+    after = RecordingHost()
+    fake_adapter().teardown(AdapterRun.model_validate_json(stored), after)
+    assert after.commands == before.commands == [("cellguard", ("reap", f"fake-{run.run_id}"))]
 
 
 # --------------------------------------------------------------------------- agent ids
 
 
-def test_agent_ids_default_to_none_when_the_sheet_names_no_source(
+def test_agent_ids_default_to_none(
     fake_adapter: Callable[..., FakeAdapter], tmp_path: Path
 ) -> None:
     assert fake_adapter().agent_ids(tmp_path) is None
 
 
-def test_agent_ids_must_be_implemented_when_the_sheet_names_a_source(
+def test_an_adapter_whose_sheet_names_an_id_source_must_read_it(
     fake_adapter: Callable[..., FakeAdapter], tmp_path: Path
 ) -> None:
-    adapter = fake_adapter(good_sheet(agent_id_source="events.jsonl agent_id", agent_id_gap=None))
-    with pytest.raises(NotImplementedError, match="agent_id_source"):
-        adapter.agent_ids(tmp_path)
+    sheet = good_sheet(agent_id_source="events.jsonl agent_id", agent_id_gap=None)
+    with pytest.raises(TypeError, match="agent_ids"):
+        fake_adapter(sheet)
+
+    write_sheet(tmp_path, sheet)
+
+    class Reading(FakeAdapter):
+        sheets_dir = tmp_path
+
+        def agent_ids(self, collected: Path) -> dict[int, str] | None:
+            return {0: "root"}
+
+    assert Reading().agent_ids(tmp_path) == {0: "root"}
 
 
 def _calls(seqs: Sequence[int]) -> list[Any]:
@@ -710,6 +997,8 @@ def test_no_agent_ids_means_telemetry_infers_them() -> None:
         {"files": {"a/b": b"x"}},
         {"files": {"..": b"x"}},
         {"files": {"": b"x"}},
+        {"recorded_settings": {"": "5"}},
+        {"recorded_settings": {"FAKE_MAX_MEMBERS": 5}},
     ],
 )
 def test_a_launch_refuses_malformed_parts(changes: dict[str, Any]) -> None:
@@ -725,9 +1014,18 @@ def test_a_launch_refuses_malformed_parts(changes: dict[str, Any]) -> None:
         {"target_url": "ftp://goat"},
         {"llm_base_url": "tap:8080"},
         {"objective": ""},
+        {"limits": {"max_turns": 0, "timeout_s": 60}},
+        {"limits": {"max_turns": 10, "timeout_s": 0}},
+        {"limits": {"max_turns": True, "timeout_s": 60}},
+        {"limits": {"max_turns": 10, "timeout_s": 10**9}},
+        {"limits": {"max_turns": 10, "timeout_s": 60, "budget_usd": 1.0}},
     ],
 )
 def test_an_adapter_run_refuses_malformed_parts(changes: dict[str, Any]) -> None:
     good = run_for(model()).model_dump()
     with pytest.raises(ValidationError):
         AdapterRun.model_validate({**good, **changes})
+
+
+def test_channel_status_values() -> None:
+    assert {s.value for s in ChannelStatus} == {"disabled", "unresolved"}

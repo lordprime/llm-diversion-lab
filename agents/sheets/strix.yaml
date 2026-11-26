@@ -1,6 +1,7 @@
 # Strix capability sheet. Every value comes from docs/OLLAMA_SUPPORT_AUDIT.md;
-# audit_refs names the section behind each field, and "unknown" marks what the audit
-# could not verify. The Strix adapter task fills in what is still unknown.
+# audit_refs and each side channel's audit_ref name the section behind it, and
+# "unknown" marks what the audit could not verify. An unresolved side channel or an
+# unknown turn cap makes every run unsupported until the Strix adapter task fixes it.
 framework: strix
 version: v1.7.1 # LLM config byte-identical to the audited 1.7.0 (6b7ae2e)
 commit: 685bbc8
@@ -9,21 +10,48 @@ support_level: native
 # STRIX_LLM=ollama/<model> maps to LiteLLM's ollama_chat/ route (models.py 609-610)
 wire_formats: [ollama_chat]
 # litellm.api_base is set globally from LLM_API_BASE (models.py 721-723, 978-982), so
-# every path below reaches the tap when LLM_API_BASE=<tap>.
+# every path below reaches the tap when LLM_API_BASE=<tap>. Also set
+# STRIX_CONTEXT_FALLBACK_TOKENS to the model's num_ctx (strix/llm/context_budget.py 61-68),
+# or compaction fires too late.
 model_call_paths:
   - "main agent: OpenAI Agents SDK LitellmModel behind StrixProvider (strix/config/models.py 563-660)"
   - "history compaction: _summarize through StrixProvider().get_model, no tools (strix/llm/compaction.py 302-316)"
   - "report dedupe judge: STRIX_DEDUPE_MODEL, defaults to the main model (strix/report/dedupe.py 365)"
-side_channels_disabled:
-  web_search_perplexity: "PERPLEXITY_API_KEY unset (web_search would call the hosted sonar-reasoning-pro, strix/tools/web_search/tool.py 49-53)"
-  web_search_exa: "EXA_API_KEY unset (web_search falls back to Exa, strix/tools/web_search/tool.py 122)"
-  telemetry: "STRIX_TELEMETRY=false (PostHog and Scarf, on by default, strix/interface/main.py)"
-  context_images: "STRIX_MAX_CONTEXT_IMAGES=0 for text-only models (default 3, strix/config/settings.py)"
-  codex_endpoint: "STRIX_LLM=ollama/<model>, never a chatgpt/ model (hard-coded Codex endpoint, strix/config/codex.py 50)"
-# Open for the Strix adapter task (the audit names no switch, so it is not listed above):
-# the update check against GitHub and PyPI (strix/interface/update_check.py).
-# Also set STRIX_CONTEXT_FALLBACK_TOKENS to the model's num_ctx (strix/llm/context_budget.py
-# 61-68), or compaction fires too late.
+side_channels:
+  web_search_perplexity:
+    status: disabled
+    setting: "PERPLEXITY_API_KEY unset"
+    audit_ref: "§2.2, §3"
+    note: "web_search would call Perplexity's hosted sonar-reasoning-pro (strix/tools/web_search/tool.py 49-53)"
+  web_search_exa:
+    status: disabled
+    setting: "EXA_API_KEY unset"
+    audit_ref: "§2.2, §3"
+    note: "without a Perplexity key web_search falls back to Exa (strix/tools/web_search/tool.py 122)"
+  telemetry:
+    status: disabled
+    setting: "STRIX_TELEMETRY=false"
+    audit_ref: "§2.2, §3"
+    note: "PostHog and Scarf, on by default (strix/interface/main.py)"
+  context_images:
+    status: disabled
+    setting: "STRIX_MAX_CONTEXT_IMAGES=0"
+    audit_ref: "§2.2, §3"
+    note: "for text-only models; the default keeps 3 screenshots in context (strix/config/settings.py)"
+  codex_endpoint:
+    status: disabled
+    setting: "STRIX_LLM=ollama/<model>"
+    audit_ref: "§2.2"
+    note: "chatgpt/ models use a hard-coded Codex endpoint (strix/config/codex.py 50)"
+  dedupe_endpoint:
+    status: disabled
+    setting: "STRIX_DEDUPE_MODEL and DEDUPE_LLM_API_BASE unset"
+    audit_ref: "§2.2, §4"
+    note: "unset, the dedupe judge uses the main model; whether DEDUPE_LLM_API_BASE is overridden by the global api_base is unverified (§4 item 11)"
+  update_check:
+    status: unresolved
+    audit_ref: "§2.2"
+    note: "update check against GitHub and PyPI (strix/interface/update_check.py); the audit names no switch"
 min_num_ctx: 16384 # local.mdx: raise num_ctx to "at least 16k-32k"
 sub_agents: dynamic # create_agent spawns children on demand; no cap found
 agent_id_source: null
@@ -35,7 +63,6 @@ audit_refs:
   support_level: "§1, §2.2"
   wire_formats: "§1, §2.2"
   model_call_paths: "§2.2"
-  side_channels_disabled: "§2.2, §3"
   min_num_ctx: "§1, §2.2"
   sub_agents: "§2.2"
   agent_id_source: "§2.2"

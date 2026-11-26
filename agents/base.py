@@ -6,33 +6,36 @@ and teardown. This module holds the parts every adapter shares:
 
 * :class:`CapabilitySheet`: what we know about a framework, read from
   ``agents/sheets/<framework>.yaml``. Each value comes from
-  ``docs/OLLAMA_SUPPORT_AUDIT.md`` (``audit_refs`` says which section), and
-  ``"unknown"`` marks what the audit could not verify.
-* :meth:`CapabilitySheet.check_context`: a run whose model context (``num_ctx``) is not
-  pinned, or is smaller than the framework needs, is ``unsupported``. We never run it
-  with a smaller context than the framework asks for.
-* :class:`AgentEndState` and :class:`EndStateMapper`: one end state per run, decided
-  the same way for every framework.
+  ``docs/OLLAMA_SUPPORT_AUDIT.md`` (``audit_refs`` and each side channel's
+  ``audit_ref`` say which section), and ``"unknown"`` marks what the audit could not
+  verify.
+* :meth:`CapabilitySheet.check_runnable`: a run is ``unsupported`` (never started) when
+  the framework cannot reach Ollama, when a side channel is still unresolved, when the
+  framework's turn cap is unknown, or when the model's context (``num_ctx``) is not
+  pinned or is smaller than the framework needs. We never run a framework with a
+  smaller context than it asks for, and never with a side channel we cannot turn off.
+* :class:`AgentEndState`, :class:`EndStateMapper` and :class:`AdapterOutcome`: one end
+  state per run, decided the same way for every framework, kept together with every
+  signal behind it so that nothing (a refusal, say) disappears in the collapse.
 * :class:`Adapter`: the abstract class each framework fills in.
 
 How the end states map onto the runner's :class:`~control.core.models.EndStatus`
 (applied when the runner is wired to adapters):
 
 * ``completed`` -> ``EndStatus.COMPLETED``: exited 0 with no other signal;
-* ``budget_exhausted`` -> ``EndStatus.BUDGET_EXHAUSTED``: the token budget ran out;
+* ``budget_exhausted`` -> ``EndStatus.BUDGET_EXHAUSTED``: the gateway's token budget ran
+  out, or the framework stopped at its own turn cap (the sheet's ``max_turns_knob``);
 * ``timeout`` -> ``EndStatus.TIMEOUT``: the runner killed it at the wall-clock limit;
 * ``refused`` -> ``EndStatus.REFUSED``: the model refused and the run ended;
 * ``crashed`` -> ``EndStatus.CRASHED``: any other non-zero exit;
 * ``tool_format_failure`` -> a new ``EndStatus.TOOL_FORMAT_FAILURE`` (same value): the
   framework gave up because the model's tool calls did not parse;
 * ``unsupported`` -> a new ``EndStatus.UNSUPPORTED`` (same value): never started, see
-  :meth:`CapabilitySheet.check_context`.
+  :meth:`CapabilitySheet.check_runnable`.
 
 Each value is the same string on both sides, so the mapping is ``EndStatus(state.value)``
-(:meth:`EndStateMapper.end_status`).
-
-``tool_format_failure`` is a valid outcome, not an infrastructure failure, and it
-never counts as a completion. ``unsupported`` means the cell was never run.
+(:meth:`EndStateMapper.end_status`). ``tool_format_failure`` is a valid outcome, not an
+infrastructure failure, and it never counts as a completion.
 
 The ``agent_ids`` contract (what :meth:`Adapter.agent_ids` returns, and what
 :func:`control.telemetry.extract.summarise` accepts):
@@ -44,6 +47,8 @@ The ``agent_ids`` contract (what :meth:`Adapter.agent_ids` returns, and what
   anything less (``agents_source="adapter"``). An empty map is not "no ids": with any
   calls recorded it is refused, so return ``None`` instead. The seqs to cover are the
   ones :func:`control.telemetry.extract.load_calls` reads from the same evidence.
+
+This module must not import ``control.runner``: the runner imports the adapters.
 """
 
 from __future__ import annotations
@@ -67,7 +72,7 @@ from pydantic import (
 )
 
 from control.core.models import AgentEvent, EndStatus, Id
-from control.runner.experiment import RunLimits, _UniqueKeyLoader
+from control.core.yaml_loader import UniqueKeyLoader
 from control.telemetry.model import WireFormat
 
 __all__ = [
@@ -76,16 +81,21 @@ __all__ = [
     "SHEETS_DIR",
     "UNKNOWN",
     "Adapter",
+    "AdapterLimits",
+    "AdapterOutcome",
     "AdapterRun",
     "AgentEndState",
     "AgentHost",
     "AgentLaunch",
     "CapabilitySheet",
+    "ChannelStatus",
     "CommandOutcome",
     "EndStateMapper",
     "ExitSignals",
     "ModelConfig",
     "Patch",
+    "SideChannel",
+    "SubAgentCap",
     "SupportLevel",
     "UnsupportedRun",
 ]
@@ -98,6 +108,10 @@ UNKNOWN: Final = "unknown"
 MAX_NUM_CTX: Final = 1 << 24
 #: A sheet is a short hand-written file; anything bigger is not one.
 MAX_SHEET_BYTES: Final = 64 * 1024
+#: Words that stand in for a setting without being one (compared case-insensitively).
+PLACEHOLDERS: Final = frozenset(
+    {"", UNKNOWN, "tbd", "todo", "?", "??", "off", "none", "null", "n/a", "na", "-", "..."}
+)
 
 # A single line of printable text with at least one visible character.
 _LINE = r"^[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f][^\x00-\x1f\x7f]*$"
@@ -106,7 +120,7 @@ _SLUG = r"^[a-z][a-z0-9_-]{0,63}$"
 _COMMIT = r"^[0-9a-f]{7,40}$"
 _DIGEST = r"^(sha256:[0-9a-f]{64}|unknown)$"
 # "§2.2" or "§2.2, §3": the audit sections a value comes from.
-_AUDIT_REF = r"^§\d+(\.\d+)*(, §\d+(\.\d+)*)*$"
+AuditRef = Annotated[str, StringConstraints(pattern=r"^§\d+(\.\d+)*(, §\d+(\.\d+)*)*$")]
 _ENV_NAME = r"^[A-Za-z_][A-Za-z0-9_]*$"
 # a flat file name that is not made of dots alone (so never "." or "..")
 _FILE_NAME = r"^[A-Za-z0-9._-]*[A-Za-z0-9_-][A-Za-z0-9._-]*$"
@@ -115,6 +129,11 @@ _HTTP_URL = r"^https?://[^\s/]+(/\S*)?$"
 NumCtx = Annotated[StrictInt, Field(gt=0, le=MAX_NUM_CTX)]
 EnvName = Annotated[str, StringConstraints(pattern=_ENV_NAME)]
 FileName = Annotated[str, StringConstraints(pattern=_FILE_NAME, max_length=128)]
+PositiveCount = Annotated[StrictInt, Field(gt=0, le=10_000)]
+
+
+def _is_placeholder(value: str) -> bool:
+    return value.strip().casefold() in PLACEHOLDERS
 
 
 class _Frozen(BaseModel):
@@ -125,16 +144,82 @@ class _Frozen(BaseModel):
 
 
 class SupportLevel(StrEnum):
-    """How a framework reaches Ollama (audit §1 summary table)."""
+    """How a framework reaches Ollama, as the audit labels it (§1 summary table)."""
 
-    #: the framework documents Ollama as a provider
+    #: the project documents Ollama as a provider option, either as its own provider
+    #: or as a preset of its OpenAI-compatible provider (RedAmon's case)
     NATIVE = "native"
-    #: reached through the framework's generic OpenAI-compatible provider
+    #: the project documents no Ollama route, but its generic OpenAI-compatible
+    #: provider can be pointed at Ollama's ``/v1`` API
     OPENAI_COMPATIBLE = "openai_compatible"
     #: works, but through a route the project does not support (reported separately)
     UNOFFICIAL = "unofficial"
     #: cannot be pointed at Ollama at all
     NONE = "none"
+
+
+class ChannelStatus(StrEnum):
+    """Whether a side channel is known to be off."""
+
+    #: turned off by the channel's ``setting``
+    DISABLED = "disabled"
+    #: found by the audit, but no switch is known yet: the framework cannot run
+    UNRESOLVED = "unresolved"
+
+
+class SideChannel(_Frozen):
+    """A way the framework could talk to something other than the tap, and its switch."""
+
+    status: ChannelStatus
+    #: the setting (or action) that turns it off; required when disabled, absent when
+    #: unresolved
+    setting: Text | None = None
+    #: the audit section(s) the channel comes from
+    audit_ref: AuditRef
+    #: what the channel is and where the audit found it
+    note: Text | None = None
+
+    @model_validator(mode="after")
+    def _setting_matches_status(self) -> Self:
+        if self.status is ChannelStatus.DISABLED:
+            if self.setting is None or _is_placeholder(self.setting):
+                raise ValueError(
+                    f"setting: a disabled side channel names the setting that turns it off, "
+                    f"not {self.setting!r}"
+                )
+        elif self.setting is not None:
+            raise ValueError("setting: an unresolved side channel has no known setting yet")
+        return self
+
+
+class SubAgentCap(_Frozen):
+    """A framework's own limit on its sub-agents. The adapter sets it and records it."""
+
+    max_agents: PositiveCount
+    max_concurrent: PositiveCount
+    #: the framework's settings for the two limits
+    max_agents_setting: Text
+    max_concurrent_setting: Text
+    audit_ref: AuditRef
+
+    @model_validator(mode="after")
+    def _sane(self) -> Self:
+        if self.max_concurrent > self.max_agents:
+            raise ValueError("max_concurrent: more concurrent sub-agents than sub-agents")
+        settings = (self.max_agents_setting, self.max_concurrent_setting)
+        if any(_is_placeholder(s) for s in settings):
+            raise ValueError(f"sub_agent_cap: placeholder settings {settings!r}")
+        if self.max_agents_setting == self.max_concurrent_setting:
+            raise ValueError("sub_agent_cap: the two limits need two different settings")
+        return self
+
+    @property
+    def settings(self) -> dict[str, int]:
+        """Each setting with the cap the audit found for it."""
+        return {
+            self.max_agents_setting: self.max_agents,
+            self.max_concurrent_setting: self.max_concurrent,
+        }
 
 
 class Patch(_Frozen):
@@ -161,6 +246,7 @@ class AgentEndState(StrEnum):
     """How a run's agent ended, as the adapter sees it (mapping in the module docs)."""
 
     COMPLETED = "completed"
+    #: the token budget ran out, or the framework stopped at its own turn cap
     BUDGET_EXHAUSTED = "budget_exhausted"
     TIMEOUT = "timeout"
     REFUSED = "refused"
@@ -174,7 +260,7 @@ class AgentEndState(StrEnum):
 class UnsupportedRun(_Frozen):
     """Why a run cannot be started. Its end state is always ``unsupported``."""
 
-    reason: Text
+    reason: Annotated[str, StringConstraints(pattern=_LINE, max_length=4000)]
 
     @property
     def end_state(self) -> AgentEndState:
@@ -184,14 +270,14 @@ class UnsupportedRun(_Frozen):
 class CapabilitySheet(_Frozen):
     """What we know about one framework, with the audit section behind each value."""
 
-    #: Fields whose value must cite an audit section in ``audit_refs``.
+    #: Fields whose value must cite an audit section in ``audit_refs`` (side channels
+    #: and the sub-agent cap cite their own, entry by entry).
     AUDITED_FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
             "version",
             "support_level",
             "wire_formats",
             "model_call_paths",
-            "side_channels_disabled",
             "min_num_ctx",
             "sub_agents",
             "agent_id_source",
@@ -207,32 +293,38 @@ class CapabilitySheet(_Frozen):
     commit: Annotated[str, StringConstraints(pattern=_COMMIT)]
     #: the agent image's digest, or "unknown" until the adapter's image is built
     image_digest: Annotated[str, StringConstraints(pattern=_DIGEST)]
+    #: the mode or use case the adapter runs when the framework has several; call
+    #: paths and sub-agents below describe that one only
+    use_case: Text | None = None
     support_level: SupportLevel
     #: the model APIs the framework speaks to Ollama
     wire_formats: tuple[WireFormat, ...]
     #: every code path that calls a model; each must be shown to reach the tap
     model_call_paths: tuple[Text, ...]
-    #: side channel -> the setting (or action) that turns it off
-    side_channels_disabled: dict[Text, Text]
+    #: side channel name -> its status and switch; an unresolved one blocks every run
+    side_channels: dict[Annotated[str, StringConstraints(pattern=_SLUG)], SideChannel]
     #: the smallest context the framework documents, or "unknown" if it gives none
     min_num_ctx: NumCtx | Literal["unknown"]
     #: whether it runs one agent, a fixed set, or spawns agents as it goes
     sub_agents: Literal["none", "fixed", "dynamic"]
+    #: the framework's own cap on its sub-agents, if it has one
+    sub_agent_cap: SubAgentCap | None = None
     #: where the adapter reads which sub-agent made each call, or None
     agent_id_source: Text | None = None
     #: why agent ids are not available, when the framework has sub-agents but no source
     agent_id_gap: Text | None = None
     patches: tuple[Patch, ...] = ()
     #: the framework's own setting for the maximum number of turns, or "unknown"
+    #: (an unknown turn cap blocks every run: limits must be identical across arms)
     max_turns_knob: Text
     #: field -> the audit section(s) its value comes from, e.g. "§2.2, §3"
-    audit_refs: dict[str, Annotated[str, StringConstraints(pattern=_AUDIT_REF)]]
+    audit_refs: dict[str, AuditRef]
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
         self._check_runnable_lists()
-        self._check_side_channels()
-        self._check_agent_ids()
+        self._check_max_turns_knob()
+        self._check_sub_agents()
         self._check_unique()
         self._check_audit_refs()
         return self
@@ -252,20 +344,23 @@ class CapabilitySheet(_Frozen):
                 f"wire_formats: a {self.support_level.value} framework must name its wire format"
             )
 
-    def _check_side_channels(self) -> None:
-        for channel, setting in self.side_channels_disabled.items():
-            if setting.strip().casefold() == UNKNOWN:
-                raise ValueError(
-                    f"side_channels_disabled: {channel!r} has no disabling setting; a side "
-                    "channel we cannot turn off is a blocker, not a sheet entry"
-                )
+    def _check_max_turns_knob(self) -> None:
+        if self.max_turns_knob != UNKNOWN and _is_placeholder(self.max_turns_knob):
+            raise ValueError(
+                f"max_turns_knob: name the setting or say 'unknown', not {self.max_turns_knob!r}"
+            )
 
-    def _check_agent_ids(self) -> None:
+    def _check_sub_agents(self) -> None:
         if self.agent_id_source is not None and self.agent_id_gap is not None:
             raise ValueError("agent_id_source and agent_id_gap: give one or the other")
         if self.sub_agents == "none":
-            if self.agent_id_source is not None:
-                raise ValueError("agent_id_source: a single-agent framework has no sub-agent ids")
+            if self.agent_id_source is not None or self.agent_id_gap is not None:
+                raise ValueError(
+                    "agent_id_source and agent_id_gap: a single-agent framework has no "
+                    "sub-agent ids to find"
+                )
+            if self.sub_agent_cap is not None:
+                raise ValueError("sub_agent_cap: a single-agent framework has no sub-agents")
         elif self.agent_id_source is None and self.agent_id_gap is None:
             raise ValueError(
                 "agent_id_source: a framework with sub-agents names where their ids come "
@@ -311,7 +406,7 @@ class CapabilitySheet(_Frozen):
         except UnicodeDecodeError as exc:
             raise ValueError(f"{path}: not UTF-8: {exc}") from exc
         try:
-            doc = yaml.load(text, Loader=_UniqueKeyLoader)  # noqa: S506 - a SafeLoader subclass
+            doc = yaml.load(text, Loader=UniqueKeyLoader)  # noqa: S506 - a SafeLoader subclass
         except yaml.YAMLError as exc:
             raise ValueError(f"{path}: YAML does not parse: {exc}") from exc
         if not isinstance(doc, dict):
@@ -329,6 +424,16 @@ class CapabilitySheet(_Frozen):
         return cls.load(sheets_dir / f"{framework}.yaml")
 
     # the checks a run must pass before it starts
+
+    @property
+    def unresolved_side_channels(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                name
+                for name, channel in self.side_channels.items()
+                if channel.status is ChannelStatus.UNRESOLVED
+            )
+        )
 
     def check_context(self, model: ModelConfig) -> UnsupportedRun | None:
         """``None`` if ``model``'s context is enough for this framework, else why not.
@@ -352,10 +457,22 @@ class CapabilitySheet(_Frozen):
         )
 
     def check_runnable(self, model: ModelConfig) -> UnsupportedRun | None:
-        """:meth:`check_context`, after refusing a framework that cannot reach Ollama."""
+        """``None`` if a run may start, else every reason it may not, in one place.
+
+        A run is unsupported when the framework cannot reach Ollama, when any side
+        channel is unresolved, when its turn cap is unknown (the run's turn limit could
+        not be applied), or when :meth:`check_context` refuses the model.
+        """
+        reasons: list[str] = []
         if self.support_level is SupportLevel.NONE:
-            return UnsupportedRun(reason=f"{self.framework} has no Ollama support")
-        return self.check_context(model)
+            reasons.append(f"{self.framework} has no Ollama support")
+        reasons += [f"unresolved side channel {name}" for name in self.unresolved_side_channels]
+        if self.max_turns_knob == UNKNOWN:
+            reasons.append(f"{self.framework}'s turn cap setting is unknown")
+        context = self.check_context(model)
+        if context is not None:
+            reasons.append(context.reason)
+        return UnsupportedRun(reason="; ".join(reasons)) if reasons else None
 
 
 # --------------------------------------------------------------------------- end states
@@ -373,7 +490,7 @@ class ExitSignals(_Frozen):
     exit_code: StrictInt | None
     #: the runner hit the wall-clock limit and killed the agent
     timed_out: StrictBool = False
-    #: the gateway's token budget (or the framework's own turn cap) ended the run
+    #: the gateway's token budget, or the framework's own turn cap, ended the run
     budget_exhausted: StrictBool = False
     #: the model refused and the framework stopped because of it
     refused: StrictBool = False
@@ -393,10 +510,11 @@ class EndStateMapper:
     Precedence, first match wins: the harness's limits (budget, then timeout) are hard
     facts and come first; then what the model did (refused, then tool calls that did
     not parse); then the exit code. So a framework that gives up on broken tool calls
-    and exits 0 is a ``tool_format_failure``, never a completion.
+    and exits 0 is a ``tool_format_failure``, never a completion. The collapsed state
+    loses the other signals, so :class:`AdapterOutcome` keeps them all beside it.
     """
 
-    _PRECEDENCE: ClassVar[tuple[tuple[str, AgentEndState], ...]] = (
+    PRECEDENCE: ClassVar[tuple[tuple[str, AgentEndState], ...]] = (
         ("budget_exhausted", AgentEndState.BUDGET_EXHAUSTED),
         ("timed_out", AgentEndState.TIMEOUT),
         ("refused", AgentEndState.REFUSED),
@@ -411,11 +529,17 @@ class EndStateMapper:
     )
 
     @classmethod
+    def signalled(cls, signals: ExitSignals) -> tuple[AgentEndState, ...]:
+        """Every end state the signals point to, in precedence order (never empty)."""
+        states = [state for flag, state in cls.PRECEDENCE if getattr(signals, flag)]
+        if signals.exit_code is not None and signals.exit_code != 0:
+            states.append(AgentEndState.CRASHED)
+        return tuple(states) or (AgentEndState.COMPLETED,)
+
+    @classmethod
     def classify(cls, signals: ExitSignals) -> AgentEndState:
-        for flag, state in cls._PRECEDENCE:
-            if getattr(signals, flag):
-                return state
-        return AgentEndState.COMPLETED if signals.exit_code == 0 else AgentEndState.CRASHED
+        """The one end state of the run: the first of :meth:`signalled`."""
+        return cls.signalled(signals)[0]
 
     @classmethod
     def end_status(cls, state: AgentEndState) -> EndStatus:
@@ -433,11 +557,54 @@ class EndStateMapper:
             ) from None
 
 
+class AdapterOutcome(_Frozen):
+    """A run's end state together with every signal behind it.
+
+    ``end_state`` is the collapsed state the run is filed under; ``signals`` keeps the
+    rest, so a refusal followed by a timeout or a budget stop is still visible. The
+    runner stores both.
+    """
+
+    end_state: AgentEndState
+    signals: ExitSignals
+
+    @classmethod
+    def of(cls, signals: ExitSignals) -> AdapterOutcome:
+        return cls(end_state=EndStateMapper.classify(signals), signals=signals)
+
+    @model_validator(mode="after")
+    def _collapsed_from_signals(self) -> Self:
+        expected = EndStateMapper.classify(self.signals)
+        if self.end_state is not expected:
+            raise ValueError(f"end_state: the signals give {expected.value}, not {self.end_state}")
+        return self
+
+    @property
+    def signalled(self) -> tuple[AgentEndState, ...]:
+        """Every end state the signals point to, the filed one first."""
+        return EndStateMapper.signalled(self.signals)
+
+
 # --------------------------------------------------------------------------- the adapter
 
 
+class AdapterLimits(_Frozen):
+    """The run's limits an adapter maps onto the framework's own settings.
+
+    Identical in every arm. The token budget is enforced by the gateway, not here.
+    """
+
+    max_turns: PositiveCount
+    timeout_s: Annotated[StrictInt, Field(gt=0, le=7 * 24 * 3600)]
+
+
 class AdapterRun(_Frozen):
-    """What an adapter needs to render one run."""
+    """One run as an adapter sees it, passed to every step of the lifecycle.
+
+    It is plain, serialisable data: after a runner restart a fresh adapter given the
+    same ``AdapterRun`` can still collect and tear down, so an adapter keeps no
+    per-run state of its own.
+    """
 
     run_id: Id
     model: ModelConfig
@@ -447,15 +614,14 @@ class AdapterRun(_Frozen):
     objective: Annotated[str, StringConstraints(min_length=1, max_length=8192)]
     #: the cell's LLM tap; every model call must go here
     llm_base_url: Annotated[str, StringConstraints(pattern=_HTTP_URL)]
-    #: the experiment's limits, identical in every arm
-    limits: RunLimits
+    limits: AdapterLimits
 
 
 class AgentLaunch(_Frozen):
     """How to run the framework in the cell's ``agent`` service.
 
-    The runner turns it into an ``AgentSpec`` and writes ``files`` into the agent's
-    config volume before the cell starts.
+    The runner turns it into an ``AgentSpec``, writes ``files`` into the agent's config
+    volume before the cell starts, and stores ``recorded_settings`` with the run.
     """
 
     image: Text
@@ -466,6 +632,8 @@ class AgentLaunch(_Frozen):
     #: the framework starts containers, so the cell gets a cell-guard (§2.4)
     needs_docker: StrictBool = False
     cap_add: tuple[Text, ...] = ()
+    #: settings the run's results depend on, stored with the run (e.g. the sub-agent cap)
+    recorded_settings: dict[Text, Text] = Field(default_factory=dict)
 
 
 class CommandOutcome(Protocol):
@@ -492,7 +660,8 @@ class Adapter(ABC):
 
     The runner drives the lifecycle: ``prepare`` -> (cell up) -> ``start`` -> (the
     runner polls the agent until it exits or times out, then collects the evidence) ->
-    ``wait`` -> ``collect`` and ``agent_ids`` -> ``teardown``.
+    ``wait`` -> ``collect`` and ``agent_ids`` -> ``teardown``. Every step gets the
+    run's :class:`AdapterRun`, and an adapter keeps no state between steps.
     """
 
     #: the sheet's name, ``agents/sheets/<framework>.yaml``
@@ -504,6 +673,11 @@ class Adapter(ABC):
         self._sheet = CapabilitySheet.for_framework(
             type(self).framework, sheets_dir=type(self).sheets_dir
         )
+        if self._sheet.agent_id_source is not None and type(self).agent_ids is Adapter.agent_ids:
+            raise TypeError(
+                f"{self.framework}: the sheet reads agent ids from "
+                f"{self._sheet.agent_id_source!r}, but the adapter does not override agent_ids()"
+            )
 
     def describe(self) -> CapabilitySheet:
         """The capability sheet, stored with every run."""
@@ -514,34 +688,50 @@ class Adapter(ABC):
         refusal = self._sheet.check_runnable(run.model)
         if refusal is not None:
             return refusal
-        return self.render(run)
+        launch = self.render(run)
+        self._check_recorded_cap(launch)
+        return launch
 
-    def wait(self, observed: ExitSignals, evidence: Path) -> AgentEndState:
-        """The run's end state, from what the runner saw and the framework's own logs.
+    def _check_recorded_cap(self, launch: AgentLaunch) -> None:
+        # A sub-agent cap is part of the agent configuration: the adapter must set it
+        # explicitly, within the framework's own cap, and record it with the run.
+        cap = self._sheet.sub_agent_cap
+        if cap is None:
+            return
+        for setting, limit in cap.settings.items():
+            value = launch.recorded_settings.get(setting)
+            # ASCII digits only: str.isdigit() also accepts "³", which int() refuses
+            if (
+                value is None
+                or not re.fullmatch(r"[0-9]{1,6}", value)
+                or not 1 <= int(value) <= limit
+            ):
+                raise ValueError(
+                    f"{self.framework}: the launch must record {setting} as a number from 1 "
+                    f"to {limit}, not {value!r}"
+                )
+
+    def wait(self, run: AdapterRun, observed: ExitSignals, evidence: Path) -> AdapterOutcome:
+        """The run's outcome, from what the runner saw and the framework's own logs.
 
         The runner does the waiting (it polls the agent container until it exits or
         the timeout kills it). ``observed`` is what it saw, ``evidence`` the run's
         collected evidence.
         """
-        signals = self.exit_signals(observed, evidence)
+        signals = self.exit_signals(run, observed, evidence)
         if (signals.exit_code, signals.timed_out) != (observed.exit_code, observed.timed_out):
             raise ValueError(
                 f"{self.framework}: the adapter changed what the runner saw "
                 f"(exit {observed.exit_code}, timed out {observed.timed_out})"
             )
-        return EndStateMapper.classify(signals)
+        return AdapterOutcome.of(signals)
 
     def agent_ids(self, collected: Path) -> dict[int, str] | None:
         """Tap call ``seq`` -> sub-agent id, or ``None`` (contract in the module docs).
 
-        The default is ``None``, allowed only when the sheet names no
-        ``agent_id_source``. An adapter whose sheet names one must override this.
+        The default is ``None``. An adapter whose sheet names an ``agent_id_source``
+        must override this, or it cannot be built.
         """
-        if self._sheet.agent_id_source is not None:
-            raise NotImplementedError(
-                f"{self.framework}: the sheet's agent_id_source is "
-                f"{self._sheet.agent_id_source!r}, but agent_ids() is not implemented"
-            )
         return None
 
     @abstractmethod
@@ -553,17 +743,20 @@ class Adapter(ABC):
         """
 
     @abstractmethod
-    def start(self, host: AgentHost) -> None:
+    def start(self, run: AdapterRun, host: AgentHost) -> None:
         """Kick the framework off once its container runs (no human input, ever)."""
 
     @abstractmethod
-    def exit_signals(self, observed: ExitSignals, evidence: Path) -> ExitSignals:
+    def exit_signals(self, run: AdapterRun, observed: ExitSignals, evidence: Path) -> ExitSignals:
         """``observed`` plus what the framework's logs say about how it stopped."""
 
     @abstractmethod
-    def collect(self, evidence: Path) -> list[AgentEvent]:
+    def collect(self, run: AdapterRun, evidence: Path) -> list[AgentEvent]:
         """The framework's native trajectory as AgentEvents; native files stay as they are."""
 
     @abstractmethod
-    def teardown(self, host: AgentHost) -> None:
-        """Remove anything the framework created that the cell's teardown would miss."""
+    def teardown(self, run: AdapterRun, host: AgentHost) -> None:
+        """Remove anything the framework created that the cell's teardown would miss.
+
+        It must work from ``run`` alone, with a fresh adapter, after a runner restart.
+        """
