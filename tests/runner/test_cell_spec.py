@@ -21,6 +21,7 @@ import yaml
 
 from agents.scripted.agent import AgentScript
 from cell.catcher.callback_log import CatcherConfig
+from cell.cellguard.policy import PinnedHost
 from cell.injector.serve_log import InjectorConfig
 from control.core.models import Arm, RunManifest
 from control.core.tokens import TAG_PATTERN
@@ -613,6 +614,21 @@ def test_a_bad_reset_is_refused(meta: Any, error: str) -> None:
         ResetSpec.from_meta(meta)
 
 
+@pytest.mark.parametrize("host", ["bad_host", "target,tap:1.2.3.4", "target\nevil", "10.0.0.1"])
+def test_a_cell_file_with_a_bad_agent_host_is_refused(
+    experiment: Experiment, schedule: list[ScheduledRun], tmp_path: Path, host: str
+) -> None:
+    """The agent host is pinned in /etc/hosts and handed to cell-guard: it must be a name."""
+    tree = tmp_path / "tree"
+    (tree / "deploy" / "compose").mkdir(parents=True)
+    (tree / "targets").symlink_to(REPO_ROOT / "targets")
+    cell = yaml.safe_load((REPO_ROOT / "deploy" / "compose" / "cell.dvga.yml").read_text())
+    cell["x-lab"]["agent_host"] = host
+    (tree / "deploy" / "compose" / "cell.dvga.yml").write_text(yaml.safe_dump(cell))
+    with pytest.raises(CellError, match=r"x-lab\.agent_host"):
+        _render(experiment, schedule, Arm.CONTROL, templates_root=tree)
+
+
 def test_no_reset_declared_is_none() -> None:
     assert ResetSpec.from_meta(None) is None
 
@@ -646,6 +662,14 @@ def test_an_agent_that_starts_containers_gets_a_cell_guard(
     env = guard["environment"]
     catcher_ip = services["catcher"]["networks"]["agent"]["ipv4_address"]
     assert env["LAB_CELLGUARD_DNS"] == catcher_ip
+    # The containers it starts get the agent's own pinned hosts, from the same list: the
+    # agent's extra_hosts and the guard's variable are one rendering, never two.
+    pinned = PinnedHost.parse_all(env["LAB_CELLGUARD_EXTRA_HOSTS"])
+    assert [str(h) for h in pinned] == services["agent"]["extra_hosts"]
+    assert env["LAB_CELLGUARD_EXTRA_HOSTS"] == ",".join(services["agent"]["extra_hosts"])
+    injector_ip = services["injector"]["networks"]["agent"]["ipv4_address"]
+    tap_ip = services["tap"]["networks"]["agent"]["ipv4_address"]
+    assert env["LAB_CELLGUARD_EXTRA_HOSTS"] == f"target:{injector_ip},tap:{tap_ip}"
     assert env["LAB_CELLGUARD_NETWORK"] == project.document["networks"]["agent"]["name"]
     # The scratch volume is created by the backend (labelled lab.run_id only) before
     # anything starts; Compose would never create it, cell-guard would unlabelled.

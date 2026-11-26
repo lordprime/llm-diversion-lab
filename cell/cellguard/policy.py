@@ -29,7 +29,9 @@ What is allowed (everything else is denied):
   ``image@digest``. Forced: the cell's network (``HostConfig.NetworkMode`` and
   ``NetworkingConfig``), the cell's resolver (``HostConfig.Dns``), both ownership
   labels (also on volume mounts), memory (no swap), CPU and PID limits (a lower request
-  is kept), and the cell's name prefix on ``?name=``. Every DNS name the container
+  is kept), the cell's pinned hosts as ``HostConfig.ExtraHosts`` (the agent's own
+  target and ``tap`` entries, :class:`PinnedHost`; everything else resolves through
+  the catcher), and the cell's name prefix on ``?name=``. Every DNS name the container
   publishes on the cell network carries the cell prefix: network aliases and a
   non-empty ``Hostname`` must start with it (so none can be ``target``, ``tap`` or
   ``catcher``). Mounts: only the cell's scratch *named* volume (``<name>:/path[:ro]``
@@ -53,6 +55,13 @@ What is allowed (everything else is denied):
 * start, stop, kill, wait, remove, inspect, logs, attach (incl. websocket), resize,
   exec create/start/resize/inspect: only on containers carrying both ownership labels;
   the path is pinned to the container's full id. A privileged exec is denied;
+* copying files in and out (``docker cp``): ``HEAD``, ``GET`` and ``PUT
+  /containers/{id}/archive``, on the same owned containers only. ``path`` is required,
+  absolute and resolved the way Docker resolves it before it is forwarded (see
+  :func:`_archive_path`); the upload also takes ``noOverwriteDirNonDir`` and
+  ``copyUIDGID`` (see :func:`_archive_query` for why ``copyUIDGID`` is safe). The upload
+  body is a tar stream the proxy relays unbuffered (:data:`STREAM_OPS`); the policy never
+  sees it;
 * container and volume lists: forced to both ownership label filters; network list:
   forced to the ``lab.run_id`` filter;
 * image list and inspect (read-only); pull, import, build, push, tag, export and
@@ -62,12 +71,16 @@ What is allowed (everything else is denied):
 * volume create: local driver without options or query parameters; both ownership
   labels and the cell's name prefix are forced.
 
+``GET /info`` stays denied (a ruling): it describes the host daemon (kernel, storage
+paths, registry mirrors, other containers' counts), none of which an agent needs.
+
 **Query strings are allow-listed per operation** (:data:`_QUERY_KEYS`): a key the
 operation does not list is denied (``query.param``), whatever its value, because the
 daemon acts on keys the policy never looks at (``start?checkpoint=..&checkpoint-dir=..``
 hands a host directory to the runtime). The forwarded query is rebuilt from the
-checked pairs, never passed through. A request target with a control, space or
-non-ASCII character is malformed.
+checked pairs, never passed through, and a percent-escape that does not decode to
+UTF-8 is denied (it would otherwise be forwarded as a different value than the one
+checked). A request target with a control, space or non-ASCII character is malformed.
 
 Denial reasons echo at most :data:`MAX_REASON_CHARS` characters (they quote the
 agent's own text and go to the evidence and the 403 body).
@@ -77,6 +90,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import posixpath
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -94,18 +108,21 @@ __all__ = [
     "DEFAULT_PIDS_LIMIT",
     "DIGEST_PATTERN",
     "IMAGE_ROLES",
+    "MAX_ARCHIVE_PATH",
     "MAX_REASON_CHARS",
     "MIN_API_VERSION",
     "ORIGIN",
     "ORIGIN_LABEL",
     "RUN_ID_PATTERN",
     "RUN_LABEL",
+    "STREAM_OPS",
     "ULIMIT_CAPS",
     "AllowedImage",
     "CellContext",
     "Decision",
     "DockerRequest",
     "ImageRef",
+    "PinnedHost",
     "Route",
     "Target",
     "evaluate",
@@ -169,6 +186,10 @@ _PORT_RE = re.compile(r"^[0-9]{1,5}(?:-[0-9]{1,5})?(?:/(?:tcp|udp|sctp))?$")
 
 #: A request target is printable ASCII without spaces (``!`` to ``~``) and nothing else.
 _TARGET_RE = re.compile(r"^[\x21-\x7e]*$")
+#: Longest container path a copy may name, in UTF-8 bytes (Linux ``PATH_MAX``).
+MAX_ARCHIVE_PATH: Final = 4096
+#: Control characters (C0, DEL, C1) never allowed in a decoded copy path; NUL among them.
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 #: Longest denial reason recorded or answered: reasons quote agent text, which is cut.
 MAX_REASON_CHARS: Final = 240
 
@@ -298,6 +319,79 @@ def load_images_lock(
     return tuple(images)
 
 
+#: One RFC 1123 host label: letters, digits and inner hyphens, at most 63 characters.
+_HOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_HOSTNAME_RE = re.compile(rf"^{_HOST_LABEL}(?:\.{_HOST_LABEL})*$")
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedHost:
+    """A name pinned to an address in a container's ``/etc/hosts`` (``name:ip``).
+
+    The cell pins the target's name (to the injector) and ``tap`` in the agent's
+    ``/etc/hosts``; every container cell-guard creates gets exactly the same entries
+    (:attr:`CellContext.extra_hosts`), because its DNS server is the catcher, which
+    answers every other name with its own address. The format is defined here once:
+    ``control/runner/cell_spec.py`` renders both the agent's ``extra_hosts`` and
+    ``LAB_CELLGUARD_EXTRA_HOSTS`` from these objects.
+
+    Only an RFC 1123 host name (dot-separated labels, not itself an address) and an
+    IPv4 literal that can be a container's address (not unspecified, loopback,
+    link-local, multicast, broadcast or reserved) are accepted.
+    """
+
+    name: str
+    ip: str
+
+    def __post_init__(self) -> None:
+        if len(self.name) > 253 or not _HOSTNAME_RE.fullmatch(self.name):
+            raise ValueError(f"pinned host: {self.name!r} is not an RFC 1123 host name")
+        if self.name.replace(".", "").isdigit():
+            raise ValueError(f"pinned host: {self.name!r} is an address, not a name")
+        try:
+            address = ipaddress.IPv4Address(self.ip)
+        except ValueError:
+            reason = f"pinned host {self.name}: {self.ip!r} is not an IPv4 address"
+            raise ValueError(reason) from None
+        unusable = (
+            address.is_unspecified
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_multicast
+            or address.is_reserved
+        )
+        if unusable or str(address) != self.ip:
+            raise ValueError(f"pinned host {self.name}: {self.ip!r} is not a usable address")
+
+    def __str__(self) -> str:
+        return f"{self.name}:{self.ip}"
+
+    @classmethod
+    def parse_all(cls, text: str) -> tuple[PinnedHost, ...]:
+        """``name:ip,name:ip`` as :meth:`render` writes it; anything else is refused.
+
+        No spaces, no empty entries, no repeated name (compared case-insensitively, as
+        resolvers compare names), at least one entry.
+        """
+        if not text:
+            raise ValueError("pinned hosts: none given")
+        hosts: list[PinnedHost] = []
+        for entry in text.split(","):
+            name, colon, ip = entry.partition(":")
+            if not colon:
+                raise ValueError(f"pinned hosts: {entry!r} is not name:ip")
+            hosts.append(cls(name, ip))
+        names = [h.name.lower() for h in hosts]
+        if len(set(names)) != len(names):
+            raise ValueError(f"pinned hosts: a name is repeated in {text!r}")
+        return tuple(hosts)
+
+    @staticmethod
+    def render(hosts: Sequence[PinnedHost]) -> str:
+        """The one-line form :meth:`parse_all` reads (an environment variable's value)."""
+        return ",".join(str(h) for h in hosts)
+
+
 @dataclass(frozen=True, slots=True)
 class CellContext:
     """The cell cell-guard protects: its run, network, allow-list, scratch and limits."""
@@ -318,6 +412,10 @@ class CellContext:
     #: ``<run_id lowercased>-``. It ends with ``-`` and holds no other ``-``, and run
     #: ids hold none, so one cell's prefix is never a prefix of another's.
     name_prefix: str | None = None
+    #: Forced as ``HostConfig.ExtraHosts`` of every created container, replacing what
+    #: the agent asked for: the agent's own pinned names (the target, ``tap``), so a
+    #: container it starts reaches them rather than the catcher.
+    extra_hosts: tuple[PinnedHost, ...] = ()
 
     def __post_init__(self) -> None:
         if not _RUN_ID_RE.fullmatch(self.run_id):
@@ -337,6 +435,11 @@ class CellContext:
         for limit in (self.memory_bytes, self.nano_cpus, self.pids_limit):
             if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
                 raise ValueError(f"limits must be positive integers, got {limit!r}")
+        if not all(isinstance(h, PinnedHost) for h in self.extra_hosts):
+            raise ValueError("extra hosts must be PinnedHost entries")
+        if self.extra_hosts:
+            # one parse of the rendered form repeats every check, duplicates included
+            PinnedHost.parse_all(PinnedHost.render(self.extra_hosts))
 
     @property
     def prefix(self) -> str:
@@ -433,6 +536,7 @@ _ROUTES: Final[tuple[tuple[frozenset[str], re.Pattern[str], str, str | None], ..
     for methods, pattern, op, kind in [
         ("GET HEAD", r"/_ping", "system.ping", None),
         ("GET", r"/version", "system.version", None),
+        # Routed so the denial names it; it has no handler on purpose (host details).
         ("GET", r"/info", "system.info", None),
         ("GET", r"/events", "system.events", None),
         ("GET", r"/system/df", "system.df", None),
@@ -449,6 +553,9 @@ _ROUTES: Final[tuple[tuple[frozenset[str], re.Pattern[str], str, str | None], ..
         ("GET", rf"{_C}/logs", "container.logs", "container"),
         ("POST", rf"{_C}/attach", "container.attach", "container"),
         ("GET", rf"{_C}/attach/ws", "container.attach", "container"),
+        ("HEAD", rf"{_C}/archive", "container.archive.stat", "container"),
+        ("GET", rf"{_C}/archive", "container.archive.get", "container"),
+        ("PUT", rf"{_C}/archive", "container.archive.put", "container"),
         ("POST", rf"{_C}/exec", "exec.create", "container"),
         ("POST", rf"{_E}/start", "exec.start", "exec"),
         ("POST", rf"{_E}/resize", "exec.resize", "exec"),
@@ -991,7 +1098,8 @@ _HOST_CONFIG: Final[_Schema] = {
     "ReadonlyRootfs": _bool,
     "Init": _bool,
     "OomKillDisable": _bool,
-    # The resolver is forced to the cell's; /etc/hosts entries could shadow cell names.
+    # The resolver is forced to the cell's; /etc/hosts entries could shadow cell names,
+    # so the agent's ExtraHosts are denied and the cell's pinned ones forced instead.
     "Dns": _zero("create.field"),
     "DnsOptions": _zero("create.field"),
     "DnsSearch": _zero("create.field"),
@@ -1238,6 +1346,11 @@ def _container_create(r: Route, req: DockerRequest, ctx: CellContext) -> Decisio
     host["NanoCpus"] = _cap(host.get("NanoCpus"), ctx.nano_cpus)
     host["PidsLimit"] = _cap(host.get("PidsLimit"), ctx.pids_limit)
     host["Dns"] = [ctx.dns]
+    forced_hosts: tuple[str, ...] = ()
+    if ctx.extra_hosts:
+        # Replaced, never merged: an agent's own entries are denied by the schema.
+        host["ExtraHosts"] = [str(h) for h in ctx.extra_hosts]
+        forced_hosts = ("HostConfig.ExtraHosts",)
     if body.get("Hostname"):
         _check_dns_name(body["Hostname"], ctx, "create.name", "hostname")
     else:
@@ -1253,6 +1366,7 @@ def _container_create(r: Route, req: DockerRequest, ctx: CellContext) -> Decisio
         "HostConfig.NanoCpus",
         "HostConfig.PidsLimit",
         "HostConfig.Dns",
+        *forced_hosts,
         "name",
     )
     return _allow(
@@ -1288,6 +1402,19 @@ _VOLUME_CREATE: Final[_Schema] = {
 #: Operations that take a request body; every other operation must send none.
 _BODY_OPS: Final = frozenset({"container.create", "exec.create", "exec.start", "volume.create"})
 _UPGRADE_OPS: Final = frozenset({"container.attach", "exec.start"})
+#: Operations whose request body is a stream the proxy relays as it comes, never
+#: buffered and never shown to the policy (a tar archive for ``docker cp``). The policy
+#: decides on the path and query alone; a buffered body on one of them is denied.
+STREAM_OPS: Final = frozenset({"container.archive.put"})
+#: Values accepted for the upload's boolean flags, and the canonical form forwarded.
+#: Docker reads ``no``/``none`` as false while Podman refuses them, so only the forms
+#: both daemons read the same way are accepted.
+_ARCHIVE_FLAGS: Final[Mapping[str, str]] = {
+    "1": "true",
+    "true": "true",
+    "0": "false",
+    "false": "false",
+}
 
 
 def _owned(target: Target | None, kind: str, ctx: CellContext) -> bool:
@@ -1353,6 +1480,81 @@ def _targeted(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
         forced=forced,
         upgrade=r.op in _UPGRADE_OPS,
     )
+
+
+def _archive_path(raw: str) -> str:
+    """The container path of a copy, resolved the way Docker resolves it.
+
+    Docker joins the path to ``/`` and cleans it lexically (``filepath.Join("/", p)``),
+    keeping a trailing ``/.`` (copy a directory's contents) or ``/``
+    (``archive.PreserveTrailingDotOrSeparator``); it then follows symlinks only inside
+    the container's root filesystem. So ``..`` is harmless: it stops at the container's
+    ``/`` and can never name anything outside it. It is still resolved here rather than
+    forwarded, for two reasons: the evidence records the path the daemon acts on, and a
+    daemon that joins the path to its host mount point before cleaning (Podman's path
+    resolution does) never sees a ``..`` at all. Symlinks cannot be checked here (the
+    guard cannot see the container's files); both daemons confine them to the
+    container's root and its mounts, which never include a host path (no bind mounts).
+
+    Denied: a relative path (the daemon would resolve it against the container's
+    working directory, which the policy does not know), any control character (NUL
+    included; ``%00`` decodes to one) and anything longer than :data:`MAX_ARCHIVE_PATH`.
+    """
+    if len(raw.encode("utf-8")) > MAX_ARCHIVE_PATH:
+        raise _Denied("archive.path", f"path is longer than {MAX_ARCHIVE_PATH} bytes")
+    if _CONTROL_RE.search(raw):
+        raise _Denied("archive.path", f"path {raw!r} holds a control character")
+    if not raw.startswith("/"):
+        raise _Denied("archive.path", f"path {raw!r} is not absolute")
+    # posixpath keeps a leading "//" (POSIX allows it to mean something else); Go does not.
+    resolved = posixpath.normpath("/" + raw.lstrip("/"))
+    if posixpath.basename(raw.rstrip("/")) == "." and posixpath.basename(resolved) != ".":
+        resolved = resolved.rstrip("/") + "/."
+    if raw.endswith("/") and not resolved.endswith("/"):
+        resolved += "/"
+    return resolved
+
+
+def _archive_query(r: Route) -> tuple[str, tuple[str, ...]]:
+    """The forwarded query of a copy, and the fields it rewrote.
+
+    Each key at most once (the daemons read the first or the last of a repeated key,
+    and the guard would not know which one it checked). ``path`` is required.
+
+    ``copyUIDGID`` is allowed. Without it the daemon gives extracted files the owners
+    written in the tar headers; with it, every file is owned by the container's own
+    configured user, looked up in the container's ``/etc/passwd``. Either way the
+    numbers are ids inside the container's user namespace (remapped on a rootless or
+    userns-remapped daemon), and the files land only in that container's root
+    filesystem or its mounts: the cell scratch volume, anonymous volumes and tmpfs,
+    never a host path. Root in the container can already create any of those files
+    (``chown``, ``chmod u+s``) with an exec, so neither form gives the agent a file it
+    could not make itself; ``copyUIDGID`` only narrows the owners. The lookup reads the
+    passwd file and loads no libraries from the container (the ``docker cp`` NSS
+    escape, CVE-2019-14271, was fixed in Docker 19.03.1).
+    """
+    pairs = parse_qsl(r.query, keep_blank_values=True)
+    if len({key for key, _ in pairs}) != len(pairs):
+        raise _Denied("archive.query", "repeated query parameter")
+    values = dict(pairs)
+    raw = values.pop("path", "")
+    if not raw:
+        raise _Denied("archive.path", "path is required")
+    resolved = _archive_path(raw)
+    out = [("path", resolved)]
+    for key, value in values.items():
+        flag = _ARCHIVE_FLAGS.get(value.lower())
+        if flag is None:
+            raise _Denied("archive.query", f"{key}={value!r} is not a boolean")
+        out.append((key, flag))
+    return urlencode(out), ("path",) if resolved != raw else ()
+
+
+def _container_archive(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
+    """``docker cp`` on one of this cell's containers: ownership first, then the query."""
+    decision = _targeted(r, req, ctx)
+    query, forced = _archive_query(r)
+    return replace(decision, path=f"{decision.path.partition('?')[0]}?{query}", forced=forced)
 
 
 def _own_list(r: Route, req: DockerRequest, ctx: CellContext) -> Decision:
@@ -1442,6 +1644,9 @@ _HANDLERS: Final[Mapping[str, _Handler]] = {
     "container.remove": _targeted,
     "container.logs": _targeted,
     "container.attach": _targeted,
+    "container.archive.stat": _container_archive,
+    "container.archive.get": _container_archive,
+    "container.archive.put": _container_archive,
     "exec.create": _targeted,
     "exec.start": _targeted,
     "exec.resize": _targeted,
@@ -1475,6 +1680,10 @@ _QUERY_KEYS: Final[Mapping[str, frozenset[str]]] = {
         {"follow", "stdout", "stderr", "since", "until", "timestamps", "tail"}
     ),
     "container.attach": frozenset({"stream", "stdin", "stdout", "stderr", "logs", "detachKeys"}),
+    # The daemons read only ``path`` on a stat or a download; the flags shape an upload.
+    "container.archive.stat": frozenset({"path"}),
+    "container.archive.get": frozenset({"path"}),
+    "container.archive.put": frozenset({"path", "noOverwriteDirNonDir", "copyUIDGID"}),
     "exec.create": frozenset(),
     "exec.start": frozenset(),
     "exec.resize": frozenset({"h", "w"}),
@@ -1499,10 +1708,14 @@ _QUERY_RULES: Final[Mapping[str, str]] = {
 def _checked_query(r: Route) -> Route:
     """``r`` with its query rebuilt from pairs whose keys the operation allows."""
     allowed = _QUERY_KEYS.get(r.op, frozenset())
-    pairs = parse_qsl(r.query, keep_blank_values=True)
+    rule = _QUERY_RULES.get(r.op, "query.param")
+    try:
+        # Strict: a lenient decode would forward U+FFFD in place of the agent's bytes.
+        pairs = parse_qsl(r.query, keep_blank_values=True, errors="strict")
+    except UnicodeDecodeError:
+        raise _Denied(rule, f"query of {r.op} is not valid UTF-8") from None
     for key, _ in pairs:
         if key not in allowed:
-            rule = _QUERY_RULES.get(r.op, "query.param")
             raise _Denied(rule, f"query parameter {key!r} is not allowed on {r.op}")
     return replace(r, query=urlencode(pairs))
 

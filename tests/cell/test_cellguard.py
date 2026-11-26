@@ -12,13 +12,16 @@ Three layers:
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import io
 import json
 import os
 import signal
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -40,6 +43,7 @@ from cell.cellguard.policy import (
     CellContext,
     Decision,
     DockerRequest,
+    PinnedHost,
     Target,
     evaluate,
     load_images_lock,
@@ -60,6 +64,9 @@ DIGEST_B = "sha256:" + "b" * 64
 NETWORK = "lab-cell-net"
 #: The cell resolver (the catcher's DNS) every agent container is forced to use.
 CELL_DNS = "10.89.0.53"
+#: The agent's pinned hosts (the target via the injector, and the tap), forced on every
+#: container cell-guard creates, as cell_spec renders them for LAB_CELLGUARD_EXTRA_HOSTS.
+EXTRA_HOSTS = "target:10.89.0.3,tap:10.89.0.4"
 RUN = new_id("run")
 OTHER_RUN = new_id("run")
 CID = "c" * 64
@@ -79,6 +86,7 @@ def make_ctx(**overrides: Any) -> CellContext:
         "memory_bytes": 1 << 30,
         "nano_cpus": 1_000_000_000,
         "pids_limit": 256,
+        "extra_hosts": PinnedHost.parse_all(EXTRA_HOSTS),
     }
     values.update(overrides)
     return CellContext(**values)
@@ -594,8 +602,9 @@ def test_other_container_operations_are_denied() -> None:
         ("POST", "restart"),
         ("POST", "update"),
         ("POST", "rename?name=x"),
-        ("GET", "archive?path=/"),
-        ("PUT", "archive?path=/"),
+        # docker cp is HEAD, GET and PUT only (tests below); other methods stay denied.
+        ("POST", "archive?path=/"),
+        ("DELETE", "archive?path=/"),
         ("GET", "export"),
         ("POST", "commit"),
         ("GET", "changes"),
@@ -642,6 +651,256 @@ def test_exec_operations_follow_the_owning_container() -> None:
         assert decision.allowed and decision.op == op
         assert decision.upgrade == (op == "exec.start")
         assert not evaluate(DockerRequest(method, path, body, target=theirs), CTX).allowed
+
+
+# --------------------------------------------------------------------------- docker cp (archive)
+
+#: (method, operation) of the three docker cp requests.
+ARCHIVE = [
+    ("HEAD", "container.archive.stat"),
+    ("GET", "container.archive.get"),
+    ("PUT", "container.archive.put"),
+]
+
+
+def archive(method: str, query: str, target: Target | None = None, ref: str = "mine") -> Decision:
+    path = f"/v1.44/containers/{ref}/archive" + (f"?{query}" if query else "")
+    return evaluate(DockerRequest(method, path, target=target or own()), CTX)
+
+
+def forwarded_query(decision: Decision) -> dict[str, list[str]]:
+    return parse_qs(urlsplit(decision.path).query, keep_blank_values=True)
+
+
+@pytest.mark.parametrize(("method", "op"), ARCHIVE)
+@pytest.mark.parametrize("version", ["/v1.44", "/v1.40", ""])
+def test_archive_on_own_container_is_allowed_and_pinned_to_its_id(
+    method: str, op: str, version: str
+) -> None:
+    path = f"{version}/containers/mine/archive?path=/tmp/x"
+    decision = evaluate(DockerRequest(method, path, target=own()), CTX)
+    assert decision.allowed, decision.reason
+    assert (decision.op, decision.rule) == (op, op)
+    assert decision.path == f"{version}/containers/{CID}/archive?path=%2Ftmp%2Fx"
+    assert decision.body == b""
+    assert not decision.upgrade
+    assert decision.forced == ()
+
+
+@pytest.mark.parametrize(("method", "op"), ARCHIVE)
+def test_archive_on_foreign_unknown_or_infrastructure_container_is_denied(
+    method: str, op: str
+) -> None:
+    infra = Target(kind="container", id=OTHER_CID, name="agent", labels=INFRA)
+    unlabelled = Target(kind="container", id=OTHER_CID, name="x", labels={})
+    an_exec = Target(kind="exec", id=CID, name=None, labels=MINE)
+    cases = [(foreign(), "target.not_owned"), (infra, "target.not_owned")]
+    cases += [(unlabelled, "target.not_owned"), (an_exec, "target.not_owned")]
+    for target, rule in cases:
+        decision = archive(method, "path=/etc/passwd", target, ref="theirs")
+        assert (decision.allowed, decision.op, decision.rule) == (False, op, rule), target
+    path = "/v1.44/containers/ghost/archive?path=/"
+    gone = evaluate(DockerRequest(method, path, target=None), CTX)
+    assert (gone.allowed, gone.rule) == (False, "target.unknown")
+    # Ownership is checked first: a bad query on a foreign container is still not_owned.
+    assert archive(method, "path=rel&path=x", foreign(), ref="theirs").rule == "target.not_owned"
+
+
+def test_archive_on_an_old_api_version_is_denied() -> None:
+    path = "/v1.39/containers/mine/archive?path=/tmp"
+    decision = evaluate(DockerRequest("GET", path, target=own()), CTX)
+    assert (decision.allowed, decision.rule) == (False, "api.version")
+
+
+@pytest.mark.parametrize(
+    ("query", "forwarded"),
+    [
+        ("path=/work", {"path": ["/work"]}),
+        (
+            "path=/work&noOverwriteDirNonDir=true",
+            {"path": ["/work"], "noOverwriteDirNonDir": ["true"]},
+        ),
+        ("path=/work&copyUIDGID=1", {"path": ["/work"], "copyUIDGID": ["true"]}),
+        (
+            "copyUIDGID=FALSE&path=/work&noOverwriteDirNonDir=0",
+            {"path": ["/work"], "copyUIDGID": ["false"], "noOverwriteDirNonDir": ["false"]},
+        ),
+        (
+            "path=/work&noOverwriteDirNonDir=True&copyUIDGID=false",
+            {"path": ["/work"], "noOverwriteDirNonDir": ["true"], "copyUIDGID": ["false"]},
+        ),
+    ],
+)
+def test_archive_upload_accepts_its_flags_in_canonical_form(
+    query: str, forwarded: dict[str, list[str]]
+) -> None:
+    decision = archive("PUT", query)
+    assert decision.allowed, decision.reason
+    assert forwarded_query(decision) == forwarded
+    # The path always goes first; the flags follow in the order they were sent.
+    assert urlsplit(decision.path).query.startswith("path=")
+
+
+@pytest.mark.parametrize("value", ["", "yes", "no", "none", "on", "2", "t", "%20true", "tru%65x"])
+@pytest.mark.parametrize("flag", ["noOverwriteDirNonDir", "copyUIDGID"])
+def test_archive_upload_flags_must_be_plain_booleans(flag: str, value: str) -> None:
+    decision = archive("PUT", f"path=/tmp&{flag}={value}")
+    assert (decision.allowed, decision.rule) == (False, "archive.query"), value
+
+
+@pytest.mark.parametrize("method", ["HEAD", "GET"])
+@pytest.mark.parametrize("flag", ["noOverwriteDirNonDir=true", "copyUIDGID=true"])
+def test_stat_and_download_take_only_a_path(method: str, flag: str) -> None:
+    decision = archive(method, f"path=/tmp&{flag}")
+    assert (decision.allowed, decision.rule) == (False, "query.param")
+
+
+@pytest.mark.parametrize(("method", "op"), ARCHIVE)
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "bogus=1",
+        "rename=%7B%7D",  # Podman's libpod-only rename map
+        "pause=false",  # Podman's libpod-only pause switch
+        "Path=/etc",  # keys are case-sensitive
+        "PATH=/etc",
+        "path%00=/etc",
+        "=x",
+        "followLink=1",
+    ],
+)
+def test_archive_denies_any_other_query_key(method: str, op: str, extra: str) -> None:
+    decision = archive(method, f"path=/tmp&{extra}")
+    assert (decision.allowed, decision.op, decision.rule) == (False, op, "query.param"), extra
+
+
+@pytest.mark.parametrize(("method", "op"), ARCHIVE)
+@pytest.mark.parametrize(
+    "query",
+    [
+        "path=/tmp&path=/etc",
+        "path=/tmp&path=/tmp",
+        "path=/a&path=",
+        "path=/tmp&copyUIDGID=true&copyUIDGID=false",
+        "path=/tmp&noOverwriteDirNonDir=1&noOverwriteDirNonDir=1",
+    ],
+)
+def test_archive_denies_repeated_keys(method: str, op: str, query: str) -> None:
+    decision = archive(method, query)
+    # GET and HEAD refuse the upload flags as unknown keys before they count as repeats.
+    flags = "UIDGID" in query or "NonDir" in query
+    rule = "query.param" if flags and method != "PUT" else "archive.query"
+    assert (decision.allowed, decision.op, decision.rule) == (False, op, rule)
+
+
+@pytest.mark.parametrize(("method", "op"), ARCHIVE)
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",  # no path at all
+        "path=",
+        "path",
+        "path=tmp/x",  # relative: the daemon would resolve it against WORKDIR
+        "path=./x",
+        "path=..",
+        "path=%20/tmp",
+        "path=/tmp/a%00b",  # %00 decodes to NUL
+        "path=%00",
+        "path=/tmp%0a",
+        "path=/tmp/x%0d%0aX-Evil:%201",  # a header-smuggling attempt
+        "path=/tmp%09x",
+        "path=/tmp%7f",
+        "path=/tmp%c2%85",  # NEL, a C1 control
+    ],
+)
+def test_archive_denies_missing_relative_or_control_paths(method: str, op: str, query: str) -> None:
+    decision = archive(method, query)
+    assert (decision.allowed, decision.op, decision.rule) == (False, op, "archive.path"), query
+    assert "\r" not in decision.reason and "\n" not in decision.reason
+
+
+@pytest.mark.parametrize(
+    ("path", "resolved"),
+    [
+        ("/", "/"),
+        ("/work", "/work"),
+        ("/work/", "/work/"),  # a trailing slash means "must be a directory"
+        ("/src/.", "/src/."),  # copy a directory's contents
+        ("/src/./", "/src/./"),
+        ("/.", "/."),
+        ("/..", "/"),
+        ("/../../../etc/passwd", "/etc/passwd"),  # `..` stops at the container's root
+        ("/work/../etc/shadow", "/etc/shadow"),
+        ("/a/b/../../..", "/"),
+        ("/a/b/../..//../c/.", "/c/."),
+        ("//etc//passwd", "/etc/passwd"),  # Go's Clean folds a leading "//"; posixpath not
+        ("///", "/"),
+        ("/a/./b/.//c", "/a/b/c"),
+        ("/a\\..\\b", "/a\\..\\b"),  # a backslash is an ordinary file name character
+        ("/work/café/日本", "/work/café/日本"),
+        ("/work/a b+c", "/work/a b+c"),
+    ],
+)
+def test_archive_path_is_resolved_the_way_docker_resolves_it(path: str, resolved: str) -> None:
+    decision = archive("GET", "path=" + quote(path, safe=""))
+    assert decision.allowed, decision.reason
+    assert forwarded_query(decision)["path"] == [resolved]
+    assert ".." not in forwarded_query(decision)["path"][0].split("/")
+    assert decision.forced == (() if resolved == path else ("path",))
+
+
+def test_archive_path_length_is_capped_and_the_reason_with_it() -> None:
+    at_cap = "/" + "a" * (policy.MAX_ARCHIVE_PATH - 1)
+    assert archive("GET", f"path={at_cap}").allowed
+    over = archive("GET", f"path={at_cap}a")
+    assert (over.allowed, over.rule) == (False, "archive.path")
+    # The cap counts UTF-8 bytes, not characters.
+    wide = "/" + "é" * (policy.MAX_ARCHIVE_PATH // 2)
+    assert archive("GET", "path=" + quote(wide)).rule == "archive.path"
+    huge = archive("PUT", "path=/" + "%41" * 60_000)
+    assert (huge.allowed, huge.rule) == (False, "archive.path")
+    assert len(huge.reason) <= policy.MAX_REASON_CHARS
+
+
+def test_archive_query_that_is_not_utf8_is_denied() -> None:
+    for query in ("path=/tmp/%ff", "path=/%c3", "path=/%ed%a0%80"):
+        decision = archive("GET", query)
+        assert (decision.allowed, decision.rule) == (False, "query.param"), query
+
+
+def test_archive_unicode_path_is_forwarded_as_utf8() -> None:
+    decision = archive("PUT", "path=%2Ftmp%2F%E6%97%A5%F0%9F%92%A5")
+    assert decision.allowed
+    assert decision.path.endswith("?path=%2Ftmp%2F%E6%97%A5%F0%9F%92%A5")
+
+
+def test_archive_raw_control_or_non_ascii_targets_are_malformed() -> None:
+    for path in (
+        "/v1.44/containers/mine/archive?path=/tmp\r\nX-Evil: 1",
+        "/v1.44/containers/mine/archive?path=/tmp\x00",
+        "/v1.44/containers/mine/archive?path=/té",
+        "/v1.44/containers/mine/archive?path=/a b",
+        "/v1.44/containers/mine/../json/archive?path=/",
+    ):
+        decision = evaluate(DockerRequest("GET", path, target=own()), CTX)
+        assert (decision.allowed, decision.rule) == (False, "path.malformed"), path
+
+
+@pytest.mark.parametrize(("method", "op"), ARCHIVE)
+def test_archive_bodies_never_reach_the_policy(method: str, op: str) -> None:
+    """The upload is streamed by the proxy; a buffered body is a wiring error."""
+    path = "/v1.44/containers/mine/archive?path=/tmp"
+    decision = evaluate(DockerRequest(method, path, b"tar bytes", target=own()), CTX)
+    assert (decision.allowed, decision.rule) == (False, "body.unexpected")
+    assert (op in policy.STREAM_OPS) == (method == "PUT")
+
+
+@pytest.mark.parametrize("path", ["/info", "/v1.44/info", "/v1.40/info"])
+def test_daemon_info_stays_denied(path: str) -> None:
+    decision = evaluate(DockerRequest("GET", path), CTX)
+    assert (decision.allowed, decision.op, decision.rule) == (False, "system.info", "system.info")
+    assert not evaluate(DockerRequest("HEAD", path), CTX).allowed
+    assert not evaluate(DockerRequest("GET", path + "?format=json"), CTX).allowed
 
 
 OWN_FILTER = [f"{RUN_LABEL}={RUN}", f"{ORIGIN_LABEL}={ORIGIN}"]
@@ -863,6 +1122,7 @@ def test_forwarded_create_body_is_rebuilt_not_passed_through() -> None:
         "NanoCpus",
         "PidsLimit",
         "Dns",
+        "ExtraHosts",
     }
     assert body["Image"] == ALP
     assert not create({"Image": IMG, "Healthcheck": {"Test": ["x"], "Escape": 1}}).allowed
@@ -1289,6 +1549,14 @@ QUERY_OPS = [
     ),
     ("GET", "/v1.44/containers/{c}/attach/ws", "container", "stream=1&stdout=1&logs=0"),
     ("POST", "/v1.44/containers/{c}/resize", "container", "h=10&w=80"),
+    ("HEAD", "/v1.44/containers/{c}/archive", "container", "path=/tmp"),
+    ("GET", "/v1.44/containers/{c}/archive", "container", "path=/tmp"),
+    (
+        "PUT",
+        "/v1.44/containers/{c}/archive",
+        "container",
+        "path=/tmp&noOverwriteDirNonDir=true&copyUIDGID=false",
+    ),
     ("GET", "/v1.44/containers/{c}/json", "container", "size=1"),
     ("DELETE", "/v1.44/containers/{c}", "container", "force=1&link=0&v=1"),
     ("POST", "/v1.44/exec/{e}/resize", "exec", "h=10&w=80"),
@@ -1470,11 +1738,161 @@ def test_prefixed_names_are_allowed_and_dns_is_forced() -> None:
         "Aliases": [f"{prefix}web", f"{prefix}api"]
     }
     assert body["HostConfig"]["Dns"] == [CELL_DNS]
-    assert not {"DnsSearch", "DnsOptions", "ExtraHosts"} & set(body["HostConfig"])
+    assert not {"DnsSearch", "DnsOptions"} & set(body["HostConfig"])
+    # An empty request is no request: the cell's pinned hosts are forced all the same.
+    assert body["HostConfig"]["ExtraHosts"] == EXTRA_HOSTS.split(",")
     # Without a hostname the daemon uses the short id: fine.
     assert "Hostname" not in allowed_create({"Image": IMG, "Hostname": ""})
     assert allowed_create({"Image": IMG})["HostConfig"]["Dns"] == [CELL_DNS]
     assert "HostConfig.Dns" in create({"Image": IMG}).forced
+
+
+# --------------------------------------------------------------------------- pinned hosts
+
+
+def test_created_containers_get_exactly_the_cells_pinned_hosts() -> None:
+    decision = create({"Image": IMG})
+    assert decision.allowed
+    assert json.loads(decision.body)["HostConfig"]["ExtraHosts"] == [
+        "target:10.89.0.3",
+        "tap:10.89.0.4",
+    ]
+    assert "HostConfig.ExtraHosts" in decision.forced
+    # Every form of an agent-chosen entry is refused, never merged with the forced ones.
+    for asked in (
+        ["target:10.89.0.66"],
+        ["target:10.89.0.3"],  # even the very entry the cell would force
+        ["tap:10.89.0.4", "evil:1.2.3.4"],
+        "target:10.89.0.66",
+        {"target": "10.89.0.66"},
+        [""],
+    ):
+        denied = create({"Image": IMG, "HostConfig": {"ExtraHosts": asked}})
+        assert (denied.allowed, denied.rule) == (False, "create.field"), asked
+    # A case-folded twin cannot slip one in either.
+    twin = create({"Image": IMG, "HostConfig": {"extrahosts": ["target:10.89.0.66"]}})
+    assert (twin.allowed, twin.rule) == (False, "body.shadow_key")
+
+
+def test_a_cell_without_pinned_hosts_forces_none() -> None:
+    bare = make_ctx(extra_hosts=())
+    body = json.dumps({"Image": IMG}).encode()
+    decision = evaluate(DockerRequest("POST", "/v1.44/containers/create", body), bare)
+    assert decision.allowed
+    assert "ExtraHosts" not in json.loads(decision.body)["HostConfig"]
+    assert "HostConfig.ExtraHosts" not in decision.forced
+
+
+@pytest.mark.parametrize(
+    ("text", "hosts"),
+    [
+        (EXTRA_HOSTS, [("target", "10.89.0.3"), ("tap", "10.89.0.4")]),
+        ("tap:172.18.0.4", [("tap", "172.18.0.4")]),  # the smoke lane pins the tap alone
+        ("juice-shop.local:192.168.7.9", [("juice-shop.local", "192.168.7.9")]),
+        ("a:10.0.0.1,b:10.0.0.1", [("a", "10.0.0.1"), ("b", "10.0.0.1")]),
+        ("x" * 63 + ":10.0.0.1", [("x" * 63, "10.0.0.1")]),
+    ],
+)
+def test_pinned_hosts_parse_and_render_round_trip(text: str, hosts: list[tuple[str, str]]) -> None:
+    parsed = PinnedHost.parse_all(text)
+    assert [(h.name, h.ip) for h in parsed] == hosts
+    assert PinnedHost.render(parsed) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        ",",
+        "target:10.89.0.3,",  # an empty entry
+        ",target:10.89.0.3",
+        "target:10.89.0.3,,tap:10.89.0.4",
+        "target:10.89.0.3,tap:10.89.0.4,target:10.89.0.9",  # a repeated name
+        "target:10.89.0.3,TARGET:10.89.0.9",  # names compare case-insensitively
+        "target:10.89.0.3\ntap:10.89.0.4",  # a newline instead of a comma
+        "target:10.89.0.3\nevil:1.2.3.4",
+        "target:10.89.0.3\r\n",
+        "target:10.89.0.3 ",
+        " target:10.89.0.3",
+        "target :10.89.0.3",
+        "target:10.89.0.3;tap:10.89.0.4",
+        "target=10.89.0.3",
+        "target",
+        "target:",
+        ":10.89.0.3",
+        "target:10.89.0.3:80",
+        "target:fd00::3",  # IPv6
+        "target:::1",
+        "target:[fd00::3]",
+        "target:0.0.0.0",  # unspecified
+        "target:127.0.0.1",  # loopback
+        "target:169.254.0.3",  # link-local
+        "target:224.0.0.1",  # multicast
+        "target:255.255.255.255",  # broadcast
+        "target:240.0.0.1",  # reserved
+        "target:010.089.000.003",  # leading zeros (octal on some resolvers)
+        "target:10.89.3",  # inet_aton shorthand
+        "target:0x0a.0.0.3",
+        "target:10.89.0.300",
+        "target:10.89.0.3/24",
+        "-target:10.89.0.3",  # a label may not start or end with a hyphen
+        "target-:10.89.0.3",
+        "tar_get:10.89.0.3",
+        "target..lab:10.89.0.3",
+        ".target:10.89.0.3",
+        "target.:10.89.0.3",
+        "x" * 64 + ":10.0.0.1",  # a label over 63 characters
+        ".".join(["x" * 63] * 4) + ":10.0.0.1",  # a name over 253 characters
+        "10.89.0.3:10.89.0.3",  # a name that is an address
+        "t\u00e4rget:10.89.0.3",  # not ASCII
+        "target:10.89.0.3\x00",
+        "*:10.89.0.3",
+    ],
+)
+def test_pinned_hosts_refuse_anything_else(text: str) -> None:
+    with pytest.raises(ValueError, match="pinned host"):
+        PinnedHost.parse_all(text)
+
+
+def test_cell_context_checks_its_pinned_hosts() -> None:
+    target = PinnedHost("target", "10.89.0.3")
+    with pytest.raises(ValueError, match="repeated"):
+        make_ctx(extra_hosts=(target, PinnedHost("Target", "10.89.0.4")))
+    with pytest.raises(ValueError, match="PinnedHost"):
+        make_ctx(extra_hosts=("target:10.89.0.3",))
+    assert make_ctx(extra_hosts=(target,)).extra_hosts == (target,)
+
+
+@pytest.mark.parametrize(
+    "value", ["", "target:0.0.0.0,tap:10.89.0.4", "target:10.89.0.3\nevil:1.2.3.4", "tap:::1"]
+)
+def test_cell_guard_refuses_to_start_without_valid_pinned_hosts(tmp_path: Path, value: str) -> None:
+    with short_tmp() as d:
+        env = {**_guard_env(tmp_path, d), "LAB_CELLGUARD_EXTRA_HOSTS": value}
+        with pytest.raises(ValueError, match=r"LAB_CELLGUARD_EXTRA_HOSTS|pinned host"):
+            CellGuardConfig.from_env(env)
+
+
+def test_cell_guard_process_exits_2_on_malformed_pinned_hosts(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[2]
+    with short_tmp() as d:
+        env = {
+            **os.environ,
+            "PYTHONPATH": str(root),
+            **_guard_env(tmp_path, d),
+            "LAB_CELLGUARD_EXTRA_HOSTS": "target:10.89.0.3,target:10.89.0.4",
+        }
+        done = subprocess.run(
+            [sys.executable, "-m", "cell.cellguard.proxy"],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        assert done.returncode == 2, done.stderr
+        assert b"repeated" in done.stderr
+        assert not (d / "guard.sock").exists()  # it never listened
 
 
 def test_cell_dns_must_be_an_ip_address() -> None:
@@ -1698,6 +2116,7 @@ def test_only_agent_role_images_are_allowed(tmp_path: Path) -> None:
         "LAB_RUN_ID": RUN,
         "LAB_CELLGUARD_NETWORK": NETWORK,
         "LAB_CELLGUARD_DNS": CELL_DNS,
+        "LAB_CELLGUARD_EXTRA_HOSTS": EXTRA_HOSTS,
         "LAB_CELLGUARD_IMAGES_LOCK": str(lock),
         "LAB_EVIDENCE_DIR": str(tmp_path / "ev"),
     }
@@ -1719,6 +2138,7 @@ def test_config_from_env(tmp_path: Path) -> None:
         "LAB_CELLGUARD_UPSTREAM": "/var/run/docker.sock",
         "LAB_CELLGUARD_NETWORK": NETWORK,
         "LAB_CELLGUARD_DNS": CELL_DNS,
+        "LAB_CELLGUARD_EXTRA_HOSTS": EXTRA_HOSTS,
         "LAB_CELLGUARD_IMAGES_LOCK": str(lock),
         "LAB_CELLGUARD_SCRATCH_VOLUME": "lab-scratch",
         "LAB_CELLGUARD_MEMORY": "268435456",
@@ -1742,6 +2162,7 @@ def test_config_from_env(tmp_path: Path) -> None:
         CellGuardConfig.from_env({**env, "LAB_CELLGUARD_NAME_PREFIX": "a-b-"})
     assert config.listen == tmp_path / "guard.sock"
     assert config.context.dns == CELL_DNS
+    assert PinnedHost.render(config.context.extra_hosts) == EXTRA_HOSTS
     with pytest.raises(ValueError):
         CellGuardConfig.from_env({**env, "LAB_CELLGUARD_DNS": "not-an-ip"})
     for missing in [
@@ -1749,6 +2170,7 @@ def test_config_from_env(tmp_path: Path) -> None:
         "LAB_CELLGUARD_NETWORK",
         "LAB_CELLGUARD_IMAGES_LOCK",
         "LAB_CELLGUARD_DNS",
+        "LAB_CELLGUARD_EXTRA_HOSTS",
     ]:
         with pytest.raises(ValueError):
             CellGuardConfig.from_env({k: v for k, v in env.items() if k != missing})
@@ -1769,8 +2191,38 @@ def short_tmp() -> Iterator[Path]:
         yield Path(d)
 
 
+def make_tar(name: str, data: bytes) -> bytes:
+    """A one-file tar archive, as ``docker cp`` sends and receives them."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+#: What a daemon answers to ``HEAD``/``GET /containers/{id}/archive``: the path's stat as
+#: base64 JSON in a header, and for ``GET`` the tar, chunked (Docker sends no length).
+ARCHIVE_STAT = {"name": "x", "size": 5, "mode": 420, "mtime": "2026-11-26T00:00:00Z"}
+ARCHIVE_STAT_HEADER = base64.b64encode(json.dumps(ARCHIVE_STAT).encode()).decode()
+ARCHIVE_TAR = make_tar("x", b"hello")
+ARCHIVE_HEAD = (
+    "HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\n"
+    f"X-Docker-Container-Path-Stat: {ARCHIVE_STAT_HEADER}\r\nConnection: close\r\n"
+).encode()
+ARCHIVE_STAT_RESPONSE = ARCHIVE_HEAD + b"\r\n"
+ARCHIVE_GET_RESPONSE = (
+    ARCHIVE_HEAD
+    + b"Transfer-Encoding: chunked\r\n\r\n"
+    + f"{len(ARCHIVE_TAR):x}\r\n".encode()
+    + ARCHIVE_TAR
+    + b"\r\n0\r\n\r\n"
+)
+
+
 class FakeDaemon:
-    """A minimal upstream: canned JSON per route, plus a hijacking echo on exec start."""
+    """A minimal upstream: canned JSON per route, a hijacking echo on exec start, and
+    ``docker cp`` (a stat header, a tar download, an upload taken as it arrives)."""
 
     def __init__(self, sock: Path) -> None:
         self.sock = sock
@@ -1787,6 +2239,10 @@ class FakeDaemon:
         }
         self.execs = {"e1": {"ID": "e1", "ContainerID": CID}}
         self.server: asyncio.Server | None = None
+        #: The upload received so far (visible while it is still arriving).
+        self.uploaded = bytearray()
+        #: Requests whose body ended early (the proxy cut them off).
+        self.cut_off = 0
 
     async def start(self) -> None:
         self.server = await asyncio.start_unix_server(self._handle, path=str(self.sock))
@@ -1806,10 +2262,13 @@ class FakeDaemon:
                 k.strip().lower(): v.strip()
                 for k, _, v in (line.partition(":") for line in lines[1:] if line)
             }
-            body = await reader.readexactly(int(headers.get("content-length", "0")))
             path = urlsplit(target).path
-            self.requests.append((method, target, headers, body))
             base = path.removeprefix("/v1.44")
+            if base.endswith("/archive"):
+                await self._archive(method, target, headers, reader, writer)
+                return
+            body = await reader.readexactly(int(headers.get("content-length", "0")))
+            self.requests.append((method, target, headers, body))
             if base.startswith("/exec/") and base.endswith("/start"):
                 writer.write(
                     b"HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream"
@@ -1828,8 +2287,47 @@ class FakeDaemon:
                 + raw
             )
             await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            self.cut_off += 1
         finally:
             writer.close()
+
+    async def _archive(
+        self,
+        method: str,
+        target: str,
+        headers: dict[str, str],
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        if method in ("HEAD", "GET"):
+            self.requests.append((method, target, headers, b""))
+            writer.write(ARCHIVE_GET_RESPONSE if method == "GET" else ARCHIVE_STAT_RESPONSE)
+            await writer.drain()
+            return
+        if "path=%2Fmissing" in target:  # answers at once, never reading the upload
+            writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}")
+            await writer.drain()
+            return
+        self.uploaded = bytearray()
+        if headers.get("transfer-encoding") == "chunked":
+            while size := int((await reader.readuntil(b"\r\n"))[:-2], 16):
+                self.uploaded += await reader.readexactly(size)
+                if await reader.readexactly(2) != b"\r\n":
+                    raise asyncio.IncompleteReadError(b"", 2)
+            if await reader.readuntil(b"\r\n") != b"\r\n":
+                raise asyncio.IncompleteReadError(b"", 2)
+        else:
+            remaining = int(headers.get("content-length", "0"))
+            while remaining:
+                data = await reader.read(min(remaining, 4096))
+                if not data:
+                    raise asyncio.IncompleteReadError(b"", remaining)
+                self.uploaded += data
+                remaining -= len(data)
+        self.requests.append((method, target, headers, bytes(self.uploaded)))
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        await writer.drain()
 
     def _respond(self, method: str, base: str) -> tuple[int, dict[str, Any] | bytes]:
         parts = base.strip("/").split("/")
@@ -2175,6 +2673,280 @@ async def test_proxy_403_body_caps_echoed_agent_text(tmp_path: Path) -> None:
     assert len(record["reason"]) <= policy.MAX_REASON_CHARS
 
 
+# --------------------------------------------------------------------------- proxy: docker cp
+
+ARCHIVE_PATH = "/v1.44/containers/mine/archive?path=%2Ftmp"
+PINNED_ARCHIVE = f"/v1.44/containers/{CID}/archive?path=%2Ftmp"
+
+
+def uploads(daemon: FakeDaemon) -> list[tuple[str, str, dict[str, str], bytes]]:
+    """The uploads the daemon received whole (ownership lookups are left out)."""
+    return [r for r in daemon.requests if r[0] == "PUT"]
+
+
+def chunked(*parts: bytes) -> bytes:
+    return b"".join(f"{len(p):x}\r\n".encode() + p + b"\r\n" for p in parts) + b"0\r\n\r\n"
+
+
+def put_head(path: str, framing: str, extra: str = "") -> bytes:
+    return (
+        f"PUT {path} HTTP/1.1\r\nHost: docker\r\nContent-Type: application/x-tar\r\n"
+        f"{framing}\r\n{extra}\r\n"
+    ).encode()
+
+
+def lenient_call(sock: Path, raw: bytes) -> bytes:
+    """Send ``raw`` even if the peer stops reading it, then read what the peer answered.
+
+    A server that answers before reading the whole body closes on unread data, which
+    resets the connection; the kernel still hands over what it answered first (an
+    asyncio reader would drop it), so this reads with a plain blocking socket.
+    """
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(10)
+        conn.connect(str(sock))
+        with contextlib.suppress(OSError):
+            conn.sendall(raw)
+        data = b""
+        with contextlib.suppress(OSError):
+            while chunk := conn.recv(65536):
+                data += chunk
+    return data
+
+
+async def until(predicate: Callable[[], bool], timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "condition never held"
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize(
+    ("method", "op", "expected"),
+    [
+        ("HEAD", "container.archive.stat", ARCHIVE_STAT_RESPONSE),
+        ("GET", "container.archive.get", ARCHIVE_GET_RESPONSE),
+    ],
+)
+async def test_proxy_relays_archive_stat_and_download_as_is(
+    tmp_path: Path, method: str, op: str, expected: bytes
+) -> None:
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        resp = await call(sock, req(method, "/v1.44/containers/mine/archive?path=/tmp/../tmp/x"))
+        assert resp == expected  # byte for byte, the stat header and chunked tar included
+        head = resp.split(b"\r\n\r\n", 1)[0].decode()
+        stat = head.split("X-Docker-Container-Path-Stat: ", 1)[1].split("\r\n", 1)[0]
+        assert json.loads(base64.b64decode(stat)) == ARCHIVE_STAT
+        forwarded = [(m, t) for m, t, _, _ in daemon.requests if not t.endswith("/json")]
+        assert forwarded == [(method, f"/v1.44/containers/{CID}/archive?path=%2Ftmp%2Fx")]
+    [record] = records_of(tmp_path)
+    assert (record["op"], record["allowed"], record["target"]) == (op, True, CID)
+    assert record["forced"] == ["path"]
+
+
+async def test_proxy_streams_an_upload_without_buffering_it(tmp_path: Path) -> None:
+    first, rest = b"a" * 50_000, b"b" * 50_000
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        reader, writer = await asyncio.open_unix_connection(str(sock))
+        writer.write(put_head(ARCHIVE_PATH, f"Content-Length: {len(first) + len(rest)}") + first)
+        await writer.drain()
+        # The daemon has the first half while the client still holds the second.
+        await until(lambda: len(daemon.uploaded) == len(first))
+        writer.write(rest)
+        await writer.drain()
+        resp = await asyncio.wait_for(reader.read(), timeout=5)
+        writer.close()
+        assert resp.startswith(b"HTTP/1.1 200")
+        [(_m, target, headers, body)] = uploads(daemon)
+        assert (target, body) == (PINNED_ARCHIVE, first + rest)
+        assert headers["content-length"] == str(len(first) + len(rest))
+        assert headers["content-type"] == "application/x-tar"
+        assert "transfer-encoding" not in headers
+    [record] = records_of(tmp_path)
+    assert (record["op"], record["allowed"]) == ("container.archive.put", True)
+    # The record describes the empty body the policy saw, never the archive.
+    assert record["body_bytes"] == 0
+
+
+async def test_proxy_reframes_chunked_uploads(tmp_path: Path) -> None:
+    tar = make_tar("upload.txt", b"x" * 3000)
+    parts = [tar[:100], tar[100:2000], tar[2000:]]
+    # A chunk extension and a trailer: neither may reach the daemon.
+    body = f"{len(parts[0]):x};ext=1\r\n".encode() + parts[0] + b"\r\n" + chunked(*parts[1:])
+    body = body.removesuffix(b"0\r\n\r\n") + b"0\r\nX-Trailer: evil\r\n\r\n"
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        resp = await call(sock, put_head(ARCHIVE_PATH, "Transfer-Encoding: chunked") + body)
+        assert resp.startswith(b"HTTP/1.1 200")
+        [(_m, _t, headers, received)] = uploads(daemon)
+        assert received == tar
+        assert headers["transfer-encoding"] == "chunked"
+        assert "content-length" not in headers
+        assert b"evil" not in daemon.raw_heads[-1] and b"ext=" not in daemon.raw_heads[-1]
+
+
+async def test_proxy_upload_beyond_the_json_body_limit_passes(tmp_path: Path) -> None:
+    big = b"z" * (proxy.MAX_BODY + 1024)
+    assert len(big) < proxy.MAX_STREAM_BODY
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        resp = await call(sock, put_head(ARCHIVE_PATH, f"Content-Length: {len(big)}") + big)
+        assert resp.startswith(b"HTTP/1.1 200")
+        assert uploads(daemon)[0][3] == big
+        # A JSON body that size is still refused.
+        resp = await asyncio.to_thread(
+            lenient_call, sock, req("POST", "/v1.44/containers/create", big)
+        )
+        assert resp.startswith(b"HTTP/1.1 413")
+
+
+async def test_proxy_caps_uploads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(proxy, "MAX_STREAM_BODY", 1024)
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        # Declared over the cap: refused before the policy, nothing forwarded.
+        resp = await call(sock, put_head(ARCHIVE_PATH, "Content-Length: 1025") + b"x" * 1025)
+        assert resp.startswith(b"HTTP/1.1 413")
+        assert daemon.requests == []
+        # Exactly the cap passes.
+        resp = await call(sock, put_head(ARCHIVE_PATH, "Content-Length: 1024") + b"x" * 1024)
+        assert resp.startswith(b"HTTP/1.1 200")
+        assert len(uploads(daemon)) == 1
+        # A chunked stream that crosses the cap is cut off at the chunk that would cross
+        # it: the daemon never gets more than the cap, nor a complete upload.
+        stream = chunked(b"a" * 600, b"b" * 600)
+        resp = await call(sock, put_head(ARCHIVE_PATH, "Transfer-Encoding: chunked") + stream)
+        assert resp.startswith(b"HTTP/1.1 413")
+        await until(lambda: daemon.cut_off == 1)
+        assert bytes(daemon.uploaded) == b"a" * 600
+        assert len(uploads(daemon)) == 1
+    records = [(r["allowed"], r["rule"], r["op"]) for r in records_of(tmp_path)]
+    assert records == [
+        (False, "http.413", "container.archive.put"),
+        (True, "container.archive.put", "container.archive.put"),
+        (True, "container.archive.put", "container.archive.put"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("framing", "sent"),
+    [
+        ("Content-Length: 1000", b"x" * 400),
+        ("Content-Length: 1000", b""),
+        ("Transfer-Encoding: chunked", b"100\r\n" + b"x" * 10),
+        ("Transfer-Encoding: chunked", b"10\r\n" + b"x" * 16 + b"\r\n"),  # no last chunk
+        ("Transfer-Encoding: chunked", b"zz\r\n"),  # malformed chunk size
+        ("Transfer-Encoding: chunked", b"4\r\nabcdXX"),  # chunk without its CRLF
+    ],
+)
+async def test_proxy_cuts_off_a_truncated_or_malformed_upload(
+    tmp_path: Path, framing: str, sent: bytes
+) -> None:
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        reader, writer = await asyncio.open_unix_connection(str(sock))
+        writer.write(put_head(ARCHIVE_PATH, framing) + sent)
+        await writer.drain()
+        writer.write_eof()
+        resp = await asyncio.wait_for(reader.read(), timeout=5)
+        writer.close()
+        assert resp.startswith(b"HTTP/1.1 400"), resp
+        await until(lambda: daemon.cut_off == 1)
+        assert uploads(daemon) == []  # the daemon never saw a complete upload
+
+
+async def test_proxy_relays_the_daemons_early_answer_to_an_upload(tmp_path: Path) -> None:
+    big = b"x" * (2 << 20)  # more than the socket buffers hold
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        path = "/v1.44/containers/mine/archive?path=/missing"
+        raw = put_head(path, f"Content-Length: {len(big)}") + big
+        resp = await asyncio.to_thread(lenient_call, sock, raw)
+        assert resp.startswith(b"HTTP/1.1 404"), resp[:80]
+        assert uploads(daemon) == []
+
+
+async def test_proxy_answers_expect_continue_only_once_an_upload_is_allowed(
+    tmp_path: Path,
+) -> None:
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        reader, writer = await asyncio.open_unix_connection(str(sock))
+        writer.write(put_head(ARCHIVE_PATH, "Content-Length: 5", "Expect: 100-continue\r\n"))
+        await writer.drain()
+        interim = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+        assert interim == b"HTTP/1.1 100 Continue\r\n\r\n"
+        writer.write(b"hello")
+        await writer.drain()
+        assert (await asyncio.wait_for(reader.read(), timeout=5)).startswith(b"HTTP/1.1 200")
+        writer.close()
+        assert "expect" not in uploads(daemon)[0][2]
+        # A denied upload gets its 403 straight away, never a 100.
+        theirs = "/v1.44/containers/theirs/archive?path=/tmp"
+        resp = await call(sock, put_head(theirs, "Content-Length: 5", "Expect: 100-continue\r\n"))
+        assert resp.startswith(b"HTTP/1.1 403")
+
+
+async def test_proxy_denies_uploads_to_foreign_containers_unread(tmp_path: Path) -> None:
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        theirs = "/v1.44/containers/theirs/archive?path=/tmp"
+        raw = put_head(theirs, "Content-Length: 300000") + b"x" * 300_000
+        resp = await asyncio.to_thread(lenient_call, sock, raw)
+        assert resp.startswith(b"HTTP/1.1 403") and b"target.not_owned" in resp
+        resp = await call(sock, req("GET", "/v1.44/containers/ghost/archive?path=/etc"))
+        assert resp.startswith(b"HTTP/1.1 403") and b"target.unknown" in resp
+        # Only the ownership lookups reached the daemon; the upload was never read.
+        assert all((m, t[-5:]) == ("GET", "/json") for m, t, _h, _b in daemon.requests)
+        assert daemon.uploaded == bytearray()
+
+
+async def test_proxy_upload_cannot_smuggle_a_second_request(tmp_path: Path) -> None:
+    smuggled = b"GET /v1.44/info HTTP/1.1\r\nHost: docker\r\n\r\n"
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        raw = put_head(ARCHIVE_PATH, "Content-Length: 10") + b"0123456789" + smuggled
+        resp = await call(sock, raw)
+        assert resp.startswith(b"HTTP/1.1 200")
+        assert resp.count(b"HTTP/1.1") == 1
+        assert [(m, b) for m, _t, _h, b in uploads(daemon)] == [("PUT", b"0123456789")]
+        assert not any("/info" in t for _m, t, _h, _b in daemon.requests)
+
+
+@pytest.mark.parametrize(
+    ("raw", "status", "rule"),
+    [
+        # An encoded CRLF in the path: a header-smuggling attempt, denied by the policy.
+        (
+            put_head(ARCHIVE_PATH + "%0d%0aX-Evil:%201", "Content-Length: 0"),
+            403,
+            "archive.path",
+        ),
+        (put_head(ARCHIVE_PATH + "%00", "Content-Length: 0"), 403, "archive.path"),
+        (
+            put_head("/v1.44/containers/mine/archive?path=/" + "%41" * 20_000, "Content-Length: 0"),
+            403,
+            "archive.path",
+        ),
+        # A raw CRLF ends the request line early: malformed.
+        (b"PUT /v1.44/containers/mine/archive?path=/x\r\nX-Evil: 1 HTTP/1.1\r\n\r\n", 400, None),
+        (
+            put_head(ARCHIVE_PATH, "Content-Length: 4\r\nTransfer-Encoding: chunked") + b"abcd",
+            400,
+            None,
+        ),
+        (put_head(ARCHIVE_PATH, "Transfer-Encoding: gzip, chunked"), 400, None),
+        (put_head(ARCHIVE_PATH, "Content-Length: 4\r\nContent-Length: 5") + b"abcd", 400, None),
+        (put_head(ARCHIVE_PATH, "Content-Length: -1"), 400, None),
+        (put_head(ARCHIVE_PATH, "Content-Length: 99999999999999"), 400, None),
+    ],
+)
+async def test_proxy_refuses_hostile_uploads_unforwarded(
+    tmp_path: Path, raw: bytes, status: int, rule: str | None
+) -> None:
+    async with running_guard(tmp_path) as (_guard, daemon, sock):
+        resp = await call(sock, raw)
+        assert resp.startswith(f"HTTP/1.1 {status}".encode()), resp[:80]
+        assert uploads(daemon) == [] and daemon.uploaded == bytearray()
+        message = json.loads(resp.split(b"\r\n\r\n", 1)[1])["message"]
+        assert len(message) < 400
+    [record] = records_of(tmp_path)
+    assert record["allowed"] is False
+    assert record["rule"] == (rule or f"http.{status}")
+
+
 # --------------------------------------------------------------------------- stopping
 
 
@@ -2185,6 +2957,7 @@ def _guard_env(tmp_path: Path, d: Path) -> dict[str, str]:
         "LAB_RUN_ID": RUN,
         "LAB_CELLGUARD_NETWORK": NETWORK,
         "LAB_CELLGUARD_DNS": CELL_DNS,
+        "LAB_CELLGUARD_EXTRA_HOSTS": EXTRA_HOSTS,
         "LAB_CELLGUARD_IMAGES_LOCK": str(lock),
         "LAB_CELLGUARD_LISTEN": str(d / "guard.sock"),
         "LAB_CELLGUARD_UPSTREAM": str(d / "no-daemon.sock"),  # a denial never asks it
@@ -2275,12 +3048,15 @@ def _podman_client() -> Any:
     return client, image
 
 
-def raw_request(sock: Path, method: str, path: str, doc: dict[str, Any]) -> tuple[int, bytes]:
-    """One raw HTTP request on a Unix socket (bypasses the SDK's body building)."""
+def raw_request(
+    sock: Path, method: str, path: str, doc: dict[str, Any] | None = None
+) -> tuple[int, bytes]:
+    """One raw HTTP request on a Unix socket (bypasses the SDK's body building); no
+    ``doc`` sends no body."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(30)
         conn.connect(str(sock))
-        conn.sendall(req(method, path, json.dumps(doc).encode()))
+        conn.sendall(req(method, path, b"" if doc is None else json.dumps(doc).encode()))
         data = b""
         while chunk := conn.recv(65536):
             data += chunk
@@ -2359,6 +3135,11 @@ def test_podman_integration(tmp_path: Path) -> None:
             assert attrs["HostConfig"]["NanoCpus"] == 500_000_000
             assert attrs["HostConfig"]["PidsLimit"] == 64
             assert attrs["Image"] == image.id  # the tag was pinned to the listed digest
+            # The agent's pinned hosts are forced, so its siblings reach the target and
+            # the tap rather than the catcher.
+            assert attrs["HostConfig"]["ExtraHosts"] == EXTRA_HOSTS.split(",")
+            hosts = sbx.exec_run(["cat", "/etc/hosts"]).output.decode()
+            assert "10.89.0.3" in hosts and "10.89.0.4" in hosts
             # The agent's name got the cell prefix; the unprefixed name still resolves.
             assert attrs["Name"].lstrip("/") == f"{ctx.prefix}cg-sbx-{suffix}"
             assert client.containers.get(f"cg-sbx-{suffix}").id == sbx.id
@@ -2492,12 +3273,35 @@ def test_podman_integration(tmp_path: Path) -> None:
             for attempt in (
                 lambda: client.api.inspect_container(infra.id),
                 lambda: client.api.exec_create(infra.id, ["true"]),
+                lambda: client.api.get_archive(infra.id, "/etc/hostname"),
+                lambda: client.api.put_archive(infra.id, "/root", make_tar("x", b"x")),
                 lambda: client.api.remove_container(infra.id, force=True),
             ):
                 with pytest.raises(docker.errors.APIError) as untouchable:
                     attempt()
                 assert untouchable.value.status_code == 403
             assert infra.id not in {c.id for c in client.containers.list(all=True)}
+
+            # docker cp through the guard: an upload, its stat, a download and back.
+            sent = b"through-docker-cp"
+            assert sbx.put_archive("/root", make_tar("cp-probe.txt", sent))
+            status, reply = raw_request(
+                listen, "HEAD", f"/v1.44/containers/{sbx.id}/archive?path=/root/cp-probe.txt"
+            )
+            assert status == 200, reply
+            assert b"x-docker-container-path-stat:" in reply.lower()
+            for path in ("/root/cp-probe.txt", "/root/../../root/cp-probe.txt"):
+                chunks, stat = sbx.get_archive(path)
+                assert (stat["name"], stat["size"]) == ("cp-probe.txt", len(sent))
+                with tarfile.open(fileobj=io.BytesIO(b"".join(chunks))) as tar:
+                    member = tar.extractfile("cp-probe.txt")
+                    assert member is not None and member.read() == sent
+            # A relative path, an unknown key and a NUL are refused, never forwarded.
+            for bad in ("path=root", "path=/root&rename=x", "path=/root%00"):
+                status, reply = raw_request(
+                    listen, "GET", f"/v1.44/containers/{sbx.id}/archive?{bad}"
+                )
+                assert status == 403, (bad, reply)
 
             # Streams through exec work (upgrade passthrough).
             code, out = sbx.exec_run(["echo", "through-the-guard"])
@@ -2562,5 +3366,9 @@ def test_podman_integration(tmp_path: Path) -> None:
         "exec.create",
         "exec.start",
         "container.remove",
+        "container.archive.put",
+        "container.archive.stat",
+        "container.archive.get",
     }
+    assert {"archive.path", "query.param"} <= denied_rules
     assert all(r["stream"] == CELLGUARD_STREAM for r in records)

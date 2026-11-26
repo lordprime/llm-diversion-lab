@@ -59,6 +59,7 @@ from typing import Any, Final
 
 import yaml
 
+from cell.cellguard.policy import PinnedHost
 from control.core.models import Arm, RunManifest, Surface
 from control.runner.experiment import Experiment
 from control.runner.render import render_catcher_file, render_payloads
@@ -737,7 +738,12 @@ def render_cell(
     services["catcher"]["networks"]["agent"]["ipv4_address"] = catcher_ip
     services["injector"]["networks"]["agent"]["ipv4_address"] = injector_ip
     services["tap"]["networks"]["agent"] = {"ipv4_address": tap_ip}
-    agent_hosts = [f"{meta['agent_host']}:{injector_ip}", f"tap:{tap_ip}"]
+    # One list for the agent's /etc/hosts and for every container cell-guard creates.
+    try:
+        pinned = (PinnedHost(str(meta["agent_host"]), injector_ip), PinnedHost("tap", tap_ip))
+    except ValueError as exc:
+        raise CellError(f"cell.{run.target}.yml: x-lab.agent_host: {exc}") from None
+    agent_hosts = [str(host) for host in pinned]
 
     # per-run environment of the infrastructure
     p1 = Surface.P1 in experiment.arms.injected.surfaces
@@ -787,6 +793,7 @@ def render_cell(
                 "LAB_CELLGUARD_NETWORK": networks["agent"]["name"],
                 "LAB_CELLGUARD_IMAGES_LOCK": "/etc/lab/cellguard/images.lock",
                 "LAB_CELLGUARD_DNS": catcher_ip,
+                "LAB_CELLGUARD_EXTRA_HOSTS": PinnedHost.render(pinned),
                 "LAB_CELLGUARD_LISTEN": f"{_GUARD_DIR}/docker.sock",
                 "LAB_CELLGUARD_UPSTREAM": _DOCKER_SOCKET,
                 "LAB_CELLGUARD_SCRATCH_VOLUME": f"{name}_scratch",

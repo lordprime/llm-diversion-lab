@@ -20,6 +20,13 @@ Every connection carries exactly one request (the proxy answers with
    the client's headers only :data:`FORWARDED_HEADERS` are forwarded (plus the
    ``Upgrade`` of an upgrade operation); ``Host`` is always ``docker``.
 
+Uploads (``docker cp`` into a container, ``PUT /containers/{id}/archive``) are the one
+body the proxy does not buffer: the policy decides on the path and query alone, and the
+tar stream is relayed to the daemon as it arrives, re-framed by the proxy and capped at
+:data:`MAX_STREAM_BODY`. Its decision record therefore carries the size and hash of the
+empty body the policy saw, not of the archive. Downloads and stats (``GET``/``HEAD``)
+relay the daemon's response as is, ``X-Docker-Container-Path-Stat`` header included.
+
 Names: container and volume names the agent chooses get the cell's prefix at create
 time, so a lookup of an unprefixed name tries the prefixed name first.
 
@@ -49,6 +56,10 @@ Configuration (:meth:`CellGuardConfig.from_env`):
   never are.
 * ``LAB_CELLGUARD_DNS`` (required): IP address of the cell resolver (the catcher's
   DNS), forced as every created container's only nameserver.
+* ``LAB_CELLGUARD_EXTRA_HOSTS`` (required): the agent's pinned hosts,
+  ``<target host>:<ip>,tap:<ip>`` (:class:`~cell.cellguard.policy.PinnedHost`), forced as
+  every created container's ``ExtraHosts`` so it reaches the target and the tap rather
+  than the catcher. Missing or malformed, cell-guard refuses to start.
 * ``LAB_CELLGUARD_LISTEN`` (default ``/run/cellguard/docker.sock``): socket to serve.
 * ``LAB_CELLGUARD_UPSTREAM`` (default ``/var/run/docker.sock``; ``unix://`` accepted).
 * ``LAB_CELLGUARD_SCRATCH_VOLUME`` (optional): the cell's scratch named volume, the one
@@ -80,7 +91,7 @@ import signal
 import stat
 import sys
 import threading
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -93,9 +104,11 @@ from cell.cellguard.policy import (
     DEFAULT_PIDS_LIMIT,
     RUN_ID_PATTERN,
     RUN_LABEL,
+    STREAM_OPS,
     CellContext,
     Decision,
     DockerRequest,
+    PinnedHost,
     Route,
     Target,
     evaluate,
@@ -113,6 +126,7 @@ __all__ = [
     "FORWARDED_HEADERS",
     "MAX_BODY",
     "MAX_HEAD",
+    "MAX_STREAM_BODY",
     "STOP_DRAIN_S",
     "CellGuard",
     "CellGuardConfig",
@@ -129,8 +143,13 @@ CELLGUARD_DIR: Final = "cellguard"
 DECISIONS_FILE: Final = f"{CELLGUARD_DIR}/decisions.jsonl"
 #: Largest accepted request head (request line and headers).
 MAX_HEAD: Final = 64 * 1024
-#: Largest accepted request body; every allowed request has a small JSON body.
+#: Largest accepted request body the policy reads; every one is a small JSON body.
 MAX_BODY: Final = 4 * 1024 * 1024
+#: Largest streamed request body (a ``docker cp`` upload, :data:`STREAM_OPS`). Agents
+#: copy scripts, wordlists and reports, not images; this bounds one upload, not disk use
+#: (an exec can write as much). Over it: ``413`` before anything is forwarded when the
+#: length is declared, or the upload is cut off when a chunked stream crosses it.
+MAX_STREAM_BODY: Final = 64 * 1024 * 1024
 #: Largest response accepted from an ownership lookup on the real socket.
 _MAX_LOOKUP: Final = 16 * 1024 * 1024
 #: Time a client has to send its whole request, and a lookup has to complete.
@@ -302,6 +321,7 @@ class CellGuardConfig:
             "LAB_CELLGUARD_NETWORK",
             "LAB_CELLGUARD_IMAGES_LOCK",
             "LAB_CELLGUARD_DNS",
+            "LAB_CELLGUARD_EXTRA_HOSTS",
         ):
             if not env.get(required):
                 raise ValueError(f"{required}: not set")
@@ -321,6 +341,7 @@ class CellGuardConfig:
             ),
             scratch_volume=env.get("LAB_CELLGUARD_SCRATCH_VOLUME") or None,
             name_prefix=env.get("LAB_CELLGUARD_NAME_PREFIX") or None,
+            extra_hosts=PinnedHost.parse_all(env["LAB_CELLGUARD_EXTRA_HOSTS"]),
             memory_bytes=_positive_int(env, "LAB_CELLGUARD_MEMORY", DEFAULT_MEMORY_BYTES),
             nano_cpus=_positive_int(env, "LAB_CELLGUARD_NANO_CPUS", DEFAULT_NANO_CPUS),
             pids_limit=_positive_int(env, "LAB_CELLGUARD_PIDS", DEFAULT_PIDS_LIMIT),
@@ -393,8 +414,14 @@ def _header(head: bytes, name: str) -> str | None:
     return None
 
 
-async def _read_chunked(reader: asyncio.StreamReader, limit: int) -> bytes:
-    body = bytearray()
+async def _chunks(reader: asyncio.StreamReader, limit: int) -> AsyncIterator[bytes]:
+    """The data of a chunked body, in pieces of at most 64 KiB, as it arrives.
+
+    A chunk that would take the body over ``limit`` is refused (``413``) before any of
+    it is read; trailers are dropped. A body that ends early raises
+    :class:`asyncio.IncompleteReadError`.
+    """
+    total = 0
     while True:
         size_line = await reader.readuntil(b"\r\n")
         size_text = size_line[:-2].split(b";", 1)[0].strip()
@@ -404,39 +431,93 @@ async def _read_chunked(reader: asyncio.StreamReader, limit: int) -> bytes:
         if size == 0:
             while (await reader.readuntil(b"\r\n")) != b"\r\n":
                 pass  # trailers are dropped
-            return bytes(body)
-        if len(body) + size > limit:
+            return
+        total += size
+        if total > limit:
             raise _BadRequest(413, "request body too large")
-        body += await reader.readexactly(size)
+        while size > 0:
+            data = await reader.read(min(size, 65536))
+            if not data:
+                raise asyncio.IncompleteReadError(b"", size)
+            size -= len(data)
+            yield data
         if await reader.readexactly(2) != b"\r\n":
             raise _BadRequest(400, "malformed chunk")
 
 
-async def _read_body(
-    head: _Head, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-) -> bytes:
-    lengths = set(head.get("content-length"))
-    encodings = head.get("transfer-encoding")
-    if lengths and encodings:
-        raise _BadRequest(400, "both Content-Length and Transfer-Encoding")
-    if len(lengths) > 1:
-        raise _BadRequest(400, "conflicting Content-Length")
-    if encodings and [e.lower() for e in encodings] != ["chunked"]:
-        raise _BadRequest(400, "unsupported Transfer-Encoding")
-    length = 0
-    if lengths:
-        text = lengths.pop()
-        if not _DECIMAL_RE.fullmatch(text):
-            raise _BadRequest(400, "malformed Content-Length")
-        length = int(text)
-        if length > MAX_BODY:
-            raise _BadRequest(413, "request body too large")
-    if (encodings or length) and any(v.lower() == "100-continue" for v in head.get("expect")):
-        writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
-        await writer.drain()
-    if encodings:
-        return await _read_chunked(reader, MAX_BODY)
-    return await reader.readexactly(length) if length else b""
+async def _read_chunked(reader: asyncio.StreamReader, limit: int) -> bytes:
+    return b"".join([data async for data in _chunks(reader, limit)])
+
+
+@dataclass(frozen=True, slots=True)
+class _Framing:
+    """How a request body is delimited: checked once, then read or relayed.
+
+    A body the policy reads is buffered (:meth:`read`); a stream (:data:`STREAM_OPS`)
+    is relayed to the daemon piece by piece (:meth:`relay`), re-framed by the proxy so
+    the client's own framing bytes never reach the daemon.
+    """
+
+    length: int
+    chunked: bool
+    expects_continue: bool
+    limit: int
+
+    @classmethod
+    def of(cls, head: _Head, limit: int) -> _Framing:
+        """Check the framing headers; a declared length over ``limit`` is ``413``."""
+        lengths = set(head.get("content-length"))
+        encodings = head.get("transfer-encoding")
+        if lengths and encodings:
+            raise _BadRequest(400, "both Content-Length and Transfer-Encoding")
+        if len(lengths) > 1:
+            raise _BadRequest(400, "conflicting Content-Length")
+        if encodings and [e.lower() for e in encodings] != ["chunked"]:
+            raise _BadRequest(400, "unsupported Transfer-Encoding")
+        length = 0
+        if lengths:
+            text = lengths.pop()
+            if not _DECIMAL_RE.fullmatch(text):
+                raise _BadRequest(400, "malformed Content-Length")
+            length = int(text)
+            if length > limit:
+                raise _BadRequest(413, "request body too large")
+        expects = any(v.lower() == "100-continue" for v in head.get("expect"))
+        return cls(length, bool(encodings), expects and bool(encodings or length), limit)
+
+    @property
+    def header(self) -> str:
+        """The framing header the proxy sends upstream for a relayed body."""
+        return "Transfer-Encoding: chunked" if self.chunked else f"Content-Length: {self.length}"
+
+    async def _continue(self, writer: asyncio.StreamWriter) -> None:
+        if self.expects_continue:
+            writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+            await writer.drain()
+
+    async def read(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> bytes:
+        """The whole body, for the policy."""
+        await self._continue(writer)
+        if self.chunked:
+            return await _read_chunked(reader, self.limit)
+        return await reader.readexactly(self.length) if self.length else b""
+
+    async def relay(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        upstream: asyncio.StreamWriter,
+    ) -> None:
+        """Copy the body to ``upstream`` as it arrives; never more than :attr:`limit`."""
+        await self._continue(writer)
+        if not self.chunked:
+            await _copy_exact(reader, upstream, self.length)
+            return
+        async for data in _chunks(reader, self.limit):
+            upstream.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+            await upstream.drain()
+        upstream.write(b"0\r\n\r\n")
+        await upstream.drain()
 
 
 def _response(status: int, reason: str, message: str) -> bytes:
@@ -476,10 +557,11 @@ async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
 
 
 async def _copy_exact(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, n: int) -> None:
+    """Copy exactly ``n`` bytes; :class:`asyncio.IncompleteReadError` if ``reader`` ends first."""
     while n > 0:
         data = await reader.read(min(n, 65536))
         if not data:
-            return
+            raise asyncio.IncompleteReadError(b"", n)
         writer.write(data)
         await writer.drain()
         n -= len(data)
@@ -609,7 +691,10 @@ class CellGuard:
                 head = _parse_head(raw)
                 state.method, state.path = head.method, head.target
                 state.op = route(head.method, head.target).op
-                body = await _read_body(head, reader, writer)
+                streamed = state.op in STREAM_OPS
+                framing = _Framing.of(head, MAX_STREAM_BODY if streamed else MAX_BODY)
+                # A stream is relayed only once allowed; the policy never sees it.
+                body = b"" if streamed else await framing.read(reader, writer)
         except _BadRequest as bad:
             method, path = (head.method, head.target) if head else ("", "")
             op = route(method, path).op if head else "malformed"
@@ -635,7 +720,7 @@ class CellGuard:
             writer.write(_response(403, "Forbidden", message))
             await writer.drain()
             return
-        await self._forward(head, decision, reader, writer)
+        await self._forward(head, decision, reader, writer, framing)
 
     async def _forward(
         self,
@@ -643,6 +728,7 @@ class CellGuard:
         decision: Decision,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
+        framing: _Framing,
     ) -> None:
         try:
             up_reader, up_writer = await asyncio.open_unix_connection(
@@ -653,13 +739,16 @@ class CellGuard:
             await writer.drain()
             return
         try:
+            streamed = decision.op in STREAM_OPS
             lines = [f"{head.method} {decision.path} HTTP/1.1", "Host: docker"]
             kept = FORWARDED_HEADERS - {"content-type"} if decision.body else FORWARDED_HEADERS
             lines += [f"{n}: {v}" for n, v in head.headers if n.lower() in kept]
             if decision.body:
                 # The body is the policy's own JSON, whatever the client declared.
                 lines.append("Content-Type: application/json")
-            if decision.body or head.method in ("POST", "PUT"):
+            if streamed:
+                lines.append(framing.header)
+            elif decision.body or head.method in ("POST", "PUT"):
                 lines.append(f"Content-Length: {len(decision.body)}")
             upgrade = head.get("upgrade")
             if decision.upgrade and upgrade:
@@ -668,6 +757,9 @@ class CellGuard:
                 lines.append("Connection: close")
             up_writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + decision.body)
             await up_writer.drain()
+            if streamed:
+                await self._upload(framing, reader, writer, up_reader, up_writer)
+                return
             if not decision.upgrade:
                 await _pump(up_reader, writer)
                 return
@@ -686,6 +778,52 @@ class CellGuard:
                 await _pump(up_reader, writer)
         finally:
             _close(up_writer)
+
+    async def _upload(
+        self,
+        framing: _Framing,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        up_reader: asyncio.StreamReader,
+        up_writer: asyncio.StreamWriter,
+    ) -> None:
+        """Relay an allowed upload to the daemon while relaying its answer back.
+
+        Both run at once, so an answer the daemon gives before it has read the whole
+        upload (a missing path, say) still reaches the client; the rest of the upload is
+        then dropped. The client has :data:`_REQUEST_TIMEOUT_S` to send the upload. One
+        that ends early, is malformed, crosses :data:`MAX_STREAM_BODY` or times out is
+        cut off: the daemon's connection is aborted mid-body, so it never sees a
+        complete upload, and the client gets ``400`` or ``413``.
+        """
+        upload = asyncio.create_task(
+            asyncio.wait_for(framing.relay(reader, writer, up_writer), _REQUEST_TIMEOUT_S)
+        )
+        answer = asyncio.create_task(_pump(up_reader, writer))
+        try:
+            await asyncio.wait({upload, answer}, return_when=asyncio.FIRST_COMPLETED)
+            failure = None if answer.done() else upload.exception()
+            if failure is None or (
+                isinstance(failure, ConnectionError) and up_writer.transport.is_closing()
+            ):
+                await answer  # sent whole, or the daemon hung up first: relay its answer
+                return
+        finally:
+            for task in (upload, answer):
+                task.cancel()
+            await asyncio.gather(upload, answer, return_exceptions=True)
+        status, message = 400, "the client went away during the upload"
+        if isinstance(failure, _BadRequest):
+            status, message = failure.status, failure.message
+        elif isinstance(failure, asyncio.IncompleteReadError):
+            message = "request body ended before its declared end"
+        elif isinstance(failure, TimeoutError):
+            message = "request body was not sent in time"
+        up_writer.transport.abort()
+        print(f"cell-guard: upload cut off: {message}", file=sys.stderr)
+        with contextlib.suppress(Exception):
+            writer.write(_response(status, _REASONS[status], message))
+            await writer.drain()
 
     async def _splice(
         self,
