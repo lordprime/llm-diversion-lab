@@ -1,0 +1,81 @@
+# RedAmon capability sheet. Every value comes from docs/OLLAMA_SUPPORT_AUDIT.md;
+# audit_refs and each side channel's audit_ref name the section behind it, and
+# "unknown" marks what the audit could not verify. An unresolved side channel makes
+# every run unsupported until the RedAmon adapter task fixes it.
+# Side channels the audit missed come from docs/AUTOMATION_FEASIBILITY.md (feasibility_ref);
+# a "candidate" switch in a note is unverified until the adapter task checks the source.
+framework: redamon
+version: v7.9.0 # the Ollama preset and openai_compatible branch also exist at 7.6.0 (03b46b8)
+commit: 73ca9d3
+image_digest: unknown # set once CI builds the RedAmon agent image
+# The audit labels it native: its OpenAI-compatible provider has a built-in "Ollama" preset.
+support_level: native
+wire_formats: [openai_chat]
+# Configure exactly one OpenAI-compatible provider whose base URL is the tap, and assign it
+# to the agent and to every model by feature (§3).
+model_call_paths:
+  - "main agent: JSON LLMDecision through LangChain ChatOpenAI on the custom provider (agentic/orchestrator_helpers/llm_setup.py 280-320)"
+  - "Deep Think pre-step (docs/readmes/README.AGENTIC_SYSTEM.md 545)"
+  - "Cypher translator for query_graph (README.AGENTIC_SYSTEM.md 607)"
+  - "in-run LLM scope guardrail (README.AGENTIC_SYSTEM.md 31)"
+  - "LATS expansion, off by default (README.AGENTIC_SYSTEM.md 134)"
+  - "report summariser (README.AGENTIC_SYSTEM.md 732)"
+  - "ten models by feature with no fallback to the agent model (agentic/feature_models.py); the audit names roe_parse, triage, codefix, report_narratives and navigator, the other five are unknown"
+  - "CypherFix triage and codefix with bind_tools (agentic/cypherfix_triage/orchestrator.py 1341, agentic/cypherfix_codefix/orchestrator.py 737)"
+  - "out-of-run guardrail on the first custom provider (agentic/api.py 1899-1958)"
+  - "fireteam members, on by default (agentic/project_settings.py 119-122)"
+side_channels:
+  ai_attack_surface_judge:
+    status: unresolved
+    audit_ref: "§2.3, §3"
+    note: "the AI-attack-surface scan's judge spawns its own ollama/ollama:latest (qwen2.5:7b) at http://redamon-local-llm:11434 (recon_orchestrator/local_llm_manager.py); the audit says keep the scan off but names no setting"
+  kb_embeddings:
+    status: disabled
+    setting: "KB_EMBEDDING_API_BASE_URL unset"
+    audit_ref: "§2.3, §3"
+    note: "KB embeddings then stay on local sentence-transformers (.env.example 50-79)"
+  keyed_provider_model_listing:
+    status: disabled
+    setting: "no OpenAI or Anthropic provider key configured"
+    audit_ref: "§2.3"
+    note: "model listing calls api.openai.com and api.anthropic.com only for keyed providers (orchestrator_helpers/model_providers.py)"
+  hosted_default_models:
+    status: disabled
+    setting: "agent model and every model by feature set to custom/<providerId>"
+    audit_ref: "§2.3, §3"
+    note: "the default agent model is claude-opus-4-6 (agentic/project_settings.py 92)"
+  msf_update:
+    status: unresolved
+    feasibility_ref: "§6.4"
+    note: "msfupdate at start; not in the audit; candidate: MSF_AUTO_UPDATE=false (AUTOMATION_FEASIBILITY §6.4), unverified at the audited commit"
+  nuclei_template_update:
+    status: unresolved
+    feasibility_ref: "§6.4"
+    note: "nuclei template update; not in the audit; candidate: NUCLEI_AUTO_UPDATE=false (AUTOMATION_FEASIBILITY §6.4), unverified at the audited commit"
+  hardcoded_dns:
+    status: unresolved
+    feasibility_ref: "§6.4"
+    note: "a hard-coded DNS server 8.8.8.8; not in the audit; candidate: removed in the compose override (AUTOMATION_FEASIBILITY §6.4), unverified at the audited commit"
+min_num_ctx: unknown # the docs give no model-size or context guidance
+sub_agents: dynamic # root agent plus fireteam waves; members cannot spawn fireteams
+sub_agent_cap: # FIRETEAM_ENABLED is on by default; the adapter sets both caps and records them
+  max_agents: 5
+  max_concurrent: 5
+  max_agents_setting: FIRETEAM_MAX_MEMBERS
+  max_concurrent_setting: FIRETEAM_MAX_CONCURRENT
+  audit_ref: "§2.3, §3"
+agent_id_source: null
+agent_id_gap: "unknown: the audit read no RedAmon log that names the fireteam member behind each model call"
+patches: []
+# §2.3 "Multi-agent": "MAX_ITERATIONS defaults to 100"; the audit gives no file or line for it.
+max_turns_knob: MAX_ITERATIONS
+audit_refs:
+  version: "§2.3"
+  support_level: "§1, §2.3"
+  wire_formats: "§1, §2.3"
+  model_call_paths: "§2.3"
+  min_num_ctx: "§2.3"
+  sub_agents: "§2.3"
+  agent_id_source: "§2.3"
+  patches: "§3"
+  max_turns_knob: "§2.3"

@@ -1,0 +1,57 @@
+# hackingBuddyGPT capability sheet. Every value comes from docs/OLLAMA_SUPPORT_AUDIT.md,
+# except use_case (docs/AUTOMATION_FEASIBILITY.md §2.3: upstream has no free-text
+# objective). audit_refs and each side channel's audit_ref name the audit section behind
+# it, and "unknown" marks what the audit could not verify. An unresolved side channel
+# or the unknown turn cap makes every run unsupported until the hackingBuddyGPT adapter
+# task fixes it.
+# Side channels the audit missed come from docs/AUTOMATION_FEASIBILITY.md (feasibility_ref);
+# a "candidate" switch in a note is unverified until the adapter task checks the source.
+framework: hackingbuddygpt
+version: v0.5.0
+commit: e23d918
+image_digest: unknown # set once CI builds the hackingBuddyGPT agent image
+# Call paths and sub-agents below describe this use case only. The privesc use cases'
+# update-state and explanation calls, the web-API analyser, the AD planner/executors and
+# web/advanced.py's SubAgentCapability are not part of it (§2.1).
+use_case: "custom WebTestingAgent subclass registered with register_use_case (AUTOMATION_FEASIBILITY.md §2.3)"
+support_level: native
+# llm.model=ollama_chat/<model> uses LiteLLM's ollama_chat route (LiteLLM 1.97.0 in uv.lock)
+wire_formats: [ollama_chat]
+# Export OLLAMA_API_BASE=<tap>: LiteLLM's Ollama route reads it when no api_base is
+# passed (litellm/main.py 4211 at v1.97.0).
+model_call_paths:
+  - "main agent: LiteLLM.raw_completion calling litellm.completion (src/hackingBuddyGPT/utils/llm.py)"
+side_channels:
+  rag_openai_embeddings:
+    status: disabled
+    setting: "rag_path unset"
+    audit_ref: "§2.1, §3"
+    note: "the RAG extra makes a hard-coded OpenAIEmbeddings text-embedding-3-large call (utils/rag.py 28)"
+  openrouter_default_api_base:
+    status: disabled
+    setting: "llm.api_base=<tap> and OLLAMA_API_BASE=<tap>"
+    audit_ref: "§2.1, §3"
+    note: "llm.api_base defaults to OpenRouter; once the patch honours it, it must be set to the tap"
+  litellm_cost_map:
+    status: unresolved
+    feasibility_ref: "§2.3, §6.4"
+    note: "LiteLLM's remote model cost map; not in the audit; candidate: LITELLM_LOCAL_MODEL_COST_MAP=True (AUTOMATION_FEASIBILITY §2.3, §6.4), unverified at the audited commit"
+min_num_ctx: unknown # the README gives no model-size guidance; llm.context_size is user-declared (default 16385)
+sub_agents: none # one agent in this use case
+agent_id_source: null
+agent_id_gap: null
+patches:
+  - upstream_file: src/hackingBuddyGPT/utils/llm.py
+    change: "LiteLLM.raw_completion passes api_base=self.api_base to litellm.completion when llm.api_base is set explicitly"
+    reason: "the api_base argument is commented out, so llm.api_base is ignored and only OLLAMA_API_BASE reaches LiteLLM"
+max_turns_knob: unknown # the audit names no turn cap setting
+audit_refs:
+  version: "§2.1"
+  support_level: "§1, §2.1"
+  wire_formats: "§1, §2.1"
+  model_call_paths: "§2.1"
+  min_num_ctx: "§2.1"
+  sub_agents: "§1, §2.1"
+  agent_id_source: "§2.1"
+  patches: "§2.1, §3"
+  max_turns_knob: "§2.1"

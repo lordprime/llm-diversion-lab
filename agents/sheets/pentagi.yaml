@@ -1,0 +1,73 @@
+# PentAGI capability sheet. Every value comes from docs/OLLAMA_SUPPORT_AUDIT.md;
+# audit_refs and each side channel's audit_ref name the section behind it, and
+# "unknown" marks what the audit could not verify. An unresolved side channel or an
+# unknown turn cap makes every run unsupported until the PentAGI adapter task fixes it.
+# Side channels the audit missed come from docs/AUTOMATION_FEASIBILITY.md (feasibility_ref);
+# a "candidate" switch in a note is unverified until the adapter task checks the source.
+framework: pentagi
+version: v2.2.0 # main at cffed94 has the same Ollama config fields
+commit: b611fbe
+image_digest: unknown # set once CI builds the PentAGI agent image
+support_level: native
+# langchaingo's Ollama client posts to native /api/chat, not /v1 (ollama.go 19-22, 227-228)
+wire_formats: [ollama_chat]
+# One OLLAMA_SERVER_URL serves every agent role; PROXY_URL also covers LLM, embedding and
+# search calls (README 885). Models must be rebuilt with num_ctx in a Modelfile
+# (README 1627-1631).
+model_call_paths:
+  - "role agents through the Ollama provider (backend/pkg/providers/ollama/ollama.go): the 13 option types in pconfig/config.go 144-156"
+  - "auxiliary roles on the same provider: chain summariser (SUMMARIZER_*), reflector, adviser/planner, enricher, memorist, refiner"
+  - "embeddings with EMBEDDING_PROVIDER=ollama (backend/pkg/config/config.go 122); Ollama's /api/embed has no telemetry WireFormat yet"
+side_channels:
+  openai_embeddings:
+    status: disabled
+    setting: "EMBEDDING_PROVIDER=ollama"
+    audit_ref: "§2.5, §3"
+    note: "the default openai provider falls back to the OpenAI server URL (README 3770)"
+  graphiti:
+    status: unresolved
+    audit_ref: "§2.5, §3"
+    feasibility_ref: "§2.5"
+    note: "optional service with its own OpenAI-compatible LLM and embedder (README 2883-2888); the audit says turn it off but names no setting; candidate: GRAPHITI_ENABLED=false (AUTOMATION_FEASIBILITY §2.5), unverified at the audited commit"
+  search_engines:
+    status: unresolved
+    audit_ref: "§2.5"
+    feasibility_ref: "§2.5, §6.4"
+    note: "PROXY_URL routes search-engine requests (README 885); the audit names no switch that turns search off; candidate: DUCKDUCKGO_ENABLED=false (AUTOMATION_FEASIBILITY §2.5, §6.4), unverified at the audited commit"
+  scraper:
+    status: unresolved
+    audit_ref: "§2.5"
+    note: "outside PROXY_URL (README 885); the audit names no switch"
+  oauth:
+    status: unresolved
+    audit_ref: "§2.5"
+    note: "outside PROXY_URL (README 885); the audit names no switch"
+  langfuse_otel:
+    status: unresolved
+    audit_ref: "§2.5"
+    feasibility_ref: "§2.5"
+    note: "Langfuse and OTel export, outside PROXY_URL (README 885); the audit names no switch; candidate: no LANGFUSE_* and no OTEL_HOST set (AUTOMATION_FEASIBILITY §2.5), unverified at the audited commit"
+  update_reporter:
+    status: unresolved
+    feasibility_ref: "§2.5, §6.4"
+    note: "a 3-hourly report to update.pentagi.com; not in the audit; candidate: UPDATE_CHECK_INTERVAL=0 (AUTOMATION_FEASIBILITY §2.5, §6.4), unverified at the audited commit"
+  image_selection:
+    status: unresolved
+    feasibility_ref: "§2.5, §6.4"
+    note: "the image chooser picks sandbox images itself; not in the audit; candidate: DOCKER_IMAGE_SELECTION_MODE=fixed with DOCKER_DEFAULT_IMAGE_FOR_PENTEST and DOCKER_DEFAULT_IMAGE pinned (AUTOMATION_FEASIBILITY §2.5, §6.4), unverified at the audited commit"
+min_num_ctx: 110000 # "PentAGI uses 110K context size" (README 1627-1631)
+sub_agents: dynamic # the primary agent delegates to role agents; serial or parallel is unverified (§4 item 9)
+agent_id_source: null
+agent_id_gap: "unknown: the audit read no PentAGI log or trace that names the role agent behind each model call"
+patches: []
+max_turns_knob: unknown # agents have tool-call budgets (README 498-507); the audit names no setting
+audit_refs:
+  version: "§2.5"
+  support_level: "§1, §2.5"
+  wire_formats: "§1, §2.5"
+  model_call_paths: "§2.5"
+  min_num_ctx: "§1, §2.5, §3"
+  sub_agents: "§2.5, §4"
+  agent_id_source: "§2.5"
+  patches: "§3"
+  max_turns_knob: "§2.5"
