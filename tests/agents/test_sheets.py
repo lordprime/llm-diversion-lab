@@ -70,9 +70,11 @@ SIDE_CHANNELS: dict[str, dict[str, str | None]] = {
         "hosted_web_search": None,
     },
     "hackingbuddygpt": {
-        "rag_openai_embeddings": "rag_path unset",
+        "rag_openai_embeddings": (
+            "no rag extra in the image and no rag_path option in LabWebTesting"
+        ),
         "openrouter_default_api_base": "llm.api_base=<tap> and OLLAMA_API_BASE=<tap>",
-        "litellm_cost_map": None,
+        "litellm_cost_map": "LITELLM_LOCAL_MODEL_COST_MAP=True",
     },
 }
 
@@ -139,14 +141,16 @@ def test_a_candidate_switch_stays_unresolved_until_verified(
             assert channel.note.endswith("unverified at the audited commit"), channel_name
         if channel.audit_ref is None:  # found only by the feasibility study
             assert channel.feasibility_ref is not None, channel_name
-            assert channel.status is ChannelStatus.UNRESOLVED, channel_name
+            # ...and it stays unresolved until an adapter task verifies its switch in the
+            # source, citing where (Task 5: hackingBuddyGPT's LiteLLM cost map)
+            verified = channel.note is not None and "verified at" in channel.note
+            assert channel.status is ChannelStatus.UNRESOLVED or verified, channel_name
 
 
 #: The candidate switch each unresolved channel's note must name (N4).
 CANDIDATES = {
     ("strix", "update_check"): "STRIX_NO_UPDATE_CHECK=1",
     ("strix", "litellm_cost_map"): "LITELLM_LOCAL_MODEL_COST_MAP=True",
-    ("hackingbuddygpt", "litellm_cost_map"): "LITELLM_LOCAL_MODEL_COST_MAP=True",
     ("pentagi", "graphiti"): "GRAPHITI_ENABLED=false",
     ("pentagi", "search_engines"): "DUCKDUCKGO_ENABLED=false",
     ("pentagi", "langfuse_otel"): "no LANGFUSE_* and no OTEL_HOST",
@@ -181,7 +185,13 @@ def test_webfetch_notes_that_its_preflight_bypasses_the_tap(
 @pytest.mark.parametrize(
     ("name", "commit", "level", "wire", "min_ctx"),
     [
-        ("hackingbuddygpt", "e23d918", "native", WireFormat.OLLAMA_CHAT, "unknown"),
+        (
+            "hackingbuddygpt",
+            "e23d918592556f71b8e3b2ee152449e82fa14794",
+            "native",
+            WireFormat.OLLAMA_CHAT,
+            "unknown",
+        ),
         ("strix", "685bbc8", "native", WireFormat.OLLAMA_CHAT, 16384),
         ("redamon", "73ca9d3", "native", WireFormat.OPENAI_CHAT, "unknown"),
         ("pentestgpt", "e8b1bb7", "unofficial", WireFormat.ANTHROPIC_MESSAGES, 65536),
@@ -231,14 +241,18 @@ def test_every_side_channel_and_its_exact_setting(
         ("pentagi", "unknown"),
         ("redamon", "MAX_ITERATIONS"),
         ("pentestgpt", "unknown"),
-        ("hackingbuddygpt", "unknown"),
+        ("hackingbuddygpt", "limits.max_rounds"),
     ],
 )
 def test_the_turn_cap_settings(sheets: dict[str, CapabilitySheet], name: str, knob: str) -> None:
     assert sheets[name].max_turns_knob == knob
 
 
-@pytest.mark.parametrize("name", FRAMEWORKS)
+#: Frameworks whose adapter task has resolved every side channel and the turn cap.
+RESOLVED = ("hackingbuddygpt",)
+
+
+@pytest.mark.parametrize("name", [n for n in FRAMEWORKS if n not in RESOLVED])
 def test_no_framework_can_run_until_its_open_items_are_resolved(
     sheets: dict[str, CapabilitySheet], name: str
 ) -> None:
@@ -246,6 +260,18 @@ def test_no_framework_can_run_until_its_open_items_are_resolved(
     # adapter tasks must resolve them before any run starts, whatever the model.
     verdict = sheets[name].check_runnable(ModelConfig(name="qwen3:32b", num_ctx=131072))
     assert isinstance(verdict, UnsupportedRun)
+
+
+@pytest.mark.parametrize("name", RESOLVED)
+def test_a_resolved_framework_runs_with_a_pinned_context_only(
+    sheets: dict[str, CapabilitySheet], name: str
+) -> None:
+    sheet = sheets[name]
+    assert sheet.unresolved_side_channels == ()
+    assert sheet.check_runnable(ModelConfig(name="qwen3:32b", num_ctx=32768)) is None
+    unpinned = sheet.check_runnable(ModelConfig(name="qwen3:32b"))
+    assert isinstance(unpinned, UnsupportedRun)
+    assert "num_ctx is not pinned" in unpinned.reason
 
 
 def test_the_recorded_patches(sheets: dict[str, CapabilitySheet]) -> None:
@@ -268,8 +294,8 @@ def test_hackingbuddygpt_runs_one_single_agent_use_case(
     assert sheet.agent_id_source is None
     assert sheet.agent_id_gap is None
     assert sheet.model_call_paths == (
-        "main agent: LiteLLM.raw_completion calling litellm.completion "
-        "(src/hackingBuddyGPT/utils/llm.py)",
+        "main agent: ChatAgent.perform_round -> LiteLLM.raw_completion -> litellm.completion, "
+        "POST <tap>/api/chat (src/hackingBuddyGPT/utils/llm.py)",
     )
 
 

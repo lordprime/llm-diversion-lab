@@ -1,50 +1,77 @@
-# hackingBuddyGPT capability sheet. Every value comes from docs/OLLAMA_SUPPORT_AUDIT.md,
-# except use_case (docs/AUTOMATION_FEASIBILITY.md §2.3: upstream has no free-text
-# objective). audit_refs and each side channel's audit_ref name the audit section behind
-# it, and "unknown" marks what the audit could not verify. An unresolved side channel
-# or the unknown turn cap makes every run unsupported until the hackingBuddyGPT adapter
-# task fixes it.
-# Side channels the audit missed come from docs/AUTOMATION_FEASIBILITY.md (feasibility_ref);
-# a "candidate" switch in a note is unverified until the adapter task checks the source.
+# hackingBuddyGPT capability sheet. Values come from docs/OLLAMA_SUPPORT_AUDIT.md, except
+# use_case (docs/AUTOMATION_FEASIBILITY.md §2.3: upstream has no free-text objective).
+# audit_refs and each side channel's audit_ref name the audit section behind it. The M3
+# Task 5 adapter read the source at the pinned commit to resolve what the audit left open;
+# those citations are file:line at the commits below and are marked "verified at".
+#   HBG     = ipa-lab/hackingBuddyGPT @ e23d918592556f71b8e3b2ee152449e82fa14794
+#   LITELLM = BerriAI/litellm @ v1.97.0 (ef84494), the version HBG's uv.lock pins (uv.lock:1357)
 framework: hackingbuddygpt
+# The commit is 149 commits past the v0.5.0 tag (git describe v0.5.0-149-ge23d918);
+# pyproject.toml still says 0.5.0.
 version: v0.5.0
-commit: e23d918
+commit: e23d918592556f71b8e3b2ee152449e82fa14794
 image_digest: unknown # set once CI builds the hackingBuddyGPT agent image
 # Call paths and sub-agents below describe this use case only. The privesc use cases'
 # update-state and explanation calls, the web-API analyser, the AD planner/executors and
 # web/advanced.py's SubAgentCapability are not part of it (§2.1).
-use_case: "custom WebTestingAgent subclass registered with register_use_case (AUTOMATION_FEASIBILITY.md §2.3)"
+use_case: "LabWebTesting: a WebTestingAgent subclass (agents/hackingbuddygpt/lab_hbg/usecase.py, a plugin baked into the image and registered with register_use_case) with the run's objective in its system prompt, upstream's HTTPRequest, PentestPlaybook and EndRun tools plus a complete tool, no SubmitFlag, and each tool result the model sees capped at max_tool_output_chars (recorded with the run)"
 support_level: native
-# llm.model=ollama_chat/<model> uses LiteLLM's ollama_chat route (LiteLLM 1.97.0 in uv.lock)
+# llm.model=ollama_chat/<model> uses LiteLLM's ollama_chat route (LiteLLM 1.97.0 in uv.lock).
+# The plugin sets litellm.OllamaChatConfig(num_ctx=llm.context_size), so every request's
+# options carry the run's num_ctx (LITELLM litellm/llms/ollama/chat/transformation.py:289-298).
 wire_formats: [ollama_chat]
-# Export OLLAMA_API_BASE=<tap>: LiteLLM's Ollama route reads it when no api_base is
-# passed (litellm/main.py 4211 at v1.97.0).
+# The only path in this use case (verified at HBG): ChatAgent.perform_round
+# (usecases/agents.py:162) -> run_tool_calling_turn -> LiteLLM.get_response (agents.py:53)
+# -> raw_completion -> litellm.completion (utils/llm.py:138). LiteLLM's Ollama route sends
+# it to <api_base>/api/chat (LITELLM litellm/llms/ollama/chat/transformation.py:220-227).
+# Not a model call: LiteLLM's cost lookup may POST <OLLAMA_API_BASE>/api/show for the
+# model's metadata (LITELLM litellm/llms/ollama/common_utils.py:184-189); it goes to the
+# tap as well.
 model_call_paths:
-  - "main agent: LiteLLM.raw_completion calling litellm.completion (src/hackingBuddyGPT/utils/llm.py)"
+  - "main agent: ChatAgent.perform_round -> LiteLLM.raw_completion -> litellm.completion, POST <tap>/api/chat (src/hackingBuddyGPT/utils/llm.py)"
 side_channels:
   rag_openai_embeddings:
     status: disabled
-    setting: "rag_path unset"
+    setting: "no rag extra in the image and no rag_path option in LabWebTesting"
     audit_ref: "§2.1, §3"
-    note: "the RAG extra makes a hard-coded OpenAIEmbeddings text-embedding-3-large call (utils/rag.py 28)"
+    note: "the RAG extra makes a hard-coded OpenAIEmbeddings text-embedding-3-large call (utils/rag.py 28); verified at HBG: only PrivEscLinux has rag_path (usecases/priv_esc/linux_privesc.py:112,137), and without the extra utils/rag.py:1-9 cannot even import langchain_openai (the Dockerfile fails the build if it can)"
   openrouter_default_api_base:
     status: disabled
     setting: "llm.api_base=<tap> and OLLAMA_API_BASE=<tap>"
     audit_ref: "§2.1, §3"
-    note: "llm.api_base defaults to OpenRouter; once the patch honours it, it must be set to the tap"
+    note: "llm.api_base defaulted to OpenRouter (utils/llm.py:32) and was never passed on (utils/llm.py:143); verified at HBG: the image's patch passes it and makes the default empty, and LITELLM litellm/main.py:4211 uses an explicit api_base before OLLAMA_API_BASE"
   litellm_cost_map:
-    status: unresolved
+    status: disabled
+    setting: "LITELLM_LOCAL_MODEL_COST_MAP=True"
     feasibility_ref: "§2.3, §6.4"
-    note: "LiteLLM's remote model cost map; not in the audit; candidate: LITELLM_LOCAL_MODEL_COST_MAP=True (AUTOMATION_FEASIBILITY §2.3, §6.4), unverified at the audited commit"
+    note: "LiteLLM fetches its model cost map from raw.githubusercontent.com when imported (LITELLM litellm/__init__.py:405-408, 523); verified at LITELLM: with the switch set, get_model_cost_map loads only the bundled copy (litellm/litellm_core_utils/get_model_cost_map.py:441)"
+# Also switched off, though no audit or feasibility section names it (so it cannot be a
+# side channel entry yet; see the Task 5 report's base change request):
+#   LiteLLM's remote Anthropic beta-header list, fetched from raw.githubusercontent.com on
+#   the Anthropic routes only (LITELLM litellm/__init__.py:413-416,
+#   litellm/anthropic_beta_headers_manager.py:137): LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS=True.
+#   LiteLLM's .env loading in DEV mode (LITELLM litellm/__init__.py:26-27): LITELLM_MODE=PRODUCTION.
+# Checked and not reachable in this use case: HuggingFace tokenizer downloads in
+# litellm.token_counter (LITELLM litellm/utils.py:1950-1968) are only picked for llama-2,
+# llama-3, replicate and command-r names, and the ollama_chat route counts with model=""
+# (bundled tiktoken, litellm/litellm_core_utils/default_encoding.py:28); HBG's own
+# count_tokens is used only by the privesc use cases. litellm.telemetry is read nowhere on
+# the call path. No fallbacks are configured, so retries (llm.api_retries) repeat the same
+# endpoint.
 min_num_ctx: unknown # the README gives no model-size guidance; llm.context_size is user-declared (default 16385)
-sub_agents: none # one agent in this use case
+# One agent: the use case offers no SubAgentCapability, so agent_ids() returns None and
+# telemetry counts one agent from the traffic.
+sub_agents: none
 agent_id_source: null
 agent_id_gap: null
 patches:
   - upstream_file: src/hackingBuddyGPT/utils/llm.py
-    change: "LiteLLM.raw_completion passes api_base=self.api_base to litellm.completion when llm.api_base is set explicitly"
-    reason: "the api_base argument is commented out, so llm.api_base is ignored and only OLLAMA_API_BASE reaches LiteLLM"
-max_turns_knob: unknown # the audit names no turn cap setting
+    change: "LiteLLM.raw_completion passes api_base=self.api_base to litellm.completion, and llm.api_base defaults to empty (None) instead of OpenRouter"
+    reason: "the api_base argument is commented out, so llm.api_base is ignored and only OLLAMA_API_BASE reaches LiteLLM; passing the OpenRouter default on would send every model there"
+# Verified at HBG: Limits.max_rounds (utils/limits.py:30, 0 means no limit) ends the run
+# loop (usecases/usecase.py:78) once ChatAgent has counted that many rounds, one model call
+# each (usecases/agents.py:178). It is set on the command line as --limits.max_rounds.
+max_turns_knob: limits.max_rounds
 audit_refs:
   version: "§2.1"
   support_level: "§1, §2.1"

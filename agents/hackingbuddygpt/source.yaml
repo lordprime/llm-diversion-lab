@@ -1,0 +1,14 @@
+# Where the hackingBuddyGPT agent image's source comes from. The Dockerfile fetches `repo`
+# at `commit`, applies patches/*.patch and installs it with `uv sync --frozen` from the
+# project's own uv.lock (LiteLLM 1.97.0).
+name: hackingbuddygpt
+repo: https://github.com/ipa-lab/hackingBuddyGPT
+# The commit docs/OLLAMA_SUPPORT_AUDIT.md §2.1 read (HEAD of main on 2026-10-24). It is
+# 149 commits past the v0.5.0 tag (git describe: v0.5.0-149-ge23d918); pyproject.toml
+# still says 0.5.0.
+commit: e23d918592556f71b8e3b2ee152449e82fa14794
+license: MIT
+# The runtime base (upstream's .python-version is 3.13.7) and the uv used to install it;
+# the Dockerfile's ARG defaults must name exactly these.
+image_base: docker.io/library/python:3.13.7-slim-bookworm@sha256:adafcc17694d715c905b4c7bebd96907a1fd5cf183395f0ebc4d3428bd22d92d
+uv_image: ghcr.io/astral-sh/uv:0.12.24@sha256:3af4716e991d6956a41e573eab705d0ee08500cd829ed30293eb8472f372c65a

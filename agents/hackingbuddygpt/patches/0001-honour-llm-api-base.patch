@@ -1,0 +1,42 @@
+Honour llm.api_base, and stop defaulting it to OpenRouter.
+
+Why: upstream comments out api_base in LiteLLM.raw_completion ("TODO: why is this not
+working anymore", utils/llm.py:143 at e23d918), so --llm.api_base is ignored and only
+LiteLLM's OLLAMA_API_BASE fallback decides where Ollama calls go. The lab needs the
+configured endpoint (the cell's LLM tap) to be the one LiteLLM uses, so this passes it.
+The OpenRouter default was presumably why the line was commented out: passed through,
+it would send every model with no explicit api_base to OpenRouter. An empty default
+(None at runtime, like llm.proxy) keeps LiteLLM's own per-provider default instead.
+Listed in agents/sheets/hackingbuddygpt.yaml (patches). Applied with git apply at build.
+
+diff --git a/src/hackingBuddyGPT/utils/llm.py b/src/hackingBuddyGPT/utils/llm.py
+index 26c31c8..5e69ae8 100644
+--- a/src/hackingBuddyGPT/utils/llm.py
++++ b/src/hackingBuddyGPT/utils/llm.py
+@@ -29,7 +29,7 @@ class LiteLLM(LLM):
+     api_key: str = parameter(desc="API key for the upstream", secret=True)
+     model: str = parameter(desc="model name in litellm format, e.g. 'gpt-4o' or 'openrouter/anthropic/claude-3.5-sonnet'")
+     context_size: int = parameter(desc="maximum context size of the model (used for prompt trimming)")
+-    api_base: str = parameter(desc="base URL of the API", default="https://openrouter.ai/api")
++    api_base: str = parameter(desc="base URL of the API (empty: litellm's own default for the model)", default="")
+     api_timeout: int = parameter(desc="timeout for a single request in seconds", default=300)
+     api_retries: int = parameter(desc="number of retries when running into rate-limits", default=3)
+     provider: str | None = parameter(
+@@ -47,6 +47,8 @@ class LiteLLM(LLM):
+             self.proxy = None
+         if self.provider == "":
+             self.provider = None
++        if self.api_base == "":
++            self.api_base = None
+ 
+         if self.proxy:
+             # TLS verification stays on by default; only an explicit opt-in disables it,
+@@ -140,7 +142,7 @@ class LiteLLM(LLM):
+             messages=messages,
+             tools=tools,
+             tool_choice=tool_choice,
+-            # api_base=self.api_base, TODO: why is this not working anymore
++            api_base=self.api_base,
+             api_key=self.api_key,
+             timeout=self.api_timeout,
+             num_retries=self.api_retries,
