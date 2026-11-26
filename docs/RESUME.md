@@ -1,35 +1,29 @@
-# Resume checkpoint, 25 Nov 2026
+# Resume checkpoint, 26 Nov 2026
 
-All work is pushed. `main` holds everything that has passed review and CI. The detailed ledgers, with every ruling, deferred minor and probe, are in `.superpowers/sdd/*/progress.md`, which git ignores. Each has a "PAUSE 2026-11-25" section.
+All work is pushed. `main` holds everything that has passed review and CI. The detailed ledgers are in `.superpowers/sdd/*/progress.md`, which git ignores. Each has a "PAUSE 2026-11-26" section with every ruling, deferred minor and probe. A branch whose head is a `wip:` commit is an unreviewed checkpoint, and its tests may fail.
 
-## On `main` (3e2741d)
+## On `main` (008d532)
 
 | Work | What it is |
 |---|---|
-| M1a Task 1 | Dual-verdict oracle contract (effect and mechanism from a latched done v2) |
-| M1a Task 2 | Event-driven oracle latch and peer pinning; DVGA retrofit |
-| M1a Task 3 | Juice Shop GOAT image (hygiene, content pack, offline) |
-| M1a Task 4 | Juice Shop oracle (admin-session effect, login-injection mechanism) |
-| M1a Task 5 | Drupal 8.5.0 GOAT image (CVE-2018-7600) |
-| M1a Task 6 | Drupal oracle (execution-event effect, web-server-descendant mechanism) |
-| M1a Task 7 | Injector surfaces P2–P8 with a browser-rule tokenizer and a pre-registered offset |
-| Telemetry | Per-run calls, agents, context, tokens, tool calls and reasoning from captured traffic |
-| M2 Task 3 | Telemetry in the runner, store, API and the results export |
-| M2 Task 2 | Ollama service on the NVIDIA runtime, admin-only model pulls, containment checks |
+| M1a Tasks 1–8 | Dual-verdict oracles; the latch; the DVGA, Juice Shop and Drupal GOATs; injector surfaces P2–P8; placement maps and the three-target self-test |
+| Telemetry, M2 Tasks 2–3 | Per-run telemetry in the runner and the export; the Ollama service on the NVIDIA runtime |
+| M3 Task 1 | Adapter base and capability sheets: structured side channels that block a run until resolved, a per-run handle, and both exit signals recorded |
 
 ## In progress (pushed on their own branches)
 
 | Work | Branch (head) | Next step |
 |---|---|---|
-| M1a Task 8 (placement maps, three-target self-test) | `m1a/t8-selftest-three-targets` (10d2a10) | Fix round 1 is done and CI is green. Re-run the stopped re-review, then merge. |
-| M1a Task 9 (CT 111 release and acceptance) | — | With the user. Build images with a version, then pin goat-juice-shop and goat-drupal-7600 in `deploy/images.lock`. The release now runs the full three-target self-test; `--quick-selftest` is opt-in. |
-| M2 Task 1 (model gateway) | `m2/t1-gateway` (c746047, WIP) | Finish fix round 2: an exact structure count before refusing (413, not 403), a per-peer connection cap, and a nonzero exit. Then review and merge. |
-| M3 Task 1 (adapter base and capability sheets) | `m3/t1-adapter-base` (no commits yet) | Start it again: new files only. |
+| M2 Task 1 (model gateway) | `m2/t1-gateway` (04a3d4c, CI green) | Fix round 3 is done. Its re-review was stopped: run it again, then merge, with the migration renumbered to 0012. |
+| M2 Task 4 (three arms) | `m2/t4-three-arms` (d6e65ed) | Fix round 1 looks committed but was not reported. Check it, run a scoped re-review, then merge (migration 0011). After that come Tasks 5 and 6. |
+| M3 Task 1b (agent image CI lane) | `m3/t1b-agent-image-ci` (WIP) | Finish the stub model, `smoke.sh` (including `--docker` through cell-guard and `--worker-image`) and the self-check. |
+| M3 Task 1c (cell-guard) | `m3/t1c-cellguard-archive` (WIP) | Archive routes for owned containers; forced ExtraHosts; `LAB_SCRATCH_VOLUME`. |
+| M3 Tasks 2–6 (adapters) | `m3/t2-strix`, `m3/t3-pentagi`, `m3/t4-redamon`, `m3/t6-pentestgpt` (WIP); `m3/t5-hackingbuddygpt` (56b4b49) | Finish each adapter on the CI lane. hackingBuddyGPT is ready for review. |
+| M1a Task 9 (CT 111 release) | — | With the user. |
 
 ## After that
 
-- **M2 Tasks 4–6:** three arms, the equivalence check and word tags, after M1a Task 8 merges.
-- **M2 Task 7:** CISPA VM bring-up, with the user.
-- **M3 Tasks 2–9:** five adapters, the campaign runner, the results package and the open-weight campaign.
+- M2 Task 7: CISPA VM bring-up, with the user. It includes the full RedAmon kali image and the Ollama smoke runs for each adapter.
+- M3 Tasks 7–9: the campaign runner, the results package and the open-weight campaign.
 
 Plans: `docs/superpowers/plans/2026-11-24-m1a-goat-platforms.md`, `2026-11-25-m2-engine-ollama.md` and `2026-11-25-m3-adapters-open-weight-campaign.md`.
