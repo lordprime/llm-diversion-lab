@@ -12,7 +12,9 @@ cancelled by the first byte that arrives, so it does not cover a head that drips
 It also caps the connections of each peer address (``max_connections_per_peer``):
 every cell's tap has its own address, so one cell that keeps reopening sockets fills
 only its own share, never the server's whole ``max_connections``. A connection over
-the cap gets the gateway's JSON 503 and is closed before any request is read.
+either cap gets the gateway's JSON 503 and is closed before any request is read, and
+before uvicorn counts it. Neither server switches protocols: WebSocket support is off
+(``ws="none"``), and the proxy's protocol refuses an upgrade itself as well.
 
 Both servers ignore signals themselves; :meth:`Gateway.serve` stops both on SIGTERM
 or SIGINT, and stops the other when one of them ends. :meth:`Gateway.run` returns 0
@@ -38,7 +40,7 @@ from uvicorn.protocols.http.h11_impl import H11Protocol
 
 from control.gateway.admin import AdminApi
 from control.gateway.app import ModelProxy
-from control.gateway.asgi import Refused
+from control.gateway.asgi import REFUSED, Refused
 from control.gateway.config import GatewayConfig, Listener
 from control.gateway.keys import RunKeys
 
@@ -48,20 +50,12 @@ log = logging.getLogger(__name__)
 
 #: Open connections the admin listener takes: the runner needs a handful.
 ADMIN_MAX_CONNECTIONS = 32
-_PEER_BUSY_BODY = json.dumps(
-    {"error": {"type": "gateway_refused", "reason": "too many connections from this peer"}}
-).encode()
-#: The answer to a connection over its peer's cap, sent before any request is read.
-PEER_BUSY_RESPONSE = (
-    b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\n"
-    + f"content-length: {len(_PEER_BUSY_BODY)}\r\nconnection: close\r\n\r\n".encode()
-    + _PEER_BUSY_BODY
-)
 
 
 class HeadDeadlineProtocol(H11Protocol):
-    """uvicorn's h11 protocol, plus a deadline for receiving each request head and a
-    cap on each peer address's open connections.
+    """uvicorn's h11 protocol, plus a deadline for receiving each request head, a cap
+    on each peer address's open connections and on all of them, and no protocol
+    upgrades.
 
     :class:`Gateway` derives a class per server that sets the limits and its own
     ``peers`` counter (all protocol instances of a server run on one event loop).
@@ -69,30 +63,57 @@ class HeadDeadlineProtocol(H11Protocol):
 
     head_timeout_s: float = 10.0
     peer_cap: int = 32
+    total_cap: int = 256
+    #: Open connections per peer address, and refusals per peer while it has any open
+    #: (both drop a peer once its last connection closes, so they stay small).
     peers: ClassVar[Counter[str]] = Counter()
     refused: ClassVar[Counter[str]] = Counter()
+
+    @staticmethod
+    def raw_refusal(status: int, phrase: str, reason: str) -> bytes:
+        """The gateway's JSON refusal as raw bytes, for a connection no request
+        cycle will answer; the connection closes after it."""
+        body = json.dumps({"error": {"type": REFUSED, "reason": reason}}).encode()
+        head = (
+            f"HTTP/1.1 {status} {phrase}\r\ncontent-type: application/json\r\n"
+            f"content-length: {len(body)}\r\nconnection: close\r\n\r\n"
+        )
+        return head.encode() + body
 
     def connection_made(self, transport: asyncio.Transport) -> None:  # type: ignore[override]
         self._head_timer: asyncio.TimerHandle | None = None
         self._waiting_for: object = None
         self._peer: str | None = None
-        super().connection_made(transport)
-        peer = self.client[0] if self.client else ""
-        if self.peers[peer] >= self.peer_cap:
+        peername = transport.get_extra_info("peername")
+        peer = str(peername[0]) if peername else ""
+        peer_full = self.peers[peer] >= self.peer_cap
+        if peer_full or self.peers.total() >= self.total_cap:
+            # refused before uvicorn sees the connection, so it never counts against
+            # uvicorn's own limit (whose answer is a plain-text 503)
             self.refused[peer] += 1
             if str(self.refused[peer]).strip("0") == "1":  # the 1st, 10th, 100th...
                 log.warning(
-                    "gateway: peer %s is at its %d connections; refused %d so far",
+                    "gateway: peer %s has %d connections (%d in all); refused %d so far",
                     peer,
-                    self.peer_cap,
+                    self.peers[peer],
+                    self.peers.total(),
                     self.refused[peer],
                 )
-            transport.write(PEER_BUSY_RESPONSE)
+            transport.write(PEER_BUSY_RESPONSE if peer_full else GATEWAY_BUSY_RESPONSE)
             transport.close()
             return
         self._peer = peer
         self.peers[peer] += 1
+        super().connection_made(transport)
         self._arm()
+
+    def handle_websocket_upgrade(self, event: Any) -> None:
+        # The gateway speaks plain HTTP. uvicorn would hand the socket to a WebSocket
+        # protocol, and this one's connection_lost, which frees the peer's slot, would
+        # never run. (Both servers run with ws="none": this only matters if that ever
+        # changes.)
+        self.transport.write(UPGRADE_REFUSED_RESPONSE)
+        self.transport.close()
 
     def _arm(self) -> None:
         """Start waiting for the next request head (after connecting or a response)."""
@@ -123,12 +144,28 @@ class HeadDeadlineProtocol(H11Protocol):
 
     def connection_lost(self, exc: Exception | None) -> None:
         self._disarm()
-        if self._peer is not None:
-            self.peers[self._peer] -= 1
-            if self.peers[self._peer] <= 0:
-                del self.peers[self._peer]
-            self._peer = None
+        if self._peer is None:
+            return  # refused in connection_made: uvicorn never saw it
+        self.peers[self._peer] -= 1
+        if self.peers[self._peer] <= 0:
+            del self.peers[self._peer]
+            self.refused.pop(self._peer, None)
+        self._peer = None
         super().connection_lost(exc)
+
+
+#: The answers to a connection over its peer's cap or the server's, sent before any
+#: request is read.
+PEER_BUSY_RESPONSE = HeadDeadlineProtocol.raw_refusal(
+    503, "Service Unavailable", "too many connections from this peer"
+)
+GATEWAY_BUSY_RESPONSE = HeadDeadlineProtocol.raw_refusal(
+    503, "Service Unavailable", "too many connections to the gateway"
+)
+#: The answer to a request to switch protocols (a WebSocket upgrade).
+UPGRADE_REFUSED_RESPONSE = HeadDeadlineProtocol.raw_refusal(
+    400, "Bad Request", "protocol upgrades are not accepted"
+)
 
 
 class _Pinned:
@@ -166,6 +203,7 @@ class Gateway:
             {
                 "head_timeout_s": config.header_timeout_s,
                 "peer_cap": config.max_connections_per_peer,
+                "total_cap": config.max_connections,
                 "peers": Counter(),
                 "refused": Counter(),
             },
@@ -174,7 +212,10 @@ class Gateway:
         self._servers = (
             self._server(
                 _Pinned(ModelProxy(config, keys), config.listen),
-                limit_concurrency=config.max_connections,
+                # the protocol refuses connections past max_connections with the
+                # gateway's JSON 503 first; uvicorn's own limit (a plain-text 503 once
+                # it holds this many) stays one above, as a backstop
+                limit_concurrency=config.max_connections + 1,
                 http=protocol,
             ),
             self._server(
@@ -192,6 +233,7 @@ class Gateway:
                 log_config=None,
                 access_log=False,  # the gateway logs each call itself, without headers
                 proxy_headers=False,
+                ws="none",  # plain HTTP only: no WebSocket upgrades
                 server_header=False,
                 date_header=False,
                 timeout_keep_alive=5,

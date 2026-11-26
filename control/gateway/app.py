@@ -86,14 +86,22 @@ HOP_BY_HOP: Final = frozenset(
 )
 #: The most a model list from Ollama may weigh.
 MAX_LISTING_BYTES: Final = 4 << 20
-#: A body up to this size is checked on the event loop (well under a millisecond);
-#: a larger one in a worker thread. No body this small can need the exact container
-#: count, which only starts above MAX_JSON_CONTAINERS brackets.
+#: A body up to this size is checked on the event loop, a larger one in a worker
+#: thread. Measured worst cases of 64 KiB: 1.3 ms for a flood of numbers, 3 ms for
+#: 21,000 empty objects (each one calls the object hook). No body this small can need
+#: the exact count, which only starts above the caps of the policy module.
 INLINE_CHECK_BYTES: Final = 64 << 10
 #: Model checks running at once in worker threads, and how many of them one run may
-#: take, so one run's slow worst cases never hold every parse thread.
-PARSE_THREADS: Final = 4
-PARSE_THREADS_PER_RUN: Final = 2
+#: queue for. One thread: with two busy threads the event loop competes with both for
+#: each turn of the GIL and can lose several turns in a row. Measured end to end, with
+#: two runs each posting the costliest body under the caps two at a time, another
+#: run's stream was delayed up to 0.12 s with two threads and 0.05 s with one. The
+#: queue is first come, first served and each run waits for one check at a time, so
+#: the runs take turns and none can hold the thread. One check takes up to 40 MiB,
+#: or 80 MiB for a 16 MiB body with one character outside the BMP (its decoded text
+#: then takes 4 bytes a character).
+PARSE_THREADS: Final = 1
+PARSE_THREADS_PER_RUN: Final = 1
 #: Idle connections the pool to Ollama keeps for reuse.
 KEEPALIVE_CONNECTIONS: Final = 16
 
@@ -321,10 +329,14 @@ class ModelProxy:
                 model = await self._in_parse_thread(grant.run_id, policy, body, endpoint.path)
             else:
                 model = policy.check(body, endpoint.path)
-        except BodyTooComplex as complex_body:
-            raise Refused(413, complex_body.reason) from None
-        except ModelRefused as refused:
-            raise Refused(403, refused.reason) from None
+        except (BodyTooComplex, ModelRefused) as refusal:
+            # Raised in a parse thread, the refusal and the thread runner's frame (which
+            # holds the body) reference each other: without its traceback the body is
+            # freed now, not at the next garbage collection. Refused bodies piled up to
+            # hundreds of MiB that way.
+            refusal.__traceback__ = None
+            status = 413 if isinstance(refusal, BodyTooComplex) else 403
+            raise Refused(status, refusal.reason) from None
         if model is None:
             raise Refused(403, "the request names no model")
 

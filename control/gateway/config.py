@@ -79,18 +79,21 @@ class GatewayConfig:
     #: memory the caps below allow small enough to size the container.
     max_body_bytes: int = 16 << 20
     #: How many large (over 1 MiB) bodies one run, and the whole gateway, may hold in
-    #: memory at once. Worst case held: 8 x 16 MiB plus 1 MiB for every other call.
+    #: memory at once. A 128k-token context is about 0.5 MB, so a large body is rare.
+    #: Worst case held: 4 x 16 MiB plus 1 MiB for every other call (see the compose
+    #: file for the measured memory).
     max_large_bodies_per_run: int = 2
-    max_large_bodies: int = 8
+    max_large_bodies: int = 4
     #: Calls one run may have open at once (an agent with a few sub-agents needs a
     #: handful); more get 429.
     max_inflight_per_run: int = 8
     #: Calls the whole gateway may have open at once, which is also the size of the
     #: connection pool to Ollama, so the pool never queues; more get 503.
     max_upstream_connections: int = 64
-    #: Open connections on the cell-facing listener (idle ones included), and per peer
-    #: address. Each cell's tap is one peer, so 256 holds 8 cells at their full 32;
-    #: one runner per host runs one cell at a time.
+    #: Open connections on the cell-facing listener (idle ones included), in all and
+    #: per peer address; more get the gateway's JSON 503. Each cell's tap is one peer,
+    #: so 256 holds 8 cells at their full 32 (one runner per host runs one cell at a
+    #: time); the per-peer cap must stay below the total.
     max_connections: int = 256
     max_connections_per_peer: int = 32
     #: A new or kept-alive connection must deliver a complete request head this fast.
@@ -142,9 +145,9 @@ class GatewayConfig:
             raise GatewayConfigError("max_inflight_per_run exceeds max_upstream_connections")
         if self.max_large_bodies_per_run > min(self.max_large_bodies, self.max_inflight_per_run):
             raise GatewayConfigError("max_large_bodies_per_run exceeds the other caps")
-        if self.max_connections_per_peer > self.max_connections:
+        if self.max_connections_per_peer >= self.max_connections:
             # one peer could then fill every slot again
-            raise GatewayConfigError("max_connections_per_peer exceeds max_connections")
+            raise GatewayConfigError("max_connections_per_peer must be below max_connections")
 
     @classmethod
     def _limits(cls) -> list[Any]:

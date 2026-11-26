@@ -6,6 +6,7 @@ import json
 import random
 import threading
 import time
+import tracemalloc
 
 import pytest
 
@@ -13,6 +14,7 @@ from control.gateway import policy as policy_module
 from control.gateway.policy import (
     ALLOWED_ENDPOINTS,
     MAX_JSON_CONTAINERS,
+    MAX_JSON_SEPARATORS,
     BodyTooComplex,
     Decision,
     EndpointPolicy,
@@ -155,7 +157,7 @@ def test_odd_query_strings_are_denied(query: str) -> None:
 # --------------------------------------------------------------------------- models
 
 
-count_containers = ModelPolicy.count_containers
+count_structure = ModelPolicy.count_structure
 GRANT = ModelPolicy(frozenset({"qwen3:14b"}))
 
 
@@ -302,6 +304,48 @@ def test_a_body_with_too_many_arrays_or_objects_is_too_complex(fill: bytes) -> N
     # not a model refusal: it must never read like a model swap
     assert not isinstance(info.value, ModelRefused)
     assert info.value.reason.startswith("body_too_complex")
+    assert "arrays and objects" in info.value.reason
+
+
+def many_members(count: int, key_bytes: int = 200, model: str = "qwen3:14b") -> bytes:
+    """One object of ``count`` members with long, distinct keys: per byte, the parse
+    that holds the GIL longest and takes the most memory."""
+    members = b",".join(b'"%s%d":"v"' % (b"k" * key_bytes, i) for i in range(count))
+    return b'{"model": "%s", "o": {%s}}' % (model.encode(), members)
+
+
+#: The worst body under both caps: 2 separators for the model and "o", 2 per member.
+WORST_UNDER_THE_CAPS = many_members((MAX_JSON_SEPARATORS - 2) // 2)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # the review's body: one object of 1.15M members, two brackets, 14 MiB
+        b'{"model": "qwen3:14b", "o": {'
+        + b",".join(b'"k%d":""' % i for i in range(1_150_000))
+        + b"}}",
+        many_members(MAX_JSON_SEPARATORS // 2, key_bytes=10),
+        b'{"model": "qwen3:14b", "x": [' + b'"",' * MAX_JSON_SEPARATORS + b'""]}',
+        b'{"model": "qwen3:14b", "x": [' + b"true," * MAX_JSON_SEPARATORS + b"true]}",
+        b'{"model": "qwen3:14b", "x": [' + b"1," * MAX_JSON_SEPARATORS + b"1]}",
+    ],
+)
+def test_a_body_with_too_many_values_is_too_complex(body: bytes) -> None:
+    # strings, keys and literals are built in C with the GIL held: their number, not
+    # the body's size, is what a parse costs the event loop
+    assert len(body) <= 16 << 20
+    with pytest.raises(BodyTooComplex) as info:
+        GRANT.check(body, "/api/chat")
+    assert not isinstance(info.value, ModelRefused)
+    assert info.value.reason.startswith("body_too_complex")
+    assert "values" in info.value.reason
+
+
+def test_the_worst_body_under_the_caps_passes() -> None:
+    assert len(WORST_UNDER_THE_CAPS) <= 16 << 20
+    assert count_structure(WORST_UNDER_THE_CAPS) == (2, MAX_JSON_SEPARATORS)
+    assert GRANT.check(WORST_UNDER_THE_CAPS, "/api/chat") == "qwen3:14b"
 
 
 #: Minified JavaScript, as an agent fetching a single-page app's bundles gets it: about
@@ -322,16 +366,26 @@ def js_history(target_bytes: int, model: str = "qwen3:14b") -> bytes:
 def test_a_history_of_minified_javascript_passes() -> None:
     body = js_history(15 << 20)
     assert len(body) <= 16 << 20
-    assert body.count(b"[") + body.count(b"{") > 5 * MAX_JSON_CONTAINERS  # raw over-count
-    assert count_containers(body) < 1_000
+    # both raw over-counts are far past their caps, so the exact count runs
+    assert body.count(b"[") + body.count(b"{") > 5 * MAX_JSON_CONTAINERS
+    assert body.count(b",") + body.count(b":") > 5 * MAX_JSON_SEPARATORS
+    containers, separators = count_structure(body)
+    assert containers < 1_000
+    assert separators < MAX_JSON_SEPARATORS // 50  # its bulk is inside strings
     assert GRANT.check(body, "/api/chat") == "qwen3:14b"
+
+
+#: 140,000 strings of 100 braces: 14 MiB of ``{``, two real containers, and still
+#: under the separators cap.
+BRACE_STRINGS = (
+    b'{"model": "qwen3:14b", "x": [' + b",".join([b'"' + b"{" * 100 + b'"'] * 140_000) + b"]}"
+)
 
 
 def test_a_flood_of_strings_full_of_braces_passes() -> None:
-    body = b'{"model": "qwen3:14b", "x": [' + b'"{",' * 3_900_000 + b'"[[{"]}'
-    assert len(body) <= 16 << 20
-    assert count_containers(body) == 2
-    assert GRANT.check(body, "/api/chat") == "qwen3:14b"
+    assert len(BRACE_STRINGS) <= 16 << 20
+    assert count_structure(BRACE_STRINGS) == (2, 140_002)
+    assert GRANT.check(BRACE_STRINGS, "/api/chat") == "qwen3:14b"
 
 
 @pytest.mark.parametrize(
@@ -345,10 +399,10 @@ def test_a_flood_of_strings_full_of_braces_passes() -> None:
         (b'["' + b"\\n" * 3_000_000 + b'",{}]', 2),  # escapes beyond one window
         # a window is 64 KiB from where a step starts: a short string across its edge,
         # an escaped backslash split by it, and plain runs longer than a window
-        (b"[" + b"1," * 32_766 + b'"{[{[{[{",{', 2),
-        (b"[" + b"1," * 32_766 + b'"ab\\\\"[', 2),
-        (b"[" + b"1," * 32_766 + b'"ab\\"[",[', 2),
-        (b"[" + b"1," * 100_000 + b'"[",[', 2),
+        (b"[" + b"1 " * 32_766 + b'"{[{[{[{" {', 2),
+        (b"[" + b"1 " * 32_766 + b'"ab\\\\"[', 2),
+        (b"[" + b"1 " * 32_766 + b'"ab\\"[" [', 2),
+        (b"[" + b"1 " * 100_000 + b'"[" [', 2),
         (b'["a\\', 1),  # a backslash ends the body inside a string
         (b"", 0),
         (b'"', 0),
@@ -357,12 +411,29 @@ def test_a_flood_of_strings_full_of_braces_passes() -> None:
     ],
 )
 def test_the_exact_count_skips_strings(body: bytes, count: int) -> None:
-    assert count_containers(body) == count
+    assert count_structure(body)[0] == count  # the containers
 
 
-def _count_byte_by_byte(body: bytes) -> int:
+@pytest.mark.parametrize(
+    ("body", "counts"),
+    [
+        (b'{"a,:":"b","c":[1,2]}', (2, 4)),
+        (b'{"a":"x,y:z\\",:"}', (1, 1)),
+        (b'[1,2,3,"4,5"]', (1, 3)),
+        (b"[" + b"1," * 50_000 + b'":,:,"', (1, 50_000)),  # plain runs over a window
+        (b",,::", (0, 4)),
+    ],
+)
+def test_the_exact_count_counts_separators_outside_strings(
+    body: bytes, counts: tuple[int, int]
+) -> None:
+    assert count_structure(body) == counts
+
+
+def _count_byte_by_byte(body: bytes) -> tuple[int, int]:
     """The same count, the slow and obvious way."""
-    count, index, in_string = 0, 0, False
+    containers = separators = index = 0
+    in_string = False
     while index < len(body):
         byte = body[index : index + 1]
         if in_string and byte == b"\\":
@@ -371,21 +442,24 @@ def _count_byte_by_byte(body: bytes) -> int:
         if byte == b'"':
             in_string = not in_string
         elif not in_string and byte in (b"[", b"{"):
-            count += 1
+            containers += 1
+        elif not in_string and byte in (b",", b":"):
+            separators += 1
         index += 1
-    return count
+    return containers, separators
 
 
+@pytest.mark.parametrize("window", [2, 3, 7])
 def test_the_exact_count_agrees_with_a_byte_by_byte_count(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, window: int
 ) -> None:
-    # tiny windows, so random bodies cross a window's edge everywhere: inside strings,
-    # in escapes, on quotes and on brackets
-    monkeypatch.setattr(policy_module, "_WINDOW", 7)
-    rng = random.Random(20261126)  # noqa: S311 - reproducible test data, not secrets
-    for _ in range(20_000):
-        body = bytes(rng.choice(b'"\\[{a,]}\n') for _ in range(rng.randint(0, 50)))
-        assert count_containers(body, cap=10**9) == _count_byte_by_byte(body), body
+    # tiny windows (2 is the least: an escape must fit), so random bodies cross a
+    # window's edge everywhere: inside strings, in escapes, on quotes and separators
+    monkeypatch.setattr(policy_module, "_WINDOW", window)
+    rng = random.Random(20261126 + window)  # noqa: S311 - reproducible test data
+    for _ in range(10_000):
+        body = bytes(rng.choice(b'"\\[{a,:]}\n') for _ in range(rng.randint(0, 50)))
+        assert count_structure(body, 10**9, 10**9) == _count_byte_by_byte(body), body
 
 
 @pytest.mark.parametrize(
@@ -398,22 +472,23 @@ def test_the_exact_count_agrees_with_a_byte_by_byte_count(
         b'{"x":[' + b'"{",' * 4_000_000 + b'""]}',
         b"[" + b'"",' * 5_000_000 + b"]",
         b"[" + b'"\\n",' * 3_000_000 + b"]",
-        # nothing to find for 14 MiB: one search over it held the GIL for 3 s
-        b'{"s":"' + b"[" * (MAX_JSON_CONTAINERS + 5) + b'","x":[' + b"1," * 7_000_000 + b"1]}",
+        # nothing to find for 14 MiB: one search over it held the GIL for seconds
+        b'{"s":"' + b"[" * (MAX_JSON_CONTAINERS + 5) + b'","x":[' + b"1 " * 7_000_000 + b"1]}",
     ],
 )
 def test_the_exact_count_is_linear_on_hostile_strings(body: bytes) -> None:
     # an unbounded string pattern rescans to the end of the body from every quote of
     # an unterminated string (quadratic, hours for 16 MiB), and one regex call per
-    # short string takes seconds for a flood of them; all of these take well under 1 s
+    # short string takes seconds for a flood of them. Counted to the end (no cap),
+    # all of these take well under 1 s on an idle host.
     started = time.perf_counter()
-    count_containers(body + b"[" * (MAX_JSON_CONTAINERS + 5))
-    assert time.perf_counter() - started < 2.5
+    count_structure(body, 10**9, 10**9)
+    assert time.perf_counter() - started < 5
 
 
-def test_the_exact_count_stops_past_the_cap() -> None:
-    body = b"[" + b"[]," * 5_000_000
-    assert count_containers(body) == MAX_JSON_CONTAINERS + 1
+def test_the_exact_count_stops_past_the_caps() -> None:
+    assert count_structure(b"[" + b"[]," * 5_000_000)[0] == MAX_JSON_CONTAINERS + 1
+    assert count_structure(b"[" + b"1," * 5_000_000)[1] == MAX_JSON_SEPARATORS + 1
 
 
 _BRACKETS_IN_A_STRING = b'{"s":"' + b"[" * (MAX_JSON_CONTAINERS + 5) + b'",'
@@ -422,7 +497,7 @@ _BRACKETS_IN_A_STRING = b'{"s":"' + b"[" * (MAX_JSON_CONTAINERS + 5) + b'",'
 @pytest.mark.parametrize(
     "body",
     [
-        _BRACKETS_IN_A_STRING + b'"x":[' + b"1," * 8_000_000 + b"1]}",  # nothing to skip
+        _BRACKETS_IN_A_STRING + b'"x":[' + b"1 " * 8_000_000 + b"1]}",  # nothing to skip
         _BRACKETS_IN_A_STRING + b'"x":"' + b"y" * (16 << 20) + b'"}',  # one long string
         _BRACKETS_IN_A_STRING + b'"x":"' + b"\\n" * (8 << 20) + b'"}',  # all escapes
         _BRACKETS_IN_A_STRING + b'"x":[' + b'"{",' * 4_000_000 + b'""]}',
@@ -433,7 +508,7 @@ def test_the_exact_count_lets_other_threads_run(body: bytes) -> None:
     # thread next to the event loop: no single call may scan much. (One search across
     # 16 MiB with nothing to find held the GIL for about 0.13 s, far more on a busy
     # host.) This thread asks for the GIL every millisecond.
-    worker = threading.Thread(target=count_containers, args=(body,))
+    worker = threading.Thread(target=count_structure, args=(body, 10**9, 10**9))
     gaps: list[float] = []
     last = time.perf_counter()
     worker.start()  # the worker may take the GIL at once: this is already a gap
@@ -446,7 +521,56 @@ def test_the_exact_count_lets_other_threads_run(body: bytes) -> None:
     assert max(gaps) < 0.05, sorted(gaps)[-3:]
 
 
-def test_a_realistic_large_body_is_well_inside_the_container_cap() -> None:
+def _longest_gap_beside(body: bytes, parsers: int) -> float:
+    """The longest this thread waits for the GIL while ``parsers`` threads check
+    ``body`` at once (it asks every millisecond, as the event loop would)."""
+    workers = [
+        threading.Thread(target=GRANT.check, args=(body, "/api/chat")) for _ in range(parsers)
+    ]
+    gaps: list[float] = []
+    last = time.perf_counter()
+    for worker in workers:
+        worker.start()
+    while any(worker.is_alive() for worker in workers):
+        time.sleep(0.001)
+        now = time.perf_counter()
+        gaps.append(now - last)
+        last = now
+    return max(gaps)
+
+
+def test_two_worst_case_parses_at_once_leave_the_loop_its_turns() -> None:
+    # The gateway runs one parse thread (app.PARSE_THREADS). Even two worst-case
+    # parses at once, whose holds of the GIL chain, leave the loop waiting about
+    # 2 x 50 ms here. The best of three tries rules out a busy host's one-off stall.
+    best = min(_longest_gap_beside(WORST_UNDER_THE_CAPS, parsers=2) for _ in range(3))
+    assert best < 0.25, best
+
+
+@pytest.mark.parametrize(
+    ("body", "most_mib"),
+    [
+        (WORST_UNDER_THE_CAPS, 56),  # measured 40 MiB
+        (BRACE_STRINGS, 56),
+        (b'{"model": "qwen3:14b", "x": [' + b'"",' * (MAX_JSON_SEPARATORS - 3) + b'""]}', 24),
+        # one astral character makes the decoded text 4 bytes a character: 64 MiB for
+        # 16 MiB, whatever the caps (measured 80 MiB in all)
+        (b'{"model": "qwen3:14b", "e": "\xf0\x9f\x98\x80", "s": "' + b"y" * (16 << 20) + b'"}', 96),
+    ],
+)
+def test_a_parse_stays_within_its_memory(body: bytes, most_mib: int) -> None:
+    # the container's mem_limit is sized from these (deploy/compose/control-plane.yml)
+    assert len(body) <= (16 << 20) + 100
+    tracemalloc.start()
+    try:
+        assert GRANT.check(body, "/api/chat") == "qwen3:14b"
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < most_mib << 20, peak >> 20
+
+
+def test_a_realistic_large_body_is_well_inside_the_caps() -> None:
     history = [{"role": "user", "content": "x" * 16_000, "images": []} for _ in range(1000)]
     tools = [
         {"type": "function", "function": {"name": f"t{i}", "parameters": {}}} for i in range(200)

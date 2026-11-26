@@ -446,7 +446,7 @@ def test_the_gateway_publishes_nothing_and_splits_its_listeners() -> None:
     assert set(nets) == {"control", "cells", "models"}
     assert gateway["read_only"] is True and gateway["cap_drop"] == ["ALL"]
     # bounded memory and processes: bodies are held in memory, sized from the caps
-    assert gateway["mem_limit"] == "1g"
+    assert gateway["mem_limit"] == "768m"
     assert 64 <= gateway["pids_limit"] <= 256
 
 

@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import gc
 import hashlib
 import json
 import secrets
+import select
 import socket
 import subprocess
 import sys
 import threading
 import time
+import tracemalloc
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -24,7 +28,7 @@ from control.gateway.admin import AdminApi
 from control.gateway.app import ModelProxy
 from control.gateway.config import GatewayConfig, GatewayConfigError, Listener
 from control.gateway.keys import RunKeys, key_sha256
-from control.gateway.policy import MAX_JSON_CONTAINERS
+from control.gateway.policy import MAX_JSON_SEPARATORS
 from control.gateway.server import Gateway
 from tests.gateway.conftest import (
     NDJSON_CHUNKS,
@@ -37,7 +41,14 @@ from tests.gateway.conftest import (
     raw_http,
     status_of,
 )
-from tests.gateway.test_policy import MANAGEMENT, PATH_TRICKS, js_history
+from tests.gateway.test_policy import (
+    BRACE_STRINGS,
+    MANAGEMENT,
+    PATH_TRICKS,
+    WORST_UNDER_THE_CAPS,
+    js_history,
+    many_members,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SECRET = secrets.token_urlsafe(32)
@@ -489,28 +500,59 @@ def test_oversized_bodies_are_refused_before_ollama(
     assert httpx.post(gw.proxy + "/api/chat", headers=_auth(), content=exact).status_code == 200
 
 
-def test_brace_dense_bodies_pass_and_too_many_containers_is_413(
+def test_brace_dense_bodies_pass_and_too_complex_ones_are_413(
     gw: Running, fake: FakeOllama
 ) -> None:
-    # an agent's history of fetched minified JavaScript, and strings full of braces:
-    # millions of "{" and "[" inside strings, a handful of real containers
-    for body in (
-        js_history(15 << 20),
-        b'{"model": "qwen3:14b", "x": [' + b'"{",' * 3_900_000 + b'""]}',
-    ):
+    # an agent's history of fetched minified JavaScript, strings full of braces, and
+    # the costliest body under both caps: they pass, forwarded unchanged
+    for body in (js_history(15 << 20), BRACE_STRINGS, WORST_UNDER_THE_CAPS):
         assert len(body) <= 16 << 20
         response = httpx.post(gw.proxy + "/api/chat", headers=_auth(), content=body, timeout=30)
         assert response.status_code == 200
-        assert fake.seen[-1].body == body  # forwarded unchanged
+        assert fake.seen[-1].body == body
     forwarded = len(fake.seen)
-    # really over the cap: 413 with its own reason, never a 403 that reads like a
-    # model swap, and never forwarded
-    for fill in (b"[],", b"{},", b"[[]],"):
-        body = b'{"model": "qwen3:14b", "x": [' + fill * 2_000_000 + b"[]]}"
+    # really over a cap: 413 with its own reason, never a 403 that reads like a model
+    # swap, and never forwarded. The object of 1.15M members has two brackets.
+    too_complex = [
+        b'{"model": "qwen3:14b", "x": [' + fill * 2_000_000 + b"[]]}"
+        for fill in (b"[],", b"{},", b"[[]],")
+    ]
+    too_complex.append(
+        b'{"model": "qwen3:14b", "o": {'
+        + b",".join(b'"k%d":""' % i for i in range(1_150_000))
+        + b"}}"
+    )
+    for body in too_complex:
         response = httpx.post(gw.proxy + "/api/chat", headers=_auth(), content=body, timeout=30)
         assert response.status_code == 413
         assert _refusal(response).startswith("body_too_complex")
     assert len(fake.seen) == forwarded
+
+
+def test_a_refused_body_is_freed_at_once(gw: Running) -> None:
+    # A refusal raised in a parse thread used to sit in a reference cycle with the
+    # thread runner's frame, which holds the body: refused bodies piled up until the
+    # garbage collector ran (hundreds of MiB). With the collector off, nothing of the
+    # three bodies below may stay behind.
+    bodies = (
+        many_members((MAX_JSON_SEPARATORS - 2) // 2, model="llama3:8b"),  # 403
+        b'{"model": "qwen3:14b", "x": [' + b"[]," * 2_000_000 + b"[]]}",  # 413
+        b'{"model": "llama3:8b", "e": "\xf0\x9f\x98\x80", "s": "' + b"y" * (12 << 20) + b'"}',
+    )
+    gc.collect()
+    gc.disable()
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        for body in bodies:
+            response = httpx.post(gw.proxy + "/api/chat", headers=_auth(), content=body, timeout=30)
+            assert response.status_code in (403, 413)
+        time.sleep(0.3)
+        held = tracemalloc.get_traced_memory()[0] - before
+    finally:
+        tracemalloc.stop()
+        gc.enable()
+    assert held < 4 << 20, held >> 20
 
 
 def test_a_client_that_sends_its_body_too_slowly_is_cut_off(
@@ -707,7 +749,7 @@ def test_refuses_to_start_when_both_listeners_share_address_and_port() -> None:
         {"max_large_bodies_per_run": 0},
         {"max_connections": 0},
         {"max_connections_per_peer": 0},
-        {"max_connections": 64, "max_connections_per_peer": 65},
+        {"max_connections": 64, "max_connections_per_peer": 64},
     ],
 )
 def test_unsafe_configurations_are_refused(overrides: dict[str, Any]) -> None:
@@ -821,12 +863,16 @@ def test_idle_sockets_on_the_proxy_never_reach_the_admin_api(fake: FakeOllama) -
         fake.url,
         _keys(("run_a", KEY, MODEL)),
         max_connections=20,
-        max_connections_per_peer=20,  # one peer fills the whole proxy
+        max_connections_per_peer=10,
         header_timeout_s=1,
     ) as config:
         proxy, admin = f"http://{config.listen}", f"http://{config.admin_listen}"
+        # two peers at their caps fill the whole proxy
+        address = (config.listen.host, config.listen.port)
         idle = [
-            socket.create_connection((config.listen.host, config.listen.port)) for _ in range(60)
+            socket.create_connection(address, source_address=(peer, 0))
+            for _ in range(30)
+            for peer in ("127.0.0.1", "127.0.0.4")
         ]
         try:
             time.sleep(0.3)
@@ -938,7 +984,11 @@ def test_too_many_large_bodies_from_one_run_are_refused(fake: FakeOllama) -> Non
 
 @contextlib.contextmanager
 def gateway_process(upstream: str, *runs: tuple[str, str]) -> Iterator[dict[str, str]]:
-    """The gateway in its own process (and GIL), in front of ``upstream``; its URLs."""
+    """The gateway in its own process (and GIL), in front of ``upstream``; its URLs.
+
+    The child is killed if it does not report its URLs within 30 s or does not exit
+    within 30 s of its stdin closing, so it can never hang the suite.
+    """
     args = [f"{run_id}={key}" for run_id, key in runs]
     with subprocess.Popen(  # noqa: S603 - this interpreter and a test module, no input
         [sys.executable, "-m", "tests.gateway.serve_gateway", upstream, *args],
@@ -949,10 +999,16 @@ def gateway_process(upstream: str, *runs: tuple[str, str]) -> Iterator[dict[str,
     ) as process:
         assert process.stdin is not None and process.stdout is not None
         try:
+            ready, _, _ = select.select([process.stdout], [], [], 30)
+            assert ready, "the gateway process did not start within 30 s"
             yield json.loads(process.stdout.readline())
         finally:
             process.stdin.close()
-            process.wait(30)
+            try:
+                process.wait(30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
 
 #: How often the fake Ollama's ``drip`` mode sends a byte.
@@ -962,37 +1018,26 @@ DRIP_S = 0.05
 def test_a_large_body_blocks_neither_other_streams_nor_the_admin_api(fake: FakeOllama) -> None:
     fake.mode = "drip"
     other = secrets.token_urlsafe(32)
-    # the heaviest body the gateway still parses (the most containers it accepts, and
-    # a long string); the reviewer's 15 MiB of small objects, which took 9 s to parse
-    # on the event loop and is now refused before parsing; a [] flood, refused at the
-    # cap; a history of minified JavaScript and a flood of strings full of braces,
-    # which must pass; and 14 MiB with no quote or bracket after a string of brackets,
-    # which one regex search held the GIL over for seconds
-    parsed = (
-        b'{"model": "llama3:8b", "x": ['
-        + b",".join([b'{"a":1}'] * (MAX_JSON_CONTAINERS - 10))
-        + b'], "y": "'
-        + b"z" * (12 << 20)
-        + b'"}'
-    )
+    # the costliest body the gateway still parses (both caps nearly reached, long
+    # keys); the reviewer's 15 MiB of small objects, which took 9 s to parse on the
+    # event loop; a [] flood; one object of 1.15M members, which held the GIL for
+    # 425 ms; all refused before parsing. And a history of minified JavaScript and a
+    # flood of strings full of braces, which must pass.
     objects = b'{"model": "qwen3:14b", "x": [' + b",".join([b'{"a":1}'] * 1_900_000) + b"]}"
     assert len(objects) > 14 << 20
     arrays = b'{"model": "qwen3:14b", "x": [' + b"[]," * 5_000_000 + b"[]]}"
-    flood = b'{"model": "qwen3:14b", "x": [' + b'"{",' * 3_900_000 + b'""]}'
-    plain = (
-        b'{"model": "qwen3:14b", "s": "'
-        + b"[" * (MAX_JSON_CONTAINERS + 5)
-        + b'", "x": ['
-        + b"1," * 7_000_000
-        + b"1]}"
+    members = (
+        b'{"model": "qwen3:14b", "o": {'
+        + b",".join(b'"k%d":""' % i for i in range(1_150_000))
+        + b"}}"
     )
     cases = (
-        (parsed, 403, "not granted"),
+        (many_members((MAX_JSON_SEPARATORS - 2) // 2, model="llama3:8b"), 403, "not granted"),
         (objects, 413, "body_too_complex"),
         (arrays, 413, "body_too_complex"),
+        (members, 413, "body_too_complex"),
         (js_history(15 << 20), 200, ""),
-        (flood, 200, ""),
-        (plain, 200, ""),
+        (BRACE_STRINGS, 200, ""),
     )
     assert all(len(body) <= 16 << 20 for body, _, _ in cases)
     with gateway_process(fake.url, ("run_a", KEY), ("run_b", other)) as urls:
@@ -1031,16 +1076,15 @@ def test_a_large_body_blocks_neither_other_streams_nor_the_admin_api(fake: FakeO
         done.set()
         watcher.join(15)
     assert len(gaps) > 20
-    # Chunks come every 50 ms. The parse on the event loop delayed them by 9 s, and one
-    # regex search over 14 MiB by 1 to 1.5 s, on every such body (each is sent twice).
-    # Now the loop waits at most for one short regex call or for the JSON parser's
-    # last stretch in C (about 0.1 s for millions of strings). A busy host can stretch
-    # one of those, so the second-largest delay must stay under 0.2 s and none may
-    # reach 1.5 s.
+    # Chunks come every 50 ms. The parse on the event loop delayed them by 9 s on every
+    # such body (each is sent twice). Now the loop waits at most for one short regex
+    # call or for a parse's last stretch in C (about 50 ms under the caps). A busy
+    # host stretches a few of those, so the third-largest delay must stay under 0.3 s
+    # and none may reach 2 s; the policy tests carry the precise bounds.
     delays = sorted(gap - DRIP_S for gap in gaps[1:])
-    assert delays[-2] < 0.2, delays[-5:]
-    assert delays[-1] < 1.5, delays[-5:]
-    assert sorted(health)[-2] < 0.2, health
+    assert delays[-3] < 0.3, delays[-5:]
+    assert delays[-1] < 2.0, delays[-5:]
+    assert sorted(health)[-2] < 0.3, health
 
 
 def test_a_client_leaving_during_prefill_cancels_the_upstream_call(
@@ -1189,7 +1233,13 @@ def test_a_peer_that_keeps_refilling_idle_sockets_does_not_stop_another(fake: Fa
         assert set(statuses) == {200}, statuses
 
 
-def test_run_reports_a_server_that_stopped_by_itself(fake: FakeOllama) -> None:
+@pytest.mark.parametrize(
+    ("stopped", "status"),
+    [("by the caller", 0), ("proxy server", 1), ("admin server", 1)],
+)
+def test_run_reports_a_server_that_stopped_by_itself(
+    fake: FakeOllama, stopped: str, status: int
+) -> None:
     proxy_sock = socket.create_server(("127.0.0.1", 0))
     admin_sock = socket.create_server(("127.0.0.2", 0))
     config = _config(
@@ -1197,25 +1247,122 @@ def test_run_reports_a_server_that_stopped_by_itself(fake: FakeOllama) -> None:
         listen=Listener("127.0.0.1", proxy_sock.getsockname()[1]),
         admin_listen=Listener("127.0.0.2", admin_sock.getsockname()[1]),
     )
-    proxy_sock.close()
-    admin_sock.close()
+    gateway = Gateway(config, RunKeys())
     results: list[int] = []
-    for stopped_by_caller in (True, False):
-        proxy_sock = socket.create_server(("127.0.0.1", config.listen.port))
-        admin_sock = socket.create_server(("127.0.0.2", config.admin_listen.port))
-        gateway = Gateway(config, RunKeys())
-        thread = threading.Thread(
-            target=lambda g=gateway, p=proxy_sock, a=admin_sock: results.append(g.run([p, a])),
-            daemon=True,
-        )
-        thread.start()
+    thread = threading.Thread(
+        target=lambda: results.append(gateway.run([proxy_sock, admin_sock])), daemon=True
+    )
+    thread.start()
+    try:
         deadline = time.monotonic() + 10
         while not gateway.started:
             assert time.monotonic() < deadline
             time.sleep(0.01)
-        if stopped_by_caller:
+        if stopped == "by the caller":
             gateway.stop()  # what SIGTERM does
-        else:
-            gateway._servers[1].should_exit = True  # the admin server ends by itself
+        else:  # one server ends on its own; the other is stopped with it
+            gateway._servers[0 if stopped == "proxy server" else 1].should_exit = True
         thread.join(15)
-    assert results == [0, 1]
+        assert results == [status]
+    finally:
+        gateway.stop()
+        thread.join(15)
+        proxy_sock.close()
+        admin_sock.close()
+
+
+def test_peers_at_their_caps_get_the_gateways_503_never_uvicorns(fake: FakeOllama) -> None:
+    # Two peers at their full share reach max_connections. A third peer gets the
+    # gateway's JSON 503 at once, and the requests on the held connections are still
+    # served: uvicorn's own limit (a plain-text 503) is never reached.
+    with full_gateway(
+        fake.url, _keys(("run_a", KEY, MODEL)), max_connections=6, max_connections_per_peer=3
+    ) as config:
+        address = (config.listen.host, config.listen.port)
+        held = [
+            socket.create_connection(address, source_address=(peer, 0))
+            for peer in ("127.0.0.3", "127.0.0.4")
+            for _ in range(3)
+        ]
+        try:
+            time.sleep(0.2)
+            with socket.create_connection(address, source_address=("127.0.0.5", 0)) as extra:
+                extra.settimeout(5)
+                refused = b""
+                while chunk := extra.recv(4096):
+                    refused += chunk
+            assert status_of(refused) == 503
+            assert body_of(refused) == {
+                "error": {
+                    "type": "gateway_refused",
+                    "reason": "too many connections to the gateway",
+                }
+            }
+            for sock in held:
+                sock.settimeout(5)
+                sock.sendall(_raw("POST", "/api/chat", f"authorization: Bearer {KEY}", body=CHAT))
+                answer = b""
+                while chunk := sock.recv(65536):
+                    answer += chunk
+                assert status_of(answer) == 200, answer[:200]
+        finally:
+            for sock in held:
+                sock.close()
+
+
+#: A WebSocket handshake; its key is RFC 6455's sample nonce, encoded here so that no
+#: secret scanner mistakes it for a credential.
+_UPGRADE = (
+    b"GET /api/chat HTTP/1.1\r\nhost: x\r\nupgrade: websocket\r\nconnection: upgrade\r\n"
+    b"sec-websocket-key: "
+    + base64.b64encode(b"the sample nonce")
+    + b"\r\nsec-websocket-version: 13\r\n\r\n"
+)
+
+
+@pytest.mark.parametrize("ws", ["as configured", "wsproto"])
+def test_websocket_upgrades_never_leak_a_peers_slot(fake: FakeOllama, ws: str) -> None:
+    # uvicorn swaps the protocol on an upgrade, and the slot is freed only by the
+    # protocol that took it. The gateway runs with ws="none"; "wsproto" checks the
+    # protocol's own refusal, in case a WebSocket library is ever switched on.
+    pytest.importorskip("wsproto")
+    proxy_sock = socket.create_server(("127.0.0.1", 0))
+    admin_sock = socket.create_server(("127.0.0.2", 0))
+    config = _config(
+        fake.url,
+        listen=Listener("127.0.0.1", proxy_sock.getsockname()[1]),
+        admin_listen=Listener("127.0.0.2", admin_sock.getsockname()[1]),
+        max_connections=16,
+        max_connections_per_peer=3,
+    )
+    gateway = Gateway(config, _keys(("run_a", KEY, MODEL)))
+    proxy = gateway._servers[0].config
+    if ws == "wsproto":
+        proxy.ws = "wsproto"
+    thread = threading.Thread(target=gateway.run, args=([proxy_sock, admin_sock],), daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not gateway.started:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert (proxy.ws_protocol_class is None) == (ws == "as configured")
+        address = (config.listen.host, config.listen.port)
+        for _ in range(10):  # well past the peer's cap of 3
+            with socket.create_connection(address) as sock:
+                sock.settimeout(5)
+                sock.sendall(_UPGRADE)
+                answer = sock.recv(4096)
+                assert answer.startswith((b"HTTP/1.1 4", b"HTTP/1.1 400")), answer[:80]
+                assert not answer.startswith(b"HTTP/1.1 101")
+        time.sleep(0.3)
+        assert dict(proxy.http.peers) == {}  # type: ignore[union-attr]
+        response = httpx.post(
+            f"http://{config.listen}/api/chat", headers=_auth(), content=CHAT, timeout=5
+        )
+        assert response.status_code == 200
+    finally:
+        gateway.stop()
+        thread.join(15)
+        proxy_sock.close()
+        admin_sock.close()

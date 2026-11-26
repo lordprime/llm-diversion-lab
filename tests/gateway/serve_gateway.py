@@ -38,7 +38,7 @@ def main(argv: list[str]) -> int:
     for run_id, _, key in runs:
         keys.register(run_id, key_sha256(key), [MODEL], datetime.now(UTC) + timedelta(hours=1))
     gateway = Gateway(config, keys)
-    thread = threading.Thread(target=gateway.run, args=([proxy_sock, admin_sock],))
+    thread = threading.Thread(target=gateway.run, args=([proxy_sock, admin_sock],), daemon=True)
     thread.start()
     while not gateway.started:
         if not thread.is_alive():

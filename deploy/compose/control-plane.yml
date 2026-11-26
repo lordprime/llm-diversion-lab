@@ -158,12 +158,16 @@ services:
     tmpfs: [/tmp]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
-    # Sized from the gateway's caps (control/gateway/config.py): at most 8 large bodies
-    # of up to 16 MiB plus 1 MiB for each of the other 56 open calls (about 184 MiB),
-    # four model checks parsing at once (each a decoded copy plus at most 100,000
-    # arrays and objects, under 60 MiB), the process itself, and headroom.
-    mem_limit: 1g
-    # one process; the event loop, four parse threads, the DB threadpool and libpq
+    # Measured, not guessed (tests.gateway.serve_gateway on a Ryzen 7 5800H, CPython
+    # 3.12; probes in the M2 Task 1 report, fix round 3): idle 82 MiB RSS. Under 40 s
+    # of 4 runs posting 16 MiB bodies two at a time (the caps then hold 4 large
+    # bodies; measured with 2 parse threads, the gateway now runs 1) the peak was
+    # 373 MiB for bodies with one character outside the BMP (their decoded text takes
+    # 4 bytes a character), 238-259 MiB for the costliest body the caps allow, and
+    # 173-209 MiB for bodies refused as too complex. One parse takes at most 40 MiB,
+    # or 80 MiB with such a character (tracemalloc). 768 MiB is twice the worst peak.
+    mem_limit: 768m
+    # one process; the event loop, one parse thread, the DB threadpool and libpq
     pids_limit: 128
     healthcheck:
       test:
