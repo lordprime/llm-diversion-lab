@@ -26,7 +26,7 @@ from control.db.engine import session_scope
 from control.db.repo import insert_events
 from control.runner.store import RunStore
 from control.telemetry.model import RunTelemetry
-from tests.db.test_repo import _events, _seed_injected_run, add_run, seed_experiment
+from tests.db.test_repo import _events, _seed_instruction_run, add_run, seed_experiment
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -110,7 +110,7 @@ def test_unreachable_database_fails_without_leaking_the_password(
 def test_runs_ls_lists_newest_first(lab_db: Engine, capsys: pytest.CaptureFixture[str]) -> None:
     ids = seed_experiment(lab_db)
     first = add_run(lab_db, ids, schedule_index=0, arm=Arm.CONTROL)
-    second = add_run(lab_db, ids, schedule_index=1, arm=Arm.INJECTED, status=RunStatus.VALID)
+    second = add_run(lab_db, ids, schedule_index=1, arm=Arm.INSTRUCTION, status=RunStatus.VALID)
 
     rc, out, _ = _run(capsys, "runs", "ls")
 
@@ -125,7 +125,7 @@ def _second_experiment(engine: Engine, ids: dict[str, str]) -> dict[str, str]:
         **ids,
         "experiment_id": new_id("exp"),
         "control_arm_id": new_id("arm"),
-        "injected_arm_id": new_id("arm"),
+        "instruction_arm_id": new_id("arm"),
     }
     with session_scope(engine) as s:
         s.add(
@@ -147,10 +147,10 @@ def _second_experiment(engine: Engine, ids: dict[str, str]) -> dict[str, str]:
                     surfaces=[],
                 ),
                 t.ExperimentArm(
-                    arm_id=other["injected_arm_id"],
+                    arm_id=other["instruction_arm_id"],
                     experiment_id=other["experiment_id"],
-                    name="injected",
-                    arm=Arm.INJECTED,
+                    name="instruction",
+                    arm=Arm.INSTRUCTION,
                     surfaces=["P1"],
                     payload_family="derail",
                     payload_style="override",
@@ -198,7 +198,7 @@ def test_runs_ls_empty(lab_db: Engine, capsys: pytest.CaptureFixture[str]) -> No
 def test_run_show_details_and_evidence_counts(
     lab_db: Engine, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_id, placement_id = _seed_injected_run(lab_db)
+    run_id, placement_id = _seed_instruction_run(lab_db)
     with session_scope(lab_db) as s:
         insert_events(s, _events(run_id, placement_id))
         s.execute(
@@ -235,6 +235,16 @@ def test_run_show_details_and_evidence_counts(
     assert (data["effect"], data["mechanism"]) == (True, False)
     assert data["placements"] == 1
     assert data["events"] == {str(k): v for k, v in kinds.items()}
+    # block_id, and pair_id as its deprecated alias for one release, in both outputs
+    with session_scope(lab_db) as s:
+        block_id = s.scalar(select(t.Run.block_id).where(t.Run.run_id == run_id))
+    assert data["arm"] == "instruction"
+    assert data["block_id"] == data["pair_id"] == block_id
+    rc, out, _ = _run(capsys, "run", "show", run_id)
+    assert {line.split()[0] for line in out.splitlines() if block_id in line} == {
+        "block_id",
+        "pair_id",
+    }
 
 
 def test_runs_ls_and_run_show_say_why_a_run_is_invalid(
@@ -393,7 +403,7 @@ def _telemetry_runs(engine: Engine) -> tuple[dict[str, str], list[str]]:
     ids = seed_experiment(engine)
     run_ids = [
         add_run(engine, ids, schedule_index=i, arm=arm, status=RunStatus.VALID)
-        for i, arm in ((2, Arm.INJECTED), (1, Arm.CONTROL), (0, Arm.INJECTED))
+        for i, arm in ((2, Arm.INSTRUCTION), (1, Arm.CONTROL), (0, Arm.INSTRUCTION))
     ]
     ids["queued_run_id"] = add_run(engine, ids, schedule_index=3)  # nothing derived yet
     with session_scope(engine) as s:
@@ -455,7 +465,7 @@ def test_export_csv_has_one_row_per_run_in_schedule_order(
     assert [line.split(",")[0] for line in lines[1:]] == [*run_ids[::-1], ids["queued_run_id"]]
     first = lines[1].split(",")
     assert first[1:11] == [
-        "injected", ids["target_id"], ids["agent_id"], ids["model_id"],
+        "instruction", ids["target_id"], ids["agent_id"], ids["model_id"],
         "completed", "valid", "", "true", "", "12",
     ]  # fmt: skip
     assert first[-1] == "ok"

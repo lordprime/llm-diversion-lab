@@ -11,7 +11,7 @@ from psycopg import sql
 from sqlalchemy import Engine, inspect, text, update
 from sqlalchemy.exc import IntegrityError
 
-from control.core.models import EventKind, InvalidReason
+from control.core.models import Arm, EventKind, InvalidReason
 from control.db import tables as t
 from control.db.engine import create_db_engine, session_scope
 from control.db.tables import Base
@@ -295,3 +295,143 @@ def test_telemetry_migration_downgrades_to_its_parent(db_url: str) -> None:
     assert "run_telemetry" not in _tables(db_url)
     command.upgrade(cfg, "head")
     assert "run_telemetry" in _tables(db_url)
+
+
+# --------------------------------------------------------------------------- three arms (0011)
+
+
+def _arms(url: str) -> list[tuple[str, str]]:
+    eng = create_db_engine(url)
+    try:
+        with eng.connect() as conn:
+            return sorted(
+                (row.name, row.arm) for row in conn.execute(text("SELECT name, arm FROM arms"))
+            )
+    finally:
+        eng.dispose()
+
+
+def test_the_arm_checks_list_exactly_the_three_arms(db_url: str) -> None:
+    command.upgrade(alembic_config(db_url), "head")
+    eng = create_db_engine(db_url)
+    try:
+        insp = inspect(eng)
+        for table in ("arms", "runs"):
+            (check,) = [
+                c for c in insp.get_check_constraints(table) if c["name"] == f"ck_{table}_arm"
+            ]
+            assert set(re.findall(r"'([a-z_]+)'", check["sqltext"])) == {a.value for a in Arm}
+        columns = {c["name"] for c in insp.get_columns("runs")}
+        assert "block_id" in columns and "pair_id" not in columns
+    finally:
+        eng.dispose()
+
+
+def test_the_three_arm_migration_keeps_two_arm_rows_readable(db_url: str) -> None:
+    """Rows stored before 0011 (``injected``, ``pair_id``) come back as instruction runs
+    of a block with the same id; the downgrade restores them exactly."""
+    cfg = alembic_config(db_url)
+    command.upgrade(cfg, "head")
+    eng = create_db_engine(db_url)
+    try:
+        ids = seed_experiment(eng)
+        control = add_run(eng, ids, schedule_index=0, block_id="pair_old")
+        treated = add_run(eng, ids, schedule_index=1, arm=Arm.INSTRUCTION, block_id="pair_old")
+    finally:
+        eng.dispose()
+
+    command.downgrade(cfg, "0010")  # the M1a schema, as M0 and M1a self-tests wrote it
+    old = _runs(db_url)
+    assert (old[control]["arm"], old[control]["pair_id"]) == ("control", "pair_old")
+    assert (old[treated]["arm"], old[treated]["pair_id"]) == ("injected", "pair_old")
+    assert "block_id" not in old[treated]
+    assert _arms(db_url) == [("control", "control"), ("p1-p7-derail", "injected")]
+    eng = create_db_engine(db_url)
+    try:  # an M1a-era arm and run, named as M1a named them
+        with eng.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO arms (arm_id, experiment_id, name, arm, surfaces, "
+                    "payload_family, payload_style, payload_version) VALUES "
+                    "('arm_m1a', :exp, 'injected', 'injected', '{P1}', 'decoy', 'neutral', '1')"
+                ),
+                {"exp": ids["experiment_id"]},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO runs (run_id, experiment_id, arm_id, arm, target_id, agent_id, "
+                    "model_id, pair_id, schedule_index, tag) VALUES ('run_m1a', :exp, 'arm_m1a', "
+                    "'injected', :tgt, :agt, :mdl, 'pair_m1a', 2, '0123456789abcdef')"
+                ),
+                {
+                    "exp": ids["experiment_id"],
+                    "tgt": ids["target_id"],
+                    "agt": ids["agent_id"],
+                    "mdl": ids["model_id"],
+                },
+            )
+    finally:
+        eng.dispose()
+
+    command.upgrade(cfg, "head")
+    new = _runs(db_url)
+    assert (new[treated]["arm"], new[treated]["block_id"]) == ("instruction", "pair_old")
+    assert (new["run_m1a"]["arm"], new["run_m1a"]["block_id"]) == ("instruction", "pair_m1a")
+    assert (new[control]["arm"], new[control]["block_id"]) == ("control", "pair_old")
+    assert ("instruction", "instruction") in _arms(db_url)
+    eng = create_db_engine(db_url)
+    try:  # and the ORM reads them as the instruction arm
+        with session_scope(eng) as s:
+            assert s.get(t.Run, "run_m1a").arm is Arm.INSTRUCTION  # type: ignore[union-attr]
+        # the old value is refused from now on
+        with pytest.raises(IntegrityError, match="ck_runs_arm"), eng.begin() as conn:
+            conn.execute(text("UPDATE runs SET arm = 'injected' WHERE run_id = 'run_m1a'"))
+    finally:
+        eng.dispose()
+
+
+def test_a_block_holds_one_run_per_arm_and_attempt(db_url: str) -> None:
+    command.upgrade(alembic_config(db_url), "head")
+    eng = create_db_engine(db_url)
+    try:
+        ids = seed_experiment(eng)
+        add_run(eng, ids, schedule_index=0, block_id="block_a")
+        add_run(eng, ids, schedule_index=1, arm=Arm.INSTRUCTION, block_id="block_a")
+        with pytest.raises(IntegrityError, match="uq_runs_block_id_arm_attempt"):
+            add_run(eng, ids, schedule_index=2, arm=Arm.INSTRUCTION, block_id="block_a")
+    finally:
+        eng.dispose()
+
+
+def test_the_three_arm_migration_refuses_to_downgrade_over_neutral_runs(db_url: str) -> None:
+    cfg = alembic_config(db_url)
+    command.upgrade(cfg, "head")
+    eng = create_db_engine(db_url)
+    try:
+        ids = seed_experiment(eng)
+        with session_scope(eng) as s:
+            s.add(
+                t.ExperimentArm(
+                    arm_id="arm_neutral",
+                    experiment_id=ids["experiment_id"],
+                    name="neutral",
+                    arm=Arm.NEUTRAL,
+                    surfaces=["P1"],
+                    payload_family="derail",
+                    payload_style="neutral",
+                    payload_version="1",
+                )
+            )
+    finally:
+        eng.dispose()
+    with pytest.raises(RuntimeError, match="neutral run\\(s\\) or arm\\(s\\) are stored"):
+        command.downgrade(cfg, "0010")
+    assert "block_id" in {c for c in _runs_columns(db_url)}  # nothing was half-done
+
+
+def _runs_columns(url: str) -> set[str]:
+    eng = create_db_engine(url)
+    try:
+        return {c["name"] for c in inspect(eng).get_columns("runs")}
+    finally:
+        eng.dispose()

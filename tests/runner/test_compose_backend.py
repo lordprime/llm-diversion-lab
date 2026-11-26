@@ -78,7 +78,9 @@ def _after_compose(argv: tuple[str, ...]) -> tuple[str, ...]:
 @pytest.fixture(scope="module")
 def project() -> ComposeProject:
     experiment = load_experiment(REPO_ROOT / "experiments" / "selftest.yaml")
-    run = next(r for r in build_schedule(experiment) if r.arm is Arm.INJECTED)
+    run = next(
+        r for r in build_schedule(experiment) if r.arm is Arm.INSTRUCTION and r.target == "dvga"
+    )
     manifest = render_manifest(run, experiment, KEY, created_at=datetime(2026, 11, 7, tzinfo=UTC))
     return render_cell(
         run,
@@ -93,7 +95,7 @@ def project() -> ComposeProject:
 def guarded() -> ComposeProject:
     """A cell whose agent starts containers (so it has a cell-guard and a scratch volume)."""
     experiment = load_experiment(REPO_ROOT / "experiments" / "selftest.yaml")
-    run = next(r for r in build_schedule(experiment) if r.arm is Arm.CONTROL)
+    run = next(r for r in build_schedule(experiment) if r.arm is Arm.CONTROL and r.target == "dvga")
     manifest = render_manifest(run, experiment, KEY, created_at=datetime(2026, 11, 7, tzinfo=UTC))
     spec = AgentSpec(
         name="scripted",

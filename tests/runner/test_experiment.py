@@ -17,16 +17,19 @@ from control.runner.experiment import (
     DEFAULT_OFFSET_FRACTION,
     MAX_PLACEMENT_MAP_BYTES,
     SUPPORTED_SURFACES,
+    ByteEstimateTokenizer,
     Experiment,
     PlacementMapFile,
     PlacementSpec,
     TargetSpec,
+    TextMeasure,
+    check_neutral_match,
     parse_experiment,
     read_experiment,
 )
 from control.runner.render import render_manifest
 from control.runner.schedule import build_schedule
-from tests.runner.test_pairing import KEY, _doc
+from tests.runner.test_blocks import KEY, _doc, sync_neutral
 
 ALL = list(Surface)
 TEXTS = {
@@ -59,10 +62,15 @@ def _full(**changes: Any) -> dict[str, Any]:
     doc["targets"] = [
         {"name": "dvga", "objective": "outbound_service", "placements": _placements()}
     ]
-    doc["arms"]["injected"]["surfaces"] = [s.value for s in ALL]
-    doc["arms"]["injected"]["payload"]["templates"] = {s.value: t for s, t in TEXTS.items()}
+    doc["arms"]["instruction"]["surfaces"] = [s.value for s in ALL]
+    doc["arms"]["instruction"]["payload"]["templates"] = {s.value: t for s, t in TEXTS.items()}
     doc.update(changes)
-    return doc
+    return sync_neutral(doc)
+
+
+def _valid(doc: dict[str, Any]) -> Experiment:
+    """Validate ``doc`` with its neutral texts matched to whatever the test planted."""
+    return Experiment.model_validate(sync_neutral(doc))
 
 
 def _with(path: list[Any], value: Any) -> dict[str, Any]:
@@ -81,7 +89,7 @@ def _offset(surface: Surface, value: Any) -> dict[str, Any]:
 def test_every_surface_is_supported_and_a_full_experiment_validates() -> None:
     assert frozenset(ALL) == SUPPORTED_SURFACES
     assert Surface.P8 in SUPPORTED_SURFACES
-    exp = Experiment.model_validate(_full())
+    exp = _valid(_full())
     spec = exp.targets[0].placements[Surface.P3]
     assert spec.offset_fraction == DEFAULT_OFFSET_FRACTION == 0.5
 
@@ -90,19 +98,19 @@ def test_every_surface_is_supported_and_a_full_experiment_validates() -> None:
 def test_a_wrong_locator_is_refused(surface: Surface) -> None:
     doc = _with(["targets", 0, "placements", surface.value, "locator"], "html:other")
     with pytest.raises(ValidationError, match="locator must be"):
-        Experiment.model_validate(doc)
+        _valid(doc)
 
 
 @pytest.mark.parametrize("surface", [Surface.P2, Surface.P3, Surface.P6, Surface.P8])
 def test_only_p1_may_use_robots_txt(surface: Surface) -> None:
     doc = _with(["targets", 0, "placements", surface.value, "url"], "/robots.txt")
     with pytest.raises(ValidationError, match="robots"):
-        Experiment.model_validate(doc)
+        _valid(doc)
 
 
 @pytest.mark.parametrize("value", [0, 0.0, 0.25, 0.5, 1, 1.0])
 def test_offset_fraction_accepts_the_closed_unit_interval(value: float) -> None:
-    exp = Experiment.model_validate(_offset(Surface.P4, value))
+    exp = _valid(_offset(Surface.P4, value))
     assert exp.targets[0].placements[Surface.P4].offset_fraction == value
 
 
@@ -111,7 +119,7 @@ def test_offset_fraction_accepts_the_closed_unit_interval(value: float) -> None:
 )
 def test_offset_fraction_refuses_anything_else(value: Any) -> None:
     with pytest.raises(ValidationError):
-        Experiment.model_validate(_offset(Surface.P4, value))
+        _valid(_offset(Surface.P4, value))
 
 
 # A dumped experiment carries the default 0.5 on every placement, so only a changed value counts.
@@ -120,7 +128,7 @@ def test_offset_fraction_refuses_anything_else(value: Any) -> None:
 @pytest.mark.parametrize("surface", [Surface.P1, Surface.P7, Surface.P8])
 def test_offset_fraction_is_for_p2_to_p6_only(surface: Surface) -> None:
     with pytest.raises(ValidationError, match="P2-P6 only"):
-        Experiment.model_validate(_offset(surface, 0.25))
+        _valid(_offset(surface, 0.25))
 
 
 def test_placement_spec_defaults_and_rejects_unknown_fields() -> None:
@@ -133,7 +141,7 @@ def test_an_experiment_needs_a_placement_for_each_new_surface() -> None:
     doc = _full()
     del doc["targets"][0]["placements"]["P6"]
     with pytest.raises(ValidationError, match="no placement for surface P6"):
-        Experiment.model_validate(doc)
+        _valid(doc)
 
 
 # --------------------------------------------------------------------------- texts
@@ -141,12 +149,12 @@ def test_an_experiment_needs_a_placement_for_each_new_surface() -> None:
 
 def _p8(text: str, **changes: Any) -> dict[str, Any]:
     doc = _full(**changes)
-    doc["arms"]["injected"]["payload"]["templates"]["P8"] = text
+    doc["arms"]["instruction"]["payload"]["templates"]["P8"] = text
     return doc
 
 
 def test_p8_template_must_be_single_line_printable_ascii() -> None:
-    Experiment.model_validate(_p8("Notice: $tag, see $decoy_path and $callback_host"))
+    _valid(_p8("Notice: $tag, see $decoy_path and $callback_host"))
     for bad in (
         "one\nline two $tag",
         "carriage\rreturn $tag",
@@ -157,34 +165,34 @@ def test_p8_template_must_be_single_line_printable_ascii() -> None:
         "trailing $tag ",
     ):
         with pytest.raises(ValidationError, match="P8"):
-            Experiment.model_validate(_p8(bad))
+            _valid(_p8(bad))
 
 
 def test_p8_template_is_checked_once_rendered() -> None:
     fits = "x" * (512 - 16 - 1) + " $tag"  # the tag renders to 16 bytes: exactly 512
-    Experiment.model_validate(_p8(fits))
+    _valid(_p8(fits))
     with pytest.raises(ValidationError, match="512"):
-        Experiment.model_validate(_p8("x" + fits))
+        _valid(_p8("x" + fits))
     # $callback_host is <12-char token>.<callback_domain>: a long zone can push it over
     host = "$callback_host $tag " + "y" * 420
-    Experiment.model_validate(_p8(host))
+    _valid(_p8(host))
     zone = ".".join(["a" * 60] * 3) + ".test"
     with pytest.raises(ValidationError, match="512"):
-        Experiment.model_validate(_p8(host, callback_domain=zone))
+        _valid(_p8(host, callback_domain=zone))
 
 
 def test_p3_template_cannot_close_its_comment() -> None:
     doc = _full()
-    doc["arms"]["injected"]["payload"]["templates"]["P3"] = "x --> <script> $tag"
+    doc["arms"]["instruction"]["payload"]["templates"]["P3"] = "x --> <script> $tag"
     with pytest.raises(ValidationError, match="P3"):
-        Experiment.model_validate(doc)
+        _valid(doc)
 
 
 def test_templates_for_html_surfaces_may_hold_markup_like_text() -> None:
     doc = _full()
     for surface in ("P2", "P4", "P5", "P6"):
-        doc["arms"]["injected"]["payload"]["templates"][surface] = "</div><b>x</b> & $tag"
-    Experiment.model_validate(doc)
+        doc["arms"]["instruction"]["payload"]["templates"][surface] = "</div><b>x</b> & $tag"
+    _valid(doc)
 
 
 # --------------------------------------------------------------------------- manifest
@@ -194,9 +202,9 @@ def test_the_manifest_carries_the_registered_offset_for_in_page_surfaces() -> No
     doc = _full()
     doc["targets"][0]["placements"]["P3"]["offset_fraction"] = 0.25
     doc["targets"][0]["placements"]["P6"]["offset_fraction"] = 1
-    exp = Experiment.model_validate(doc)
+    exp = _valid(doc)
     schedule = build_schedule(exp)
-    run = next(r for r in schedule if r.arm.value == "injected")
+    run = next(r for r in schedule if r.arm.value == "instruction")
     by_surface = {p.surface: p for p in render_manifest(run, exp, KEY).placements}
     assert by_surface[Surface.P3].offset_fraction == 0.25
     assert by_surface[Surface.P6].offset_fraction == 1.0
@@ -209,8 +217,8 @@ def test_the_manifest_carries_the_registered_offset_for_in_page_surfaces() -> No
 
 
 def test_a_dumped_experiment_validates_again() -> None:
-    exp = Experiment.model_validate(_full())
-    assert Experiment.model_validate(exp.model_dump(mode="json")) == exp
+    exp = _valid(_full())
+    assert _valid(exp.model_dump(mode="json")) == exp
 
 
 # --------------------------------------------------------------------------- unavailable
@@ -219,7 +227,7 @@ def test_a_dumped_experiment_validates_again() -> None:
 def test_unavailable_surface_refused_with_reason() -> None:
     doc = _with(["targets", 0, "placements", "P7"], {"unavailable": "spa catch-all returns 200"})
     with pytest.raises(ValidationError) as caught:
-        Experiment.model_validate(doc)
+        _valid(doc)
     message = str(caught.value)
     assert "target dvga cannot carry surface P7" in message
     assert "unavailable: spa catch-all returns 200" in message
@@ -227,13 +235,13 @@ def test_unavailable_surface_refused_with_reason() -> None:
 
 def test_an_unavailable_surface_not_planted_is_fine_and_kept_apart() -> None:
     doc = _with(["targets", 0, "placements", "P7"], {"unavailable": "spa catch-all returns 200"})
-    doc["arms"]["injected"]["surfaces"] = ["P1", "P3"]
-    doc["arms"]["injected"]["payload"]["templates"] = {"P1": TEXTS[Surface.P1], "P3": "c $tag"}
-    target = Experiment.model_validate(doc).targets[0]
+    doc["arms"]["instruction"]["surfaces"] = ["P1", "P3"]
+    doc["arms"]["instruction"]["payload"]["templates"] = {"P1": TEXTS[Surface.P1], "P3": "c $tag"}
+    target = _valid(doc).targets[0]
     assert Surface.P7 not in target.placements
     assert target.unavailable == {Surface.P7: "spa catch-all returns 200"}
     # it validates again from its own dump
-    again = Experiment.model_validate(Experiment.model_validate(doc).model_dump(mode="json"))
+    again = _valid(_valid(doc).model_dump(mode="json"))
     assert again.targets[0].unavailable == target.unavailable
 
 
@@ -251,28 +259,28 @@ def test_an_unavailable_surface_not_planted_is_fine_and_kept_apart() -> None:
 )
 def test_a_bad_unavailable_entry_is_refused(entry: Any, error: str) -> None:
     doc = _with(["targets", 0, "placements", "P7"], entry)
-    doc["arms"]["injected"]["surfaces"] = ["P1"]
-    doc["arms"]["injected"]["payload"]["templates"] = {"P1": TEXTS[Surface.P1]}
+    doc["arms"]["instruction"]["surfaces"] = ["P1"]
+    doc["arms"]["instruction"]["payload"]["templates"] = {"P1": TEXTS[Surface.P1]}
     with pytest.raises(ValidationError, match=error):
-        Experiment.model_validate(doc)
+        _valid(doc)
 
 
 def test_a_surface_both_placed_and_unavailable_is_refused() -> None:
     doc = _full()
     doc["targets"][0]["unavailable"] = {"P7": "no 4xx path"}
     with pytest.raises(ValidationError, match="P7 both placed and unavailable"):
-        Experiment.model_validate(doc)
+        _valid(doc)
     doc = _full()
     doc["targets"][0]["unavailable"] = {"P7": "no 4xx path"}
     doc["targets"][0]["placements"]["P7"] = {"unavailable": "again"}
     with pytest.raises(ValidationError, match="listed twice"):
-        Experiment.model_validate(doc)
+        _valid(doc)
 
 
 def test_an_unknown_surface_cannot_be_unavailable() -> None:
     doc = _with(["targets", 0, "placements", "P9"], {"unavailable": "no such surface"})
     with pytest.raises(ValidationError, match="P9"):
-        Experiment.model_validate(doc)
+        _valid(doc)
 
 
 # --------------------------------------------------------------------------- placement files
@@ -295,7 +303,7 @@ def _tree(tmp_path: Path, map_text: str | None = None, *, name: str = "dvga") ->
 
 def test_placements_load_from_the_targets_file(tmp_path: Path) -> None:
     ef = read_experiment(_tree(tmp_path))
-    inline = Experiment.model_validate(_full())
+    inline = _valid(_full())
     assert ef.experiment.targets == inline.targets
 
 
@@ -531,10 +539,181 @@ def test_selftest_covers_every_target_and_surface_with_its_objective() -> None:
         "juice-shop": "admin_login",
         "drupal-7600": "code_execution",
     }
-    assert set(exp.arms.injected.surfaces) == set(Surface)
+    assert set(exp.arms.surfaces) == set(Surface)
     for target in exp.targets:
         assert not target.unavailable  # every surface is available on every target today
     for target in ("dvga", "juice-shop", "drupal-7600"):
         assert f"# frozen placement map targets/{target}/placements.yaml sha256 " in (
             ef.definition_yaml
         )
+
+
+# --------------------------------------------------------------------------- neutral arm (T1, T2)
+
+
+def _neutral_doc(**texts: str) -> dict[str, Any]:
+    """The full experiment with some neutral templates replaced (not re-synced)."""
+    doc = _full()
+    doc["arms"]["neutral"]["payload"]["templates"].update(texts)
+    return doc
+
+
+def _instruction_len(surface: Surface) -> int:
+    exp = Experiment.model_validate(_full())
+    return len(exp.arms.instruction.payload.rendered()[surface])
+
+
+def test_the_neutral_payload_may_differ_by_up_to_five_percent_on_every_measure() -> None:
+    size = _instruction_len(Surface.P2)  # "page text <tag>"
+    allowed = int(size * 0.05)
+    padded = "page text $tag" + "." * allowed
+    exp = Experiment.model_validate(_neutral_doc(P2=padded))
+    assert exp.arms.neutral.payload.templates[Surface.P2] == padded
+
+
+def test_a_neutral_payload_outside_five_percent_is_refused_with_the_measured_numbers() -> None:
+    size = _instruction_len(Surface.P6)  # "description <tag>": 28 characters
+    longer = "description $tag" + "." * (int(size * 0.05) + 1)
+    with pytest.raises(ValidationError) as caught:
+        Experiment.model_validate(_neutral_doc(P6=longer))
+    message = str(caught.value)
+    assert "not matched" in message
+    assert f"P6 chars: instruction {size}, neutral {size + 2}" in message
+    assert "P6 tokens" in message and "at most 5.0%" in message
+    assert "P6 lines" not in message  # only the measures that are off are named
+
+
+def test_a_neutral_payload_far_shorter_is_refused_too() -> None:
+    with pytest.raises(ValidationError, match=r"P1 chars: instruction 23, neutral 18"):
+        Experiment.model_validate(_neutral_doc(P1="# $tag"))
+
+
+def test_a_neutral_text_with_more_lines_is_refused_even_at_the_same_length() -> None:
+    # "<p>$tag</p>" has one line; the neutral splits the same characters over two
+    with pytest.raises(ValidationError, match=r"P7 lines: instruction 1, neutral 2"):
+        Experiment.model_validate(_neutral_doc(P7="<p>\n$tag</p>"[:-1] + ">"))
+
+
+def test_a_neutral_text_with_other_markup_is_refused() -> None:
+    with pytest.raises(ValidationError, match=r"P7 markup: instruction p /p, neutral b /b"):
+        Experiment.model_validate(_neutral_doc(P7="<b>$tag</b>"))
+
+
+def test_tokens_are_measured_on_bytes_so_non_ascii_text_can_fail_on_tokens_alone() -> None:
+    # same number of characters as "page text <tag>", but each é is two UTF-8 bytes
+    with pytest.raises(ValidationError) as caught:
+        Experiment.model_validate(_neutral_doc(P2="éééé éééé $tag"))
+    message = str(caught.value)
+    assert "P2 tokens" in message and "P2 chars" not in message
+
+
+@pytest.mark.parametrize("field", ["decoy_path", "callback_host", "token"])
+def test_a_neutral_template_may_not_name_the_instructions_fingerprint(field: str) -> None:
+    doc = _full()
+    doc["arms"]["neutral"]["payload"]["templates"]["P8"] = f"Security ${field} $tag"
+    with pytest.raises(ValidationError, match=rf"may not use \${field}"):
+        Experiment.model_validate(doc)
+
+
+@pytest.mark.parametrize("tolerance", [0, 0.0, 0.01, 0.05])
+def test_the_match_tolerance_may_be_tightened(tolerance: float) -> None:
+    doc = _full()
+    doc["arms"]["neutral"]["payload"]["match_tolerance"] = tolerance
+    exp = Experiment.model_validate(doc)  # the synced texts match exactly
+    assert exp.arms.neutral.payload.match_tolerance == tolerance
+    doc["arms"]["neutral"]["payload"]["templates"]["P2"] = "page text $tag."
+    if tolerance < 1 / len("page text 0000000000000000"):
+        with pytest.raises(ValidationError, match="P2 chars"):
+            Experiment.model_validate(doc)
+    else:
+        Experiment.model_validate(doc)
+
+
+@pytest.mark.parametrize("tolerance", [0.0500001, 0.5, 1, 100, -0.01, float("nan"), float("inf")])
+def test_the_match_tolerance_can_never_be_loosened_or_absurd(tolerance: float) -> None:
+    doc = _full()
+    doc["arms"]["neutral"]["payload"]["match_tolerance"] = tolerance
+    with pytest.raises(ValidationError, match="match_tolerance"):
+        Experiment.model_validate(doc)
+
+
+class _WordTokenizer:
+    """A stand-in for a real tokenizer: one token per word."""
+
+    def count(self, text: str) -> float:
+        return float(len(text.split()))
+
+
+def test_check_neutral_match_takes_any_tokenizer_and_reports_each_mismatch() -> None:
+    exp = Experiment.model_validate(_full())
+    instruction = exp.arms.instruction.payload
+    neutral = instruction.model_copy(
+        update={
+            "payload_id": "other",
+            "templates": {**instruction.templates, Surface.P2: "pagetext_${tag}_"},
+        }
+    )
+    assert check_neutral_match(instruction, instruction, ByteEstimateTokenizer()) == []
+    by_bytes = check_neutral_match(instruction, neutral)
+    assert by_bytes == []  # same length, same markup: the byte estimate cannot tell
+    by_words = check_neutral_match(instruction, neutral, _WordTokenizer())
+    assert [(m.surface, m.measure) for m in by_words] == [(Surface.P2, "tokens")]
+    (found,) = by_words
+    assert (found.instruction, found.neutral, found.tolerance) == (3.0, 1.0, 0.05)
+    assert str(found) == "P2 tokens: instruction 3, neutral 1 (66.7% apart, at most 5.0%)"
+
+
+def test_check_neutral_match_names_a_surface_only_one_payload_covers() -> None:
+    exp = Experiment.model_validate(_full())
+    instruction = exp.arms.instruction.payload
+    fewer = {s: t for s, t in instruction.templates.items() if s is not Surface.P8}
+    neutral = instruction.model_copy(update={"templates": fewer})
+    (found,) = check_neutral_match(instruction, neutral)
+    assert (found.surface, found.measure, found.instruction, found.neutral) == (
+        Surface.P8,
+        "template",
+        "present",
+        "missing",
+    )
+    assert "must be the same" in str(found)
+
+
+def test_the_byte_estimate_is_pinned() -> None:
+    tokenizer = ByteEstimateTokenizer()
+    assert tokenizer.count("") == 0
+    assert tokenizer.count("abcd") == 1
+    assert tokenizer.count("é") == 0.5
+    assert tokenizer.count("x" * 8192) == 2048
+
+
+def test_the_measure_reads_markup_case_insensitively_and_ignores_text_like_angles() -> None:
+    measure = TextMeasure.of("<P class=x>a < b</P><br/>", ByteEstimateTokenizer())
+    assert measure.markup == ("p", "/p", "br")
+    assert (measure.lines, measure.chars) == (1, 25)
+
+
+def test_the_hash_covers_both_payloads(tmp_path: Path) -> None:
+    fixture = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_block.yaml"
+    text = fixture.read_text()
+    old = "neutral marker $tag see https://example.org/docs/lab-selftest.html"
+    assert old in text
+    edited = text.replace(old, old.replace("docs/", "help/"))
+    (tmp_path / "experiments").mkdir()
+    (tmp_path / "experiments" / "a.yaml").write_text(text)
+    (tmp_path / "experiments" / "b.yaml").write_text(edited)
+    a = read_experiment(tmp_path / "experiments" / "a.yaml")
+    b = read_experiment(tmp_path / "experiments" / "b.yaml")
+    assert a.experiment.arms.instruction == b.experiment.arms.instruction
+    assert a.experiment.arms.neutral != b.experiment.arms.neutral
+    assert a.definition_sha256 != b.definition_sha256
+
+
+def test_the_selftest_neutral_texts_are_matched_placeholders() -> None:
+    exp = read_experiment(REPO_ROOT / "experiments" / "selftest.yaml").experiment
+    assert check_neutral_match(exp.arms.instruction.payload, exp.arms.neutral.payload) == []
+    neutral = exp.arms.neutral.payload
+    assert neutral.payload_id != exp.arms.instruction.payload.payload_id
+    assert set(neutral.templates) == set(Surface)
+    for surface in Surface:
+        assert neutral.placeholders(surface) == {"tag"}
+        assert "https://example.org/" in neutral.templates[surface]

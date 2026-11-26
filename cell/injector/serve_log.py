@@ -9,8 +9,9 @@ Configuration (:meth:`InjectorConfig.from_env`):
 
 * ``LAB_MANIFEST`` (required): path of the run's :class:`RunManifest` JSON. It decides
   the arm and every placement.
-* ``LAB_PAYLOADS`` (required for an injected run, optional for a control run): path of
-  a JSON object mapping each ``placement_id`` to its rendered text. Each text must hash
+* ``LAB_PAYLOADS`` (required for a neutral or instruction run, optional for a control
+  run): path of a JSON object mapping each ``placement_id`` to its rendered text. Each
+  text must hash
   (UTF-8, sha256) to the placement's ``content_sha256`` and contain the run's tag; a
   control run must have none (checked by :func:`~cell.injector.placement.build_plan`).
 * ``LAB_PROBE_SECRET`` (optional): the per-run probe secret. A request is a pre-flight
@@ -26,7 +27,7 @@ Evidence (:class:`ServeLog`):
 
 * ``<evidence>/injector/events.jsonl``: per request one :class:`TargetAccessEvent`,
   followed, if the request was one the injector plants on (``GET`` robots.txt or a P7
-  path in an injected run), by one :class:`PlacementServe` per placement, whether or
+  path in a neutral or instruction run), by one :class:`PlacementServe` per placement, whether or
   not the plant succeeded (``insert_ok``). Both kinds share the ``injector`` stream
   and one ``seq`` counter, which resumes after a restart. Each line is exactly
   ``model_dump_json()`` of its event; producers re-ship stored lines byte-for-byte.
@@ -57,7 +58,7 @@ from typing import Final
 from pydantic import JsonValue, ValidationError
 
 from cell.injector.placement import BODY_SURFACES, INJECTOR_STREAM, Planted
-from control.core.models import Arm, PlacementServe, RunManifest, TargetAccessEvent
+from control.core.models import PlacementServe, RunManifest, TargetAccessEvent
 
 __all__ = [
     "DEFAULT_EVIDENCE_DIR",
@@ -125,7 +126,7 @@ class InjectorConfig:
         if run_id and run_id != manifest.run_id:
             raise ValueError(f"LAB_RUN_ID {run_id!r} differs from manifest {manifest.run_id!r}")
         contents: dict[str, str] = {}
-        if env.get("LAB_PAYLOADS") or manifest.arm is Arm.INJECTED:
+        if env.get("LAB_PAYLOADS") or manifest.arm.tagged:
             contents = _load_contents(_read(env, "LAB_PAYLOADS"))
         synthesize = env.get("LAB_SYNTHESIZE_ROBOTS", "")
         if synthesize not in ("", "0", "1"):

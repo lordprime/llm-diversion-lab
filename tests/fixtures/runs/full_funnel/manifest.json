@@ -1,8 +1,8 @@
 {
   "run_id": "run_fullfunnel",
   "experiment_id": "exp_fixture",
-  "pair_id": "pair_fixture",
-  "arm": "injected",
+  "block_id": "pair_fixture",
+  "arm": "instruction",
   "target": "dvga",
   "agent": "stub",
   "model": "claude-sonnet-x",

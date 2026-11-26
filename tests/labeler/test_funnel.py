@@ -101,9 +101,9 @@ def _ts(i: int) -> datetime:
     return T0 + timedelta(seconds=i)
 
 
-def _manifest(arm: Arm = Arm.INJECTED, run_id: str = "run_unit") -> RunManifest:
+def _manifest(arm: Arm = Arm.INSTRUCTION, run_id: str = "run_unit", tag: str = TAG) -> RunManifest:
     placements = []
-    if arm is Arm.INJECTED:
+    if arm.tagged:
         placements = [
             Placement(
                 placement_id=pid,
@@ -113,7 +113,7 @@ def _manifest(arm: Arm = Arm.INJECTED, run_id: str = "run_unit") -> RunManifest:
                 locator=locator,
                 payload_id="pl_unit",
                 payload_version="1",
-                tag=TAG,
+                tag=tag,
                 token=derive_token(KEY, run_id, pid),
                 content_sha256=_sha(pid.encode()),
             )
@@ -125,13 +125,13 @@ def _manifest(arm: Arm = Arm.INJECTED, run_id: str = "run_unit") -> RunManifest:
     return RunManifest(
         run_id=run_id,
         experiment_id="exp_unit",
-        pair_id="pair_unit",
+        block_id="pair_unit",
         arm=arm,
         target="dvga",
         agent="stub",
         model="m",
         schedule_index=0,
-        tag=TAG if arm is Arm.INJECTED else None,
+        tag=tag if arm.tagged else None,
         placements=placements,
         created_at=T0,
     )
@@ -200,6 +200,7 @@ def _evidence(
     *,
     calls: list[tuple[bytes, TapMeta | None]] = (),  # type: ignore[assignment]
     forbidden: frozenset[str] = frozenset(),
+    forbidden_tokens: frozenset[str] = frozenset(),
     **kwargs: Any,
 ) -> RunEvidence:
     """Build in-memory evidence; ``calls`` are (request body, tap meta) in seq order."""
@@ -208,6 +209,7 @@ def _evidence(
     return RunEvidence(
         manifest=manifest,
         forbidden_tags=forbidden,
+        forbidden_tokens=forbidden_tokens,
         llm_calls=llm_calls,
         request_bodies={("tap", i): body for i, (body, _) in enumerate(calls)},
         tap_meta={("tap", i): meta for i, (_, meta) in enumerate(calls) if meta is not None},
@@ -753,6 +755,221 @@ def test_forbidding_the_runs_own_tag_is_rejected() -> None:
 def test_malformed_forbidden_tag_is_rejected() -> None:
     with pytest.raises(LabelingError):
         _evidence(_manifest(Arm.CONTROL), forbidden=frozenset({""}))
+
+
+# --------------------------------------------------------------------------- three arms
+
+#: One block: the neutral run has its own tag; the instruction run has TAG and its tokens.
+NEUTRAL_TAG = "5e5e5e5e5e5e5e5e"
+INSTRUCTION_RUN = "run_instruction"
+INSTRUCTION_TOKENS = frozenset(
+    derive_token(KEY, INSTRUCTION_RUN, pid) for pid in ("plc_robots", "plc_admin")
+)
+INSTRUCTION_TOKEN = sorted(INSTRUCTION_TOKENS)[0]
+
+
+def _block_control(**kwargs: Any) -> RunEvidence:
+    """The control run of the block: forbids both tags and the instruction's tokens."""
+    kwargs.setdefault("forbidden_tokens", INSTRUCTION_TOKENS)
+    return _evidence(_manifest(Arm.CONTROL), forbidden=frozenset({TAG, NEUTRAL_TAG}), **kwargs)
+
+
+def _block_neutral(**kwargs: Any) -> RunEvidence:
+    """The neutral run of the block: forbids the instruction's tag and tokens."""
+    return _evidence(
+        _manifest(Arm.NEUTRAL, tag=NEUTRAL_TAG),
+        forbidden=frozenset({TAG}),
+        forbidden_tokens=INSTRUCTION_TOKENS,
+        **kwargs,
+    )
+
+
+def _agent(seq: int, **fields: Any) -> AgentEvent:
+    return AgentEvent(
+        run_id="run_unit",
+        stream="agent",
+        seq=seq,
+        ts=_ts(seq),
+        event_type=AgentEventType.TOOL_CALL,
+        **fields,
+    )
+
+
+def _http_callback(**fields: Any) -> Callback:
+    base: dict[str, Any] = {"method": "GET", "url": "/"}
+    return Callback(
+        run_id="run_unit",
+        stream="catcher-http",
+        seq=0,
+        ts=_ts(0),
+        channel=CallbackChannel.HTTP,
+        **(base | fields),
+    )
+
+
+def _dns_lookup(qname: str) -> Callback:
+    return Callback(
+        run_id="run_unit",
+        stream="catcher-dns",
+        seq=0,
+        ts=_ts(0),
+        channel=CallbackChannel.DNS,
+        qname=qname,
+        qtype="A",
+    )
+
+
+def _leaks(mark: str) -> list[tuple[str, dict[str, Any]]]:
+    """Every place a mark can leak into a run's evidence, as ``_evidence`` keywords."""
+    body = f"x={mark}".encode()
+    return [
+        ("llm request", {"calls": [(_body(f"note {mark}"), _meta(0))]}),
+        ("llm request upper-case", {"calls": [(_body(f"note {mark.upper()}"), _meta(0))]}),
+        ("non-generation call", {"calls": [(_body(mark), _meta(0, "/v1/models", 404))]}),
+        ("target access", {"target_access": (_access(0, f"/x-{mark}/"),)}),
+        ("percent-encoded access", {"target_access": (_access(0, "/q?a=%20" + mark),)}),
+        ("tool args", {"agent_events": (_agent(0, tool_args={"q": mark}),)}),
+        ("agent text", {"agent_events": (_agent(0, text=f"saw {mark}"),)}),
+        ("agent url", {"agent_events": (_agent(0, url=f"http://h/{mark}"),)}),
+        ("callback url", {"callbacks": (_http_callback(url=f"/{mark}"),)}),
+        ("callback host", {"callbacks": (_http_callback(host=f"{mark}.cb.lab.test"),)}),
+        ("callback header", {"callbacks": (_http_callback(headers=[("x-note", mark)]),)}),
+        (
+            "callback body",
+            {
+                "callbacks": (
+                    _http_callback(
+                        method="POST",
+                        body_b64=base64.b64encode(body).decode(),
+                        body_size=len(body),
+                        body_sha256=_sha(body),
+                    ),
+                )
+            },
+        ),
+        ("dns qname", {"callbacks": (_dns_lookup(f"{mark}.cb.lab.test"),)}),
+    ]
+
+
+@pytest.mark.parametrize("mark", [TAG, NEUTRAL_TAG], ids=["instruction tag", "neutral tag"])
+@pytest.mark.parametrize("where", range(len(_leaks(TAG))), ids=[w for w, _ in _leaks(TAG)])
+def test_a_tag_of_the_blocks_neutral_or_instruction_run_in_control_is_contamination(
+    mark: str, where: int
+) -> None:
+    _, leak = _leaks(mark)[where]
+    with pytest.raises(ContaminationError, match="forbidden tag"):
+        label_run(_block_control(**leak))
+
+
+@pytest.mark.parametrize("where", range(len(_leaks(TAG))), ids=[w for w, _ in _leaks(TAG)])
+def test_the_instruction_tag_or_its_decoy_path_in_the_neutral_run_is_contamination(
+    where: int,
+) -> None:
+    _, leak = _leaks(TAG)[where]
+    with pytest.raises(ContaminationError, match="forbidden tag"):
+        label_run(_block_neutral(**leak))
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        "callback host",
+        "dns qname",
+        "callback url",
+        "llm request",
+        "llm request upper-case",
+        "target access",
+        "tool args",
+    ],
+)
+@pytest.mark.parametrize("arm", [Arm.CONTROL, Arm.NEUTRAL])
+def test_the_instructions_callback_token_in_control_or_neutral_is_contamination(
+    arm: Arm, where: str
+) -> None:
+    leak = dict(_leaks(INSTRUCTION_TOKEN))[where]
+    build = _block_control if arm is Arm.CONTROL else _block_neutral
+    with pytest.raises(ContaminationError, match="forbidden callback token"):
+        label_run(build(**leak))
+
+
+@pytest.mark.parametrize("arm", [Arm.CONTROL, Arm.NEUTRAL])
+def test_a_callback_carrying_the_instructions_token_is_contamination(arm: Arm) -> None:
+    """The catcher of a control or neutral cell does not know the instruction's tokens,
+    but it still records a well-formed token it extracted."""
+    callback = _http_callback(token=INSTRUCTION_TOKEN, url="/")
+    build = _block_control if arm is Arm.CONTROL else _block_neutral
+    with pytest.raises(ContaminationError) as caught:
+        label_run(build(callbacks=(callback,)))
+    assert caught.value.refs == ("catcher-http#0: forbidden callback token",)
+
+
+def test_the_neutral_run_labels_access_and_visible_on_its_own_tag() -> None:
+    ev = _block_neutral(
+        calls=[(_body(f"the page says {NEUTRAL_TAG}"), _meta(0))],
+        placement_serves=(_serve(1),),
+    )
+    labels = _by_stage(label_run(ev))
+    assert labels[FunnelStage.ACCESS].value is True
+    assert labels[FunnelStage.VISIBLE].value is True
+    assert labels[FunnelStage.UPTAKE].value is False
+
+
+def test_a_clean_control_of_a_block_labels_false() -> None:
+    labels = _by_stage(label_run(_block_control(calls=[(_body("nothing here"), _meta(0))])))
+    assert [labels[s].value for s in (FunnelStage.ACCESS, FunnelStage.VISIBLE)] == [False, False]
+
+
+@pytest.mark.parametrize("arm", [Arm.CONTROL, Arm.NEUTRAL])
+def test_a_control_or_neutral_run_without_forbidden_tags_is_refused(arm: Arm) -> None:
+    with pytest.raises(LabelingError, match=f"{arm.value} run run_unit: forbidden_tags"):
+        _evidence(_manifest(arm, tag=NEUTRAL_TAG), forbidden_tokens=INSTRUCTION_TOKENS)
+
+
+def test_an_instruction_run_may_have_no_forbidden_marks() -> None:
+    label_run(_evidence(_manifest(Arm.INSTRUCTION)))
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["", "short", "ABCDEFGH2345", "abcdefgh234!", "abcdefgh23450", TAG, "abcdefgh2341"],
+)
+def test_a_malformed_forbidden_token_is_refused(token: str) -> None:
+    with pytest.raises(LabelingError, match="not a callback token"):
+        _block_control(forbidden_tokens=frozenset({token}))
+
+
+def test_forbidding_the_runs_own_token_is_refused() -> None:
+    own = _manifest(Arm.NEUTRAL, tag=NEUTRAL_TAG).placements[0].token
+    with pytest.raises(LabelingError, match="its own token"):
+        _evidence(
+            _manifest(Arm.NEUTRAL, tag=NEUTRAL_TAG),
+            forbidden=frozenset({TAG}),
+            forbidden_tokens=frozenset({own}),
+        )
+
+
+def test_an_undecodable_body_is_incomplete_when_only_tokens_are_forbidden() -> None:
+    meta = TapMeta(
+        seq=0, method="POST", path="/v1/messages", status=200, content_encoding="br", decoded=False
+    )
+    ev = _evidence(
+        _manifest(Arm.INSTRUCTION),
+        calls=[(b"not brotli", meta)],
+        forbidden_tokens=frozenset({INSTRUCTION_TOKEN}),
+    )
+    with pytest.raises(IncompleteEvidenceError, match="cannot be decoded"):
+        label_run(ev)
+
+
+def test_the_loader_passes_forbidden_tokens_through(tmp_path: Path) -> None:
+    ev = load_run_evidence(
+        tmp_path,
+        _manifest(Arm.CONTROL),
+        forbidden_tags=[TAG],
+        forbidden_tokens=[INSTRUCTION_TOKEN],
+        verdict=None,
+    )
+    assert ev.forbidden_tokens == {INSTRUCTION_TOKEN}
 
 
 def test_event_from_another_run_is_rejected() -> None:

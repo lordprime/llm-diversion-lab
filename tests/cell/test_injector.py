@@ -80,8 +80,8 @@ def _placement(pid: str, surface: Surface, url: str, locator: str, text: str) ->
     )
 
 
-def _manifest(*placements: Placement, arm: Arm = Arm.INJECTED) -> RunManifest:
-    injected = arm is Arm.INJECTED
+def _manifest(*placements: Placement, arm: Arm = Arm.INSTRUCTION) -> RunManifest:
+    injected = arm is Arm.INSTRUCTION
     if injected and not placements:
         placements = (
             _placement(P1_ID, Surface.P1, "http://target/robots.txt", "robots.txt:append", P1_TEXT),
@@ -90,7 +90,7 @@ def _manifest(*placements: Placement, arm: Arm = Arm.INJECTED) -> RunManifest:
     return RunManifest(
         run_id=RUN_ID,
         experiment_id=new_id("exp"),
-        pair_id=new_id("pair"),
+        block_id=new_id("block"),
         arm=arm,
         target="dvga",
         agent="scripted",

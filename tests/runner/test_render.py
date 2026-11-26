@@ -20,6 +20,7 @@ from control.runner.experiment import Experiment, load_experiment
 from control.runner.render import (
     TokenMismatchError,
     forbidden_tags_for,
+    forbidden_tokens_for,
     placement_id_for,
     render_catcher_file,
     render_catcher_tokens,
@@ -28,10 +29,10 @@ from control.runner.render import (
     verify_manifest_tokens,
 )
 from control.runner.schedule import ScheduledRun, build_schedule
-from tests.runner.test_pairing import _experiment
+from tests.runner.test_blocks import _experiment
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DVGA_PAIR = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_pair.yaml"
+DVGA_BLOCK = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_block.yaml"
 # Derived at runtime so no key-like literal sits in the repository.
 KEY = hashlib.sha256(b"render-test-lab-key").digest()
 OTHER_KEY = hashlib.sha256(b"render-test-other-key").digest()
@@ -40,7 +41,7 @@ WHEN = datetime(2026, 11, 7, 12, 0, tzinfo=UTC)
 
 @pytest.fixture(scope="module")
 def experiment() -> Experiment:
-    return load_experiment(DVGA_PAIR)
+    return load_experiment(DVGA_BLOCK)
 
 
 @pytest.fixture(scope="module")
@@ -54,7 +55,13 @@ def _run(schedule: list[ScheduledRun], arm: Arm) -> ScheduledRun:
 
 @pytest.fixture(scope="module")
 def injected(experiment: Experiment, schedule: list[ScheduledRun]) -> RunManifest:
-    return render_manifest(_run(schedule, Arm.INJECTED), experiment, KEY, created_at=WHEN)
+    """The instruction run's manifest (the fixture keeps its short historical name)."""
+    return render_manifest(_run(schedule, Arm.INSTRUCTION), experiment, KEY, created_at=WHEN)
+
+
+@pytest.fixture(scope="module")
+def neutral(experiment: Experiment, schedule: list[ScheduledRun]) -> RunManifest:
+    return render_manifest(_run(schedule, Arm.NEUTRAL), experiment, KEY, created_at=WHEN)
 
 
 @pytest.fixture(scope="module")
@@ -66,7 +73,7 @@ def control(experiment: Experiment, schedule: list[ScheduledRun]) -> RunManifest
 
 
 def test_injected_manifest_plans_p1_and_p7_with_derived_tokens(injected: RunManifest) -> None:
-    assert injected.arm is Arm.INJECTED
+    assert injected.arm is Arm.INSTRUCTION
     assert injected.tag is not None
     assert [p.surface for p in injected.placements] == [Surface.P1, Surface.P7]
     for p in injected.placements:
@@ -84,7 +91,7 @@ def test_injected_manifest_plans_p1_and_p7_with_derived_tokens(injected: RunMani
 def test_rendering_is_deterministic_for_a_run(
     experiment: Experiment, schedule: list[ScheduledRun], injected: RunManifest
 ) -> None:
-    again = render_manifest(_run(schedule, Arm.INJECTED), experiment, KEY, created_at=WHEN)
+    again = render_manifest(_run(schedule, Arm.INSTRUCTION), experiment, KEY, created_at=WHEN)
     assert again == injected
     assert injected.placements[0].placement_id == placement_id_for(injected.run_id, Surface.P1)
 
@@ -92,7 +99,7 @@ def test_rendering_is_deterministic_for_a_run(
 def test_placement_ids_are_distinct_across_runs(
     experiment: Experiment, injected: RunManifest
 ) -> None:
-    other_run = _run(build_schedule(experiment), Arm.INJECTED)
+    other_run = _run(build_schedule(experiment), Arm.INSTRUCTION)
     other = render_manifest(other_run, experiment, KEY)
     assert {p.placement_id for p in other.placements}.isdisjoint(
         p.placement_id for p in injected.placements
@@ -111,7 +118,7 @@ def test_default_created_at_is_now_and_aware(
 def test_render_refuses_a_run_of_another_experiment(
     experiment: Experiment, schedule: list[ScheduledRun]
 ) -> None:
-    run = _run(schedule, Arm.INJECTED).model_copy(update={"experiment_id": "exp_other"})
+    run = _run(schedule, Arm.INSTRUCTION).model_copy(update={"experiment_id": "exp_other"})
     with pytest.raises(ValueError, match="experiment"):
         render_manifest(run, experiment, KEY)
 
@@ -119,7 +126,7 @@ def test_render_refuses_a_run_of_another_experiment(
 def test_render_refuses_a_run_whose_target_is_not_in_the_experiment(
     experiment: Experiment, schedule: list[ScheduledRun]
 ) -> None:
-    run = _run(schedule, Arm.INJECTED).model_copy(update={"target": "juice-shop"})
+    run = _run(schedule, Arm.INSTRUCTION).model_copy(update={"target": "juice-shop"})
     with pytest.raises(ValueError, match="target"):
         render_manifest(run, experiment, KEY)
 
@@ -202,7 +209,7 @@ def test_the_real_injector_accepts_the_rendered_inputs(
     experiment: Experiment, injected: RunManifest, control: RunManifest
 ) -> None:
     plan = build_plan(injected, render_payloads(injected, experiment))
-    assert plan.arm is Arm.INJECTED
+    assert plan.arm is Arm.INSTRUCTION
     assert plan.robots is not None
     assert len(plan.errors) == 1
     assert build_plan(control, render_payloads(control, experiment)).arm is Arm.CONTROL
@@ -211,12 +218,12 @@ def test_the_real_injector_accepts_the_rendered_inputs(
 def test_payloads_are_refused_if_the_template_changed(
     experiment: Experiment, injected: RunManifest
 ) -> None:
-    payload = experiment.arms.injected.payload
+    payload = experiment.arms.instruction.payload
     changed_payload = payload.model_copy(
         update={"templates": {**payload.templates, Surface.P1: "# edited $tag"}}
     )
-    changed_arm = experiment.arms.injected.model_copy(update={"payload": changed_payload})
-    changed_arms = experiment.arms.model_copy(update={"injected": changed_arm})
+    changed_arm = experiment.arms.instruction.model_copy(update={"payload": changed_payload})
+    changed_arms = experiment.arms.model_copy(update={"instruction": changed_arm})
     changed = experiment.model_copy(update={"arms": changed_arms})
     with pytest.raises(ValueError, match="content_sha256"):
         render_payloads(injected, changed)
@@ -303,28 +310,25 @@ def test_the_key_is_not_kept_on_any_rendered_object(
 # --------------------------------------------------------------------------- forbidden tags
 
 
-def test_a_control_run_forbids_its_paired_injected_runs_tag(
-    schedule: list[ScheduledRun],
-) -> None:
+def test_a_control_run_forbids_both_tags_of_its_block(schedule: list[ScheduledRun]) -> None:
     ctrl = _run(schedule, Arm.CONTROL)
-    inj = _run(schedule, Arm.INJECTED)
-    assert ctrl.pair_id == inj.pair_id
-    forbidden = forbidden_tags_for(ctrl, schedule)
-    assert forbidden
-    assert inj.tag in forbidden
+    neu = _run(schedule, Arm.NEUTRAL)
+    ins = _run(schedule, Arm.INSTRUCTION)
+    assert ctrl.block_id == neu.block_id == ins.block_id
+    assert forbidden_tags_for(ctrl, schedule) == {neu.tag, ins.tag}
 
 
-def test_an_injected_run_forbids_other_runs_tags_but_never_its_own() -> None:
+def test_a_tagged_run_forbids_every_other_runs_tag_but_never_its_own() -> None:
     exp = _experiment()
     sched = build_schedule(exp)
-    injected_runs = [r for r in sched if r.arm is Arm.INJECTED]
-    for run in injected_runs:
+    tagged = [r for r in sched if r.arm.tagged]
+    for run in tagged:
         forbidden = forbidden_tags_for(run, sched)
         assert run.tag not in forbidden
-        assert forbidden == {r.tag for r in injected_runs if r is not run}
+        assert forbidden == {r.tag for r in tagged if r is not run}
     for run in sched:
         if run.arm is Arm.CONTROL:
-            assert forbidden_tags_for(run, sched) == {r.tag for r in injected_runs}
+            assert forbidden_tags_for(run, sched) == {r.tag for r in tagged}
 
 
 def test_forbidden_tags_refuse_a_run_not_in_the_schedule(
@@ -335,18 +339,56 @@ def test_forbidden_tags_refuse_a_run_not_in_the_schedule(
         forbidden_tags_for(stranger, schedule)
 
 
-def test_forbidden_tags_refuse_a_control_run_without_its_pair(
+def test_forbidden_tags_refuse_a_control_or_neutral_run_without_its_block(
     schedule: list[ScheduledRun],
 ) -> None:
     ctrl = _run(schedule, Arm.CONTROL)
-    with pytest.raises(ValueError, match="paired injected run"):
+    with pytest.raises(ValueError, match="no neutral run of its block"):
         forbidden_tags_for(ctrl, [ctrl])
+    neu = _run(schedule, Arm.NEUTRAL)
+    with pytest.raises(ValueError, match="no instruction run of its block"):
+        forbidden_tags_for(neu, [ctrl, neu])
 
 
-def test_the_labeller_accepts_the_forbidden_tags(
-    schedule: list[ScheduledRun], injected: RunManifest, control: RunManifest
+def test_the_labeller_accepts_the_forbidden_marks(
+    experiment: Experiment,
+    schedule: list[ScheduledRun],
+    injected: RunManifest,
+    neutral: RunManifest,
+    control: RunManifest,
 ) -> None:
     by_id = {r.run_id: r for r in schedule}
-    for manifest in (control, injected):
-        tags = forbidden_tags_for(by_id[manifest.run_id], schedule)
-        RunEvidence(manifest=manifest, forbidden_tags=tags)
+    for manifest in (control, neutral, injected):
+        run = by_id[manifest.run_id]
+        RunEvidence(
+            manifest=manifest,
+            forbidden_tags=forbidden_tags_for(run, schedule),
+            forbidden_tokens=forbidden_tokens_for(run, schedule, experiment, KEY),
+        )
+
+
+def test_neutral_manifest_plants_its_own_texts_where_the_instruction_does(
+    experiment: Experiment, injected: RunManifest, neutral: RunManifest
+) -> None:
+    assert neutral.arm is Arm.NEUTRAL and neutral.tag is not None
+    assert neutral.tag != injected.tag
+    pairs = list(zip(neutral.placements, injected.placements, strict=True))
+    for ours, theirs in pairs:
+        assert (ours.surface, ours.url, ours.locator, ours.offset_fraction) == (
+            theirs.surface,
+            theirs.url,
+            theirs.locator,
+            theirs.offset_fraction,
+        )
+        assert ours.payload_id == experiment.arms.neutral.payload.payload_id
+        assert ours.token == derive_token(KEY, neutral.run_id, ours.placement_id)
+    texts = render_payloads(neutral, experiment)
+    for placement in neutral.placements:
+        text = texts[placement.placement_id]
+        assert neutral.tag in text
+        assert "/x-" not in text and experiment.callback_domain not in text
+        assert placement.token not in text
+    # the injector plants a neutral run exactly like an instruction run
+    plan = build_plan(neutral, texts)
+    assert plan.arm is Arm.NEUTRAL
+    assert plan.robots is not None and len(plan.errors) == 1

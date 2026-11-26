@@ -12,10 +12,11 @@ Configuration is read from the environment once, at script load
 ``LAB_PAYLOADS``, ``LAB_PROBE_SECRET``, ``LAB_EVIDENCE_DIR``, ``LAB_RUN_ID``); a bad
 configuration is logged as an error, which makes ``mitmdump`` exit at startup.
 
-The injector never answers a request itself: every request reaches the app. In an
-injected run it transforms the app's own response to the few ``GET`` requests it acts
-on (rules in :mod:`cell.injector.placement`), keeping the app's headers (``Date``,
-``Server``, cookies...) so planted responses have the app's shape. When a body changes,
+The injector never answers a request itself: every request reaches the app. In a
+tagged (neutral or instruction) run it transforms the app's own response to the few
+``GET`` requests it acts on (rules in :mod:`cell.injector.placement`), keeping the
+app's headers (``Date``, ``Server``, cookies...) so planted responses have the app's
+shape. When a body changes,
 Content-Length is fixed (unless Transfer-Encoding is used), an ETag is recomputed
 (quoted digest, ``W/`` kept) and ``Digest``/``Repr-Digest``/``Content-Digest``/
 ``Content-MD5`` are dropped. 204, 206 (or any ``Content-Range``) and 304 are never

@@ -44,9 +44,10 @@ from control.runner.cell_spec import (
 from control.runner.experiment import Experiment, load_experiment
 from control.runner.render import render_manifest
 from control.runner.schedule import ScheduledRun, build_schedule
+from tests.runner.test_blocks import sync_neutral
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DVGA_PAIR = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_pair.yaml"
+DVGA_BLOCK = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_block.yaml"
 KEY = hashlib.sha256(b"cell-spec-test-lab-key").digest()
 WHEN = datetime(2026, 11, 7, 12, 0, tzinfo=UTC)
 POOL = ipaddress.IPv4Network("10.231.0.0/16")
@@ -80,7 +81,7 @@ def no_default_host_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 
 @pytest.fixture(scope="module")
 def experiment() -> Experiment:
-    return load_experiment(DVGA_PAIR)
+    return load_experiment(DVGA_BLOCK)
 
 
 @pytest.fixture(scope="module")
@@ -126,7 +127,7 @@ def control(
 def injected(
     experiment: Experiment, schedule: list[ScheduledRun]
 ) -> tuple[ScheduledRun, RunManifest, ComposeProject]:
-    return _render(experiment, schedule, Arm.INJECTED)
+    return _render(experiment, schedule, Arm.INSTRUCTION)
 
 
 def _both(
@@ -410,7 +411,7 @@ def test_project_name_is_built_from_the_run_id_only(schedule: list[ScheduledRun]
 def test_a_manifest_that_disagrees_with_the_run_is_refused(
     experiment: Experiment, schedule: list[ScheduledRun]
 ) -> None:
-    run = next(r for r in schedule if r.arm is Arm.INJECTED)
+    run = next(r for r in schedule if r.arm is Arm.INSTRUCTION)
     manifest = render_manifest(run, experiment, KEY, created_at=WHEN)
     for update in (
         {"target": "../../etc"},
@@ -436,7 +437,7 @@ def test_canaries_are_root_only_files_minted_fresh_for_every_render(
     experiment: Experiment, schedule: list[ScheduledRun]
 ) -> None:
     seen: set[str] = set()
-    for arm in (Arm.CONTROL, Arm.INJECTED, Arm.INJECTED):
+    for arm in (Arm.CONTROL, Arm.INSTRUCTION, Arm.INSTRUCTION):
         run, manifest, project = _render(experiment, schedule, arm)
         files = {(f.volume, f.name): f for f in project.files if f.volume.startswith("secret_")}
         assert set(files) == SECRET_FILES
@@ -448,7 +449,7 @@ def test_canaries_are_root_only_files_minted_fresh_for_every_render(
             seen.add(value)
             for derived in (
                 run.run_id,
-                run.pair_id,
+                run.block_id,
                 run.tag or "-",
                 manifest.created_at.isoformat(),
             ):
@@ -540,7 +541,7 @@ def three() -> Experiment:
 
 
 @pytest.mark.parametrize("target", sorted(OBJECTIVES))
-@pytest.mark.parametrize("arm", [Arm.CONTROL, Arm.INJECTED])
+@pytest.mark.parametrize("arm", [Arm.CONTROL, Arm.INSTRUCTION])
 def test_each_target_gets_its_own_exploit_and_reset(
     three: Experiment, target: str, arm: Arm
 ) -> None:
@@ -562,7 +563,7 @@ def test_each_target_gets_its_own_exploit_and_reset(
         kind == "form",
     )
     # every planted page is fetched once, in surface order, whatever the arm
-    urls = [three.target(target).placements[s].url for s in sorted(three.arms.injected.surfaces)]
+    urls = [three.target(target).placements[s].url for s in sorted(three.arms.surfaces)]
     assert [s.path for s in script.steps if s.action == "fetch"] == list(dict.fromkeys(urls))
     assert [p for p, _ in project.probe_paths] == list(dict.fromkeys(urls))
     assert project.reset is not None
@@ -698,7 +699,7 @@ def test_gateway_mode_routes_the_tap_to_the_gateway_without_a_stub(
     experiment: Experiment, schedule: list[ScheduledRun]
 ) -> None:
     _, _, project = _render(
-        experiment, schedule, Arm.INJECTED, settings=_settings(llm_gateway=GATEWAY)
+        experiment, schedule, Arm.INSTRUCTION, settings=_settings(llm_gateway=GATEWAY)
     )
     services = _services(project)
     assert "stub-llm" not in services
@@ -966,10 +967,10 @@ def test_new_surfaces_are_probed_for_a_200_not_an_error_status(experiment: Exper
         "url": "/page",
         "locator": "header:x-security-notice",
     }
-    doc["arms"]["injected"]["surfaces"] = ["P1", "P3", "P7", "P8"]
-    doc["arms"]["injected"]["payload"]["templates"]["P3"] = "comment $tag"
-    doc["arms"]["injected"]["payload"]["templates"]["P8"] = "notice $tag"
-    wide = Experiment.model_validate(doc)
-    _run, manifest, project = _render(wide, build_schedule(wide), Arm.INJECTED)
+    doc["arms"]["instruction"]["surfaces"] = ["P1", "P3", "P7", "P8"]
+    doc["arms"]["instruction"]["payload"]["templates"]["P3"] = "comment $tag"
+    doc["arms"]["instruction"]["payload"]["templates"]["P8"] = "notice $tag"
+    wide = Experiment.model_validate(sync_neutral(doc))
+    _run, manifest, project = _render(wide, build_schedule(wide), Arm.INSTRUCTION)
     assert dict(project.probe_paths) == {"/robots.txt": 200, "/.env": 404, "/page": 200}
     assert {p.surface.value for p in manifest.placements} == {"P1", "P3", "P7", "P8"}

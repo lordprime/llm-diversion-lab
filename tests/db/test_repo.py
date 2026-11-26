@@ -28,11 +28,11 @@ TOKEN = "abcdefgh2345"  # noqa: S105 -- fixture callback token, not a secret
 
 
 def seed_experiment(engine: Engine) -> dict[str, str]:
-    """Insert one experiment with a control and an injected arm, plus registry rows."""
+    """Insert one experiment with a control and an instruction arm, plus registry rows."""
     ids = {
         "experiment_id": new_id("exp"),
         "control_arm_id": new_id("arm"),
-        "injected_arm_id": new_id("arm"),
+        "instruction_arm_id": new_id("arm"),
         "target_id": new_id("tgt"),
         "agent_id": new_id("agt"),
         "model_id": new_id("mdl"),
@@ -58,10 +58,10 @@ def seed_experiment(engine: Engine) -> dict[str, str]:
                     surfaces=[],
                 ),
                 t.ExperimentArm(
-                    arm_id=ids["injected_arm_id"],
+                    arm_id=ids["instruction_arm_id"],
                     experiment_id=ids["experiment_id"],
                     name="p1-p7-derail",
-                    arm=Arm.INJECTED,
+                    arm=Arm.INSTRUCTION,
                     surfaces=["P1", "P7"],
                     payload_family="derail",
                     payload_style="override",
@@ -100,17 +100,17 @@ def run_row(
     schedule_index: int,
     arm: Arm = Arm.CONTROL,
     status: RunStatus = RunStatus.QUEUED,
-    pair_id: str | None = None,
+    block_id: str | None = None,
 ) -> t.Run:
     return t.Run(
         run_id=new_id("run"),
         experiment_id=ids["experiment_id"],
-        arm_id=ids["control_arm_id" if arm is Arm.CONTROL else "injected_arm_id"],
+        arm_id=ids["control_arm_id" if arm is Arm.CONTROL else "instruction_arm_id"],
         arm=arm,
         target_id=ids["target_id"],
         agent_id=ids["agent_id"],
         model_id=ids["model_id"],
-        pair_id=pair_id or new_id("pair"),
+        block_id=block_id or new_id("block"),
         schedule_index=schedule_index,
         status=status,
         invalid_reason=m.InvalidReason.INTERNAL if status is RunStatus.INVALID else None,
@@ -273,7 +273,7 @@ def test_control_run_cannot_carry_a_tag(engine: Engine) -> None:
                 target_id=ids["target_id"],
                 agent_id=ids["agent_id"],
                 model_id=ids["model_id"],
-                pair_id=new_id("pair"),
+                block_id=new_id("block"),
                 schedule_index=0,
                 tag=TAG,
             )
@@ -288,11 +288,11 @@ def test_run_arm_must_match_its_arm_row(engine: Engine) -> None:
                 run_id=new_id("run"),
                 experiment_id=ids["experiment_id"],
                 arm_id=ids["control_arm_id"],
-                arm=Arm.INJECTED,
+                arm=Arm.INSTRUCTION,
                 target_id=ids["target_id"],
                 agent_id=ids["agent_id"],
                 model_id=ids["model_id"],
-                pair_id=new_id("pair"),
+                block_id=new_id("block"),
                 schedule_index=0,
                 tag=TAG,
             )
@@ -392,7 +392,7 @@ def _decision(run_id: str, seq: int = 0, **update: Any) -> m.CellGuardDecision:
 
 
 def test_cellguard_decisions_are_stored_idempotently(engine: Engine) -> None:
-    run_id, _ = _seed_injected_run(engine)
+    run_id, _ = _seed_instruction_run(engine)
     events: list[Event] = [_decision(run_id), _decision(run_id, 1, rule="create.privileged")]
     with session_scope(engine) as s:
         assert insert_events(s, events) == InsertResult(inserted=2)
@@ -414,10 +414,10 @@ def _count(engine: Engine, model: type[Any]) -> int:
         return s.scalar(select(func.count()).select_from(model)) or 0
 
 
-def _seed_injected_run(engine: Engine) -> tuple[str, str]:
-    """An injected run with one planted placement; returns (run_id, placement_id)."""
+def _seed_instruction_run(engine: Engine) -> tuple[str, str]:
+    """An instruction run with one planted placement; returns (run_id, placement_id)."""
     ids = seed_experiment(engine)
-    run_id = add_run(engine, ids, schedule_index=0, arm=Arm.INJECTED)
+    run_id = add_run(engine, ids, schedule_index=0, arm=Arm.INSTRUCTION)
     placement_id = new_id("pl")
     with session_scope(engine) as s:
         s.add(
@@ -450,7 +450,7 @@ def _kind_table_counts(engine: Engine) -> dict[str, int]:
 
 def test_normal_batch_inserts_all_rows_and_records_every_key(engine: Engine) -> None:
     """(d) a fresh batch: every event stored, every key in event_keys with its kind."""
-    run_id, placement_id = _seed_injected_run(engine)
+    run_id, placement_id = _seed_instruction_run(engine)
     events = _events(run_id, placement_id)
 
     with session_scope(engine) as s:
@@ -480,7 +480,7 @@ def test_normal_batch_inserts_all_rows_and_records_every_key(engine: Engine) -> 
 
 def test_reshipping_identical_events_counts_duplicates(engine: Engine) -> None:
     """(b) an identical re-ship: all duplicates, nothing inserted, no conflict."""
-    run_id, placement_id = _seed_injected_run(engine)
+    run_id, placement_id = _seed_instruction_run(engine)
     events = _events(run_id, placement_id)
     with session_scope(engine) as s:
         insert_events(s, events)
@@ -495,7 +495,7 @@ def test_reshipping_identical_events_counts_duplicates(engine: Engine) -> None:
 
 def test_same_key_under_another_kind_is_a_conflict(engine: Engine) -> None:
     """(a) injector#0 stored as target_access, re-shipped as placement_serve: rejected."""
-    run_id, placement_id = _seed_injected_run(engine)
+    run_id, placement_id = _seed_instruction_run(engine)
     access = m.TargetAccessEvent(
         run_id=run_id, stream="injector", seq=0, ts=TS, flow_id="f1", method="GET", url="/"
     )
@@ -530,7 +530,7 @@ def test_same_key_under_another_kind_is_a_conflict(engine: Engine) -> None:
 
 def test_same_key_and_kind_with_altered_content_is_a_conflict(engine: Engine) -> None:
     """(c) write-once evidence: a changed event under a stored key is rejected."""
-    run_id, _ = _seed_injected_run(engine)
+    run_id, _ = _seed_instruction_run(engine)
     original = m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=False)
     altered = m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=True)
     with session_scope(engine) as s:
@@ -547,7 +547,7 @@ def test_same_key_and_kind_with_altered_content_is_a_conflict(engine: Engine) ->
 
 def test_mixed_batch_reports_each_outcome(engine: Engine) -> None:
     """New, duplicate and conflicting events in one batch are each handled correctly."""
-    run_id, _ = _seed_injected_run(engine)
+    run_id, _ = _seed_instruction_run(engine)
     first = m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=False)
     with session_scope(engine) as s:
         insert_events(s, [first])
@@ -568,7 +568,7 @@ def test_mixed_batch_reports_each_outcome(engine: Engine) -> None:
 
 
 def test_conflict_within_one_call_first_event_wins(engine: Engine) -> None:
-    run_id, _ = _seed_injected_run(engine)
+    run_id, _ = _seed_instruction_run(engine)
     a = m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=False)
     b = m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=True)
     with session_scope(engine) as s:
@@ -584,7 +584,7 @@ def test_conflict_within_one_call_first_event_wins(engine: Engine) -> None:
 
 def test_per_table_unique_key_is_a_second_line_of_defence(engine: Engine) -> None:
     """A kind-table row written around the ledger makes insert_events fail loudly."""
-    run_id, _ = _seed_injected_run(engine)
+    run_id, _ = _seed_instruction_run(engine)
     poll = m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=False)
     with session_scope(engine) as s:
         s.add(t.OraclePoll(**poll.model_dump(exclude={"kind"})))  # bypasses event_keys

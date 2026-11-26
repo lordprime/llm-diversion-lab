@@ -5,8 +5,8 @@ decide, from a run's :class:`~control.core.models.RunManifest` and the rendered 
 its placements, which requests to the target get an :class:`Action`, and we compute the
 bytes the addon plants into the app's response.
 
-The injector never fabricates a response. Every request goes to the app; in an
-injected run the addon then transforms the app's *own* response for ``GET`` requests
+The injector never fabricates a response. Every request goes to the app; in a
+neutral or instruction run the addon then transforms the app's *own* response for ``GET`` requests
 only, keeping the app's status line and headers wherever the rules below allow, so
 the arms differ only by the planted content (DEVELOPMENT_PLAN section 4.4):
 
@@ -879,8 +879,8 @@ def build_plan(
                 "is not supported by the injector"
             )
 
-    if manifest.tag is None:  # pragma: no cover - RunManifest forbids it for injected
-        raise ValueError("injected manifest has no tag")
+    if manifest.tag is None:  # pragma: no cover - RunManifest forbids it for a tagged arm
+        raise ValueError(f"{manifest.arm.value} manifest has no tag")
     prefix = decoy_prefix(manifest.tag)
     if any(under_decoy(p, prefix) for p in errors):
         raise ValueError("a P7 path lies under the decoy path")
@@ -889,7 +889,7 @@ def build_plan(
     if shared := sorted(set(errors) & set(pages)):
         raise ValueError(f"a P7 placement shares its path with a page placement: {shared}")
     return InjectionPlan(
-        arm=Arm.INJECTED,
+        arm=manifest.arm,
         robots=Action(ActionKind.ROBOTS, tuple(robots)) if robots else base_only,
         errors=errors,
         pages=pages,

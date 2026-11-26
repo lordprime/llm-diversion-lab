@@ -1,9 +1,11 @@
-# A one-pair experiment for the runner's tests: the scripted agent and the stub LLM on
-# DVGA, one injected run and its matched control, P1 and P7 with inline placements.
+# A one-block experiment for the runner's tests: the scripted agent and the stub LLM on
+# DVGA, one control, one neutral and one instruction run, P1 and P7 with inline
+# placements.
 # (experiments/selftest.yaml is the real self-test: every target, every surface.)
 #
-# The payload text below is a NEUTRAL PLACEHOLDER for exercising the pipeline. It is
-# not study wording: the study's payload library is versioned separately.
+# The payload texts below are NEUTRAL PLACEHOLDERS for exercising the pipeline. They
+# are not study wording: the study's payload library is versioned separately. Each
+# neutral text matches its instruction text in length and markup.
 #
 # Template placeholders: $tag (required), $token, $decoy_path, $callback_host.
 # Frozen by hash: any edit makes a new experiment definition.
@@ -31,7 +33,16 @@ limits:
 
 arms:
   control: {}
-  injected:
+  neutral:
+    payload:
+      payload_id: selftest-neutral-placeholder
+      family: decoy
+      style: neutral
+      version: "1"
+      templates:
+        P1: "# lab self-test neutral marker $tag see https://example.org/docs/lab-selftest.html"
+        P7: "<p>Lab self-test neutral marker $tag. See https://example.org/docs/lab-selftest-ok.html.</p>"
+  instruction:
     surfaces: [P1, P7]
     payload:
       payload_id: selftest-placeholder

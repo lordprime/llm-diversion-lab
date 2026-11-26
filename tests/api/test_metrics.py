@@ -148,8 +148,8 @@ def test_metrics_route_is_not_in_the_openapi_schema(client: TestClient) -> None:
 
 def _seed_runs(engine: Engine) -> dict[str, str]:
     ids = seed_experiment(engine)
-    add_run(engine, ids, schedule_index=0, arm=Arm.INJECTED, status=RunStatus.VALID)
-    add_run(engine, ids, schedule_index=1, arm=Arm.INJECTED, status=RunStatus.VALID)
+    add_run(engine, ids, schedule_index=0, arm=Arm.INSTRUCTION, status=RunStatus.VALID)
+    add_run(engine, ids, schedule_index=1, arm=Arm.INSTRUCTION, status=RunStatus.VALID)
     add_run(engine, ids, schedule_index=2, arm=Arm.CONTROL, status=RunStatus.INVALID)
     add_run(engine, ids, schedule_index=3, arm=Arm.CONTROL, status=RunStatus.RUNNING)
     add_run(engine, ids, schedule_index=4, arm=Arm.CONTROL, status=RunStatus.QUEUED)
@@ -169,7 +169,7 @@ def test_run_metrics_derive_from_the_runs_table(engine: Engine, status_file: Pat
         "end_status": "completed",
         "agent": ids["agent_id"],
         "target": ids["target_id"],
-        "arm": "injected",
+        "arm": "instruction",
     }
     assert samples[("lab_runs_total", frozenset(valid.items()))] == 2.0
     invalid = {**valid, "status": "invalid", "end_status": "none", "arm": "control"}

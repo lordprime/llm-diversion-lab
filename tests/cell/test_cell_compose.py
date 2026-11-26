@@ -41,7 +41,7 @@ from control.runner.schedule import build_schedule
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = REPO_ROOT / "deploy" / "compose" / "cell.dvga.yml"
-DVGA_PAIR = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_pair.yaml"
+DVGA_BLOCK = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_block.yaml"
 KEY = hashlib.sha256(b"cell-compose-test-key").digest()
 WHEN = datetime(2026, 11, 7, 12, 0, tzinfo=UTC)
 POOL = ipaddress.IPv4Network("10.232.0.0/16")
@@ -71,9 +71,9 @@ def _size(text: str) -> int:
     return int(text[:-1]) * units[text[-1]] if text[-1] in units else int(text)
 
 
-@pytest.fixture(scope="module", params=[Arm.CONTROL, Arm.INJECTED])
+@pytest.fixture(scope="module", params=[Arm.CONTROL, Arm.INSTRUCTION])
 def rendered(request: pytest.FixtureRequest) -> dict[str, Any]:
-    experiment = load_experiment(DVGA_PAIR)
+    experiment = load_experiment(DVGA_BLOCK)
     run = next(r for r in build_schedule(experiment) if r.arm is request.param)
     manifest = render_manifest(run, experiment, KEY, created_at=WHEN)
     project = render_cell(
@@ -231,7 +231,7 @@ def _control_manifest() -> RunManifest:
     return RunManifest(
         run_id=RUN_ID,
         experiment_id=new_id("exp"),
-        pair_id=new_id("pair"),
+        block_id=new_id("block"),
         arm=Arm.CONTROL,
         target="dvga",
         agent="scripted",

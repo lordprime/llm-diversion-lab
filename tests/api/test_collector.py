@@ -56,9 +56,9 @@ def _placement(
     )
 
 
-def _injected_run(engine: Engine) -> tuple[str, dict[str, str]]:
+def _instruction_run(engine: Engine) -> tuple[str, dict[str, str]]:
     ids = seed_experiment(engine)
-    return add_run(engine, ids, schedule_index=0, arm=Arm.INJECTED), ids
+    return add_run(engine, ids, schedule_index=0, arm=Arm.INSTRUCTION), ids
 
 
 def _manifest(engine: Engine, run_id: str) -> m.RunManifest:
@@ -68,7 +68,7 @@ def _manifest(engine: Engine, run_id: str) -> m.RunManifest:
         return m.RunManifest(
             run_id=run.run_id,
             experiment_id=run.experiment_id,
-            pair_id=run.pair_id,
+            block_id=run.block_id,
             arm=run.arm,
             target="dvga",
             agent="scripted",
@@ -76,14 +76,14 @@ def _manifest(engine: Engine, run_id: str) -> m.RunManifest:
             schedule_index=run.schedule_index,
             attempt=run.attempt,
             tag=run.tag,
-            placements=[_placement(run_id)] if run.arm is Arm.INJECTED else [],
+            placements=[_placement(run_id)] if run.arm is Arm.INSTRUCTION else [],
             created_at=TS,
         )
 
 
 def _run_with_manifest(client: TestClient, engine: Engine) -> tuple[str, str]:
-    """An injected run whose manifest (one placement) was posted; (run_id, placement_id)."""
-    run_id, _ = _injected_run(engine)
+    """An instruction run whose manifest (one placement) was posted; (run_id, placement_id)."""
+    run_id, _ = _instruction_run(engine)
     manifest = _manifest(engine, run_id)
     r = client.post(f"/v1/runs/{run_id}/manifest", content=manifest.model_dump_json())
     assert r.status_code == 200, r.text
@@ -186,7 +186,7 @@ def test_same_batch_twice_stores_events_once(client: TestClient, engine: Engine)
 
 
 def test_schema_invalid_batch_is_422_and_persisted(client: TestClient, engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     good = json.loads(
         _batch_json(
             run_id,
@@ -213,7 +213,7 @@ def test_schema_invalid_batch_is_422_and_persisted(client: TestClient, engine: E
 
 
 def test_unparseable_body_is_422_and_persisted(client: TestClient, engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     body = b'{"run_id": "\xff not json'
     r = client.post(f"/v1/runs/{run_id}/events:batch", content=body)
     assert r.status_code == 422
@@ -223,7 +223,7 @@ def test_unparseable_body_is_422_and_persisted(client: TestClient, engine: Engin
 
 
 def test_url_and_payload_run_id_must_match(client: TestClient, engine: Engine) -> None:
-    run_id, ids = _injected_run(engine)
+    run_id, ids = _instruction_run(engine)
     other = add_run(engine, ids, schedule_index=1)
     body = _batch_json(
         other, [m.OraclePoll(run_id=other, stream="oracle", seq=0, ts=TS, status=True)]
@@ -298,7 +298,7 @@ def test_batch_the_database_refuses_is_422_and_persisted(
     client: TestClient, engine: Engine
 ) -> None:
     """Schema-valid but unstorable (stop_reason longer than its column): nothing half-written."""
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     ok = m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=False)
     bad = m.LlmCall(
         run_id=run_id,
@@ -322,7 +322,7 @@ def test_a_constraint_rejection_names_only_the_sqlstate_and_constraint(
     client: TestClient, engine: Engine
 ) -> None:
     """No raw database text (which echoes row values) in the response or the kept detail."""
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     bad = m.LlmCall(
         run_id=run_id,
         stream="tap",
@@ -343,7 +343,7 @@ def test_a_constraint_rejection_names_only_the_sqlstate_and_constraint(
 
 
 def test_a_check_violation_names_its_constraint(engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     with pytest.raises(IntegrityError) as err, session_scope(engine) as s:
         s.execute(
             t.Artifact.__table__.insert().values(
@@ -358,7 +358,7 @@ def test_a_check_violation_names_its_constraint(engine: Engine) -> None:
 
 def test_a_long_method_or_qtype_is_stored(client: TestClient, engine: Engine) -> None:
     """Verb tampering and odd DNS types are evidence, not a reason to refuse the batch."""
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     method = "PROPFIND-" + "X" * 31  # 40 characters
     events: list[Event] = [
         m.TargetAccessEvent(
@@ -395,7 +395,7 @@ def test_nul_in_text_and_jsonb_is_stored_replaced_deterministically(
     client: TestClient, engine: Engine
 ) -> None:
     """NUL (which Postgres text and JSONB cannot hold) becomes U+FFFD; never a 422."""
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     ev = m.AgentEvent(
         run_id=run_id,
         stream="agent",
@@ -423,7 +423,7 @@ def test_nul_in_text_and_jsonb_is_stored_replaced_deterministically(
 def test_nul_in_a_heartbeat_or_oracle_message_is_stored_replaced(
     client: TestClient, engine: Engine
 ) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     hb = m.RunHeartbeat(run_id=run_id, seq=0, phase="claimed", ts=TS, message="x\x00y")
     for _ in range(2):
         r = client.post(f"/v1/runs/{run_id}/status", content=hb.model_dump_json())
@@ -441,7 +441,7 @@ def test_nul_in_a_heartbeat_or_oracle_message_is_stored_replaced(
 
 
 def test_verdict_sets_end_status_and_outcome(client: TestClient, engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     _mark_valid(engine, run_id)
     r = client.post(f"/v1/runs/{run_id}/verdict", content=_verdict(run_id).model_dump_json())
     assert r.status_code == 200, r.text
@@ -454,7 +454,7 @@ def test_verdict_sets_end_status_and_outcome(client: TestClient, engine: Engine)
 
 
 def test_verdict_is_write_once(client: TestClient, engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     _mark_valid(engine, run_id)
     url = f"/v1/runs/{run_id}/verdict"
     assert client.post(url, content=_verdict(run_id).model_dump_json()).status_code == 200
@@ -476,7 +476,7 @@ def test_verdict_is_write_once(client: TestClient, engine: Engine) -> None:
 def test_verdict_with_an_undecidable_mechanism_stores_null(
     client: TestClient, engine: Engine
 ) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     _mark_valid(engine, run_id)
     body = _verdict(run_id, mechanism=None).model_dump_json()
     assert client.post(f"/v1/runs/{run_id}/verdict", content=body).status_code == 200
@@ -486,7 +486,7 @@ def test_verdict_with_an_undecidable_mechanism_stores_null(
 def test_verdict_differing_only_in_the_mechanism_is_a_conflict(
     client: TestClient, engine: Engine
 ) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     _mark_valid(engine, run_id)
     url = f"/v1/runs/{run_id}/verdict"
     assert client.post(url, content=_verdict(run_id).model_dump_json()).status_code == 200
@@ -499,7 +499,7 @@ def test_verdict_differing_only_in_the_mechanism_is_a_conflict(
 def test_verdict_whose_outcome_matches_neither_verdict_is_rejected(
     client: TestClient, engine: Engine
 ) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     _mark_valid(engine, run_id)
     body = _verdict(run_id).model_dump(mode="json") | {
         "outcome": False,
@@ -512,7 +512,7 @@ def test_verdict_whose_outcome_matches_neither_verdict_is_rejected(
 
 
 def test_verdict_without_an_effect_is_rejected(client: TestClient, engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     _mark_valid(engine, run_id)
     body = _verdict(run_id).model_dump(mode="json")
     del body["effect"]
@@ -523,7 +523,7 @@ def test_verdict_without_an_effect_is_rejected(client: TestClient, engine: Engin
 def test_verdict_same_instant_other_timezone_is_a_duplicate(
     client: TestClient, engine: Engine
 ) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     _mark_valid(engine, run_id)
     url = f"/v1/runs/{run_id}/verdict"
     assert client.post(url, content=_verdict(run_id).model_dump_json()).status_code == 200
@@ -538,7 +538,7 @@ def test_a_verdict_is_stored_only_for_a_run_finished_valid(
     client: TestClient, engine: Engine, status: str
 ) -> None:
     """One source of Outcome: a verdict for a run not (yet) valid is a conflict, kept."""
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     if status != "queued":
         with session_scope(engine) as s:
             s.execute(
@@ -558,7 +558,7 @@ def test_a_verdict_is_stored_only_for_a_run_finished_valid(
 
 
 def test_verdict_run_id_mismatch_is_422(client: TestClient, engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     r = client.post(f"/v1/runs/{run_id}/verdict", content=_verdict(new_id("run")).model_dump_json())
     assert r.status_code == 422
     assert _run(engine, run_id).outcome is None
@@ -574,7 +574,7 @@ def test_verdict_for_unknown_run_is_404(client: TestClient, engine: Engine) -> N
 
 
 def test_manifest_stores_placements_and_hash_once(client: TestClient, engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     manifest = _manifest(engine, run_id)
     url = f"/v1/runs/{run_id}/manifest"
 
@@ -600,19 +600,19 @@ def test_manifest_stores_placements_and_hash_once(client: TestClient, engine: En
 
 
 def test_manifest_must_agree_with_the_queued_run(client: TestClient, engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
-    manifest = _manifest(engine, run_id).model_copy(update={"pair_id": new_id("pair")})
+    run_id, _ = _instruction_run(engine)
+    manifest = _manifest(engine, run_id).model_copy(update={"block_id": new_id("block")})
     r = client.post(f"/v1/runs/{run_id}/manifest", content=manifest.model_dump_json())
     assert r.status_code == 409
-    assert "pair_id" in r.json()["fields"]
+    assert "block_id" in r.json()["fields"]
     assert _count(engine, t.Placement) == 0
     assert _run(engine, run_id).manifest_sha256 is None
 
 
 def test_manifest_schema_invalid_is_422_and_persisted(client: TestClient, engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     bad = json.loads(_manifest(engine, run_id).model_dump_json())
-    bad["placements"] = []  # injected run without placements
+    bad["placements"] = []  # instruction run without placements
     r = client.post(f"/v1/runs/{run_id}/manifest", content=json.dumps(bad))
     assert r.status_code == 422
     assert [x.endpoint for x in _rejected(engine)] == [m.CollectorEndpoint.MANIFEST]
@@ -629,7 +629,7 @@ def _artifacts(run_id: str, *files: tuple[str, str, int]) -> str:
 
 
 def test_artifacts_registered_idempotently(client: TestClient, engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     url = f"/v1/runs/{run_id}/artifacts"
     body = _artifacts(run_id, ("manifest.json", SHA, 10), ("llm/0000.req.json", SHA, 99))
 
@@ -642,7 +642,7 @@ def test_artifacts_registered_idempotently(client: TestClient, engine: Engine) -
 
 
 def test_artifact_rehash_is_a_conflict(client: TestClient, engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     url = f"/v1/runs/{run_id}/artifacts"
     assert client.post(url, content=_artifacts(run_id, ("net.pcap", SHA, 5))).status_code == 200
 
@@ -665,7 +665,7 @@ def test_artifact_rehash_is_a_conflict(client: TestClient, engine: Engine) -> No
 def test_artifact_path_must_be_a_safe_relative_key(
     client: TestClient, engine: Engine, path: str
 ) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     body = json.dumps(
         {"run_id": run_id, "artifacts": [{"path": path, "sha256": SHA, "size_bytes": 1}]}
     )
@@ -685,7 +685,7 @@ def _heartbeat(run_id: str, seq: int, phase: m.RunPhase, **kw: Any) -> str:
 
 
 def test_status_heartbeats_are_stored_idempotently(client: TestClient, engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     url = f"/v1/runs/{run_id}/status"
     hb = _heartbeat(run_id, 0, m.RunPhase.AGENT_RUNNING)
 
@@ -729,7 +729,7 @@ def test_api_exposes_no_way_to_update_or_delete_evidence() -> None:
 
 
 def test_oversized_batch_is_422_and_persisted(client: TestClient, engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     n = m.MAX_EVENTS_PER_BATCH + 1
     events = [
         m.OraclePoll(run_id=run_id, stream="oracle", seq=i, ts=TS, status=False).model_dump(
@@ -750,7 +750,7 @@ def test_oversized_batch_is_422_and_persisted(client: TestClient, engine: Engine
 
 
 def test_oversized_artifact_batch_is_422(client: TestClient, engine: Engine) -> None:
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     files = [
         {"path": f"f/{i}", "sha256": SHA, "size_bytes": 1}
         for i in range(m.MAX_ARTIFACTS_PER_BATCH + 1)
@@ -768,7 +768,7 @@ def test_unexpected_db_error_is_500_and_body_kept(
         raise OperationalError("INSERT ...", {}, Exception("server closed the connection"))
 
     monkeypatch.setattr(repo, "insert_events", broken)
-    run_id, _ = _injected_run(engine)
+    run_id, _ = _instruction_run(engine)
     body = _batch_json(
         run_id, [m.OraclePoll(run_id=run_id, stream="oracle", seq=0, ts=TS, status=True)]
     )

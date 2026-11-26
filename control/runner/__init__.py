@@ -1,1 +1,1 @@
-"""Runner: experiment config, matched-pair scheduling and per-run rendering."""
+"""Runner: experiment config, three-arm block scheduling and per-run rendering."""

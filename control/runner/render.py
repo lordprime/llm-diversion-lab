@@ -15,12 +15,18 @@ Placement ids are a function of the run: ``pl_<run ULID>_<surface>`` (e.g.
 tokens; only ``created_at`` differs unless given.
 
 :func:`forbidden_tags_for` gives the labeller the tags that must not appear in a run's
-evidence: the tags of every *other* injected run in the same schedule, every attempt
-included (a retry has a new run id and tag, so its evidence is told apart). For a control
-run that always includes its paired injected run's tag (so the set is never empty);
-for an injected run it is the rest of the experiment's tags, which turns any
-cross-run leak (shared gateway, agent memory, a reused cell) into a refusal rather
-than a silently mislabelled run.
+evidence: the tags of every *other* tagged (neutral or instruction) run in the same
+schedule, every attempt included (a retry has a new run id and tag, so its evidence is
+told apart). For a control run that always includes both tags of its own block, the
+neutral's and the instruction's, so the only tag-free run of a block is checked for
+both; for a neutral run it always includes its block's instruction tag (and so the
+instruction's decoy path, ``/x-<tag>``). For every run it covers the rest of the
+experiment's tags, which turns any cross-run leak (shared gateway, agent memory, a
+reused cell) into a refusal rather than a silently mislabelled run.
+
+:func:`forbidden_tokens_for` adds the callback tokens of the block's instruction run
+(every attempt) for its control and neutral runs: the callback host is part of the
+instruction's own fingerprint, and a neutral text never names one.
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ from control.runner.schedule import ScheduledRun
 __all__ = [
     "TokenMismatchError",
     "forbidden_tags_for",
+    "forbidden_tokens_for",
     "placement_id_for",
     "render_catcher_file",
     "render_catcher_tokens",
@@ -99,26 +106,27 @@ def render_manifest(
 ) -> RunManifest:
     """The :class:`RunManifest` of ``run``.
 
-    A control run gets no tag and no placements. An injected run gets its scheduled tag
-    and one placement per surface of the injected arm, in the arm's order, each with
-    the target's url and locator, the payload's id and version, the callback token
-    ``derive_token(lab_key, run_id, placement_id)`` and the sha256 of its rendered
-    UTF-8 text.
+    A control run gets no tag and no placements. A neutral or instruction run gets its
+    scheduled tag and one placement per planted surface, in the instruction arm's order,
+    each with the target's url and locator, its own arm's payload id and version, the
+    callback token ``derive_token(lab_key, run_id, placement_id)`` and the sha256 of its
+    rendered UTF-8 text. Both tagged arms plant the same surfaces at the same places:
+    only the text differs.
     """
     if not lab_key:
         raise ValueError("lab_key must be non-empty")
     _check_run(run, experiment)
     placements: list[Placement] = []
-    if run.arm is Arm.INJECTED:
+    if run.arm.tagged:
         if run.tag is None:  # pragma: no cover - ScheduledRun forbids it
-            raise ValueError(f"injected run {run.run_id} has no tag")
-        arm = experiment.arms.injected
+            raise ValueError(f"{run.arm.value} run {run.run_id} has no tag")
+        payload = experiment.arms.payload(run.arm)
         target = experiment.target(run.target)
-        for surface in arm.surfaces:
+        for surface in experiment.arms.surfaces:
             placement_id = placement_id_for(run.run_id, surface)
             token = derive_token(lab_key, run.run_id, placement_id)
             text = render_text(
-                arm.payload.templates[surface],
+                payload.templates[surface],
                 tag=run.tag,
                 token=token,
                 callback_domain=experiment.callback_domain,
@@ -131,8 +139,8 @@ def render_manifest(
                     surface=surface,
                     url=spec.url,
                     locator=spec.locator,
-                    payload_id=arm.payload.payload_id,
-                    payload_version=arm.payload.version,
+                    payload_id=payload.payload_id,
+                    payload_version=payload.version,
                     tag=run.tag,
                     token=token,
                     content_sha256=_sha256(text),
@@ -142,7 +150,7 @@ def render_manifest(
     return RunManifest(
         run_id=run.run_id,
         experiment_id=run.experiment_id,
-        pair_id=run.pair_id,
+        block_id=run.block_id,
         arm=run.arm,
         target=run.target,
         agent=run.agent,
@@ -173,17 +181,19 @@ def verify_manifest_tokens(manifest: RunManifest, lab_key: bytes) -> None:
 def render_payloads(manifest: RunManifest, experiment: Experiment) -> dict[str, str]:
     """The injector's ``LAB_PAYLOADS`` content: ``placement_id`` -> rendered text.
 
-    Empty for a control run. Each text is re-rendered from the experiment's templates
-    and must hash to its placement's ``content_sha256`` and contain the run's tag; a
-    mismatch (the experiment changed after the manifest was rendered) raises
-    ``ValueError``.
+    Empty for a control run. Each text is re-rendered from the templates of the
+    manifest's own arm and must hash to its placement's ``content_sha256`` and contain
+    the run's tag; a mismatch (the experiment changed after the manifest was rendered,
+    or a placement names the other arm's payload) raises ``ValueError``.
     """
     if manifest.experiment_id != experiment.experiment_id:
         raise ValueError(
             f"manifest {manifest.run_id} belongs to experiment {manifest.experiment_id}, "
             f"not {experiment.experiment_id}"
         )
-    payload = experiment.arms.injected.payload
+    if not manifest.arm.tagged:
+        return {}
+    payload = experiment.arms.payload(manifest.arm)
     texts: dict[str, str] = {}
     for placement in manifest.placements:
         where = f"run {manifest.run_id} placement {placement.placement_id}"
@@ -236,22 +246,66 @@ def render_catcher_file(manifest: RunManifest, experiment: Experiment) -> bytes:
     return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
 
 
+def _require_block_partners(
+    run: ScheduledRun, schedule: Sequence[ScheduledRun], arms: Sequence[Arm]
+) -> None:
+    """``ValueError`` unless ``schedule`` holds ``run`` and, in its block, a run of each of
+    ``arms``."""
+    if not any(r.run_id == run.run_id for r in schedule):
+        raise ValueError(f"run {run.run_id} is not in the schedule")
+    for arm in arms:
+        if not any(r.block_id == run.block_id and r.arm is arm for r in schedule):
+            raise ValueError(
+                f"{run.arm.value} run {run.run_id}: no {arm.value} run of its block in the schedule"
+            )
+
+
+#: For each arm, the arms of the same block whose evidence must never show in it.
+_GUARDED_BY: dict[Arm, tuple[Arm, ...]] = {
+    Arm.CONTROL: (Arm.NEUTRAL, Arm.INSTRUCTION),
+    Arm.NEUTRAL: (Arm.INSTRUCTION,),
+    Arm.INSTRUCTION: (),
+}
+
+
 def forbidden_tags_for(run: ScheduledRun, schedule: Sequence[ScheduledRun]) -> frozenset[str]:
-    """Tags that must not occur in ``run``'s evidence: every other injected run's tag.
+    """Tags that must not occur in ``run``'s evidence: every other tagged run's tag.
 
     ``schedule`` is every attempt of every run (see
     :func:`~control.runner.schedule.retry`), so the set covers the tags of the other
     attempts too, including earlier attempts of ``run`` itself. For a control run it
-    always contains its paired injected run's tag(s) and is therefore never empty (the
-    labeller requires that); ``ValueError`` if the schedule lacks that run. Never
-    contains ``run``'s own tag. ``ValueError`` if ``run`` is not in ``schedule``.
+    always contains its block's neutral and instruction tags, and for a neutral run its
+    block's instruction tag, so neither set is ever empty (the labeller requires that);
+    ``ValueError`` if the schedule lacks those runs. Never contains ``run``'s own tag.
+    ``ValueError`` if ``run`` is not in ``schedule``.
     """
-    if not any(r.run_id == run.run_id for r in schedule):
-        raise ValueError(f"run {run.run_id} is not in the schedule")
-    if run.arm is Arm.CONTROL and not any(
-        r.pair_id == run.pair_id and r.arm is Arm.INJECTED for r in schedule
-    ):
-        raise ValueError(f"control run {run.run_id}: no paired injected run in the schedule")
+    _require_block_partners(run, schedule, _GUARDED_BY[run.arm])
     return frozenset(
         r.tag for r in schedule if r.run_id != run.run_id and r.tag is not None and r.tag != run.tag
+    )
+
+
+def forbidden_tokens_for(
+    run: ScheduledRun,
+    schedule: Sequence[ScheduledRun],
+    experiment: Experiment,
+    lab_key: bytes,
+) -> frozenset[str]:
+    """Callback tokens that must not occur in ``run``'s evidence.
+
+    For a control or neutral run: the token of every planted surface of every attempt of
+    its block's instruction run, as the lab key derives them (the instruction's own
+    callback host). Empty for an instruction run. ``ValueError`` as for
+    :func:`forbidden_tags_for`.
+    """
+    if not lab_key:
+        raise ValueError("lab_key must be non-empty")
+    _require_block_partners(run, schedule, _GUARDED_BY[run.arm])
+    if run.arm is Arm.INSTRUCTION:
+        return frozenset()
+    return frozenset(
+        derive_token(lab_key, r.run_id, placement_id_for(r.run_id, surface))
+        for r in schedule
+        if r.block_id == run.block_id and r.arm is Arm.INSTRUCTION
+        for surface in experiment.arms.surfaces
     )

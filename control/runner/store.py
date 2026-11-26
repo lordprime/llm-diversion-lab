@@ -31,7 +31,7 @@ from control.db import tables as t
 from control.db.engine import session_scope
 from control.db.repo import claim_next_run
 from control.runner.experiment import ExperimentFile
-from control.runner.schedule import ScheduledRun
+from control.runner.schedule import BLOCK_ARMS, ScheduledRun
 from control.telemetry.model import RunTelemetry
 
 __all__ = [
@@ -194,29 +194,31 @@ class RunStore:
         catalog: RunCatalog,
     ) -> None:
         exp = ef.experiment
-        payload = exp.arms.injected.payload
-        arm_ids = {Arm.CONTROL: new_id("arm"), Arm.INJECTED: new_id("arm")}
-        s.add_all(
-            [
+        arm_ids = {arm: new_id("arm") for arm in BLOCK_ARMS}
+        rows = [
+            t.ExperimentArm(
+                arm_id=arm_ids[Arm.CONTROL],
+                experiment_id=exp.experiment_id,
+                name=Arm.CONTROL.value,
+                arm=Arm.CONTROL,
+                surfaces=[],
+            )
+        ]
+        for arm in (Arm.NEUTRAL, Arm.INSTRUCTION):
+            payload = exp.arms.payload(arm)
+            rows.append(
                 t.ExperimentArm(
-                    arm_id=arm_ids[Arm.CONTROL],
+                    arm_id=arm_ids[arm],
                     experiment_id=exp.experiment_id,
-                    name="control",
-                    arm=Arm.CONTROL,
-                    surfaces=[],
-                ),
-                t.ExperimentArm(
-                    arm_id=arm_ids[Arm.INJECTED],
-                    experiment_id=exp.experiment_id,
-                    name="injected",
-                    arm=Arm.INJECTED,
-                    surfaces=[sf.value for sf in exp.arms.injected.surfaces],
+                    name=arm.value,
+                    arm=arm,
+                    surfaces=[sf.value for sf in exp.arms.surfaces],
                     payload_family=payload.family.value,
                     payload_style=payload.style.value,
                     payload_version=payload.version,
-                ),
-            ]
-        )
+                )
+            )
+        s.add_all(rows)
         s.flush()
         targets, agents, models = {}, {}, {}
         for target in exp.targets:
@@ -278,7 +280,7 @@ class RunStore:
                     target_id=targets[r.target],
                     agent_id=agents[r.agent],
                     model_id=models[r.model],
-                    pair_id=r.pair_id,
+                    block_id=r.block_id,
                     schedule_index=r.schedule_index,
                     attempt=r.attempt,
                     tag=r.tag,
@@ -302,7 +304,7 @@ class RunStore:
         return ScheduledRun(
             run_id=run.run_id,
             experiment_id=run.experiment_id,
-            pair_id=run.pair_id,
+            block_id=run.block_id,
             arm=run.arm,
             target=target,
             agent=agent,
@@ -316,8 +318,8 @@ class RunStore:
     def load_schedule(self, experiment_id: str) -> list[ScheduledRun]:
         """Every attempt of every run of the experiment, in schedule order.
 
-        ``rep`` is not a column: it is recovered as the pair's rank among the pairs of
-        its cell, ordered by schedule position (repetitions are interchangeable).
+        ``rep`` is not a column: it is recovered as the block's rank among the blocks
+        of its cell, ordered by schedule position (repetitions are interchangeable).
         """
         with session_scope(self._engine) as s:
             rows = s.execute(
@@ -327,12 +329,12 @@ class RunStore:
             ).all()
         reps: dict[tuple[str, str, str], list[str]] = {}
         for run, target, agent, model in rows:
-            pairs = reps.setdefault((target, agent, model), [])
-            if run.pair_id not in pairs:
-                pairs.append(run.pair_id)
+            blocks = reps.setdefault((target, agent, model), [])
+            if run.block_id not in blocks:
+                blocks.append(run.block_id)
         return [
             self._scheduled(
-                run, target, agent, model, reps[(target, agent, model)].index(run.pair_id)
+                run, target, agent, model, reps[(target, agent, model)].index(run.block_id)
             )
             for run, target, agent, model in rows
         ]

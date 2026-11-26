@@ -2,7 +2,7 @@
 
 :meth:`Runner.run_experiment` takes the host-wide lock (:func:`host_lock`, default
 :data:`DEFAULT_RUNNER_LOCK`; the self-test takes the same one), registers the
-experiment and its matched-pair schedule (:class:`~control.runner.store.RunStore`; a
+experiment and its three-arm block schedule (:class:`~control.runner.store.RunStore`; a
 resumed queue must have the same definition hash and the same image builds), checks
 the whole stored schedule with :func:`~control.runner.schedule.check_schedule`
 (``experiment=``, all attempts) and then claims and runs queued runs one at a time. If
@@ -129,7 +129,12 @@ from control.runner.oracle import (
     OracleScore,
     parse_done,
 )
-from control.runner.render import forbidden_tags_for, render_manifest, verify_manifest_tokens
+from control.runner.render import (
+    forbidden_tags_for,
+    forbidden_tokens_for,
+    render_manifest,
+    verify_manifest_tokens,
+)
 from control.runner.schedule import ScheduledRun, ScheduleError, build_schedule, check_schedule
 from control.runner.ship import (
     CollectorClient,
@@ -1036,6 +1041,7 @@ class Runner:
             state.evidence_dir,
             state.manifest,
             forbidden_tags=forbidden_tags_for(state.run, schedule),
+            forbidden_tokens=forbidden_tokens_for(state.run, schedule, experiment, self._lab_key),
             verdict=state.verdict,
         )
         return tuple(label_run(evidence))

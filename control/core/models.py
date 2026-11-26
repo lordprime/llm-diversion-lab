@@ -5,7 +5,7 @@ and API payload. JSON Schemas under ``schemas/`` are generated from them by
 ``python -m tools.gen_schemas`` and must never be edited by hand.
 
 Field names use the study's domain words verbatim: ``surface``, ``placement``,
-``arm``, ``pair_id``, ``access``, ``visible``, ``uptake``, ``outcome``, ``run_id``,
+``arm``, ``block_id``, ``access``, ``visible``, ``uptake``, ``outcome``, ``run_id``,
 ``experiment_id``.
 
 Event sequencing and idempotency contract
@@ -32,6 +32,7 @@ from enum import StrEnum
 from typing import Annotated, Final, Literal, Self
 
 from pydantic import (
+    AliasChoices,
     AwareDatetime,
     BaseModel,
     ConfigDict,
@@ -50,6 +51,7 @@ from control.core.tokens import TAG_PATTERN, TOKEN_PATTERN
 __all__ = [
     "ALL_MODELS",
     "ARTIFACT_PATH_PATTERN",
+    "LEGACY_INJECTED_ARM",
     "MAX_ARTIFACTS_PER_BATCH",
     "MAX_EVENTS_PER_BATCH",
     "SCHEMA_VERSION",
@@ -127,8 +129,35 @@ class Surface(StrEnum):
 
 
 class Arm(StrEnum):
+    """The three arms of a block (register items T1 and S1).
+
+    * ``control``: the clean site, no tag and nothing planted;
+    * ``neutral``: the same surfaces, tag and markup as the instruction, with matched
+      innocuous text that asks for nothing;
+    * ``instruction``: the prevention prompt itself.
+
+    Before the three-arm design the treated arm was called ``injected``. That value is
+    still read (as :attr:`INSTRUCTION`) for one release, so manifests and rows written
+    by M0 and M1a stay readable; nothing writes it any more.
+    """
+
     CONTROL = "control"
-    INJECTED = "injected"
+    NEUTRAL = "neutral"
+    INSTRUCTION = "instruction"
+
+    @classmethod
+    def _missing_(cls, value: object) -> Arm | None:
+        # the two-arm design's treated arm, read as the instruction arm (deprecated)
+        return cls.INSTRUCTION if value == LEGACY_INJECTED_ARM else None
+
+    @property
+    def tagged(self) -> bool:
+        """Whether runs of this arm carry a tag and placements (every arm but control)."""
+        return self is not Arm.CONTROL
+
+
+#: The old name of the instruction arm, still accepted on input for one release.
+LEGACY_INJECTED_ARM: Final = "injected"
 
 
 class OracleVerdictKind(StrEnum):
@@ -512,13 +541,18 @@ class FunnelLabel(_Model):
 class RunManifest(_Model):
     """Everything planned for one run, written before the agent starts.
 
-    A control run is tag-free: no ``tag`` and no placements. An injected run has a
-    tag and at least one placement, each belonging to this run and carrying its tag.
+    A control run is tag-free: no ``tag`` and no placements. A neutral or instruction
+    run has a tag and at least one placement, each belonging to this run and carrying
+    its tag, so the control run is the only tag-free run of its block.
+
+    ``block_id`` names the run's block (one control, one neutral and one instruction
+    run of the same cell and repetition). A manifest written before the three-arm design
+    names it ``pair_id``; that key is still read for one release.
     """
 
     run_id: Id
     experiment_id: Id
-    pair_id: Id
+    block_id: Annotated[Id, Field(validation_alias=AliasChoices("block_id", "pair_id"))]
     arm: Arm
     target: NonEmptyStr
     agent: NonEmptyStr
@@ -536,7 +570,7 @@ class RunManifest(_Model):
                 raise ValueError("control run must have no tag and no placements")
             return self
         if self.tag is None or not self.placements:
-            raise ValueError("injected run requires a tag and at least one placement")
+            raise ValueError(f"{self.arm.value} run requires a tag and at least one placement")
         ids = [p.placement_id for p in self.placements]
         if len(set(ids)) != len(ids):
             raise ValueError("placement_id values must be unique")

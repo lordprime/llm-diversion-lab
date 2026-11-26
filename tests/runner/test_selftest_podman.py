@@ -8,8 +8,8 @@ runs: the agent is the scripted one, the "attack" is DVGA's own importPaste.
 Needs the ``docker`` CLI with the compose plugin, a reachable socket, and the images
 ``localhost/lab-cell:dev`` (``cell/Dockerfile``) and ``localhost/goat-<target>:dev`` for
 DVGA, Juice Shop and Drupal (``targets/<target>/Dockerfile``); skipped otherwise, unless
-``LAB_E2E_REQUIRE=1``. The first test runs the DVGA pair only
-(``tests/fixtures/experiments/dvga_pair.yaml``); ``labctl selftest`` runs every target.
+``LAB_E2E_REQUIRE=1``. The first test runs the DVGA block only
+(``tests/fixtures/experiments/dvga_block.yaml``); ``labctl selftest`` runs every target.
 ``LAB_E2E_ENGINE`` (``podman``/``docker``) and ``DOCKER_HOST`` choose the engine.
 Docker-only options (bridge names, DOCKER-USER) are not exercised here; their
 rendering is asserted in ``test_cell_spec.py``.
@@ -17,7 +17,7 @@ rendering is asserted in ``test_cell_spec.py``.
 ``test_labctl_selftest_end_to_end`` runs ``labctl selftest`` itself (full mode) on a
 development host (``LAB_DEV=1``, no host profile, settings from the environment): the
 lab wiring from a temporary ``LAB_ROOT``, a Collector served over HTTP, the
-containment probe in both cells. ``LAB_E2E_LAN`` names the LAN address to probe
+containment probe in every cell. ``LAB_E2E_LAN`` names the LAN address to probe
 (default: this machine's default gateway); it must answer from this machine. Under
 rootless Podman the agent network's gateway is the rootless network namespace, which
 answers with a reset, so the probe's host address is this machine's own address
@@ -66,7 +66,7 @@ IMAGES = {
     "goat-juice-shop": "localhost/goat-juice-shop:dev",
     "goat-drupal-7600": "localhost/goat-drupal-7600:dev",
 }
-DVGA_PAIR = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_pair.yaml"
+DVGA_BLOCK = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_block.yaml"
 KEY = hashlib.sha256(b"selftest-e2e-lab-key").digest()
 
 
@@ -103,7 +103,7 @@ def collector(engine: Engine) -> Iterator[CollectorClient]:
         yield CollectorClient(http)
 
 
-def test_the_selftest_pair_in_real_cells(
+def test_the_selftest_block_in_real_cells(
     engine: Engine, collector: CollectorClient, docker_env: dict[str, str], tmp_path: Path
 ) -> None:
     engine_kind = os.environ.get("LAB_E2E_ENGINE") or (
@@ -120,8 +120,8 @@ def test_the_selftest_pair_in_real_cells(
         runs_dir=tmp_path / "runs",
         work_dir=tmp_path / "work",
     )
-    results = runner.run_experiment(read_experiment(DVGA_PAIR))
-    assert [(r.status, r.detail) for r in results] == [(RunStatus.VALID, "")] * 2
+    results = runner.run_experiment(read_experiment(DVGA_BLOCK))
+    assert [(r.status, r.detail) for r in results] == [(RunStatus.VALID, "")] * 3
     assert {r.end_status for r in results} == {EndStatus.COMPLETED}
     assert {r.outcome for r in results} == {True}
 
@@ -130,18 +130,21 @@ def test_the_selftest_pair_in_real_cells(
         callbacks = s.scalars(select(t.Callback)).all()
     for result in results:
         got = {stage: labels[(result.run_id, stage)] for stage in FunnelStage}
-        treated = result.arm is Arm.INJECTED
+        tagged = result.arm.tagged
         assert got == {
-            FunnelStage.ACCESS: treated,
-            FunnelStage.VISIBLE: treated,
-            FunnelStage.UPTAKE: treated,
-            FunnelStage.OUTCOME: True,  # the objective is reached in both arms
+            FunnelStage.ACCESS: tagged,
+            FunnelStage.VISIBLE: tagged,
+            FunnelStage.UPTAKE: result.arm is Arm.INSTRUCTION,  # only it names a decoy
+            FunnelStage.OUTCOME: True,  # the objective is reached in every arm
         }, result.arm
-    injected = next(r for r in results if r.arm is Arm.INJECTED)
-    channels = {c.channel for c in callbacks if c.run_id == injected.run_id and c.token}
-    assert channels == {CallbackChannel.HTTP, CallbackChannel.DNS}
+    for result in results:
+        channels = {c.channel for c in callbacks if c.run_id == result.run_id and c.token}
+        if result.arm is Arm.INSTRUCTION:
+            assert channels == {CallbackChannel.HTTP, CallbackChannel.DNS}
+        else:
+            assert channels == set(), result.arm
 
-    # nothing of either cell is left behind
+    # nothing of any cell is left behind
     full = {**os.environ, **docker_env}
     for result in results:
         label = f"label=lab.run_id={result.run_id}"
@@ -237,8 +240,8 @@ def test_labctl_selftest_end_to_end(
     failed = {c["name"]: c["detail"] for c in report["checks"] if not c["ok"]}
     assert rc == 0, failed
     assert report["passed"] and not report["quick"] and not failed
-    assert len(report["runs"]) == 6 and len(report["probes"]) == 6
-    assert len(report["resets"]) == 6 and all(r["ok"] for r in report["resets"])
+    assert len(report["runs"]) == 9 and len(report["probes"]) == 9
+    assert len(report["resets"]) == 9 and all(r["ok"] for r in report["resets"])
     assert all(p["contained"] for p in report["probes"])
     # the host's own LAN address was probed as well (no control plane in development)
     own = _own_address(lan)

@@ -98,7 +98,7 @@ def _placement(pid: str, surface: Surface, url: str) -> Placement:
     )
 
 
-def _manifest(*, injected: bool = True) -> RunManifest:
+def _manifest(*, tagged: bool = True) -> RunManifest:
     placements = [
         _placement(P1_ID, Surface.P1, "/robots.txt"),
         _placement(P7_ID, Surface.P7, "/.env"),
@@ -106,14 +106,14 @@ def _manifest(*, injected: bool = True) -> RunManifest:
     return RunManifest(
         run_id=RUN_ID,
         experiment_id=new_id("exp"),
-        pair_id=new_id("pair"),
-        arm=Arm.INJECTED if injected else Arm.CONTROL,
+        block_id=new_id("block"),
+        arm=Arm.INSTRUCTION if tagged else Arm.CONTROL,
         target="dvga",
         agent="scripted",
         model="stub",
         schedule_index=0,
-        tag=TAG if injected else None,
-        placements=placements if injected else [],
+        tag=TAG if tagged else None,
+        placements=placements if tagged else [],
         created_at=TS,
     )
 
@@ -122,8 +122,8 @@ def _token(pid: str) -> str:
     return derive_token(CONTROL_PLANE_KEY, RUN_ID, pid)
 
 
-def _config(tmp_path: Path, *, injected: bool = True) -> CatcherConfig:
-    manifest = _manifest(injected=injected)
+def _config(tmp_path: Path, *, tagged: bool = True) -> CatcherConfig:
+    manifest = _manifest(tagged=tagged)
     return CatcherConfig(
         run_id=RUN_ID,
         tokens=TokenIndex.build(manifest),
@@ -199,7 +199,7 @@ def test_token_to_run_rejects_unknown_or_malformed(token: str) -> None:
 
 
 def test_token_to_run_control_run_has_no_tokens() -> None:
-    assert token_to_run(_token(P1_ID), _manifest(injected=False)) is None
+    assert token_to_run(_token(P1_ID), _manifest(tagged=False)) is None
 
 
 def _with_tokens(*tokens: str) -> RunManifest:
@@ -328,7 +328,7 @@ def test_config_rejects_run_id_mismatch(tmp_path: Path) -> None:
 
 
 def test_config_control_run(tmp_path: Path) -> None:
-    config = CatcherConfig.from_env(_env_files(tmp_path, _manifest(injected=False)))
+    config = CatcherConfig.from_env(_env_files(tmp_path, _manifest(tagged=False)))
     assert config.tokens.entries == ()
     assert config.tokens.lookup(_token(P1_ID)) is None
 
@@ -357,7 +357,7 @@ def test_config_from_a_token_only_file(tmp_path: Path) -> None:
 
 
 def test_config_from_a_token_only_file_for_a_control_run(tmp_path: Path) -> None:
-    config = CatcherConfig.from_env(_token_env(tmp_path, _tokens_doc(_manifest(injected=False))))
+    config = CatcherConfig.from_env(_token_env(tmp_path, _tokens_doc(_manifest(tagged=False))))
     assert config.tokens.entries == ()
 
 
@@ -519,7 +519,7 @@ def test_http_unverified_token_recorded_without_token(tmp_path: Path) -> None:
 
 
 def test_http_control_run_records_callbacks(tmp_path: Path) -> None:
-    with _client(_config(tmp_path, injected=False)) as client:
+    with _client(_config(tmp_path, tagged=False)) as client:
         resp = client.get(f"/r/{_token(P1_ID)}")
     assert resp.content == FIXED_BODY
     [cb] = _callbacks(tmp_path / HTTP_EVENTS_FILE)
@@ -698,8 +698,8 @@ def _handler(ip: str = "172.30.0.7") -> SimpleNamespace:
     return SimpleNamespace(client_address=(ip, 40000), protocol="udp")
 
 
-def _resolver(tmp_path: Path, *, injected: bool = True) -> CatcherResolver:
-    return CatcherResolver(_config(tmp_path, injected=injected), parse_catcher_ip(CATCHER_IP))
+def _resolver(tmp_path: Path, *, tagged: bool = True) -> CatcherResolver:
+    return CatcherResolver(_config(tmp_path, tagged=tagged), parse_catcher_ip(CATCHER_IP))
 
 
 def test_dns_answers_any_name_with_fixed_ip_and_records(tmp_path: Path) -> None:
@@ -757,7 +757,7 @@ def test_dns_ipv6_catcher_answers_aaaa(tmp_path: Path) -> None:
 
 
 def test_dns_control_run_records(tmp_path: Path) -> None:
-    resolver = _resolver(tmp_path, injected=False)
+    resolver = _resolver(tmp_path, tagged=False)
     resolver.resolve(_query(f"{_token(P1_ID)}.cb.lab.test"), _handler())
     [cb] = _callbacks(tmp_path / DNS_EVENTS_FILE)
     assert cb.token is None

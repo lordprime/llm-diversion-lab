@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -61,8 +62,8 @@ def manifest_dict(**over: Any) -> dict[str, Any]:
     d: dict[str, Any] = {
         "run_id": RUN,
         "experiment_id": EXP,
-        "pair_id": PAIR,
-        "arm": "injected",
+        "block_id": PAIR,
+        "arm": "instruction",
         "target": "dvga",
         "agent": "scripted",
         "model": "stub",
@@ -221,7 +222,8 @@ def test_surface_enum_is_p1_to_p8() -> None:
 
 
 def test_enum_values() -> None:
-    assert {a.value for a in Arm} == {"control", "injected"}
+    assert [a.value for a in Arm] == ["control", "neutral", "instruction"]
+    assert [a.tagged for a in Arm] == [False, True, True]
     assert [s.value for s in FunnelStage] == ["access", "visible", "uptake", "outcome"]
     assert {e.value for e in EndStatus} == {
         "completed",
@@ -267,10 +269,49 @@ def test_real_tag_and_token_validate() -> None:
     assert (p.tag, p.token) == (tag, token)
 
 
-def test_manifest_injected_constructs() -> None:
+def test_manifest_instruction_constructs() -> None:
     mf = RunManifest.model_validate(manifest_dict())
-    assert mf.arm is Arm.INJECTED
+    assert mf.arm is Arm.INSTRUCTION
     assert mf.placements[0].surface is Surface.P1
+
+
+def test_manifest_neutral_carries_the_tag_and_placements_like_the_instruction() -> None:
+    mf = RunManifest.model_validate(manifest_dict(arm="neutral"))
+    assert (mf.arm, mf.tag, len(mf.placements)) == (Arm.NEUTRAL, TAG, 1)
+
+
+@pytest.mark.parametrize(
+    "over", [{"tag": None}, {"placements": []}, {"tag": None, "placements": []}]
+)
+def test_a_neutral_run_without_a_tag_or_placements_is_rejected(over: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError, match="neutral run requires a tag"):
+        RunManifest.model_validate(manifest_dict(arm="neutral", **over))
+
+
+def test_a_control_run_with_a_tag_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="control run must have no tag"):
+        RunManifest.model_validate(manifest_dict(arm="control", placements=[]))
+
+
+def test_a_manifest_written_before_the_three_arms_is_still_read() -> None:
+    """M0 and M1a manifests say ``pair_id`` and ``injected``: read as block and instruction."""
+    old = manifest_dict(arm="injected")
+    old["pair_id"] = old.pop("block_id")
+    mf = RunManifest.model_validate_json(json.dumps(old))
+    assert (mf.arm, mf.block_id) == (Arm.INSTRUCTION, PAIR)
+    assert "pair_id" not in mf.model_dump() and mf.model_dump()["arm"] == "instruction"
+    assert Arm("injected") is Arm.INSTRUCTION
+
+
+@pytest.mark.parametrize("arm", ["Injected", "INSTRUCTION", "treated", "", "pair", "injected "])
+def test_unknown_arm_values_are_refused(arm: str) -> None:
+    with pytest.raises(ValidationError):
+        RunManifest.model_validate(manifest_dict(arm=arm))
+
+
+def test_a_manifest_naming_both_block_id_and_pair_id_is_refused() -> None:
+    with pytest.raises(ValidationError):
+        RunManifest.model_validate(manifest_dict(pair_id=PAIR))
 
 
 def test_manifest_control_must_be_tag_free() -> None:
@@ -282,7 +323,7 @@ def test_manifest_control_must_be_tag_free() -> None:
         RunManifest.model_validate(manifest_dict(arm="control", tag=TAG, placements=[]))
 
 
-def test_manifest_injected_requires_tag_and_placements() -> None:
+def test_manifest_instruction_requires_tag_and_placements() -> None:
     with pytest.raises(ValidationError):
         RunManifest.model_validate(manifest_dict(tag=None))
     with pytest.raises(ValidationError):

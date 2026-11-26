@@ -347,7 +347,7 @@ def foreign_placements(session: Session, run_id: str, placement_ids: Iterable[st
 
 
 #: Manifest fields that must agree with the queued run row.
-MANIFEST_RUN_FIELDS = ("experiment_id", "pair_id", "arm", "schedule_index", "attempt", "tag")
+MANIFEST_RUN_FIELDS = ("experiment_id", "block_id", "arm", "schedule_index", "attempt", "tag")
 
 
 def record_manifest(session: Session, manifest: m.RunManifest) -> WriteResult:

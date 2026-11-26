@@ -590,7 +590,7 @@ def _check_manifest(run: ScheduledRun, manifest: RunManifest) -> None:
     fields = (
         "run_id",
         "experiment_id",
-        "pair_id",
+        "block_id",
         "arm",
         "target",
         "agent",
@@ -617,7 +617,7 @@ def _agent_script(
     host, port = str(meta["agent_host"]), int(meta["agent_port"])
     target_url = f"http://{host}" if port == 80 else f"http://{host}:{port}"
     target = experiment.target(run.target)
-    planted = sorted(experiment.arms.injected.surfaces)
+    planted = sorted(experiment.arms.surfaces)
     # each planted page once, in surface order (P3-P6 and P8 often share one page)
     urls = list(dict.fromkeys(target.placements[s].url for s in planted))
     objective = meta.get("objective")
@@ -740,7 +740,7 @@ def render_cell(
     agent_hosts = [f"{meta['agent_host']}:{injector_ip}", f"tap:{tap_ip}"]
 
     # per-run environment of the infrastructure
-    p1 = Surface.P1 in experiment.arms.injected.surfaces
+    p1 = Surface.P1 in experiment.arms.surfaces
     services["injector"]["environment"].update(
         LAB_RUN_ID=run.run_id,
         LAB_PROBE_SECRET=secrets.probe_secret,
@@ -857,7 +857,7 @@ def render_cell(
 
     # each planted path once (P3-P6 and P8 often share a page), in surface order
     expected: dict[str, int] = {}
-    for surface in sorted(experiment.arms.injected.surfaces):
+    for surface in sorted(experiment.arms.surfaces):
         placement = target_spec.placements[surface]
         if surface is Surface.P7:  # the locator names the error the app must answer with
             expected.setdefault(placement.url, int(placement.locator.rpartition(":")[2]))

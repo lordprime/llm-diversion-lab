@@ -11,8 +11,9 @@ Commands (each takes ``--json`` for scripting):
   schedule order (:mod:`control.cli.export`); refuses to mix telemetry versions unless
   ``--allow-mixed-versions``.
 * ``labctl selftest [--quick] [--json]``: the instrumentation self-test
-  (:mod:`control.runner.selftest`): one injected and one control DVGA cell with the
-  scripted agent and the stub LLM, a containment probe, and the checks; the result is
+  (:mod:`control.runner.selftest`): one block per target (a control, a neutral and an
+  instruction cell) with the scripted agent and the stub LLM, a containment probe, and
+  the checks (``--quick``: the first target only); the result is
   recorded in the self-test status file (``labctl status``, ``/metrics``), after an
   "in progress" marker recorded before it starts. SIGTERM and SIGHUP end it through
   ``SystemExit`` (exit 128 + signal), so its cell is still torn down.
@@ -268,11 +269,11 @@ def _cmd_run_show(args: argparse.Namespace, settings: LabSettings) -> int:
         _json(data)
         return EXIT_OK
     scalar = [
-        "run_id", "experiment_id", "pair_id", "arm", "schedule_index", "attempt", "target_id",
-        "agent_id", "model_id", "status", "invalid_reason", "invalid_detail", "end_status",
-        "outcome", "effect", "mechanism", "oracle_message", "tag", "dev", "manifest_sha256",
-        "created_at", "started_at", "finished_at", "decided_at", "placements", "artifacts",
-        "rejected_batches",
+        "run_id", "experiment_id", "block_id", "pair_id", "arm", "schedule_index", "attempt",
+        "target_id", "agent_id", "model_id", "status", "invalid_reason", "invalid_detail",
+        "end_status", "outcome", "effect", "mechanism", "oracle_message", "tag", "dev",
+        "manifest_sha256", "created_at", "started_at", "finished_at", "decided_at", "placements",
+        "artifacts", "rejected_batches",
     ]  # fmt: skip
     width = max(map(len, scalar))
     for key in scalar:
@@ -580,7 +581,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = add(
         "selftest",
-        "instrumentation self-test: an injected and a control cell, containment probe",
+        "instrumentation self-test: a control, a neutral and an instruction cell per target, "
+        "containment probe",
         _cmd_selftest,
     )
     p.add_argument(

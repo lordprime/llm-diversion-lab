@@ -285,7 +285,7 @@ class Run(Base):
     __table_args__ = (
         ForeignKeyConstraint(["arm_id", "arm"], ["arms.arm_id", "arms.arm"]),
         UniqueConstraint("experiment_id", "schedule_index", "attempt"),
-        UniqueConstraint("pair_id", "arm", "attempt"),
+        UniqueConstraint("block_id", "arm", "attempt"),
         CheckConstraint("schedule_index >= 0", name="schedule_index_nonnegative"),
         CheckConstraint("attempt >= 1", name="attempt_positive"),
         CheckConstraint("(arm = 'control') = (tag IS NULL)", name="control_has_no_tag"),
@@ -312,7 +312,9 @@ class Run(Base):
     target_id: Mapped[str] = mapped_column(_ID, ForeignKey("targets.target_id"))
     agent_id: Mapped[str] = mapped_column(_ID, ForeignKey("agents.agent_id"))
     model_id: Mapped[str] = mapped_column(_ID, ForeignKey("models.model_id"))
-    pair_id: Mapped[str] = mapped_column(_ID, index=True)
+    #: the run's block: one control, one neutral and one instruction run (M0 and M1a
+    #: wrote two-arm pairs here, as ``pair_id``; migration 0011 renamed the column)
+    block_id: Mapped[str] = mapped_column(_ID, index=True)
     schedule_index: Mapped[int] = mapped_column(Integer)
     attempt: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))
     status: Mapped[RunStatus] = mapped_column(

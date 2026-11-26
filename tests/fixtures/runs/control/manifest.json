@@ -1,7 +1,7 @@
 {
   "run_id": "run_control",
   "experiment_id": "exp_fixture",
-  "pair_id": "pair_fixture",
+  "block_id": "pair_fixture",
   "arm": "control",
   "target": "dvga",
   "agent": "stub",

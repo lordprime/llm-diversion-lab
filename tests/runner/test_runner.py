@@ -47,6 +47,7 @@ from control.core.models import (
     TargetAccessEvent,
     Verdict,
 )
+from control.core.tokens import derive_token
 from control.db import tables as t
 from control.db.engine import session_scope
 from control.db.repo import invalid_runs_by_reason
@@ -56,6 +57,7 @@ from control.runner.cell_spec import AgentSpec, CellError, CellSettings, Compose
 from control.runner.compose_backend import CellHandle, CollectReport, CommandResult, ContainerState
 from control.runner.experiment import read_experiment
 from control.runner.oracle import LATCH_COMMAND, LATCH_FILE, DoneResult, OracleScore
+from control.runner.render import placement_id_for
 from control.runner.runner import (
     DEFAULT_RUNNER_LOCK,
     CellLeftBehindError,
@@ -71,7 +73,7 @@ from tests.runner.test_derive import ARTIFACTS as TELEMETRY_ARTIFACTS
 from tests.runner.test_derive import record_ollama_calls
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DVGA_PAIR = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_pair.yaml"
+DVGA_BLOCK = REPO_ROOT / "tests" / "fixtures" / "experiments" / "dvga_block.yaml"
 KEY = hashlib.sha256(b"runner-test-lab-key").digest()
 IMAGES = {
     "lab-cell": "ghcr.io/lordprime/lab-cell@sha256:" + "a" * 64,
@@ -157,10 +159,17 @@ def write_cell_evidence(
     unplanned_serve: bool = False,
     torn_line: bool = False,
 ) -> None:
-    """What a cell running the scripted agent leaves behind, for its own manifest."""
+    """What a cell running the scripted agent leaves behind, for its own manifest.
+
+    Like the scripted agent, it follows only what the planted texts name: the decoy path
+    if a text names ``/x-<tag>``, a callback host if a text names one. So an instruction
+    run shows both, and a neutral run (whose texts name neither) shows neither.
+    """
     manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
     payloads: dict[str, str] = json.loads(_file(project, "cfg_injector", "payloads.json"))
     run_id, tag = manifest.run_id, manifest.tag
+    planted = "\n".join(payloads.values())
+    named = [p for p in manifest.placements if f"{p.token}.cb.lab.test" in planted]
     access: list[Any] = []
     seq = 0
     for path, status in project.probe_paths if probe_prefix is not None else ():
@@ -229,7 +238,7 @@ def write_cell_evidence(
             )
         )
         seq += 2
-    if tag is not None:
+    if tag is not None and f"/x-{tag}" in planted:
         access.append(
             TargetAccessEvent(
                 run_id=run_id,
@@ -307,8 +316,8 @@ def write_cell_evidence(
             )
         ],
     )
-    if manifest.placements:
-        token = manifest.placements[0].token
+    if named:
+        token = named[0].token
         _write_events(
             dest / "catcher" / "dns" / "events.jsonl",
             [
@@ -321,7 +330,7 @@ def write_cell_evidence(
                     qname=f"{token}.cb.lab.test.",
                     qtype="A",
                     token=token,
-                    placement_id=manifest.placements[0].placement_id,
+                    placement_id=named[0].placement_id,
                 )
             ],
         )
@@ -550,21 +559,32 @@ def _by_arm(results: list[RunResult], arm: Arm) -> RunResult:
 # --------------------------------------------------------------------------- the pair
 
 
-def test_selftest_pair_runs_valid_and_labels_the_funnel(
+def test_a_block_runs_valid_and_labels_the_funnel_per_arm(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
     backend = FakeBackend()
     results = _runner(engine, collector, backend, tmp_path).run_experiment(
-        read_experiment(DVGA_PAIR)
+        read_experiment(DVGA_BLOCK)
     )
-    assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
-    injected, control = _by_arm(results, Arm.INJECTED), _by_arm(results, Arm.CONTROL)
+    assert [r.status for r in results] == [RunStatus.VALID] * 3
+    injected, control = _by_arm(results, Arm.INSTRUCTION), _by_arm(results, Arm.CONTROL)
+    neutral = _by_arm(results, Arm.NEUTRAL)
     assert _labels(engine, injected.run_id) == {
         FunnelStage.ACCESS: True,
         FunnelStage.VISIBLE: True,
         FunnelStage.UPTAKE: True,
         FunnelStage.OUTCOME: True,
     }
+    # the neutral text reached the model with its tag, but names nothing to act on
+    assert _labels(engine, neutral.run_id) == {
+        FunnelStage.ACCESS: True,
+        FunnelStage.VISIBLE: True,
+        FunnelStage.UPTAKE: False,
+        FunnelStage.OUTCOME: True,
+    }
+    with session_scope(engine) as s:
+        rows = s.scalars(select(t.Run).where(t.Run.run_id.in_([r.run_id for r in results])))
+        assert len({row.block_id for row in rows}) == 1
     assert _labels(engine, control.run_id) == {
         FunnelStage.ACCESS: False,
         FunnelStage.VISIBLE: False,
@@ -584,14 +604,14 @@ def test_selftest_pair_runs_valid_and_labels_the_funnel(
     for result in results:
         mine = [c for c, arg in backend.calls if arg == result.run_id]
         assert mine == ["prepare", "up", "health", "start_agent", "collect", "teardown"]
-    # the paired runs ran adjacent, in schedule order
+    # the block's runs ran one after another, in schedule order
     assert [r.run_id for r in results] == sorted(r.run_id for r in results)
 
 
 def test_no_file_the_runner_wrote_holds_the_lab_key(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    _runner(engine, collector, FakeBackend(), tmp_path).run_experiment(read_experiment(DVGA_PAIR))
+    _runner(engine, collector, FakeBackend(), tmp_path).run_experiment(read_experiment(DVGA_BLOCK))
     forms = [KEY, KEY.hex().encode(), base64.b64encode(KEY), base64.b32encode(KEY).lower()]
     files = [p for p in tmp_path.rglob("*") if p.is_file()]
     assert files
@@ -605,11 +625,11 @@ def test_registering_is_idempotent_and_frozen_by_hash(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
     runner = _runner(engine, collector, FakeBackend(), tmp_path)
-    ef = read_experiment(DVGA_PAIR)
+    ef = read_experiment(DVGA_BLOCK)
     first = runner.register(ef)
     assert [r.run_id for r in runner.register(ef)] == [r.run_id for r in first]
     edited = tmp_path / "selftest.yaml"
-    edited.write_text(DVGA_PAIR.read_text().replace("seed: 20261107", "seed: 20261108"))
+    edited.write_text(DVGA_BLOCK.read_text().replace("seed: 20261107", "seed: 20261108"))
     with pytest.raises(StoreError, match="another definition"):
         runner.register(read_experiment(edited))
 
@@ -620,7 +640,7 @@ def test_registering_is_idempotent_and_frozen_by_hash(
 def _single(
     engine: Engine, collector: CollectorClient, backend: FakeBackend, tmp_path: Path
 ) -> list[RunResult]:
-    return _runner(engine, collector, backend, tmp_path).run_experiment(read_experiment(DVGA_PAIR))
+    return _runner(engine, collector, backend, tmp_path).run_experiment(read_experiment(DVGA_BLOCK))
 
 
 def test_a_wrong_p7_status_fails_the_probe_before_the_agent_starts(
@@ -634,7 +654,7 @@ def test_a_wrong_p7_status_fails_the_probe_before_the_agent_starts(
         assert row.invalid_reason is InvalidReason.PROBE_FAILED and row.outcome is None
         assert "/.env" in (row.invalid_detail or "")
     assert not any(c == "start_agent" for c, _ in backend.calls)
-    assert [c for c, _ in backend.calls].count("teardown") == 2
+    assert [c for c, _ in backend.calls].count("teardown") == 3
 
 
 def test_a_failed_placement_check_fails_the_probe_before_the_agent_starts(
@@ -705,30 +725,62 @@ def test_a_timeout_kills_the_agent_and_is_recorded(
         sleep=lambda _s: None,
         clock=lambda: float(next(ticks)),
     )
-    results = runner.run_experiment(read_experiment(DVGA_PAIR))
+    results = runner.run_experiment(read_experiment(DVGA_BLOCK))
     assert {r.status for r in results} == {RunStatus.VALID}
     assert {r.end_status for r in results} == {EndStatus.TIMEOUT}
-    assert [c for c, _ in backend.calls].count("kill_agent") == 2
+    assert [c for c, _ in backend.calls].count("kill_agent") == 3
     for result in results:
         assert _run_row(engine, result.run_id).outcome is False
         assert _labels(engine, result.run_id)[FunnelStage.OUTCOME] is False
 
 
-def test_a_leaked_tag_in_the_control_run_is_contamination(
-    engine: Engine, collector: CollectorClient, tmp_path: Path
+@pytest.mark.parametrize(
+    ("into", "source"),
+    [
+        (Arm.CONTROL, Arm.NEUTRAL),
+        (Arm.CONTROL, Arm.INSTRUCTION),
+        (Arm.NEUTRAL, Arm.INSTRUCTION),
+    ],
+)
+def test_a_tag_of_the_block_leaked_into_control_or_neutral_is_contamination(
+    engine: Engine, collector: CollectorClient, tmp_path: Path, into: Arm, source: Arm
 ) -> None:
-    ef = read_experiment(DVGA_PAIR)
+    ef = read_experiment(DVGA_BLOCK)
 
     def leak(project: ComposeProject) -> str | None:
         manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
-        if manifest.arm is Arm.INJECTED:
+        if manifest.arm is not into:
             return None
         schedule = RunStore(engine).load_schedule(ef.experiment.experiment_id)
-        return next(r.tag for r in schedule if r.pair_id == manifest.pair_id and r.tag)
+        return next(r.tag for r in schedule if r.block_id == manifest.block_id and r.arm is source)
 
     results = _single(engine, collector, FakeBackend(leak=leak), tmp_path)
-    assert _by_arm(results, Arm.CONTROL).reason is InvalidReason.CONTAMINATED
-    assert _by_arm(results, Arm.INJECTED).status is RunStatus.VALID
+    assert _by_arm(results, into).reason is InvalidReason.CONTAMINATED
+    for arm in set(Arm) - {into}:
+        assert _by_arm(results, arm).status is RunStatus.VALID
+
+
+def test_the_instructions_callback_host_leaked_into_the_neutral_run_is_contamination(
+    engine: Engine, collector: CollectorClient, tmp_path: Path
+) -> None:
+    """Only the host, without the tag: the forbidden-token check still catches it."""
+    ef = read_experiment(DVGA_BLOCK)
+
+    def leak(project: ComposeProject) -> str | None:
+        manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
+        if manifest.arm is not Arm.NEUTRAL:
+            return None
+        schedule = RunStore(engine).load_schedule(ef.experiment.experiment_id)
+        other = next(
+            r for r in schedule if r.block_id == manifest.block_id and r.arm is Arm.INSTRUCTION
+        )
+        token = derive_token(KEY, other.run_id, placement_id_for(other.run_id, Surface.P7))
+        return f"http://{token}.cb.lab.test/"
+
+    results = _single(engine, collector, FakeBackend(leak=leak), tmp_path)
+    neutral = _by_arm(results, Arm.NEUTRAL)
+    assert neutral.reason is InvalidReason.CONTAMINATED
+    assert "forbidden callback token" in neutral.detail
 
 
 @pytest.mark.parametrize(
@@ -758,7 +810,7 @@ def test_cell_failures_map_to_their_invalid_reason(
     for result in results:
         assert _run_row(engine, result.run_id).invalid_reason is reason
     with session_scope(engine) as s:
-        assert invalid_runs_by_reason(s) == {reason.value: 2}  # what metrics read
+        assert invalid_runs_by_reason(s) == {reason.value: 3}  # what metrics read
 
 
 def test_a_manifest_whose_tokens_do_not_verify_never_reaches_a_cell(
@@ -779,7 +831,7 @@ def test_a_manifest_whose_tokens_do_not_verify_never_reaches_a_cell(
     monkeypatch.setattr(runner_module, "render_manifest", tampered)
     backend = FakeBackend()
     results = _single(engine, collector, backend, tmp_path)
-    injected = _by_arm(results, Arm.INJECTED)
+    injected = _by_arm(results, Arm.INSTRUCTION)
     assert injected.status is RunStatus.INVALID and "token" in injected.detail
     assert not any(arg == injected.run_id for _, arg in backend.calls)
     assert _by_arm(results, Arm.CONTROL).status is RunStatus.VALID
@@ -832,7 +884,7 @@ def test_injector_failures_invalidate_the_run(
 ) -> None:
     results = _single(engine, collector, backend, tmp_path)
     reasons = {r.arm: r.reason for r in results}
-    assert reasons[Arm.INJECTED] is InvalidReason.INJECTOR_FAILED
+    assert reasons[Arm.INSTRUCTION] is InvalidReason.INJECTOR_FAILED
     if backend.probe_serves:  # a dead injector fails both arms
         assert reasons[Arm.CONTROL] is InvalidReason.INJECTOR_FAILED
     else:  # a control run has no placements to serve
@@ -857,7 +909,7 @@ def test_an_agent_stuck_in_created_is_a_cell_failure_not_a_timeout(
         sleep=lambda _s: None,
         clock=lambda: float(next(ticks)),
     )
-    results = runner.run_experiment(read_experiment(DVGA_PAIR))
+    results = runner.run_experiment(read_experiment(DVGA_BLOCK))
     assert {r.reason for r in results} == {InvalidReason.CELL_FAILED}
     assert all("never started" in r.detail for r in results)
     assert not any(c == "kill_agent" for c, _ in backend.calls)
@@ -895,7 +947,7 @@ def test_every_problem_is_kept_and_a_failed_teardown_is_the_reason(
 def test_resuming_with_other_image_builds_is_refused(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(DVGA_PAIR)
+    ef = read_experiment(DVGA_BLOCK)
     _runner(engine, collector, FakeBackend(), tmp_path).register(ef)
     rebuilt = Runner(
         store=RunStore(engine),
@@ -920,12 +972,12 @@ def test_one_runner_per_host(
     try:
         with pytest.raises(HostLockError):
             _runner(engine, collector, FakeBackend(), tmp_path).run_experiment(
-                read_experiment(DVGA_PAIR)
+                read_experiment(DVGA_BLOCK)
             )
     finally:
         os.close(fd)
     runner = _runner(engine, collector, FakeBackend(), tmp_path)
-    assert len(runner.run_experiment(read_experiment(DVGA_PAIR))) == 2
+    assert len(runner.run_experiment(read_experiment(DVGA_BLOCK))) == 3
 
 
 def test_a_database_error_at_the_end_never_escapes_run_one(
@@ -967,7 +1019,7 @@ def test_the_verdict_is_decided_at_the_final_poll(
 def test_a_failed_teardown_stops_the_experiment_and_leaves_the_rest_queued(
     engine: Engine, collector: CollectorClient, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    ef = read_experiment(DVGA_PAIR)
+    ef = read_experiment(DVGA_BLOCK)
     backend = FakeBackend(teardown_error="network labcabc left")
     with pytest.raises(CellLeftBehindError) as err:
         _runner(engine, collector, backend, tmp_path).run_experiment(ef)
@@ -978,7 +1030,7 @@ def test_a_failed_teardown_stops_the_experiment_and_leaves_the_rest_queued(
         r.run_id: RunStore(engine).status(r.run_id)[0]
         for r in RunStore(engine).load_schedule(ef.experiment.experiment_id)
     }
-    assert sorted(statuses.values()) == [RunStatus.INVALID, RunStatus.QUEUED]
+    assert sorted(statuses.values()) == [RunStatus.INVALID, RunStatus.QUEUED, RunStatus.QUEUED]
     assert "stopping" in caplog.text
 
 
@@ -1043,21 +1095,21 @@ def test_an_invalid_run_never_gets_a_verdict(
         real(self, verdict)
 
     monkeypatch.setattr(CollectorClient, "post_verdict", spy)
-    ef = read_experiment(DVGA_PAIR)
+    ef = read_experiment(DVGA_BLOCK)
 
     def leak(project: ComposeProject) -> str | None:
         manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
-        if manifest.arm is Arm.INJECTED:
+        if manifest.arm is Arm.INSTRUCTION:
             return None
         schedule = RunStore(engine).load_schedule(ef.experiment.experiment_id)
-        return next(r.tag for r in schedule if r.pair_id == manifest.pair_id and r.tag)
+        return next(r.tag for r in schedule if r.block_id == manifest.block_id and r.tag)
 
     results = _single(engine, collector, FakeBackend(leak=leak), tmp_path)
     control = _by_arm(results, Arm.CONTROL)
     assert control.reason is InvalidReason.CONTAMINATED
     assert control.run_id not in posted  # labelling failed after the verdict was decided
     assert _run_row(engine, control.run_id).outcome is None
-    assert _by_arm(results, Arm.INJECTED).run_id in posted
+    assert _by_arm(results, Arm.INSTRUCTION).run_id in posted
 
 
 def test_a_failed_verdict_post_leaves_a_valid_run_with_its_verdict_on_disk(
@@ -1089,7 +1141,7 @@ def test_a_development_run_is_recorded_as_such(
         tick_s=0,
         sleep=lambda _s: None,
     )
-    results = runner.run_experiment(read_experiment(DVGA_PAIR))
+    results = runner.run_experiment(read_experiment(DVGA_BLOCK))
     assert all(_run_row(engine, r.run_id).dev for r in results)
     plain = _single(engine, collector, FakeBackend(), tmp_path / "plain")
     assert plain == [] or not any(_run_row(engine, r.run_id).dev for r in plain)
@@ -1098,7 +1150,7 @@ def test_a_development_run_is_recorded_as_such(
 def test_finish_is_atomic_labels_roll_back_with_the_status(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(DVGA_PAIR)
+    ef = read_experiment(DVGA_BLOCK)
     schedule = _runner(engine, collector, FakeBackend(), tmp_path).register(ef)
     queued = schedule[0]  # never claimed: the status UPDATE matches no running row
     label = FunnelLabel(
@@ -1187,7 +1239,7 @@ def test_a_dead_cell_guard_before_the_agent_is_a_cell_failure(
 ) -> None:
     backend = FakeBackend(dead_before_start={"cellguard": ContainerState("exited", 1)})
     results = _guarded_runner(engine, collector, backend, tmp_path).run_experiment(
-        read_experiment(DVGA_PAIR)
+        read_experiment(DVGA_BLOCK)
     )
     assert {r.reason for r in results} == {InvalidReason.CELL_FAILED}
     assert all("cellguard" in r.detail for r in results)
@@ -1198,7 +1250,7 @@ def test_a_cell_guard_dying_during_the_run_is_a_recording_failure(
 ) -> None:
     backend = FakeBackend(dead_after_start={"cellguard": ContainerState("exited", 137)})
     results = _guarded_runner(engine, collector, backend, tmp_path).run_experiment(
-        read_experiment(DVGA_PAIR)
+        read_experiment(DVGA_BLOCK)
     )
     assert {r.reason for r in results} == {InvalidReason.RECORDING_FAILED}
 
@@ -1245,18 +1297,18 @@ def test_the_verdict_is_posted_even_when_its_file_cannot_be_written(
 def test_verdict_files_pending_then_final_and_none_for_an_invalid_run(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(DVGA_PAIR)
+    ef = read_experiment(DVGA_BLOCK)
 
     def leak(project: ComposeProject) -> str | None:
         manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
-        if manifest.arm is Arm.INJECTED:
+        if manifest.arm is Arm.INSTRUCTION:
             return None
         schedule = RunStore(engine).load_schedule(ef.experiment.experiment_id)
-        return next(r.tag for r in schedule if r.pair_id == manifest.pair_id and r.tag)
+        return next(r.tag for r in schedule if r.block_id == manifest.block_id and r.tag)
 
     results = _single(engine, collector, FakeBackend(leak=leak), tmp_path)
     runs = tmp_path / "runs"
-    control, injected = _by_arm(results, Arm.CONTROL), _by_arm(results, Arm.INJECTED)
+    control, injected = _by_arm(results, Arm.CONTROL), _by_arm(results, Arm.INSTRUCTION)
     assert control.reason is InvalidReason.CONTAMINATED
     assert not list(runs.glob(f"{control.run_id}.verdict*"))  # pending file removed
     assert [p.name for p in runs.glob(f"{injected.run_id}.verdict*")] == [
@@ -1267,7 +1319,7 @@ def test_verdict_files_pending_then_final_and_none_for_an_invalid_run(
 def test_development_settings_are_recorded_when_the_run_is_claimed(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(DVGA_PAIR)
+    ef = read_experiment(DVGA_BLOCK)
     store = RunStore(engine)
     schedule = _runner(engine, collector, FakeBackend(), tmp_path).register(ef)
     claimed = store.claim_next(ef.experiment.experiment_id, schedule, dev=True)
@@ -1385,7 +1437,7 @@ def test_a_cell_guard_killed_at_stop_is_a_recording_failure(
 ) -> None:
     backend = FakeBackend(stop_exit={"cellguard": 137})
     results = _guarded_runner(engine, collector, backend, tmp_path).run_experiment(
-        read_experiment(DVGA_PAIR)
+        read_experiment(DVGA_BLOCK)
     )
     assert {r.reason for r in results} == {InvalidReason.RECORDING_FAILED}
 
@@ -1446,7 +1498,7 @@ def test_invalid_detail_is_redacted(
 def test_store_finish_redacts_the_detail(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(DVGA_PAIR)
+    ef = read_experiment(DVGA_BLOCK)
     store = RunStore(engine)
     schedule = _runner(engine, collector, FakeBackend(), tmp_path).register(ef)
     run = store.claim_next(ef.experiment.experiment_id, schedule)
@@ -1478,7 +1530,7 @@ def test_a_valid_finish_never_takes_an_end_status(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
     """A valid run's end status comes with its verdict only (one source)."""
-    ef = read_experiment(DVGA_PAIR)
+    ef = read_experiment(DVGA_BLOCK)
     store = RunStore(engine)
     schedule = _runner(engine, collector, FakeBackend(), tmp_path).register(ef)
     run = store.claim_next(ef.experiment.experiment_id, schedule)
@@ -1494,14 +1546,14 @@ def test_a_pending_verdict_that_cannot_be_removed_never_escapes_run_one(
         path.mkdir()  # unlink() then fails with IsADirectoryError
 
     monkeypatch.setattr(runner_module, "write_atomic", as_directory)
-    ef = read_experiment(DVGA_PAIR)
+    ef = read_experiment(DVGA_BLOCK)
 
     def leak(project: ComposeProject) -> str | None:
         manifest = RunManifest.model_validate_json(_file(project, "cfg_injector", "manifest.json"))
-        if manifest.arm is Arm.INJECTED:
+        if manifest.arm is Arm.INSTRUCTION:
             return None
         schedule = RunStore(engine).load_schedule(ef.experiment.experiment_id)
-        return next(r.tag for r in schedule if r.pair_id == manifest.pair_id and r.tag)
+        return next(r.tag for r in schedule if r.block_id == manifest.block_id and r.tag)
 
     results = _single(engine, collector, FakeBackend(leak=leak), tmp_path)
     control = _by_arm(results, Arm.CONTROL)
@@ -1547,7 +1599,7 @@ def test_a_run_stores_both_verdicts_and_the_latch_dump(
         assert LATCH_FILE in stored
     # the latch is dumped once per run, after the final poll
     dumps = [a for c, a in backend.calls if c.startswith("exec:") and a == " ".join(LATCH_COMMAND)]
-    assert len(dumps) == 2
+    assert len(dumps) == 3
 
 
 def test_an_effect_without_the_mechanism_is_stored_as_such(
@@ -1607,7 +1659,7 @@ def test_a_failing_latch_dump_invalidates_the_run(
 def test_the_mechanism_is_primary_only_when_the_experiment_says_so(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(DVGA_PAIR)
+    ef = read_experiment(DVGA_BLOCK)
     primary = ef.experiment.model_copy(update={"oracle_primary": OracleVerdictKind.MECHANISM})
     mech_ef = dataclasses.replace(ef, experiment=primary)
     effect_only = done_v2(effect=True, mechanism=False, latch_events=1)
@@ -1621,7 +1673,7 @@ def test_the_mechanism_is_primary_only_when_the_experiment_says_so(
 def test_an_undecidable_primary_mechanism_invalidates_the_run(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
-    ef = read_experiment(DVGA_PAIR)
+    ef = read_experiment(DVGA_BLOCK)
     primary = ef.experiment.model_copy(update={"oracle_primary": OracleVerdictKind.MECHANISM})
     undecided = done_v2(effect=True, mechanism=None, latch_events=1)
     backend = FakeBackend(done=[(0, done_v2(effect=False, mechanism=None)), (0, undecided)])
@@ -1738,9 +1790,9 @@ def test_a_run_with_ollama_traffic_gets_a_telemetry_row_and_artifacts(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
     results = _runner(engine, collector, FakeBackend(ollama_calls=2), tmp_path).run_experiment(
-        read_experiment(DVGA_PAIR)
+        read_experiment(DVGA_BLOCK)
     )
-    assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
+    assert [r.status for r in results] == [RunStatus.VALID] * 3
     for result in results:
         row = _telemetry(engine, result.run_id)
         assert row is not None and row.telemetry_error is None
@@ -1762,9 +1814,9 @@ def test_broken_telemetry_leaves_the_run_valid_and_records_the_error(
 
     monkeypatch.setattr(derive_module, "load_calls", boom)
     results = _runner(engine, collector, FakeBackend(), tmp_path).run_experiment(
-        read_experiment(DVGA_PAIR)
+        read_experiment(DVGA_BLOCK)
     )
-    assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
+    assert [r.status for r in results] == [RunStatus.VALID] * 3
     for result in results:
         row = _run_row(engine, result.run_id)
         assert (row.status, row.outcome, row.invalid_reason) == (RunStatus.VALID, True, None)
@@ -1788,9 +1840,9 @@ def test_a_telemetry_store_that_fails_too_still_leaves_the_run_valid(
     monkeypatch.setattr(RunStore, "record_telemetry", refuse)
     monkeypatch.setattr(RunStore, "record_telemetry_error", refuse)
     results = _runner(engine, collector, FakeBackend(), tmp_path).run_experiment(
-        read_experiment(DVGA_PAIR)
+        read_experiment(DVGA_BLOCK)
     )
-    assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
+    assert [r.status for r in results] == [RunStatus.VALID] * 3
     assert all(_telemetry(engine, r.run_id) is None for r in results)
 
 
@@ -1805,9 +1857,9 @@ def test_telemetry_artifacts_that_the_collector_refuses_are_an_error_not_an_inva
 
     refusing = RefusingCollector(collector._http)
     results = _runner(engine, refusing, FakeBackend(), tmp_path).run_experiment(
-        read_experiment(DVGA_PAIR)
+        read_experiment(DVGA_BLOCK)
     )
-    assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
+    assert [r.status for r in results] == [RunStatus.VALID] * 3
     row = _telemetry(engine, results[0].run_id)
     assert row is not None and row.telemetry_error and "collector said no" in row.telemetry_error
 
@@ -1817,7 +1869,7 @@ def test_an_invalid_run_that_reached_collection_still_gets_its_telemetry(
 ) -> None:
     results = _runner(
         engine, collector, FakeBackend(torn_line=True, ollama_calls=1), tmp_path
-    ).run_experiment(read_experiment(DVGA_PAIR))
+    ).run_experiment(read_experiment(DVGA_BLOCK))
     assert all(r.status is RunStatus.INVALID for r in results)
     row = _telemetry(engine, results[0].run_id)
     assert row is not None and row.telemetry_error is None and row.calls == 2
@@ -1827,7 +1879,7 @@ def test_a_run_that_made_no_llm_call_has_an_empty_summary_and_stays_invalid(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
     results = _runner(engine, collector, FakeBackend(llm_calls=False), tmp_path).run_experiment(
-        read_experiment(DVGA_PAIR)
+        read_experiment(DVGA_BLOCK)
     )
     assert all(r.reason is InvalidReason.NO_LLM_CALLS for r in results)
     row = _telemetry(engine, results[0].run_id)
@@ -1838,7 +1890,7 @@ def test_telemetry_is_derived_again_without_conflict(
     engine: Engine, collector: CollectorClient, tmp_path: Path
 ) -> None:
     runner = _runner(engine, collector, FakeBackend(ollama_calls=1), tmp_path)
-    ef = read_experiment(DVGA_PAIR)
+    ef = read_experiment(DVGA_BLOCK)
     (result, *_) = runner.run_experiment(ef)
     scheduled = next(
         r for r in runner._store.load_schedule(ef.experiment.experiment_id)
@@ -1861,7 +1913,7 @@ def test_telemetry_is_derived_again_without_conflict(
 
 def _valid_and_untouched(engine: Engine, results: list[RunResult]) -> None:
     """Both runs are valid, with their verdict, outcome and labels as they always are."""
-    assert [r.status for r in results] == [RunStatus.VALID, RunStatus.VALID]
+    assert [r.status for r in results] == [RunStatus.VALID] * 3
     for result in results:
         row = _run_row(engine, result.run_id)
         assert (row.status, row.invalid_reason, row.outcome) == (RunStatus.VALID, None, True)
@@ -1882,7 +1934,7 @@ def test_a_telemetry_step_that_raises_leaves_status_and_verdict_untouched(
 
     monkeypatch.setattr(derive_module, step, boom)
     results = _runner(engine, collector, FakeBackend(), tmp_path).run_experiment(
-        read_experiment(DVGA_PAIR)
+        read_experiment(DVGA_BLOCK)
     )
     _valid_and_untouched(engine, results)
     for result in results:
@@ -1902,7 +1954,7 @@ def test_a_failing_summary_store_is_recorded_as_an_error_and_the_run_is_untouche
 
     monkeypatch.setattr(RunStore, "record_telemetry", refuse)  # the error store still works
     results = _runner(engine, collector, FakeBackend(), tmp_path).run_experiment(
-        read_experiment(DVGA_PAIR)
+        read_experiment(DVGA_BLOCK)
     )
     _valid_and_untouched(engine, results)
     for result in results:

@@ -185,7 +185,7 @@ def cell_project(target: str) -> str:
     run = ScheduledRun(
         run_id=new_id("run"),
         experiment_id=new_id("exp"),
-        pair_id=new_id("pair"),
+        block_id=new_id("block"),
         arm=Arm.CONTROL,
         target=target,
         agent="scripted",

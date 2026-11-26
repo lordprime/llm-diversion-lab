@@ -165,8 +165,11 @@ def list_runs(
 
 @dataclass(frozen=True, slots=True)
 class RunDetail:
+    """One run in full. ``to_json`` also prints ``block_id`` as ``pair_id``, the name it
+    had before the three-arm design: a deprecated alias kept for one release."""
+
     run: RunSummary
-    pair_id: str
+    block_id: str
     schedule_index: int
     attempt: int
     tag: str | None
@@ -193,7 +196,8 @@ class RunDetail:
 
         return {
             **self.run.to_json(),
-            "pair_id": self.pair_id,
+            "block_id": self.block_id,
+            "pair_id": self.block_id,  # deprecated alias of block_id, for one release
             "schedule_index": self.schedule_index,
             "attempt": self.attempt,
             "tag": self.tag,
@@ -251,7 +255,7 @@ def get_run(session: Session, run_id: str) -> RunDetail | None:
     ).first()
     return RunDetail(
         run=_summary(run),
-        pair_id=run.pair_id,
+        block_id=run.block_id,
         schedule_index=run.schedule_index,
         attempt=run.attempt,
         tag=run.tag,

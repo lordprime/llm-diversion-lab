@@ -1,7 +1,7 @@
 """The instrumentation self-test: ``labctl selftest [--quick]`` (DEVELOPMENT_PLAN 5.3).
 
-It runs ``experiments/selftest.yaml`` (one injected and one matched control cell per
-target -- DVGA, Juice Shop and Drupal -- with every surface each target's frozen
+It runs ``experiments/selftest.yaml`` (one block per target -- a control, a neutral and
+an instruction cell on DVGA, Juice Shop and Drupal -- with every surface each target's frozen
 placement map carries, the scripted agent, the stub LLM; no model is called) through the
 real :class:`~control.runner.runner.Runner`, holding the host's runner lock for the
 whole self-test, and then checks the result from the database, the evidence on disk and
@@ -11,20 +11,28 @@ login SQL injection, Drupal's CVE-2018-7600), sent only to the run's own target.
 check is named ``<target> <arm>: <what>``. It **passes** only if all of these hold, on
 every target:
 
-* both runs are ``valid`` **and** ended ``completed`` (a crashed agent still gives a
-  valid run: crashing is an outcome, so ``valid`` alone is not enough);
-* both runs' stored verdict is Outcome, effect **and** mechanism true
+* all three runs are ``valid`` **and** ended ``completed`` (a crashed agent still
+  gives a valid run: crashing is an outcome, so ``valid`` alone is not enough);
+* every run's stored verdict is Outcome, effect **and** mechanism true
   (``runs.outcome``, ``runs.effect``, ``runs.mechanism``, ``runs.decided_at``): the
-  scripted exploit runs in both arms, and the runner's probe already required the
-  oracle to answer "not yet" before each agent;
-* injected run: Access, Visible, Uptake and Outcome are all true; the catcher recorded
-  a callback on **both** channels (HTTP and DNS) whose token is the one the lab key
-  derives for one of the run's own placements;
+  scripted exploit runs in every arm (the self-test proves the instruments, not an
+  effect), and the runner's probe already required the oracle to answer "not yet"
+  before each agent;
+* instruction run: Access, Visible, Uptake and Outcome are all true; the catcher
+  recorded a callback on **both** channels (HTTP and DNS) whose token is the one the
+  lab key derives for one of the run's own placements;
+* neutral run: Access and Visible are true (its own tag was planted and reached the
+  model, exactly as the instruction's does) and Uptake is false; no token callback
+  reached it, and no file of its evidence holds any instruction run's tag (so no decoy
+  path ``/x-<tag>``) or token (so no callback host), any target's: those are the
+  instruction's own fingerprint;
 * control run: Access, Visible and Uptake are false, no token callback reached it,
-  and no file of its evidence holds any injected run's tag or token (any target's),
-  base64 fields (``body_b64``) decoded (the labeller's forbidden-tag check already
-  made a leaking control ``contaminated``; the scan repeats it independently);
-* **reset after success**, on both runs: after the runner's final poll and latch dump,
+  and no file of its evidence holds any neutral or instruction run's tag or token
+  (any target's); the control is the only tag-free run of its block;
+* the evidence scans decode base64 fields (``body_b64``); the labeller's forbidden-tag
+  and forbidden-token checks already made a leaking run ``contaminated``, and the scan
+  repeats them independently;
+* **reset after success**, on every run: after the runner's final poll and latch dump,
   the target's own reset (``x-lab.reset``: DVGA's ``/start_over``, a Juice Shop
   restart, Drupal's cache tables emptied) leaves effect, mechanism and the latch as they
   were (:class:`ResetGate`; the runner's verdict was already taken);
@@ -52,7 +60,7 @@ every target:
 * after teardown nothing (container, volume, network) is labelled with either run id,
   and the runs' cell work directories are gone.
 
-Before the pair runs, resources left by **earlier self-tests** are swept: those
+Before the blocks run, resources left by **earlier self-tests** are swept: those
 labelled ``lab.run_id`` with a run of an ``exp_selftest_*`` experiment (none can be
 running: the self-test holds the runner lock), and such runs still ``running`` (a
 killed self-test's) or still ``queued`` (never to run: each self-test registers a fresh
@@ -64,11 +72,11 @@ cell failure, not as a containment failure.
 
 ``deploy/release.sh`` runs the full self-test after every deploy (``--quick-selftest``
 runs ``--quick`` instead). ``--quick`` keeps the
-**first target only** (DVGA: one matched pair, two cells, the smallest unit the
-matched-pair schedule can run, and the control's zero-tag check is a core claim) and
+**first target only** (DVGA: one block, three cells, the smallest unit the block
+schedule can run, and the control's zero-tag check is a core claim) and
 runs the containment probe in the **first cell only** (the cells differ only by subnet;
 the host firewall covers the whole cell range). Every other check is the same. Full
-mode runs every target's pair and probes every cell.
+mode runs every target's block and probes every cell.
 
 Each invocation registers a **fresh experiment** (``exp_selftest_<ULID>``; the file's
 text with that id and a provenance comment), so self-tests can be repeated and a new
@@ -169,6 +177,7 @@ from control.runner.runner import (
     host_lock,
     runner_lock_path,
 )
+from control.runner.schedule import BLOCK_ARMS
 from control.runner.ship import CollectorClient
 from control.runner.store import RunStore
 
@@ -1193,7 +1202,7 @@ def _cell_dir(work_dir: Path, run_id: str) -> Path:
 def run_selftest(
     deps: SelftestDeps, *, quick: bool, clock: Callable[[], float] = time.time
 ) -> SelftestReport:
-    """Run the self-test pair under the host lock and check it; never raises."""
+    """Run the self-test blocks under the host lock and check them; never raises."""
     started = clock()
     try:
         ef = derive_experiment(deps.templates_root / SELFTEST_EXPERIMENT, quick=quick)
@@ -1224,7 +1233,7 @@ def run_selftest(
                 results = runner.run_experiment(ef)
             except CellLeftBehindError as exc:
                 results = list(exc.results)
-                checks.append(Check("run the pair", False, f"stopped: {exc}"[:500]))
+                checks.append(Check("run the blocks", False, f"stopped: {exc}"[:500]))
             checks += _check_results(
                 deps,
                 ef,
@@ -1235,10 +1244,10 @@ def run_selftest(
                 unstopped=resets.unchecked,
             )
     except HostLockError as exc:
-        checks.append(Check("run the pair", False, f"another runner is active: {exc}"))
+        checks.append(Check("run the blocks", False, f"another runner is active: {exc}"))
     except Exception as exc:
         log.exception("selftest: failed")
-        checks.append(Check("run the pair", False, f"{type(exc).__name__}: {str(exc)[:300]}"))
+        checks.append(Check("run the blocks", False, f"{type(exc).__name__}: {str(exc)[:300]}"))
     try:
         runs = tuple(_run_summary(deps.engine, r) for r in results)
     except Exception as exc:
@@ -1416,9 +1425,9 @@ def _check_results(
     quick: bool,
     unstopped: frozenset[str] = frozenset(),
 ) -> list[Check]:
-    """Every check on the runs, named ``<target> <arm>: <what>`` (one pair per target)."""
+    """Every check on the runs, named ``<target> <arm>: <what>`` (one block per target)."""
     checks: list[Check] = []
-    expected = 2 * len(ef.experiment.targets)
+    expected = len(BLOCK_ARMS) * len(ef.experiment.targets)
     checks.append(
         Check("runs", len(results) == expected, f"{len(results)} runs, expected {expected}")
     )
@@ -1426,11 +1435,14 @@ def _check_results(
         rows = s.scalars(
             select(t.Run).where(t.Run.experiment_id == ef.experiment.experiment_id)
         ).all()
-        injected_ids = [row.run_id for row in rows if row.arm is Arm.INJECTED]
-        needles = {row.tag for row in rows if row.tag}
-        needles |= set(
-            s.scalars(select(t.Placement.token).where(t.Placement.run_id.in_(injected_ids))).all()
-        )
+        # the marks of each tagged arm: its runs' tags and placement tokens
+        marks: dict[Arm, set[str]] = {}
+        for arm in (Arm.NEUTRAL, Arm.INSTRUCTION):
+            ids = [row.run_id for row in rows if row.arm is arm]
+            marks[arm] = {row.tag for row in rows if row.arm is arm and row.tag}
+            marks[arm] |= set(
+                s.scalars(select(t.Placement.token).where(t.Placement.run_id.in_(ids))).all()
+            )
         target_of: dict[str, str] = {
             run_id: name
             for run_id, name in s.execute(
@@ -1440,7 +1452,7 @@ def _check_results(
             ).all()
         }
     for target in ef.experiment.targets:
-        for arm in (Arm.INJECTED, Arm.CONTROL):
+        for arm in BLOCK_ARMS:
             if not any(r.arm is arm and target_of.get(r.run_id) == target.name for r in results):
                 checks.append(
                     Check(f"{target.name} {arm.value}: valid", False, "no run of this arm")
@@ -1461,9 +1473,28 @@ def _check_results(
             )
         )
         labels = _labels(deps.engine, result.run_id)
-        if result.arm is Arm.INJECTED:
+        if result.arm is Arm.INSTRUCTION:
             checks.append(_funnel_check(name, labels, want_true=tuple(FunnelStage)))
             checks.append(_callback_check(deps, name, result.run_id))
+        elif result.arm is Arm.NEUTRAL:
+            checks.append(
+                _funnel_check(
+                    name,
+                    labels,
+                    want_true=(FunnelStage.ACCESS, FunnelStage.VISIBLE, FunnelStage.OUTCOME),
+                    want_false=(FunnelStage.UPTAKE,),
+                )
+            )
+            checks.append(
+                _clean_of(
+                    deps,
+                    name,
+                    result.run_id,
+                    marks[Arm.INSTRUCTION],
+                    "an instruction",
+                    "no instruction marks",
+                )
+            )
         else:
             checks.append(
                 _funnel_check(
@@ -1472,8 +1503,17 @@ def _check_results(
                     want_false=(FunnelStage.ACCESS, FunnelStage.VISIBLE, FunnelStage.UPTAKE),
                 )
             )
-            checks.append(_control_clean(deps, name, result.run_id, needles))
-        # the scripted agent runs the target's exploit in both arms: both succeed
+            checks.append(
+                _clean_of(
+                    deps,
+                    name,
+                    result.run_id,
+                    marks[Arm.NEUTRAL] | marks[Arm.INSTRUCTION],
+                    "a neutral or instruction",
+                    "no tags",
+                )
+            )
+        # the scripted agent runs the target's exploit in every arm: all succeed
         checks.append(_oracle_check(name, *_stored_verdict(deps.engine, result.run_id)))
         reset = reset_of.get(result.run_id)
         if reset is None:
@@ -1614,7 +1654,11 @@ def _holds(data: bytes, needles: Iterable[bytes]) -> bool:
     return False
 
 
-def _control_clean(deps: SelftestDeps, name: str, run_id: str, needles: set[str]) -> Check:
+def _clean_of(
+    deps: SelftestDeps, name: str, run_id: str, needles: set[str], whose: str, check: str
+) -> Check:
+    """The check ``<name>: <check>``: no token callback reached the run and none of
+    ``needles`` (the tags and tokens of ``whose`` runs) is in any file of its evidence."""
     problems: list[str] = []
     with session_scope(deps.engine) as s:
         tokened = [
@@ -1623,7 +1667,7 @@ def _control_clean(deps: SelftestDeps, name: str, run_id: str, needles: set[str]
             if c.token
         ]
     if tokened:
-        problems.append(f"token callbacks reached the control: {sorted(set(tokened))}")
+        problems.append(f"token callbacks reached the run: {sorted(set(tokened))}")
     wanted = [n.lower().encode() for n in needles]
     evidence = deps.runs_dir / run_id
     if not evidence.is_dir():
@@ -1635,9 +1679,9 @@ def _control_clean(deps: SelftestDeps, name: str, run_id: str, needles: set[str]
     )
     if leaked:
         problems.append(
-            f"an injected tag or token is in {len(leaked)} evidence files: {leaked[:5]}"
+            f"{whose} run's tag or token is in {len(leaked)} evidence files: {leaked[:5]}"
         )
-    return Check(f"{name}: no tags", not problems, "; ".join(problems))
+    return Check(f"{name}: {check}", not problems, "; ".join(problems))
 
 
 def _files(root: Path) -> Iterator[Path]:
