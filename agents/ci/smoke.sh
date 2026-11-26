@@ -21,6 +21,10 @@
 #           /run/cellguard/docker.sock, with DOCKER_HOST pointing at it. cell-guard
 #           forces every container the agent creates onto this run's network with the
 #           canary as its only DNS server, so `tap` resolves and egress is recorded.
+#           The agent also gets LAB_RUN_ID (the run cell-guard labels everything with;
+#           names it creates get the prefix `<run id lowercased>-`) and
+#           LAB_SCRATCH_VOLUME (the one named volume workers may mount, e.g.
+#           `-v $LAB_SCRATCH_VOLUME:/workspace`, to share files with each other).
 #
 # Outputs, in $SMOKE_OUT (or --out):
 #   requests.jsonl  every request the stub saw (path, method, headers with auth values
@@ -38,6 +42,9 @@
 #   10  the canary saw an egress attempt (checked first: it wins over 11 and 12)
 #   11  the agent did not finish within --timeout seconds and was killed
 #   12  the agent exited with a non-zero status
+# Environment: SMOKE_OUT (outputs), EXTRA_IMAGES (extra images this job built),
+# SMOKE_START_TIMEOUT (seconds each helper has to come up, default 30), and
+# SMOKE_KIT_IMAGE / SMOKE_HOLDER_IMAGE / SMOKE_DOCKER_SOCKET to override the defaults.
 # Containers, volumes and the network are removed on every exit, the guard-started
 # containers and volumes (found by their lab.run_id label) included.
 set -Eeuo pipefail
@@ -46,6 +53,7 @@ readonly EXIT_USAGE=2 EXIT_SETUP=3 EXIT_EGRESS=10 EXIT_TIMEOUT=11 EXIT_AGENT=12
 readonly KIT_IMAGE=${SMOKE_KIT_IMAGE:-lab-smoke-kit:ci}
 readonly HOLDER_IMAGE=${SMOKE_HOLDER_IMAGE:-docker.io/library/busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec}
 readonly DOCKER_SOCKET=${SMOKE_DOCKER_SOCKET:-/var/run/docker.sock}
+readonly START_TIMEOUT=${SMOKE_START_TIMEOUT:-30} # seconds each helper has to come up
 readonly GUARD_DIR=/run/cellguard
 readonly NAME_RE='^_?[a-z0-9][a-z0-9-]{0,40}$'
 readonly PINNED_RE='^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$'
@@ -142,6 +150,7 @@ done
 [[ -z "$env_file" || (-f "$env_file" && -r "$env_file") ]] || fail_usage "--env-file: no such file: $env_file"
 [[ "$timeout_s" =~ ^[1-9][0-9]{0,4}$ ]] || fail_usage "--timeout: not a number of seconds: $timeout_s"
 [[ -n "$out" ]] || fail_usage "set SMOKE_OUT or pass --out"
+[[ "$START_TIMEOUT" =~ ^[1-9][0-9]{0,3}$ ]] || fail_usage "SMOKE_START_TIMEOUT: not a number of seconds"
 for cap in "${caps[@]}"; do
 	[[ "$cap" =~ $CAP_RE ]] || fail_usage "--cap-add: not a capability: $cap"
 	[[ "$cap" != SYS_ADMIN && "$cap" != NET_ADMIN && "$cap" != ALL ]] || fail_usage "--cap-add: $cap is never granted"
@@ -182,11 +191,11 @@ ip_of() {
 	docker inspect -f "{{(index .NetworkSettings.Networks \"$net\").IPAddress}}" "$1"
 }
 
-# Wait up to 30 s for a check command (run inside a container) to succeed.
+# Wait up to $START_TIMEOUT seconds for a check command (run in a container) to succeed.
 wait_for() {
 	local what=$1
 	shift
-	for _ in $(seq 60); do
+	for _ in $(seq $((START_TIMEOUT * 2))); do
 		if "$@" >/dev/null 2>&1; then return 0; fi
 		sleep 0.5
 	done
@@ -212,7 +221,7 @@ work=$(mktemp -d)
 # job's build step built it, i.e. it is listed in $EXTRA_IMAGES (a tag that merely
 # resolves here may be a pulled, unpinned registry image).
 lock="$work/images.lock"
-echo "images:" >"$lock"
+((${#workers[@]})) && echo "images:" >"$lock" || echo "images: []" >"$lock"
 index=0
 for ref in "${workers[@]}"; do
 	index=$((index + 1))
@@ -287,7 +296,10 @@ if ((use_docker)); then
 		-v "$lock:/etc/lab/cellguard/images.lock:ro" \
 		"$KIT_IMAGE" python -m cell.cellguard.proxy >/dev/null
 	wait_for "cell-guard" docker exec "$guard" test -S "$GUARD_DIR/docker.sock"
-	agent_args+=(-v "$guard_volume:$GUARD_DIR" -e "DOCKER_HOST=unix://$GUARD_DIR/docker.sock")
+	# the agent learns its run id (cell-guard's ownership label and name prefix) and the one
+	# named volume its workers may mount, to share files with them
+	agent_args+=(-v "$guard_volume:$GUARD_DIR" -e "DOCKER_HOST=unix://$GUARD_DIR/docker.sock"
+		-e "LAB_RUN_ID=$run_id" -e "LAB_SCRATCH_VOLUME=$scratch_volume")
 fi
 
 docker run -d --name "$holder" --network "$net" --hostname agent \
